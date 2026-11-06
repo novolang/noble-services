@@ -1,0 +1,238 @@
+// src/sensor_control.nv — what the Cycling Speed and Cadence,
+// Running Speed and Cadence and Cycling Power services share: the Sensor
+// Location characteristic (0x2A5D) and the control point procedures that
+// set the cumulative value, calibrate the sensor and change or list its
+// locations.
+//
+// A control point is written by the client and answers with an indication
+// whose value is a response code, the opcode it answers and a result.  The
+// opcodes differ between the services; the result codes and the location
+// procedures do not.  `ScState` holds what a procedure changes, for the
+// application to read.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_SENSOR_LOCATION = 0x2A5D
+
+// The result of a control point procedure.
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_PARAMETER = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+
+// The Error Codes of a write to the control point of Cycling Speed and
+// Cadence and of Running Speed and Cadence: an indication is unconfirmed,
+// and the client has not enabled indications.  The Running Speed and
+// Cadence Service defines these two Application Error Codes itself.
+const ERR_PROCEDURE_ALREADY_IN_PROGRESS = 0x80
+const ERR_CCCD_IMPROPERLY_CONFIGURED = 0x81
+
+// The Cycling Power Service takes the same two errors from the Common Profile
+// and Service Error Codes (`att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS` and
+// `att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED`) and uses 0x80 for a different
+// error, Inappropriate Connection Parameters.
+
+// The octets a control point value holds at most: the longest request or
+// response, the size of the default ATT_MTU less the three octets of an
+// indication.
+const CONTROL_POINT_SIZE = 20
+
+// Where on the body or the bicycle the sensor sits.  Absent leaves the
+// Sensor Location characteristic out.
+enum SensorLocation
+    Absent
+    Other
+    TopOfShoe
+    InShoe
+    Hip
+    FrontWheel
+    LeftCrank
+    RightCrank
+    LeftPedal
+    RightPedal
+    FrontHub
+    RearDropout
+    Chainstay
+    RearWheel
+    RearHub
+    Chest
+    Spider
+    ChainRing
+
+// The octet of the Sensor Location characteristic, -1 for Absent.
+fn location_value(location: SensorLocation) -> Int
+    match location
+        Absent => -1
+        Other => 0
+        TopOfShoe => 1
+        InShoe => 2
+        Hip => 3
+        FrontWheel => 4
+        LeftCrank => 5
+        RightCrank => 6
+        LeftPedal => 7
+        RightPedal => 8
+        FrontHub => 9
+        RearDropout => 10
+        Chainstay => 11
+        RearWheel => 12
+        RearHub => 13
+        Chest => 14
+        Spider => 15
+        ChainRing => 16
+
+// The largest Sensor Location value.
+const LOCATION_MAX = 16
+
+// What a sensor supports and what the control point has changed.
+// `locations` lists the values the client may select; empty means the
+// sensor has one location and the procedures that change or list them are
+// not supported.  `cumulative_supported` and `calibration_supported` say
+// whether the sensor takes those procedures.  The remaining fields hold
+// the outcome: the location in use, the cumulative value the client set
+// (`cumulative_set` tells a value was set), and whether the client asked
+// for a calibration the application must then perform.
+struct ScState
+    locations: [Int]
+    cumulative_supported: Bool
+    calibration_supported: Bool
+    var location: Int
+    var cumulative_value: Int
+    var cumulative_set: Bool
+    var calibration_requested: Bool
+
+fn new_sc_state(location: SensorLocation, locations: [Int], cumulative_supported: Bool, calibration_supported: Bool) -> ScState
+    ScState {
+        locations: locations, cumulative_supported: cumulative_supported, calibration_supported: calibration_supported,
+        location: location_value(location), cumulative_value: 0, cumulative_set: false, calibration_requested: false }
+
+// A response value: the response code `code`, the opcode it answers, the
+// result and the parameter octets.
+fn response(code: Int, op: Int, result: Int, parameter: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(3 + list.len(parameter))
+    list.append(out, [code as u8, op as u8, result as u8])
+    list.append(out, parameter)
+    out
+
+fn lists_location(state: ScState, value: Int) -> Bool
+    for l in state.locations
+        if l == value
+            return true
+    false
+
+// The result and the parameter of Update Sensor Location with the request
+// parameter `request`.
+fn update_location(var state: ScState, request: [u8]) -> (Int, [u8])
+    if list.len(state.locations) == 0
+        return (RESULT_OP_CODE_NOT_SUPPORTED, [])
+    if list.len(request) != 1 or not lists_location(state, request[0] as Int)
+        return (RESULT_INVALID_PARAMETER, [])
+    state.location = request[0] as Int
+    (RESULT_SUCCESS, [])
+
+// The result and the parameter of Request Supported Sensor Locations: the
+// locations, one octet each.
+fn list_locations(state: ScState) -> (Int, [u8])
+    if list.len(state.locations) == 0
+        return (RESULT_OP_CODE_NOT_SUPPORTED, [])
+    var out: [u8] = []
+    for l in state.locations
+        list.push(out, l as u8)
+    (RESULT_SUCCESS, out)
+
+// The result of Set Cumulative Value with the request parameter `request`,
+// four octets.
+fn set_cumulative(var state: ScState, request: [u8]) -> Int
+    if not state.cumulative_supported
+        return RESULT_OP_CODE_NOT_SUPPORTED
+    if list.len(request) != 4
+        return RESULT_INVALID_PARAMETER
+    state.cumulative_value = wire.get(request, 0, 4)
+    state.cumulative_set = true
+    RESULT_SUCCESS
+
+// The result of Start Sensor Calibration.
+fn start_calibration(var state: ScState) -> Int
+    if not state.calibration_supported
+        return RESULT_OP_CODE_NOT_SUPPORTED
+    state.calibration_requested = true
+    RESULT_SUCCESS
+
+// Add the control point characteristic: write and indicate, with the
+// default-size value that keeps a client's request up to
+// `CONTROL_POINT_SIZE` octets writable, its Client Characteristic
+// Configuration descriptor, and the rule that a write needs indications
+// enabled and none unconfirmed.  The handles are the value and the
+// descriptor.
+fn add_control_point(var db: GattDb, uuid16: Int, write: gatt_server.Access, cccd: gatt_server.Permissions) -> Result<(Int, Int), profile_builder.ProfileError>
+    add_control_point_with_errors(var db, uuid16, write, cccd, ERR_CCCD_IMPROPERLY_CONFIGURED, ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+
+// `add_control_point` with the Error Codes the service answers: `subscription_error`
+// for a write while indications are not enabled and `busy_error` for a write
+// while an indication is unconfirmed.
+fn add_control_point_with_errors(var db: GattDb, uuid16: Int, write: gatt_server.Access, cccd: gatt_server.Permissions, subscription_error: Int, busy_error: Int) -> Result<(Int, Int), profile_builder.ProfileError>
+    var blank: [u8] = []
+    for _ in 0..CONTROL_POINT_SIZE
+        list.push(blank, 0)
+    let value = profile_builder.add_value(var db, gatt_server.PROP_WRITE | gatt_server.PROP_INDICATE,
+        profile_builder.write_only(write), gatt_server.le16(uuid16), blank)!
+    let descriptor = profile_builder.add_cccd(var db, cccd)!
+    if not gatt_server.require_indication(var db, value, subscription_error, busy_error)
+        return Err(profile_builder.ProfileError.NoRoom)
+    Ok((value, descriptor))
+
+// Whether `access` lets a client do something at all.
+fn is_granted(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        _ => true
+
+// Whether `access` is at LE security mode 1 level 1, 2 or 3, the levels the
+// Cycling Power and Running Speed and Cadence profiles allow.
+fn is_profile_level(access: gatt_server.Access) -> Bool
+    match access
+        SecureConnections => false
+        _ => true
+
+// Whether the accesses of a sensor service meet its profile: a client reads
+// the Feature and Sensor Location at `read`, reads and writes each Client
+// Characteristic Configuration descriptor, and writes the control point at
+// `control_point_write` when the service has one; none of them is Denied and
+// none needs more than security level 3.
+fn accesses_conform(read: gatt_server.Access, measurement_cccd: gatt_server.Permissions, has_control_point: Bool, control_point_write: gatt_server.Access, control_point_cccd: gatt_server.Permissions) -> Bool
+    if not is_granted(read) or not is_profile_level(read)
+        return false
+    if not cccd_conforms(measurement_cccd)
+        return false
+    if not has_control_point
+        return true
+    is_granted(control_point_write) and is_profile_level(control_point_write) and cccd_conforms(control_point_cccd)
+
+fn cccd_conforms(p: gatt_server.Permissions) -> Bool
+    is_granted(p.read) and is_profile_level(p.read) and is_granted(p.write) and is_profile_level(p.write)
+
+// Add the Sensor Location characteristic when `location` is not Absent: its
+// handle, 0 for none.
+fn add_location(var db: GattDb, location: SensorLocation, read: gatt_server.Access) -> Result<Int, profile_builder.ProfileError>
+    let v = location_value(location)
+    if v < 0
+        return Ok(0)
+    profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(read),
+        gatt_server.le16(UUID_SENSOR_LOCATION), [v as u8])
+
+// The value the client last wrote to the control point `handle`.
+fn written(db: GattDb, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// Store `response` as the value of the control point `handle`, keep the
+// Sensor Location `location_handle` (0 for none) in step with `state`, and
+// answer the indication PDUs: the response, none when the client has not
+// enabled indications.
+fn respond(var db: GattDb, var link: AttLink, handle: Int, location_handle: Int, state: ScState, value: [u8], now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handle, value)
+    if location_handle != 0
+        let _ = gatt_server.set_value(var db, location_handle, [state.location as u8])
+    gatt_server.send_value(var db, var link, handle, now_ms)

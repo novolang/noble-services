@@ -1,0 +1,1492 @@
+// tests/physical_activity_monitor_tests.nv — the unit tests of src/physical_activity_monitor.nv.
+//
+//   novo test tests/physical_activity_monitor_tests.nv
+
+use std.test
+use limits
+use att
+use gatt_server
+use links
+use profile_builder
+use fixtures.{ req, peer, subscribe, read }
+use wire
+use physical_activity_monitor.{ CONFIG_INVALID, CONFIG_NOT_PERMITTED, CONFIG_OK, ERR_ACTIVITY_TYPE_OUT_OF_RANGE, ERR_INVALID_SESSION_ID, ERR_INVALID_SUB_SESSION_ID, ERR_INVALID_TYPE, ERR_NOTHING_TO_STOP, ERR_NO_DATA_AVAILABLE, ERR_NO_SESSIONS_AVAILABLE, ERR_NO_SESSION_RUNNING, ERR_OPERATION_FAILED, ERR_OP_CODE_NOT_SUPPORTED, ERR_SESSION_STILL_RUNNING, FEATURE_ACTIVITY_TYPE, FEATURE_BITS, FEATURE_DEVICE_WORN, FEATURE_MULTIPLE_USERS, FEATURE_USER_DATA_SERVICE, OP_ENQUIRE_SESSIONS, OP_ENQUIRE_SUB_SESSIONS, OP_GET_ENDED_SESSION_DATA, OP_START_SESSION, PamsConfig, PamsHandles, PamsPolicy, PamsRecord, PamsState, PamsStored, add_pams_service, default_pams_config, default_pams_policy, new_pams_state, pams_activity_octet_valid, pams_average_activity_type, pams_bit_carried, pams_config_error, pams_current_value, pams_encode, pams_features_value, pams_field_features, pams_find_session, pams_find_sub, pams_fixed_size, pams_flags_size, pams_is_summary, pams_kind_uuid, pams_longest, pams_new_session_id, pams_receive, pams_record, pams_record_valid, pams_report_failure, pams_segments, pams_send_record, pams_set_consent, pams_set_field, pams_set_monitor_type, pams_set_time, pams_sizes, pams_start, pams_stop, pams_sub_count, pams_value_valid, pams_with_user_type, pams_worn_bit }
+
+// `pams_receive` with the default policy, for the tests that do not look at it.
+@tier(app)
+fn receive_default(var s: GattServer, h: PamsHandles, config: PamsConfig, var st: PamsState, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_pams_policy()
+    pams_receive(var s.db, var s.link, h, config, var st, var policy, peer(), pdu, now_ms)
+
+// A server for `config` whose link is authenticated.
+@tier(app)
+fn server(config: PamsConfig) -> (GattServer, PamsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_pams_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+// Write the Client Characteristic Configuration descriptor at `cccd`.
+// The Error Code of the first PDU of `out` when it is an Error Response, 0
+// otherwise.
+@tier(app)
+fn error_of(out: [[u8]]) -> Int
+    if list.len(out) > 0 and list.len(out[0]) >= 5 and (out[0][0] as Int) == 0x01
+        return out[0][4] as Int
+    0
+
+// Every Features bit.
+@tier(app)
+fn all_features() -> Int
+    (1 << FEATURE_BITS) - 1
+
+@tier(app)
+fn full_config() -> PamsConfig
+    default_pams_config(all_features())
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_full_service_lists_its_characteristics_in_the_table_order()
+    let (s, h) = server(full_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.features, 3)
+    // Seven data characteristics, each with its descriptor, then the control point, the current session and the descriptor.
+    for k in 0..7
+        test.assert_eq(h.data[k], 5 + 3 * k)
+        test.assert_eq(h.data_cccd[k], 6 + 3 * k)
+    test.assert_eq(h.control_point, 26)
+    test.assert_eq(h.control_point_cccd, 27)
+    test.assert_eq(h.current, 29)
+    test.assert_eq(h.current_cccd, 30)
+    test.assert_eq(h.descriptor, 32)
+    test.assert_eq(h.descriptor_cccd, 33)
+    test.assert_eq(gatt_server.last_handle(s.db), 33)
+    test.assert_eq(s.db.attributes[0].value, [0x3E, 0x18])
+    // Declarations: Read; Notify for the instantaneous kinds and Indicate for the summary ones; Write and Indicate; Read and Indicate; Indicate.
+    test.assert_eq(s.db.attributes[1].value, [0x02, 3, 0, 0x3B, 0x2B])
+    let props = [0x10, 0x20, 0x10, 0x20, 0x20, 0x10, 0x20]
+    for k in 0..7
+        test.assert_eq(s.db.attributes[h.data[k] - 2].value, wire.octets([props[k], h.data[k], 0, 0x3C + k, 0x2B]))
+    test.assert_eq(s.db.attributes[24].value, [0x28, 26, 0, 0x43, 0x2B])
+    test.assert_eq(s.db.attributes[27].value, [0x22, 29, 0, 0x44, 0x2B])
+    test.assert_eq(s.db.attributes[30].value, [0x20, 32, 0, 0x45, 0x2B])
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_mandatory_characteristics_alone_make_the_smallest_service()
+    let config = default_pams_config(FEATURE_ACTIVITY_TYPE)
+    test.assert_eq(config.kinds, 3)
+    let (s, h) = server(config)
+    test.assert_eq(h.data[0], 5)
+    test.assert_eq(h.data_cccd[0], 6)
+    test.assert_eq(h.data[1], 8)
+    test.assert_eq(h.data_cccd[1], 9)
+    for k in 2..7
+        test.assert_eq(h.data[k], 0)
+        test.assert_eq(h.data_cccd[k], 0)
+    test.assert_eq(h.control_point, 11)
+    test.assert_eq(h.current, 14)
+    test.assert_eq(h.descriptor, 17)
+    test.assert_eq(h.descriptor_cccd, 18)
+    test.assert_eq(gatt_server.last_handle(s.db), 18)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_features_value_is_64_bits_and_read_only()
+    let (s, h) = server(full_config())
+    var t = s
+    // Bits 0 to 54 set; 55 to 63 reserved.
+    test.assert_eq(read(var t, h.features), [0x0B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00])
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.features, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(pams_features_value(0x0102030405060708), [8, 7, 6, 5, 4, 3, 2, 1])
+    // The data characteristics cannot be read, the current session can.
+    test.assert_eq(read(var t, h.data[0])[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(read(var t, h.data[1])[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(read(var t, h.control_point)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(read(var t, h.descriptor)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    var zeros: [u8] = [0x0B]
+    for _ in 0..17
+        list.push(zeros, 0)
+    test.assert_eq(read(var t, h.current), zeros)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_tables_of_the_seven_kinds_match_the_specification()
+    let longest = [38, 77, 24, 62, 29, 28, 68]
+    let counts = [11, 25, 7, 27, 5, 5, 20]
+    let flags = [3, 4, 2, 4, 1, 2, 3]
+    for k in 0..7
+        test.assert_eq(pams_longest(k), longest[k])
+        test.assert_eq(list.len(pams_sizes(k)), counts[k])
+        test.assert_eq(list.len(pams_field_features(k)), counts[k])
+        test.assert_eq(pams_flags_size(k), flags[k])
+        test.assert_eq(pams_fixed_size(k), flags[k] + 12)
+        // The Flags field holds a bit for each field and the Device Worn bit above them.
+        test.assert(counts[k] <= 8 * flags[k])
+        if pams_worn_bit(k) >= 0
+            test.assert(pams_worn_bit(k) >= counts[k])
+            test.assert_eq(pams_worn_bit(k), 8 * flags[k] - 1)
+        // Every field has a Features bit from 3 to 54.
+        for f in pams_field_features(k)
+            test.assert(f >= 3 and f < FEATURE_BITS)
+    test.assert_eq(pams_worn_bit(0), 23)
+    test.assert_eq(pams_worn_bit(2), 15)
+    test.assert_eq(pams_worn_bit(5), 15)
+    test.assert_eq(pams_worn_bit(1), -1)
+    test.assert_eq(pams_worn_bit(3), -1)
+    test.assert_eq(pams_worn_bit(4), -1)
+    test.assert_eq(pams_worn_bit(6), -1)
+    // Every Features bit from 3 to 54 lets some field in.
+    for bit in 3..FEATURE_BITS
+        test.assert(pams_bit_carried(0x7F, bit))
+    // Spot checks of the table: the Average Activity Type is field 23 of the General Activity Summary, 2 octets, bit 24.
+    test.assert_eq(pams_sizes(1)[23], 2)
+    test.assert_eq(pams_field_features(1)[23], 24)
+    test.assert_eq(pams_field_features(0)[10], 24)
+    test.assert_eq(pams_sizes(0)[7], 3)
+    test.assert_eq(pams_field_features(0)[7], 20)
+    test.assert_eq(pams_field_features(4)[3], 12)
+    test.assert_eq(pams_field_features(3)[26], 25)
+    // The summary kinds are the ones that indicate.
+    test.assert(pams_is_summary(1) and pams_is_summary(3) and pams_is_summary(4) and pams_is_summary(6))
+    test.assert(not pams_is_summary(0) and not pams_is_summary(2) and not pams_is_summary(5))
+    test.assert_eq(pams_kind_uuid(0), 0x2B3C)
+    test.assert_eq(pams_kind_uuid(6), 0x2B42)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_features_value_and_the_characteristics_must_fit_each_other()
+    var r = gatt_server.new_server([], 65)
+    // No feature at all, and a reserved bit, are refused.
+    var none = full_config()
+    none.features = 0
+    test.assert_eq(pams_config_error(none), CONFIG_INVALID)
+    none.features = 1 << 55
+    test.assert_eq(pams_config_error(none), CONFIG_INVALID)
+    none.features = -1
+    test.assert_eq(pams_config_error(none), CONFIG_INVALID)
+    match add_pams_service(var r.db, none)
+        Ok(_) => test.fail("a reserved Features bit")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // The bits 0 to 2 alone are a valid value, with the two mandatory characteristics.
+    test.assert_eq(pams_config_error(default_pams_config(FEATURE_MULTIPLE_USERS | FEATURE_USER_DATA_SERVICE | FEATURE_DEVICE_WORN)), CONFIG_OK)
+    // Heart Rate (bit 32) needs a characteristic that carries it.
+    var heart = default_pams_config(1 << 32)
+    test.assert_eq(heart.kinds, 3 | (1 << 2) | (1 << 3))
+    heart.kinds = 3
+    test.assert_eq(pams_config_error(heart), CONFIG_INVALID)
+    heart.kinds = 3 | (1 << 3)
+    test.assert_eq(pams_config_error(heart), CONFIG_OK)
+    heart.kinds = 3 | (1 << 2)
+    test.assert_eq(pams_config_error(heart), CONFIG_OK)
+    // An optional characteristic with no field the Features value supports is refused.
+    heart.kinds = 3 | (1 << 2) | (1 << 5)
+    test.assert_eq(pams_config_error(heart), CONFIG_INVALID)
+    // The two General Activity characteristics are mandatory, and bits above kind 6 are not kinds.
+    heart.kinds = 4
+    test.assert_eq(pams_config_error(heart), CONFIG_INVALID)
+    heart.kinds = 3 | (1 << 2) | (1 << 7)
+    test.assert_eq(pams_config_error(heart), CONFIG_INVALID)
+    heart.kinds = -1
+    test.assert_eq(pams_config_error(heart), CONFIG_INVALID)
+    // The limits of the table.
+    var limits = full_config()
+    limits.max_sessions = 0
+    test.assert_eq(pams_config_error(limits), CONFIG_INVALID)
+    limits.max_sessions = 0xFFFF
+    test.assert_eq(pams_config_error(limits), CONFIG_INVALID)
+    limits.max_sessions = 0xFFFE
+    test.assert_eq(pams_config_error(limits), CONFIG_OK)
+    limits.max_sub_sessions = 0
+    test.assert_eq(pams_config_error(limits), CONFIG_INVALID)
+    limits.max_sub_sessions = 1
+    limits.max_records = -1
+    test.assert_eq(pams_config_error(limits), CONFIG_INVALID)
+    limits.max_records = 0x10000
+    test.assert_eq(pams_config_error(limits), CONFIG_INVALID)
+    limits.max_records = 0
+    test.assert_eq(pams_config_error(limits), CONFIG_OK)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_profile_allows_security_levels_2_and_3_only()
+    var config = full_config()
+    config.access = gatt_server.Access.Encrypted
+    test.assert_eq(pams_config_error(config), CONFIG_OK)
+    config.access = gatt_server.Access.Authenticated
+    test.assert_eq(pams_config_error(config), CONFIG_OK)
+    for access in [gatt_server.Access.Denied, gatt_server.Access.Open, gatt_server.Access.Authorized, gatt_server.Access.SecureConnections]
+        config.access = access
+        test.assert_eq(pams_config_error(config), CONFIG_NOT_PERMITTED)
+        var r = gatt_server.new_server([], 65)
+        match add_pams_service(var r.db, config)
+            Ok(_) => test.fail("an access outside LE security mode 1 level 2 or 3")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // The access comes before the other rules.
+    config.features = 0
+    test.assert_eq(pams_config_error(config), CONFIG_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_access_is_enforced_on_every_characteristic_and_descriptor()
+    var config = full_config()
+    config.access = gatt_server.Access.Authenticated
+    // A link in the clear: the features, the current session, the descriptors and the control point are refused.
+    var s = gatt_server.new_server([], 65)
+    let h = add_pams_service(var s.db, config)!
+    test.assert_eq(read(var s, h.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.current)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.data_cccd[0])[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    for cccd in [h.data_cccd[0], h.data_cccd[1], h.data_cccd[6], h.control_point_cccd, h.current_cccd, h.descriptor_cccd]
+        test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point, [5]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // An encrypted link is not authenticated; an authenticated one reads and subscribes.
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(read(var s, h.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(list.len(read(var s, h.features)), 9)
+    subscribe(var s, h.control_point_cccd, 2)
+    // The control point write is refused where the access is, and the procedure does not start.
+    var t = gatt_server.new_server([], 65)
+    let g = add_pams_service(var t.db, config)!
+    gatt_server.set_security(var t.link, gatt_server.link_security(true, 2, 16, true))
+    var st = new_pams_state(config)
+    let out = receive_default(var t, g, config, var st, req(0x12, g.control_point, [4, 0]), 0)
+    test.assert_eq(error_of(out), att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(st.current, -1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_pams_service(var s.db, full_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)
+
+// The bytes of the value 0x00000203 in `size` octets, the value the tests give
+// a field.
+@tier(app)
+fn pattern(size: Int) -> Int
+    0x203 & ((1 << (8 * size)) - 1)
+
+// A record of `kind` with field `i` present at `v`.
+@tier(app)
+fn one_field(kind: Int, i: Int, v: Int) -> PamsRecord
+    var rec = pams_record(kind, 1, 2, 3)
+    pams_set_field(var rec, i, v)
+    rec
+
+// A record of `kind` with every field present at its pattern.
+@tier(app)
+fn every_field(kind: Int) -> PamsRecord
+    var rec = pams_record(kind, 0x0102, 0x0304, 0x05060708)
+    let sizes = pams_sizes(kind)
+    for i in 0..list.len(sizes)
+        pams_set_field(var rec, i, pattern(sizes[i]))
+    rec
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_every_field_of_every_kind_has_its_flag_its_size_and_its_place()
+    let f = all_features()
+    for k in 0..7
+        let sizes = pams_sizes(k)
+        let fixed = pams_fixed_size(k)
+        for i in 0..list.len(sizes)
+            let data = pams_encode(f, one_field(k, i, pattern(sizes[i])), 4)
+            test.assert_eq(list.len(data), fixed + sizes[i])
+            test.assert_eq(wire.get(data, 0, pams_flags_size(k)), 1 << i)
+            test.assert_eq(wire.get(data, fixed - 12, 2), 1)
+            test.assert_eq(wire.get(data, fixed - 10, 2), 2)
+            test.assert_eq(wire.get(data, fixed - 8, 4), 3)
+            test.assert_eq(wire.get(data, fixed - 4, 4), 4)
+            test.assert_eq(wire.get(data, fixed, sizes[i]), pattern(sizes[i]))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_record_has_the_fields_in_the_order_of_the_table()
+    let f = all_features()
+    // Normal Walking Energy Expenditure per Hour (field 0) and Elevation (field 7, signed).
+    var rec = pams_record(0, 0x0102, 0x0304, 0x05060708)
+    pams_set_field(var rec, 7, -2)
+    pams_set_field(var rec, 0, 0x0102)
+    test.assert_eq(pams_encode(f, rec, 0x090A0B0C), [0x81, 0x00, 0x00, 0x02, 0x01, 0x04, 0x03, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x02, 0x01, 0xFE, 0xFF, 0xFF])
+    // Every field of the longest record: the Header field joins it to 38 octets.
+    test.assert_eq(list.len(pams_encode(f, every_field(0), 0)), 37)
+    test.assert_eq(list.len(pams_encode(f, every_field(1), 0)), 76)
+    test.assert_eq(list.len(pams_encode(f, every_field(2), 0)), 23)
+    test.assert_eq(list.len(pams_encode(f, every_field(3), 0)), 61)
+    test.assert_eq(list.len(pams_encode(f, every_field(4), 0)), 28)
+    test.assert_eq(list.len(pams_encode(f, every_field(5), 0)), 27)
+    test.assert_eq(list.len(pams_encode(f, every_field(6), 0)), 67)
+    // A record with no field is its fixed part.
+    test.assert_eq(pams_encode(f, pams_record(4, 7, 0xFFFF, 0), 5), [0x00, 0x07, 0x00, 0xFF, 0xFF, 0, 0, 0, 0, 5, 0, 0, 0])
+    // The sub-session 0xFFFF is the whole session; the Sequence Number is 32 bits.
+    test.assert_eq(pams_encode(f, pams_record(4, 0xFFFE, 0xFFFF, 0xFFFFFFFF), 0xFFFFFFFF), [0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_field_is_in_a_record_only_when_its_feature_is_set_and_the_record_has_it()
+    var rec = every_field(0)
+    // Only the Metabolic Equivalent (bit 11), one octet, is supported.
+    let e = pams_encode(1 << 11, rec, 0)
+    test.assert_eq(wire.get(e, 0, 3), 1 << 4)
+    test.assert_eq(list.len(e), 15 + 1)
+    // The record has the Speed (field 5) only.
+    var some = pams_record(0, 1, 2, 3)
+    pams_set_field(var some, 5, 0x1234)
+    test.assert_eq(wire.get(pams_encode(all_features(), some, 0), 0, 3), 1 << 5)
+    test.assert_eq(list.len(pams_encode(all_features(), some, 0)), 15 + 2)
+    // A field of a feature the monitor lacks is not looked at, and neither is one the record does not have.
+    var bad = every_field(0)
+    bad.values[5] = 70000
+    test.assert_eq(list.len(pams_encode(1 << 11, bad, 0)), 16)
+    var unset = pams_record(0, 1, 2, 3)
+    unset.values[5] = 70000
+    test.assert_eq(wire.get(pams_encode(all_features(), unset, 0), 0, 3), 0)
+    test.assert_eq(list.len(pams_encode(all_features(), unset, 0)), 15)
+    // Without a feature in the value, nothing but the fixed part.
+    test.assert_eq(list.len(pams_encode(FEATURE_DEVICE_WORN, every_field(1), 0)), 16)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_device_worn_flag_is_set_only_by_a_monitor_that_supports_it()
+    var rec = pams_record(0, 1, 2, 3)
+    rec.worn = true
+    test.assert_eq(pams_encode(FEATURE_DEVICE_WORN, rec, 0)[2] as Int, 0x80)
+    test.assert_eq(pams_encode(1, rec, 0)[2] as Int, 0)
+    var cr = pams_record(2, 1, 2, 3)
+    cr.worn = true
+    test.assert_eq(wire.get(pams_encode(FEATURE_DEVICE_WORN, cr, 0), 0, 2), 0x8000)
+    var sleep = pams_record(5, 1, 2, 3)
+    sleep.worn = true
+    test.assert_eq(wire.get(pams_encode(FEATURE_DEVICE_WORN, sleep, 0), 0, 2), 0x8000)
+    // The summary kinds have no such flag.
+    for k in [1, 3, 4, 6]
+        var summary = pams_record(k, 1, 2, 3)
+        summary.worn = true
+        test.assert_eq(wire.get(pams_encode(FEATURE_DEVICE_WORN, summary, 0), 0, pams_flags_size(k)), 0)
+    // Not worn: the flag is clear.
+    test.assert_eq(wire.get(pams_encode(FEATURE_DEVICE_WORN, pams_record(0, 1, 2, 3), 0), 0, 3), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_record_outside_its_formats_is_not_sent()
+    let f = all_features()
+    test.assert(pams_record_valid(f, every_field(0)))
+    // The ends of the identifiers.
+    var ids = pams_record(0, 0xFFFE, 0xFFFF, 0xFFFFFFFF)
+    test.assert(pams_record_valid(f, ids))
+    ids.session = 0xFFFF
+    test.assert(not pams_record_valid(f, ids))
+    ids.session = -1
+    test.assert(not pams_record_valid(f, ids))
+    ids.session = 1
+    ids.sub_session = 0x10000
+    test.assert(not pams_record_valid(f, ids))
+    ids.sub_session = -1
+    test.assert(not pams_record_valid(f, ids))
+    ids.sub_session = 2
+    ids.relative_time = 0x100000000
+    test.assert(not pams_record_valid(f, ids))
+    ids.relative_time = -1
+    test.assert(not pams_record_valid(f, ids))
+    // Kinds out of range, and a record with the wrong number of values.
+    test.assert(not pams_record_valid(f, pams_record(7, 1, 2, 3)))
+    test.assert(not pams_record_valid(f, pams_record(-1, 1, 2, 3)))
+    var short = pams_record(0, 1, 2, 3)
+    short.values = [1, 2]
+    test.assert(not pams_record_valid(f, short))
+    test.assert_eq(list.len(pams_encode(f, short, 0)), 0)
+    // The value of every field must fit its octets, and neither is negative.
+    for k in 0..7
+        let sizes = pams_sizes(k)
+        for i in 0..list.len(sizes)
+            test.assert(pams_value_valid(k, i, sizes[i], 0))
+            test.assert(not pams_value_valid(k, i, sizes[i], 1 << (8 * sizes[i])))
+            if not (k == 0 and i == 7)
+                test.assert(not pams_value_valid(k, i, sizes[i], -1))
+            if not (k == 0 and i == 7) and not (k == 5 and i == 3)
+                test.assert(pams_value_valid(k, i, sizes[i], (1 << (8 * sizes[i])) - 1))
+    test.assert(not pams_record_valid(f, one_field(0, 0, 0x10000)))
+    test.assert(pams_record_valid(f, one_field(0, 0, 0xFFFF)))
+    test.assert(not pams_record_valid(f, one_field(0, 4, 0x100)))
+    test.assert(pams_record_valid(f, one_field(0, 4, 0xFF)))
+    test.assert(not pams_record_valid(f, one_field(0, 0, -1)))
+    test.assert(not pams_record_valid(f, one_field(1, 0, 0x100000000)))
+    test.assert(pams_record_valid(f, one_field(1, 0, 0xFFFFFFFF)))
+    test.assert(not pams_record_valid(f, one_field(1, 7, 0x1000000)))
+    test.assert(pams_record_valid(f, one_field(1, 7, 0xFFFFFF)))
+    // The Elevation is 24 bits signed.
+    test.assert(pams_record_valid(f, one_field(0, 7, -8388608)))
+    test.assert(pams_record_valid(f, one_field(0, 7, 8388607)))
+    test.assert(not pams_record_valid(f, one_field(0, 7, -8388609)))
+    test.assert(not pams_record_valid(f, one_field(0, 7, 8388608)))
+    // A record that is not valid is not encoded.
+    test.assert_eq(list.len(pams_encode(f, one_field(0, 0, 0x10000), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_an_activity_type_has_two_sub_fields_and_none_is_reserved()
+    let f = all_features()
+    // 0x00 to 0x0E and 0xFF are values; 0x0F to 0xFE are reserved, in either octet.
+    for v in [0x00, 0x01, 0x07, 0x0E, 0xFF]
+        test.assert(pams_activity_octet_valid(v))
+        test.assert(pams_record_valid(f, one_field(0, 10, v | (v << 8))))
+        test.assert(pams_record_valid(f, one_field(1, 23, v | (v << 8))))
+    for v in [0x0F, 0x10, 0x80, 0xFE]
+        test.assert(not pams_activity_octet_valid(v))
+        test.assert(not pams_record_valid(f, one_field(0, 10, v)))
+        test.assert(not pams_record_valid(f, one_field(0, 10, v << 8)))
+        test.assert(not pams_record_valid(f, one_field(1, 23, v)))
+        test.assert(not pams_record_valid(f, one_field(1, 23, v << 8)))
+    // The monitor-defined sub-field is the low octet, the user-defined one the high octet.
+    test.assert_eq(pams_encode(f, one_field(0, 10, 0x0E05), 0)[15] as Int, 0x05)
+    test.assert_eq(pams_encode(f, one_field(0, 10, 0x0E05), 0)[16] as Int, 0x0E)
+    // A reserved value of a field the monitor lacks is not looked at.
+    test.assert(pams_record_valid(1, one_field(0, 10, 0x50)))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_sleep_stage_has_no_reserved_bit()
+    let f = all_features()
+    // Bits 0 to 13 and 23 are stages; 14 to 22 are reserved.
+    test.assert(pams_record_valid(f, one_field(5, 3, 0x3FFF)))
+    test.assert(pams_record_valid(f, one_field(5, 3, 0x800000)))
+    test.assert(pams_record_valid(f, one_field(5, 3, 0x803FFF)))
+    for bit in 14..23
+        test.assert(not pams_record_valid(f, one_field(5, 3, 1 << bit)))
+    test.assert(not pams_record_valid(f, one_field(5, 3, 0x1000000)))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_record_over_the_default_mtu_is_sent_in_segments_of_mtu_less_4()
+    let f = all_features()
+    // The longest General Activity Instantaneous record: 37 octets after the Header field, 19 in a segment at an ATT_MTU of 23.
+    let data = pams_encode(f, every_field(0), 0)
+    test.assert_eq(list.len(data), 37)
+    let two = pams_segments(5, data, 23)
+    test.assert_eq(list.len(two), 2)
+    test.assert_eq(list.len(two[0]), 20)
+    test.assert_eq(list.len(two[1]), 19)
+    test.assert_eq(two[0][0] as Int, (5 << 2) | 1)
+    test.assert_eq(two[1][0] as Int, (6 << 2) | 2)
+    // The segments hold the record in order and whole.
+    var joined: [u8] = two[0][1:20]
+    list.append(joined, two[1][1:19])
+    test.assert_eq(joined, data)
+    // A larger ATT_MTU takes it whole, with both bits set.
+    let one = pams_segments(5, data, 64)
+    test.assert_eq(list.len(one), 1)
+    test.assert_eq(one[0][0] as Int, (5 << 2) | 3)
+    test.assert_eq(one[0][1:38], data)
+    // The longest record of all: 76 octets in four segments of 19.
+    let long = pams_encode(f, every_field(1), 0)
+    let four = pams_segments(9, long, 23)
+    test.assert_eq(list.len(four), 4)
+    test.assert_eq(four[0][0] as Int, (9 << 2) | 1)
+    test.assert_eq(four[1][0] as Int, 10 << 2)
+    test.assert_eq(four[2][0] as Int, 11 << 2)
+    test.assert_eq(four[3][0] as Int, (12 << 2) | 2)
+    for v in four
+        test.assert_eq(list.len(v), 20)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_segment_count_follows_the_size_of_the_record_and_the_mtu()
+    var data: [u8] = []
+    for i in 0..60
+        list.push(data, i as u8)
+    // N is (octets - 1) / (ATT_MTU - 4) rounded up, counting the Header field in the octets.
+    test.assert_eq(list.len(pams_segments(0, data[0:19], 23)), 1)
+    test.assert_eq(list.len(pams_segments(0, data[0:20], 23)), 2)
+    test.assert_eq(list.len(pams_segments(0, data[0:38], 23)), 2)
+    test.assert_eq(list.len(pams_segments(0, data[0:39], 23)), 3)
+    test.assert_eq(list.len(pams_segments(0, data[0:60], 23)), 4)
+    test.assert_eq(list.len(pams_segments(0, data[0:60], 64)), 1)
+    test.assert_eq(list.len(pams_segments(0, data[0:60], 63)), 2)
+    test.assert_eq(list.len(pams_segments(0, data[0:60], 65)), 1)
+    test.assert_eq(list.len(pams_segments(0, data[0:1], 23)), 1)
+    // No segment is longer than the ATT_MTU less 3.
+    for mtu in [23, 24, 30, 50]
+        for v in pams_segments(0, data, mtu)
+            test.assert(list.len(v) <= mtu - 3)
+    // An ATT_MTU under 23 and an empty record have no segment.
+    test.assert_eq(list.len(pams_segments(0, data, 22)), 0)
+    test.assert_eq(list.len(pams_segments(0, [], 23)), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_rolling_segment_counter_wraps_from_63_to_0_across_the_segments()
+    var data: [u8] = []
+    for i in 0..57
+        list.push(data, i as u8)
+    // The example of Figure 2.1: counters 62, 63 and 0.
+    let s = pams_segments(62, data, 23)
+    test.assert_eq(list.len(s), 3)
+    test.assert_eq(s[0][0] as Int, 0xF9)
+    test.assert_eq(s[1][0] as Int, 0xFC)
+    test.assert_eq(s[2][0] as Int, 0x02)
+    // A counter beyond 6 bits is taken modulo 64.
+    test.assert_eq(pams_segments(64 + 3, data, 23)[0][0] as Int, (3 << 2) | 1)
+    // The first segment has First only, a middle one neither, the last Last only.
+    test.assert_eq((s[0][0] as Int) & 3, 1)
+    test.assert_eq((s[1][0] as Int) & 3, 0)
+    test.assert_eq((s[2][0] as Int) & 3, 2)
+
+// A server for `config` whose client enabled everything: the control point, the
+// session descriptor and the current session by indication, the instantaneous
+// data characteristics by notification and the summary ones by indication.
+@tier(app)
+fn live_server(config: PamsConfig) -> (GattServer, PamsHandles)
+    let (s, h) = server(config)
+    var t = s
+    subscribe(var t, h.control_point_cccd, 2)
+    subscribe(var t, h.descriptor_cccd, 2)
+    subscribe(var t, h.current_cccd, 2)
+    for k in 0..7
+        if h.data[k] != 0
+            subscribe(var t, h.data_cccd[k], if pams_is_summary(k) then 2 else 1)
+    (t, h)
+
+// The value of a notification or indication.
+@tier(app)
+fn value_of(pdu: [u8]) -> [u8]
+    pdu[3:list.len(pdu)]
+
+// The PDUs of `all` that notify or indicate `handle`.
+@tier(app)
+fn pdus_of(all: [[u8]], handle: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for p in all
+        if list.len(p) >= 3 and ((p[0] as Int) == 0x1B or (p[0] as Int) == 0x1D) and gatt_server.read_le16(p, 1) == handle
+            list.push(out, p[:])
+    out
+
+// Confirm the indication outstanding and answer the PDUs that follow it, until
+// there is none: they are the indications that waited.
+@tier(app)
+fn confirm_all(var s: GattServer) -> [[u8]]
+    var all: [[u8]] = []
+    var go = true
+    while go
+        var more = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+        if list.len(more) == 0
+            go = false
+        else
+            list.append(all, more)
+    all
+
+// Write `request` to the control point and confirm every indication until none
+// is left: the PDUs in the order they leave, the Write Response first.
+@tier(app)
+fn run(var s: GattServer, h: PamsHandles, config: PamsConfig, var st: PamsState, request: [Int]) -> [[u8]]
+    var all = receive_default(var s, h, config, var st, req(0x12, h.control_point, request), 0)
+    if list.len(all) > 0 and (all[0][0] as Int) == att.ATT_OP_WRITE_RSP
+        list.append(all, confirm_all(var s))
+    all
+
+// The Error Code `request` is refused with, 0 when it is accepted (the procedure
+// runs and its indications are confirmed).
+@tier(app)
+fn refusal(var s: GattServer, h: PamsHandles, config: PamsConfig, var st: PamsState, request: [Int]) -> Int
+    error_of(run(var s, h, config, var st, request))
+
+// The state of a new connection with the consent of a Multiple Users monitor given.
+@tier(app)
+fn fresh(config: PamsConfig) -> PamsState
+    var st = new_pams_state(config)
+    pams_set_consent(var st, true)
+    st
+
+// A record of the summary kind `kind` with the Floors (field 16) of the
+// General Activity Summary, for the session `session` and sub-session `sub`.
+@tier(app)
+fn floors(session: Int, sub: Int, n: Int) -> PamsRecord
+    var rec = pams_record(1, session, sub, 10)
+    pams_set_field(var rec, 16, n)
+    rec
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_record_is_sent_to_a_client_that_enabled_the_characteristic_and_counted_before()
+    let config = full_config()
+    let (s, h) = server(config)
+    var t = s
+    var st = fresh(config)
+    // Not enabled: nothing leaves, the Sequence Number counts and the record is kept; the segment counter stays.
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, every_field(0), 0)), 0)
+    test.assert_eq(st.sequence[0], 1)
+    test.assert_eq(list.len(st.records), 1)
+    test.assert_eq(st.counters[0], 0)
+    subscribe(var t, h.data_cccd[0], 1)
+    let out = pams_send_record(var t.db, var t.link, h, config, var st, every_field(0), 0)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0][0] as Int, 0x1B)
+    test.assert_eq(gatt_server.read_le16(out[0], 1), h.data[0])
+    test.assert_eq(list.len(out[0]), 3 + 20)
+    test.assert_eq(list.len(out[1]), 3 + 19)
+    // The first segment: Header with First only, then the Flags field, the identifiers, the time and the Sequence Number 1.
+    test.assert_eq(value_of(out[0])[0] as Int, 1)
+    test.assert_eq(value_of(out[1])[0] as Int, (1 << 2) | 2)
+    test.assert_eq(wire.get(value_of(out[0]), 1, 3), (1 << 11) - 1)
+    test.assert_eq(wire.get(value_of(out[0]), 4, 2), 0x0102)
+    test.assert_eq(wire.get(value_of(out[0]), 6, 2), 0x0304)
+    test.assert_eq(wire.get(value_of(out[0]), 8, 4), 0x05060708)
+    test.assert_eq(wire.get(value_of(out[0]), 12, 4), 1)
+    test.assert_eq(st.sequence[0], 2)
+    test.assert_eq(st.counters[0], 2)
+    // The next record goes on with the counter and the next Sequence Number.
+    let next = pams_send_record(var t.db, var t.link, h, config, var st, every_field(0), 0)
+    test.assert_eq(value_of(next[0])[0] as Int, (2 << 2) | 1)
+    test.assert_eq(wire.get(value_of(next[0]), 12, 4), 2)
+    test.assert_eq(st.counters[0], 4)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_summary_is_indicated_in_segments_that_wait_for_each_confirmation()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let first = pams_send_record(var t.db, var t.link, h, config, var st, every_field(1), 0)
+    // The first segment leaves, the others wait.
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0][0] as Int, 0x1D)
+    test.assert_eq(gatt_server.read_le16(first[0], 1), h.data[1])
+    test.assert_eq(value_of(first[0])[0] as Int, 1)
+    let rest = confirm_all(var t)
+    test.assert_eq(list.len(rest), 3)
+    test.assert_eq(value_of(rest[0])[0] as Int, 1 << 2)
+    test.assert_eq(value_of(rest[1])[0] as Int, 2 << 2)
+    test.assert_eq(value_of(rest[2])[0] as Int, (3 << 2) | 2)
+    // The segments are the record whole.
+    var joined: [u8] = value_of(first[0])[1:20]
+    for p in rest
+        list.append(joined, value_of(p)[1:20])
+    test.assert_eq(joined, pams_encode(config.features, every_field(1), 0))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_record_the_service_cannot_send_leaves_no_trace()
+    // A service without the CardioRespiratory characteristics.
+    let config = default_pams_config(FEATURE_ACTIVITY_TYPE)
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(2, 1, 2, 3), 0)), 0)
+    test.assert_eq(st.sequence[2], 0)
+    test.assert_eq(list.len(st.records), 0)
+    // A record outside its formats, and a kind that does not exist.
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 0xFFFF, 2, 3), 0)), 0)
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(7, 1, 2, 3), 0)), 0)
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(-1, 1, 2, 3), 0)), 0)
+    test.assert_eq(st.sequence[0], 0)
+    test.assert_eq(list.len(st.records), 0)
+    // A valid one goes.
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 1, 2, 3), 0)), 1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_sequence_number_wraps_at_32_bits()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    st.sequence[4] = 0xFFFFFFFE
+    let a = pams_send_record(var t.db, var t.link, h, config, var st, pams_record(4, 1, 2, 3), 0)
+    test.assert_eq(wire.get(value_of(a[0]), 1 + 9, 4), 0xFFFFFFFE)
+    let _ = confirm_all(var t)
+    let b = pams_send_record(var t.db, var t.link, h, config, var st, pams_record(4, 1, 2, 3), 0)
+    test.assert_eq(wire.get(value_of(b[0]), 1 + 9, 4), 0xFFFFFFFF)
+    let _ = confirm_all(var t)
+    test.assert_eq(st.sequence[4], 0)
+    let c = pams_send_record(var t.db, var t.link, h, config, var st, pams_record(4, 1, 2, 3), 0)
+    test.assert_eq(wire.get(value_of(c[0]), 1 + 9, 4), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_records_are_kept_for_get_ended_session_data_within_the_limit()
+    var config = full_config()
+    config.max_records = 3
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    // An instantaneous record is added for every one sent.
+    for n in 0..4
+        var rec = pams_record(0, 1, 2, 10 + n)
+        pams_set_field(var rec, 0, n)
+        let _ = pams_send_record(var t.db, var t.link, h, config, var st, rec, 0)
+    test.assert_eq(list.len(st.records), 3)
+    // The oldest went: the relative times 11, 12 and 13 remain.
+    test.assert_eq(wire.get(st.records[0].data, 7, 4), 11)
+    test.assert_eq(wire.get(st.records[2].data, 7, 4), 13)
+    // A summary replaces the one of its session and sub-session before it.
+    var summaries = full_config()
+    summaries.max_records = 10
+    let (u, g) = live_server(summaries)
+    var v = u
+    var sst = fresh(summaries)
+    let _ = pams_send_record(var v.db, var v.link, g, summaries, var sst, floors(1, 0, 5), 0)
+    let _ = confirm_all(var v)
+    let _ = pams_send_record(var v.db, var v.link, g, summaries, var sst, floors(1, 0, 6), 0)
+    let _ = confirm_all(var v)
+    test.assert_eq(list.len(sst.records), 1)
+    test.assert_eq(sst.records[0].data[16] as Int, 6)
+    // Another sub-session, another session and another kind have their own.
+    let _ = pams_send_record(var v.db, var v.link, g, summaries, var sst, floors(1, 1, 7), 0)
+    let _ = confirm_all(var v)
+    let _ = pams_send_record(var v.db, var v.link, g, summaries, var sst, floors(2, 0, 8), 0)
+    let _ = confirm_all(var v)
+    test.assert_eq(list.len(sst.records), 3)
+    // Nothing is kept with a limit of 0.
+    var none = full_config()
+    none.max_records = 0
+    let (w, i) = live_server(none)
+    var x = w
+    var nst = fresh(none)
+    test.assert_eq(list.len(pams_send_record(var x.db, var x.link, i, none, var nst, pams_record(0, 1, 2, 3), 0)), 1)
+    test.assert_eq(list.len(nst.records), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_multiple_users_monitor_sends_no_record_before_the_consent()
+    let config = default_pams_config(all_features())
+    test.assert((config.features & FEATURE_MULTIPLE_USERS) != 0)
+    let (s, h) = live_server(config)
+    var t = s
+    var st = new_pams_state(config)
+    test.assert_eq(st.consent, false)
+    // Nothing leaves; the record is counted and kept for the user.
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 1, 2, 3), 0)), 0)
+    test.assert_eq(st.sequence[0], 1)
+    test.assert_eq(list.len(st.records), 1)
+    pams_set_consent(var st, true)
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 1, 2, 3), 0)), 1)
+    // The consent can be withdrawn.
+    pams_set_consent(var st, false)
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 1, 2, 3), 0)), 0)
+    // A single-user monitor needs none.
+    let single = default_pams_config(all_features() ^ FEATURE_MULTIPLE_USERS)
+    test.assert(new_pams_state(single).consent)
+
+// Three sessions on a monitor with the clock at 1000, 2000, 3000, 4000 and 5000
+// seconds (60 minutes offset): session 0 with two sub-sessions (1000 to 3000),
+// session 1 (3000 to 4000) and session 2, which runs from 5000.
+@tier(app)
+fn three_sessions(var s: GattServer, h: PamsHandles, config: PamsConfig, var st: PamsState)
+    pams_set_time(var st, 1000, 60)
+    let _ = run(var s, h, config, var st, [4, 0])
+    pams_set_time(var st, 2000, 60)
+    let _ = run(var s, h, config, var st, [4, 1])
+    pams_set_time(var st, 3000, 60)
+    let _ = run(var s, h, config, var st, [4, 0])
+    pams_set_time(var st, 4000, 60)
+    let _ = run(var s, h, config, var st, [5])
+    pams_set_time(var st, 5000, 60)
+    let _ = run(var s, h, config, var st, [4, 0])
+
+// The Current Session value of the running session `session` and sub-session
+// `sub` that began at `session_start` and `sub_start` (offset 60 minutes).
+@tier(app)
+fn current_value(running: Int, session: Int, session_start: Int, sub: Int, sub_start: Int) -> [Int]
+    [running, session & 0xFF, session >>> 8, session_start & 0xFF, (session_start >>> 8) & 0xFF, (session_start >>> 16) & 0xFF, 0, 0x3C, 0,
+     sub & 0xFF, sub >>> 8, sub_start & 0xFF, (sub_start >>> 8) & 0xFF, (sub_start >>> 16) & 0xFF, 0, 0x3C, 0]
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_start_session_starts_a_session_with_its_first_sub_session_and_indicates_the_current_session()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    // Before any session the value is zeros.
+    test.assert_eq(list.len(pams_current_value(st)), 17)
+    var zeros: [u8] = [0x0B]
+    for _ in 0..17
+        list.push(zeros, 0)
+    test.assert_eq(read(var t, h.current), zeros)
+    pams_set_time(var st, 1000, 60)
+    let a = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(list.len(a), 2)
+    test.assert_eq(a[0], [0x13])
+    test.assert_eq(a[1], req(0x1D, h.current, current_value(1, 0, 1000, 0, 1000)))
+    test.assert_eq(st.current, 0)
+    test.assert_eq(st.current_sub, 0)
+    test.assert_eq(read(var t, h.current), [0x0B, 1, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0])
+    // A sub-session of the session: a new Sub-session ID, one indication.
+    pams_set_time(var st, 2000, 60)
+    let b = run(var t, h, config, var st, [4, 1])
+    test.assert_eq(list.len(b), 2)
+    test.assert_eq(b[1], req(0x1D, h.current, current_value(1, 0, 1000, 1, 2000)))
+    test.assert_eq(st.current_sub, 1)
+    test.assert_eq(list.len(st.subs), 2)
+    test.assert_eq(st.subs[0].running, false)
+    test.assert_eq(st.subs[0].end_base, 2000)
+    // A new session while one runs: two indications, the stopped session and the started one.
+    pams_set_time(var st, 3000, 60)
+    let c = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(list.len(c), 3)
+    test.assert_eq(c[1], req(0x1D, h.current, current_value(0, 0, 1000, 1, 2000)))
+    test.assert_eq(c[2], req(0x1D, h.current, current_value(1, 1, 3000, 0, 3000)))
+    test.assert_eq(st.sessions[0].running, false)
+    test.assert_eq(st.sessions[0].end_base, 3000)
+    test.assert_eq(st.subs[1].running, false)
+    test.assert_eq(st.subs[1].end_base, 3000)
+    test.assert_eq(st.current, 1)
+    // The sub-session IDs start at 0 in each session.
+    test.assert_eq(st.current_sub, 0)
+    test.assert_eq(pams_sub_count(st, 1), 1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_stop_session_ends_the_session_and_its_sub_session()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    pams_set_time(var st, 1000, 60)
+    test.assert_eq(refusal(var t, h, config, var st, [5]), ERR_NOTHING_TO_STOP)
+    let _ = run(var t, h, config, var st, [4, 0])
+    pams_set_time(var st, 4000, 60)
+    let out = run(var t, h, config, var st, [5])
+    test.assert_eq(list.len(out), 2)
+    // The indication names the session that stopped, not running.
+    test.assert_eq(out[1], req(0x1D, h.current, current_value(0, 0, 1000, 0, 1000)))
+    test.assert_eq(st.current, -1)
+    test.assert_eq(st.current_sub, -1)
+    test.assert_eq(st.sessions[0].end_base, 4000)
+    test.assert_eq(st.sessions[0].end_offset, 60)
+    test.assert_eq(st.subs[0].end_base, 4000)
+    // The current session characteristic reads the same.
+    test.assert_eq(read(var t, h.current), [0x0B, 0, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0])
+    test.assert_eq(refusal(var t, h, config, var st, [5]), ERR_NOTHING_TO_STOP)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_start_sub_session_needs_a_running_session_and_a_type_of_0_or_1()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 1]), ERR_NO_SESSION_RUNNING)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 2]), ERR_INVALID_TYPE)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0xFF]), ERR_INVALID_TYPE)
+    // The type is checked first when both apply.
+    test.assert_eq(refusal(var t, h, config, var st, [4, 3]), ERR_INVALID_TYPE)
+    test.assert_eq(st.current, -1)
+    let _ = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(refusal(var t, h, config, var st, [4, 7]), ERR_INVALID_TYPE)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 1]), 0)
+    test.assert_eq(st.current_sub, 1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_enquire_sessions_describes_every_session_and_then_counts_them()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    test.assert_eq(refusal(var t, h, config, var st, [1]), ERR_NO_SESSIONS_AVAILABLE)
+    three_sessions(var t, h, config, var st)
+    let out = run(var t, h, config, var st, [1])
+    test.assert_eq(list.len(out), 5)
+    test.assert_eq(out[0], [0x13])
+    // One descriptor for each session, including the running one, then the count.
+    test.assert_eq(out[1], req(0x1D, h.descriptor, [0x01, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0, 0xB8, 0x0B, 0, 0, 0x3C, 0]))
+    test.assert_eq(out[2], req(0x1D, h.descriptor, [0x01, 1, 0, 0xB8, 0x0B, 0, 0, 0x3C, 0, 0xA0, 0x0F, 0, 0, 0x3C, 0]))
+    test.assert_eq(out[3], req(0x1D, h.descriptor, [0x03, 2, 0, 0x88, 0x13, 0, 0, 0x3C, 0]))
+    test.assert_eq(out[4], req(0x1D, h.control_point, [0xFC, 3, 0]))
+    // A negative offset is two's complement.
+    pams_set_time(var st, 6000, -60)
+    let _ = run(var t, h, config, var st, [5])
+    let again = run(var t, h, config, var st, [1])
+    test.assert_eq(again[3], req(0x1D, h.descriptor, [0x01, 2, 0, 0x88, 0x13, 0, 0, 0x3C, 0, 0x70, 0x17, 0, 0, 0xC4, 0xFF]))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_enquire_sub_sessions_describes_the_sub_sessions_of_one_session()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    three_sessions(var t, h, config, var st)
+    let out = run(var t, h, config, var st, [2, 0, 0])
+    test.assert_eq(list.len(out), 4)
+    test.assert_eq(out[1], req(0x1D, h.descriptor, [0x00, 0, 0, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0, 0xD0, 0x07, 0, 0, 0x3C, 0]))
+    test.assert_eq(out[2], req(0x1D, h.descriptor, [0x00, 0, 0, 1, 0, 0xD0, 0x07, 0, 0, 0x3C, 0, 0xB8, 0x0B, 0, 0, 0x3C, 0]))
+    test.assert_eq(out[3], req(0x1D, h.control_point, [0xFB, 2, 0]))
+    // The running session: its sub-session has the running bit and no end.
+    let running = run(var t, h, config, var st, [2, 2, 0])
+    test.assert_eq(list.len(running), 3)
+    test.assert_eq(running[1], req(0x1D, h.descriptor, [0x02, 2, 0, 0, 0, 0x88, 0x13, 0, 0, 0x3C, 0]))
+    test.assert_eq(running[2], req(0x1D, h.control_point, [0xFB, 1, 0]))
+    // A session the monitor does not have, and the reserved 0xFFFF.
+    test.assert_eq(refusal(var t, h, config, var st, [2, 9, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [2, 0xFF, 0xFF]), ERR_INVALID_SESSION_ID)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_delete_ended_session_deletes_it_and_indicates_its_descriptor_as_deleted()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    three_sessions(var t, h, config, var st)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 2, 0]), ERR_SESSION_STILL_RUNNING)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 9, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 0xFF, 0xFF]), ERR_INVALID_SESSION_ID)
+    let out = run(var t, h, config, var st, [6, 0, 0])
+    test.assert_eq(list.len(out), 2)
+    // Describes Session and Deleted Session, not running, with its end.
+    test.assert_eq(out[1], req(0x1D, h.descriptor, [0x05, 0, 0, 0xE8, 0x03, 0, 0, 0x3C, 0, 0xB8, 0x0B, 0, 0, 0x3C, 0]))
+    test.assert_eq(list.len(st.sessions), 2)
+    test.assert_eq(pams_sub_count(st, 0), 0)
+    test.assert_eq(pams_find_session(st, 0), -1)
+    // It is gone: no sub-session, no data, no second deletion.
+    test.assert_eq(refusal(var t, h, config, var st, [2, 0, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 0, 0]), ERR_INVALID_SESSION_ID)
+    let all = run(var t, h, config, var st, [1])
+    test.assert_eq(all[3], req(0x1D, h.control_point, [0xFC, 2, 0]))
+    // The session that ran last was deleted: the current session names none until the running one stops.
+    test.assert_eq(st.last, 1)
+    let _ = run(var t, h, config, var st, [6, 1, 0])
+    test.assert_eq(st.last, -1)
+    test.assert_eq(list.len(pams_current_value(st)), 17)
+    test.assert_eq(read(var t, h.current), [0x0B, 1, 2, 0, 0x88, 0x13, 0, 0, 0x3C, 0, 0, 0, 0x88, 0x13, 0, 0, 0x3C, 0])
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_session_id_is_not_reused_after_the_session_is_deleted_and_wraps_after_0xfffe()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let _ = run(var t, h, config, var st, [4, 0])
+    let _ = run(var t, h, config, var st, [5])
+    let _ = run(var t, h, config, var st, [6, 0, 0])
+    let _ = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(st.current, 1)
+    // After 0xFFFE the number is 0 again, and a number in use is skipped.
+    st.next_session = 0xFFFF
+    test.assert_eq(pams_new_session_id(st), 0)
+    st.next_session = 1
+    test.assert_eq(pams_new_session_id(st), 2)
+    st.next_session = 0xFFFE
+    test.assert_eq(pams_new_session_id(st), 0xFFFE)
+    // The sub-session IDs of a session run 0, 1, 2.
+    let _ = run(var t, h, config, var st, [4, 1])
+    let _ = run(var t, h, config, var st, [4, 1])
+    test.assert_eq(st.current_sub, 2)
+    test.assert_eq(pams_find_sub(st, 1, 0), 0)
+    test.assert_eq(pams_find_sub(st, 1, 2), 2)
+    test.assert_eq(pams_find_sub(st, 1, 3), -1)
+    test.assert_eq(pams_find_sub(st, 7, 0), -1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_table_of_sessions_has_the_room_the_configuration_gives()
+    var config = full_config()
+    config.max_sessions = 2
+    config.max_sub_sessions = 2
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0]), 0)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 1]), 0)
+    // A third sub-session does not fit; the request is refused and nothing changes.
+    test.assert_eq(refusal(var t, h, config, var st, [4, 1]), ERR_OPERATION_FAILED)
+    test.assert_eq(st.current_sub, 1)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0]), 0)
+    // Two sessions are the most; the third is refused until one is deleted.
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0]), ERR_OPERATION_FAILED)
+    test.assert_eq(st.current, 1)
+    test.assert_eq(list.len(pams_start(var t.db, var t.link, h, config, var st, false, 0)), 0)
+    let _ = run(var t, h, config, var st, [5])
+    test.assert_eq(refusal(var t, h, config, var st, [6, 0, 0]), 0)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0]), 0)
+    test.assert_eq(list.len(st.sessions), 2)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_monitor_starts_and_stops_a_session_itself()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    pams_set_time(var st, 1000, 60)
+    // No session: a sub-session and a stop do nothing.
+    test.assert_eq(list.len(pams_start(var t.db, var t.link, h, config, var st, true, 0)), 0)
+    test.assert_eq(list.len(pams_stop(var t.db, var t.link, h, var st, 0)), 0)
+    let a = pams_start(var t.db, var t.link, h, config, var st, false, 0)
+    test.assert_eq(list.len(a), 1)
+    test.assert_eq(a[0], req(0x1D, h.current, current_value(1, 0, 1000, 0, 1000)))
+    let _ = confirm_all(var t)
+    pams_set_time(var st, 2000, 60)
+    let b = pams_start(var t.db, var t.link, h, config, var st, true, 0)
+    test.assert_eq(b[0], req(0x1D, h.current, current_value(1, 0, 1000, 1, 2000)))
+    let _ = confirm_all(var t)
+    // A new session while one runs: the stopped one is indicated first, and the second waits for the confirmation.
+    pams_set_time(var st, 3000, 60)
+    let c = pams_start(var t.db, var t.link, h, config, var st, false, 0)
+    test.assert_eq(list.len(c), 1)
+    test.assert_eq(c[0], req(0x1D, h.current, current_value(0, 0, 1000, 1, 2000)))
+    let rest = confirm_all(var t)
+    test.assert_eq(list.len(rest), 1)
+    test.assert_eq(rest[0], req(0x1D, h.current, current_value(1, 1, 3000, 0, 3000)))
+    let d = pams_stop(var t.db, var t.link, h, var st, 0)
+    test.assert_eq(d[0], req(0x1D, h.current, current_value(0, 1, 3000, 0, 3000)))
+    // The average activity type of a sub-session: monitor-defined low, user-defined high; a reserved value is refused.
+    test.assert(pams_set_monitor_type(var st, 1, 0, 0x07))
+    test.assert_eq(pams_average_activity_type(st, 1, 0), 0x0007)
+    test.assert(not pams_set_monitor_type(var st, 1, 0, 0x20))
+    test.assert(not pams_set_monitor_type(var st, 1, 9, 0x07))
+    test.assert(not pams_set_monitor_type(var st, 9, 0, 0x07))
+    test.assert_eq(pams_average_activity_type(st, 9, 0), 0)
+    test.assert_eq(pams_average_activity_type(st, 1, 0), 0x0007)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_get_ended_session_data_sends_the_kept_records_and_then_counts_them()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    pams_set_time(var st, 1000, 60)
+    let _ = run(var t, h, config, var st, [4, 0])
+    for n in 0..2
+        var rec = pams_record(0, 0, 0, 1 + n)
+        pams_set_field(var rec, 0, 0x100 + n)
+        let _ = pams_send_record(var t.db, var t.link, h, config, var st, rec, 0)
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, floors(0, 0, 5), 0)
+    let _ = confirm_all(var t)
+    let _ = run(var t, h, config, var st, [4, 1])
+    var last = pams_record(0, 0, 1, 3)
+    pams_set_field(var last, 0, 0x102)
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, last, 0)
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, floors(0, 1, 6), 0)
+    let _ = confirm_all(var t)
+    let _ = run(var t, h, config, var st, [5])
+    test.assert_eq(list.len(st.records), 5)
+    // All the sub-sessions: the three instantaneous records as notifications, the counter going on, then the count (uint24).
+    let all = run(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0])
+    let data = pdus_of(all, h.data[0])
+    test.assert_eq(list.len(data), 3)
+    test.assert_eq(data[0][0] as Int, 0x1B)
+    test.assert_eq(value_of(data[0])[0] as Int, (3 << 2) | 3)
+    test.assert_eq(value_of(data[1])[0] as Int, (4 << 2) | 3)
+    test.assert_eq(value_of(data[2])[0] as Int, (5 << 2) | 3)
+    test.assert_eq(value_of(data[0])[1:18], st.records[0].data)
+    test.assert_eq(value_of(data[2])[1:18], st.records[3].data)
+    test.assert_eq(all[0], [0x13])
+    test.assert_eq(all[list.len(all) - 1], req(0x1D, h.control_point, [0xFA, 3, 0, 0]))
+    test.assert_eq(list.len(all), 5)
+    // One sub-session: its record; the two summaries as indications, one for each sub-session.
+    let one = run(var t, h, config, var st, [3, 0, 0, 1, 0, 0])
+    test.assert_eq(list.len(pdus_of(one, h.data[0])), 1)
+    test.assert_eq(one[list.len(one) - 1], req(0x1D, h.control_point, [0xFA, 1, 0, 0]))
+    let sums = run(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 1])
+    let sdata = pdus_of(sums, h.data[1])
+    test.assert_eq(list.len(sdata), 2)
+    test.assert_eq(sdata[0][0] as Int, 0x1D)
+    test.assert_eq(sdata[0][20] as Int, 5)
+    test.assert_eq(sdata[1][20] as Int, 6)
+    test.assert_eq(sums[list.len(sums) - 1], req(0x1D, h.control_point, [0xFA, 2, 0, 0]))
+    // The data records come before the control point's indication, which closes the procedure.
+    test.assert_eq(gatt_server.read_le16(sums[1], 1), h.data[1])
+    test.assert_eq(gatt_server.read_le16(sums[2], 1), h.data[1])
+    test.assert_eq(gatt_server.read_le16(sums[3], 1), h.control_point)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_long_record_is_sent_in_segments_by_get_ended_session_data()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let _ = run(var t, h, config, var st, [4, 0])
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, every_field(1), 0)
+    let _ = confirm_all(var t)
+    let _ = run(var t, h, config, var st, [5])
+    // The record was sent for session 0x0102 by the test; keep it for session 0 for the request.
+    st.records[0] = PamsStored { kind: 1, session: 0, sub: 0, data: st.records[0].data }
+    let all = run(var t, h, config, var st, [3, 0, 0, 0, 0, 1])
+    let data = pdus_of(all, h.data[1])
+    test.assert_eq(list.len(data), 4)
+    test.assert_eq(value_of(data[0])[0] as Int, (4 << 2) | 1)
+    test.assert_eq(value_of(data[3])[0] as Int, (7 << 2) | 2)
+    var joined: [u8] = []
+    for p in data
+        list.append(joined, value_of(p)[1:20])
+    test.assert_eq(joined, st.records[0].data)
+    test.assert_eq(all[list.len(all) - 1], req(0x1D, h.control_point, [0xFA, 1, 0, 0]))
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_get_ended_session_data_refuses_in_the_order_of_the_specification()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    three_sessions(var t, h, config, var st)
+    var rec = pams_record(0, 0, 0, 1)
+    pams_set_field(var rec, 0, 5)
+    st.records = [PamsStored { kind: 0, session: 0, sub: 0, data: pams_encode(config.features, rec, 0) }]
+    // A session the monitor does not have, or the reserved 0xFFFF: Invalid Session ID, whatever the rest.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 9, 0, 0xFF, 0xFF, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0xFF, 0xFF, 0, 0, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 9, 0, 9, 0, 7]), ERR_INVALID_SESSION_ID)
+    // A sub-session the session does not have.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 5, 0, 0]), ERR_INVALID_SUB_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 5, 0, 7]), ERR_INVALID_SUB_SESSION_ID)
+    // The running session, with a valid and with the "all" sub-session.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 2, 0, 0, 0, 0]), ERR_SESSION_STILL_RUNNING)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 2, 0, 0xFF, 0xFF, 0]), ERR_SESSION_STILL_RUNNING)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 2, 0, 5, 0, 0]), ERR_INVALID_SUB_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 2, 0, 0, 0, 9]), ERR_SESSION_STILL_RUNNING)
+    // A data characteristic above 6: Operation Failed.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 7]), ERR_OPERATION_FAILED)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0xFF]), ERR_OPERATION_FAILED)
+    // No record matches: No Data Available, for another sub-session, another kind.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 1, 0, 0]), ERR_NO_DATA_AVAILABLE)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 3]), ERR_NO_DATA_AVAILABLE)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 1, 0, 0xFF, 0xFF, 0]), ERR_NO_DATA_AVAILABLE)
+    // A match is accepted.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), 0)
+    // A kind the monitor lacks has nothing to send.
+    let small = default_pams_config(FEATURE_ACTIVITY_TYPE)
+    let (u, g) = live_server(small)
+    var v = u
+    var sst = fresh(small)
+    let _ = run(var v, g, small, var sst, [4, 0])
+    let _ = run(var v, g, small, var sst, [5])
+    test.assert_eq(refusal(var v, g, small, var sst, [3, 0, 0, 0xFF, 0xFF, 2]), ERR_NO_DATA_AVAILABLE)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_descriptors_of_the_procedures_must_be_configured_after_the_parameters_are_checked()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    three_sessions(var t, h, config, var st)
+    var rec = pams_record(0, 0, 0, 1)
+    pams_set_field(var rec, 0, 5)
+    st.records = [PamsStored { kind: 0, session: 0, sub: 0, data: pams_encode(config.features, rec, 0) }]
+    let improperly = 0xFD
+    // The Session Descriptor indication is off: Enquire Sessions, Enquire Sub-sessions and Delete Ended Session are refused with 0xFD ...
+    subscribe(var t, h.descriptor_cccd, 0)
+    test.assert_eq(refusal(var t, h, config, var st, [1]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [2, 0, 0]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 0, 0]), improperly)
+    // ... but a wrong Session ID is still Invalid Session ID, and a running session still Session Still Running.
+    test.assert_eq(refusal(var t, h, config, var st, [2, 9, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 9, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 2, 0]), ERR_SESSION_STILL_RUNNING)
+    test.assert_eq(st.sessions[0].id, 0)
+    // The other procedures do not need it.
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0]), 0)
+    subscribe(var t, h.descriptor_cccd, 2)
+    // The data characteristic is off: 0xFD for a match and for no data, but a wrong Session ID is Invalid Session ID.
+    subscribe(var t, h.data_cccd[0], 0)
+    subscribe(var t, h.data_cccd[3], 0)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 3]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 9, 0, 0xFF, 0xFF, 0]), ERR_INVALID_SESSION_ID)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 7]), ERR_OPERATION_FAILED)
+    // The kind needs its own kind of subscription: a notification of a summary characteristic is not an indication.
+    subscribe(var t, h.data_cccd[1], 0)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 1]), improperly)
+    subscribe(var t, h.data_cccd[0], 1)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), 0)
+    // The control point's own indication is off: 0xFD before anything else, even for an unknown opcode.
+    subscribe(var t, h.control_point_cccd, 0)
+    test.assert_eq(refusal(var t, h, config, var st, [1]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [0x77]), improperly)
+    test.assert_eq(refusal(var t, h, config, var st, [5]), improperly)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_request_for_a_data_record_waits_for_the_consent_of_a_multiple_users_monitor()
+    let config = default_pams_config(all_features())
+    let (s, h) = live_server(config)
+    var t = s
+    var st = new_pams_state(config)
+    let _ = run(var t, h, config, var st, [4, 0])
+    var rec = pams_record(0, 0, 0, 1)
+    pams_set_field(var rec, 0, 5)
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, rec, 0)
+    let _ = run(var t, h, config, var st, [5])
+    test.assert_eq(list.len(st.records), 1)
+    // No consent: Operation Failed; the sessions can still be listed and managed.
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), ERR_OPERATION_FAILED)
+    test.assert_eq(refusal(var t, h, config, var st, [1]), 0)
+    pams_set_consent(var st, true)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), 0)
+
+// A General Activity Summary record with the Floors (field 16) and the Average
+// Activity Type (field 23, zero) for the session `session` and sub-session `sub`.
+@tier(app)
+fn avg(session: Int, sub: Int) -> PamsRecord
+    var rec = pams_record(1, session, sub, 10)
+    pams_set_field(var rec, 16, 3)
+    pams_set_field(var rec, 23, 0)
+    rec
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_set_average_activity_type_sets_the_user_sub_field_of_the_sub_sessions_and_their_kept_summaries()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let _ = run(var t, h, config, var st, [4, 0])
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, avg(0, 0), 0)
+    let _ = confirm_all(var t)
+    let _ = run(var t, h, config, var st, [4, 1])
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, avg(0, 1), 0)
+    let _ = confirm_all(var t)
+    // Records of another session and of the whole session are not the sub-sessions' own.
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, avg(5, 0), 0)
+    let _ = confirm_all(var t)
+    let _ = pams_send_record(var t.db, var t.link, h, config, var st, avg(0, 0xFFFF), 0)
+    let _ = confirm_all(var t)
+    test.assert_eq(list.len(st.records), 4)
+    test.assert_eq(pams_average_activity_type(st, 0, 0), 0)
+    // The Average Activity Type is after the Floors: field 23 starts at octet 17, its user-defined sub-field is the second.
+    test.assert_eq(st.records[0].data[17] as Int, 0)
+    test.assert_eq(st.records[0].data[18] as Int, 0)
+    // Scope 1: all the sub-sessions of the running session; the answer is the Write Response alone.
+    let out = run(var t, h, config, var st, [7, 1, 0x0E])
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(pams_average_activity_type(st, 0, 0), 0x0E00)
+    test.assert_eq(pams_average_activity_type(st, 0, 1), 0x0E00)
+    test.assert_eq(st.records[0].data[18] as Int, 0x0E)
+    test.assert_eq(st.records[1].data[18] as Int, 0x0E)
+    test.assert_eq(st.records[2].data[18] as Int, 0)
+    test.assert_eq(st.records[3].data[18] as Int, 0)
+    test.assert_eq(st.records[0].data[17] as Int, 0)
+    // Scope 0: the current sub-session only, with the value 0xFF (unknown).
+    let _ = run(var t, h, config, var st, [4, 1])
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0, 0xFF]), 0)
+    test.assert_eq(pams_average_activity_type(st, 0, 2), 0xFF00)
+    test.assert_eq(pams_average_activity_type(st, 0, 0), 0x0E00)
+    test.assert_eq(pams_average_activity_type(st, 0, 1), 0x0E00)
+    // The monitor-defined sub-field is the monitor's.
+    test.assert(pams_set_monitor_type(var st, 0, 2, 0x07))
+    test.assert_eq(pams_average_activity_type(st, 0, 2), 0xFF07)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0, 0x00]), 0)
+    test.assert_eq(pams_average_activity_type(st, 0, 2), 0x0007)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_set_average_activity_type_refuses_a_scope_a_session_and_a_type_in_that_order()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    // No session: Invalid Type for a scope above 1 first, then No Session Running, then Activity Type Out Of Range.
+    test.assert_eq(refusal(var t, h, config, var st, [7, 2, 0x0F]), ERR_INVALID_TYPE)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0xFF, 0x0E]), ERR_INVALID_TYPE)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0, 0x0F]), ERR_NO_SESSION_RUNNING)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 1, 0x0E]), ERR_NO_SESSION_RUNNING)
+    let _ = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(refusal(var t, h, config, var st, [7, 2, 0x0E]), ERR_INVALID_TYPE)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0, 0x0F]), ERR_ACTIVITY_TYPE_OUT_OF_RANGE)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 1, 0xFE]), ERR_ACTIVITY_TYPE_OUT_OF_RANGE)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 1, 0x10]), ERR_ACTIVITY_TYPE_OUT_OF_RANGE)
+    for v in [0x00, 0x05, 0x0E, 0xFF]
+        test.assert_eq(refusal(var t, h, config, var st, [7, 0, v]), 0)
+        test.assert_eq(refusal(var t, h, config, var st, [7, 1, v]), 0)
+    // A session that has stopped has no sub-session to set.
+    let _ = run(var t, h, config, var st, [5])
+    test.assert_eq(refusal(var t, h, config, var st, [7, 0, 0x0E]), ERR_NO_SESSION_RUNNING)
+    // A monitor without the Activity Type feature does not define the opcode, and a request of the wrong length is refused.
+    let bare = default_pams_config(FEATURE_DEVICE_WORN)
+    let (u, g) = live_server(bare)
+    var v = u
+    var bst = fresh(bare)
+    test.assert_eq(refusal(var v, g, bare, var bst, [7, 0, 0x0E]), ERR_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(refusal(var v, g, bare, var bst, [7]), ERR_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(refusal(var t, h, config, var st, [7]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 1]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(refusal(var t, h, config, var st, [7, 1, 2, 3]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_user_sub_field_is_written_where_the_flags_put_the_average_activity_type()
+    let f = all_features()
+    // Without the field the record is as it was.
+    let plain = pams_encode(f, one_field(1, 16, 3), 0)
+    test.assert_eq(pams_with_user_type(plain, 0x0E), plain)
+    // With earlier fields (Normal Walking Energy Expenditure, 4 octets) the field moves by their size.
+    var rec = pams_record(1, 1, 2, 3)
+    pams_set_field(var rec, 0, 0x01020304)
+    pams_set_field(var rec, 23, 0x0007)
+    let data = pams_encode(f, rec, 0)
+    test.assert_eq(list.len(data), 16 + 4 + 2)
+    let patched = pams_with_user_type(data, 0x0E)
+    test.assert_eq(patched[20] as Int, 0x07)
+    test.assert_eq(patched[21] as Int, 0x0E)
+    test.assert_eq(patched[0:20], data[0:20])
+    // The original record is not changed, and a record that is too short for its flags is left alone.
+    test.assert_eq(data[21] as Int, 0)
+    test.assert_eq(pams_with_user_type(data[0:21], 0x0E), data[0:21])
+    test.assert_eq(list.len(pams_with_user_type([], 0x0E)), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_an_opcode_the_service_does_not_define_is_not_supported_and_changes_nothing()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    for op in [0x00, 0x08, 0x09, 0x20, 0x7F, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF]
+        test.assert_eq(refusal(var t, h, config, var st, [op]), ERR_OP_CODE_NOT_SUPPORTED)
+        test.assert_eq(refusal(var t, h, config, var st, [op, 1, 2, 3]), ERR_OP_CODE_NOT_SUPPORTED)
+    // A write of no octet has no opcode.
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, []), 0)), ERR_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(st.current, -1)
+    test.assert_eq(list.len(st.sessions), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_request_of_the_wrong_length_is_invalid_attribute_value_length()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let wrong = att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    test.assert_eq(refusal(var t, h, config, var st, [1, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [2]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [2, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [2, 0, 0, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [3]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0, 0, 0, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [4]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [4, 0, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [5, 0]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [6]), wrong)
+    test.assert_eq(refusal(var t, h, config, var st, [6, 0]), wrong)
+    test.assert_eq(st.current, -1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_procedure_in_progress_refuses_the_next_write_until_its_indications_are_confirmed()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    three_sessions(var t, h, config, var st)
+    // Enquire Sessions: the first descriptor is out, the others and the count wait.
+    let first = receive_default(var t, h, config, var st, req(0x12, h.control_point, [1]), 0)
+    test.assert_eq(list.len(first), 2)
+    let blocked = receive_default(var t, h, config, var st, req(0x12, h.control_point, [5]), 0)
+    test.assert_eq(list.len(blocked), 1)
+    test.assert_eq(error_of(blocked), att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    test.assert_eq(error_of(blocked), 0xFE)
+    test.assert_eq(st.current, 2)
+    // Still blocked while only the descriptors are confirmed; free after the count's confirmation.
+    let one = gatt_server.receive(var t.db, var t.link, [0x1E], 1)
+    test.assert_eq(list.len(one), 1)
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, [5]), 0)), 0xFE)
+    let _ = confirm_all(var t)
+    let free = receive_default(var t, h, config, var st, req(0x12, h.control_point, [5]), 0)
+    test.assert_eq(free[0], [0x13])
+    test.assert_eq(st.current, -1)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_long_write_is_refused_a_write_command_does_nothing_and_other_pdus_are_the_att_servers()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let long = receive_default(var t, h, config, var st, req(0x16, h.control_point, [0, 0, 4, 0]), 0)
+    test.assert_eq(error_of(long), att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    test.assert_eq(list.len(long), 1)
+    test.assert_eq(list.len(receive_default(var t, h, config, var st, req(0x52, h.control_point, [4, 0]), 0)), 0)
+    test.assert_eq(st.current, -1)
+    test.assert_eq(receive_default(var t, h, config, var st, req(0x0A, h.features, []), 0)[0], [0x0B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00])
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x0A, h.control_point, []), 0)), att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.features, [1]), 0)), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+// A policy that starts nothing and remembers what it was asked.
+@value
+struct Quiet
+    asked: Int
+    last: Int
+
+impl PamsPolicy[] for Quiet
+    @tier(app)
+    fn start_session(var self, _peer: links.LinkId, what: Int) -> Bool
+        self.asked = self.asked + 1
+        self.last = what
+        false
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_the_policy_is_asked_for_a_start_session_the_service_accepts_and_a_refusal_is_operation_failed()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    var st = new_pams_state(config)
+    var no = Quiet { asked: 0, last: -1 }
+    let refused = pams_receive(var t.db, var t.link, h, config, var st, var no, peer(), req(0x12, h.control_point, [4, 0]), 0)
+    test.assert_eq(error_of(refused), ERR_OPERATION_FAILED)
+    test.assert_eq(st.current, -1)
+    // A sub-session with no session running is the service's refusal and the policy is not asked.
+    let sub = pams_receive(var t.db, var t.link, h, config, var st, var no, peer(), req(0x12, h.control_point, [4, 1]), 0)
+    test.assert_eq(error_of(sub), ERR_NO_SESSION_RUNNING)
+    test.assert_eq(no.asked, 1)
+    test.assert_eq(no.last, 0)
+    // Stop and the other procedures are not the policy's.
+    let stop = pams_receive(var t.db, var t.link, h, config, var st, var no, peer(), req(0x12, h.control_point, [5]), 0)
+    test.assert_eq(error_of(stop), ERR_NOTHING_TO_STOP)
+    test.assert_eq(no.asked, 1)
+    test.assert_eq(no.last, 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_procedure_that_fails_after_the_write_response_reports_an_undetermined_error()
+    let config = full_config()
+    let (s, h) = live_server(config)
+    var t = s
+    let a = pams_report_failure(var t.db, var t.link, h, OP_ENQUIRE_SESSIONS, 0)
+    test.assert_eq(list.len(a), 1)
+    test.assert_eq(a[0], req(0x1D, h.control_point, [0xFF, 0xFF]))
+    let _ = confirm_all(var t)
+    test.assert_eq(pams_report_failure(var t.db, var t.link, h, OP_ENQUIRE_SUB_SESSIONS, 0)[0], req(0x1D, h.control_point, [0xFE, 0xFF]))
+    let _ = confirm_all(var t)
+    test.assert_eq(pams_report_failure(var t.db, var t.link, h, OP_GET_ENDED_SESSION_DATA, 0)[0], req(0x1D, h.control_point, [0xFD, 0xFF]))
+    let _ = confirm_all(var t)
+    // The other procedures end with the Write Response, and nothing goes to a client that did not enable the indication.
+    test.assert_eq(list.len(pams_report_failure(var t.db, var t.link, h, OP_START_SESSION, 0)), 0)
+    test.assert_eq(list.len(pams_report_failure(var t.db, var t.link, h, 0, 0)), 0)
+    subscribe(var t, h.control_point_cccd, 0)
+    test.assert_eq(list.len(pams_report_failure(var t.db, var t.link, h, OP_ENQUIRE_SESSIONS, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-PAMS-001")
+fn test_a_monitor_that_keeps_no_records_has_no_data_to_send()
+    var config = full_config()
+    config.max_records = 0
+    let (s, h) = live_server(config)
+    var t = s
+    var st = fresh(config)
+    let _ = run(var t, h, config, var st, [4, 0])
+    test.assert_eq(list.len(pams_send_record(var t.db, var t.link, h, config, var st, pams_record(0, 0, 0, 1), 0)), 1)
+    let _ = run(var t, h, config, var st, [5])
+    test.assert_eq(refusal(var t, h, config, var st, [3, 0, 0, 0xFF, 0xFF, 0]), ERR_NO_DATA_AVAILABLE)
+    // The sessions are still kept and listed.
+    test.assert_eq(refusal(var t, h, config, var st, [1]), 0)

@@ -1,0 +1,292 @@
+// tests/cycling_power_client_tests.nv — the unit tests of src/cycling_power_client.nv.
+//
+//   novo test tests/cycling_power_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use cycling_power
+use sensor_client
+use sensor_control
+use wire
+use cycling_power_client.{ CPM_BALANCE, CpMeasurement, DIRECTION_LATERAL, DIRECTION_TANGENTIAL, DIRECTION_UNKNOWN, OP_START_OFFSET_COMPENSATION, RESULT_OPERATION_FAILED, RESULT_SUCCESS, VEC_FORCE_ARRAY, VEC_TORQUE_ARRAY, cp_client_new, cp_client_start, cp_client_write, cp_decode, cp_decode_feature, cp_decode_location, cp_decode_response, cp_decode_vector, cp_feature_distributed, cp_feature_has, cp_has, cp_req_list_locations, cp_req_mask_content, cp_req_plain, cp_req_set_chain_length, cp_req_set_chain_weight, cp_req_set_crank_length, cp_req_set_cumulative, cp_req_set_span_length, cp_req_update_location, cp_response_location_at, cp_response_location_count, cp_response_offset, cp_response_value, cp_vector_at }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> CpMeasurement
+    match cp_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            CpMeasurement {
+                present: 0, power: 0, balance: 0, balance_left: false, torque: 0, torque_crank_based: false, wheel_revs: 0,
+                wheel_time: 0, crank_revs: 0, crank_time: 0, extreme_max: 0, extreme_min: 0, angle_max: 0, angle_min: 0,
+                top_dead_spot: 0, bottom_dead_spot: 0, energy: 0, offset_compensation: false }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_power_alone_and_negative_power()
+    let m = must(octets([0x00, 0x00, 0xE8, 0x03]))
+    test.assert_eq(m.power, 1000)
+    test.assert_eq(m.present, 0)
+    test.assert_eq(must(octets([0x00, 0x00, 0xFE, 0xFF])).power, -2)
+    test.assert_eq(must(octets([0x00, 0x00, 0x00, 0x80])).power, -32768)
+    test.assert_eq(must(octets([0x00, 0x00, 0xFF, 0x7F])).power, 32767)
+    // Reserved flag bits 13 to 15 are ignored.
+    test.assert_eq(must(octets([0x00, 0xE0, 0x05, 0x00])).power, 5)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_each_optional_field_alone()
+    let b = must(octets([0x03, 0x00, 0x64, 0x00, 0x81]))
+    test.assert_eq(b.balance, 0x81)
+    test.assert_eq(b.balance_left, true)
+    test.assert(cp_has(b.present, CPM_BALANCE))
+    test.assert_eq(must(octets([0x01, 0x00, 0x64, 0x00, 0x64])).balance_left, false)
+    let q = must(octets([0x0C, 0x00, 0x00, 0x00, 0x34, 0x12]))
+    test.assert_eq(q.torque, 0x1234)
+    test.assert_eq(q.torque_crank_based, true)
+    test.assert_eq(must(octets([0x04, 0x00, 0x00, 0x00, 0x34, 0x12])).torque_crank_based, false)
+    let w = must(octets([0x10, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x08]))
+    test.assert_eq(w.wheel_revs, 0x12345678)
+    test.assert_eq(w.wheel_time, 0x0800)
+    let k = must(octets([0x20, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x04]))
+    test.assert_eq(k.crank_revs, 10)
+    test.assert_eq(k.crank_time, 1024)
+    let f = must(octets([0x40, 0x00, 0x00, 0x00, 0x2C, 0x01, 0xFE, 0xFF]))
+    test.assert_eq(f.extreme_max, 300)
+    test.assert_eq(f.extreme_min, -2)
+    let e = must(octets([0x80, 0x00, 0x00, 0x00, 0x10, 0x00, 0xF0, 0xFF]))
+    test.assert_eq(e.extreme_max, 16)
+    test.assert_eq(e.extreme_min, -16)
+    // Angles: the specification's example, maximum 0xABC and minimum 0x123 in 0x123ABC.
+    let a = must(octets([0x00, 0x01, 0x00, 0x00, 0xBC, 0x3A, 0x12]))
+    test.assert_eq(a.angle_max, 0xABC)
+    test.assert_eq(a.angle_min, 0x123)
+    test.assert_eq(must(octets([0x00, 0x02, 0x00, 0x00, 0xB4, 0x00])).top_dead_spot, 180)
+    test.assert_eq(must(octets([0x00, 0x04, 0x00, 0x00, 0x5A, 0x00])).bottom_dead_spot, 90)
+    test.assert_eq(must(octets([0x00, 0x08, 0x00, 0x00, 0x2A, 0x00])).energy, 42)
+    test.assert_eq(must(octets([0x00, 0x10, 0x00, 0x00])).offset_compensation, true)
+    test.assert_eq(must(octets([0x00, 0x10, 0x00, 0x00])).present, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_all_fields_in_flag_order()
+    let v = octets([
+        0x3F, 0x1F, 0x2C, 0x01,
+        0x50,
+        0x40, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x02, 0x00, 0x00, 0x02,
+        0xBC, 0x3A, 0x12,
+        0x0B, 0x00,
+        0x0C, 0x00,
+        0x0D, 0x00])
+    let m = must(v)
+    test.assert_eq(m.power, 300)
+    test.assert_eq(m.balance, 0x50)
+    test.assert_eq(m.balance_left, true)
+    test.assert_eq(m.torque, 0x40)
+    test.assert_eq(m.torque_crank_based, true)
+    test.assert_eq(m.wheel_revs, 1)
+    test.assert_eq(m.wheel_time, 0x0100)
+    test.assert_eq(m.crank_revs, 2)
+    test.assert_eq(m.crank_time, 0x0200)
+    test.assert_eq(m.angle_max, 0xABC)
+    test.assert_eq(m.top_dead_spot, 11)
+    test.assert_eq(m.bottom_dead_spot, 12)
+    test.assert_eq(m.energy, 13)
+    test.assert_eq(m.offset_compensation, true)
+    // Octets past the fields the flags name are ignored.
+    var longer = v[:]
+    list.push(longer, 0x77)
+    test.assert_eq(must(longer).energy, 13)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_truncated_measurements_answer_none()
+    test.assert_eq(cp_decode([]), None)
+    test.assert_eq(cp_decode(octets([0x00, 0x00, 0x01])), None)
+    // Each field flagged and one octet short.
+    test.assert_eq(cp_decode(octets([0x01, 0x00, 0x00, 0x00])), None)
+    test.assert_eq(cp_decode(octets([0x04, 0x00, 0x00, 0x00, 0x01])), None)
+    test.assert_eq(cp_decode(octets([0x10, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5])), None)
+    test.assert_eq(cp_decode(octets([0x20, 0x00, 0x00, 0x00, 1, 2, 3])), None)
+    test.assert_eq(cp_decode(octets([0x40, 0x00, 0x00, 0x00, 1, 2, 3])), None)
+    test.assert_eq(cp_decode(octets([0x80, 0x00, 0x00, 0x00, 1, 2, 3])), None)
+    test.assert_eq(cp_decode(octets([0x00, 0x01, 0x00, 0x00, 1, 2])), None)
+    test.assert_eq(cp_decode(octets([0x00, 0x02, 0x00, 0x00, 1])), None)
+    test.assert_eq(cp_decode(octets([0x00, 0x04, 0x00, 0x00, 1])), None)
+    test.assert_eq(cp_decode(octets([0x00, 0x08, 0x00, 0x00, 1])), None)
+    // Every prefix of the full value is whole or None.
+    let full = octets([0x3F, 0x1F, 0x2C, 0x01, 0x50, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x02, 0x00, 0x00, 0x02, 0xBC, 0x3A, 0x12, 0x0B, 0x00, 0x0C, 0x00, 0x0D, 0x00])
+    var whole = 0
+    for k in 0..list.len(full)
+        if cp_decode(full[:k]) != None
+            whole = whole + 1
+    test.assert_eq(whole, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_feature_and_location()
+    test.assert_eq(cp_decode_feature(octets([0x0D, 0x00, 0x03, 0x00])), Some(0x0003000D))
+    test.assert_eq(cp_decode_feature(octets([0x01, 0x00, 0x00])), None)
+    test.assert(cp_feature_has(0x0004, cycling_power.FEATURE_WHEEL_REVOLUTION_DATA))
+    test.assert_eq(cp_feature_distributed(0x00200000), 2)
+    test.assert_eq(cp_feature_distributed(0x00100000), 1)
+    test.assert_eq(cp_decode_location(octets([5])), Some(5))
+    test.assert_eq(cp_decode_location([]), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_vector()
+    let b = octets([0x07, 0x00, 0x01, 0x00, 0x00, 0x04, 0x2D, 0x00, 0x0A, 0x00, 0xF6, 0xFF])
+    match cp_decode_vector(b)
+        None => test.fail("a vector")
+        Some(v) =>
+            test.assert_eq(v.crank_revs, 1)
+            test.assert_eq(v.crank_time, 1024)
+            test.assert_eq(v.first_angle, 45)
+            test.assert_eq(v.array, VEC_FORCE_ARRAY)
+            test.assert_eq(v.array_count, 2)
+            test.assert_eq(cp_vector_at(b, v, 0), 10)
+            test.assert_eq(cp_vector_at(b, v, 1), -10)
+            test.assert_eq(cp_vector_at(b, v, 2), 0)
+            test.assert_eq(v.direction, DIRECTION_UNKNOWN)
+    match cp_decode_vector(octets([0x18, 0x00, 0x05, 0x00]))
+        None => test.fail("a torque vector")
+        Some(v) =>
+            test.assert_eq(v.array, VEC_TORQUE_ARRAY)
+            test.assert_eq(v.direction, DIRECTION_TANGENTIAL)
+            test.assert_eq(v.array_count, 1)
+    match cp_decode_vector(octets([0x30, 0x00]))
+        None => test.fail("an empty vector")
+        Some(v) => test.assert_eq(v.direction, DIRECTION_LATERAL)
+    // Both arrays, an odd array, ten magnitudes and truncated fields.
+    test.assert_eq(cp_decode_vector(octets([0x0C, 0x00, 1, 0])), None)
+    test.assert_eq(cp_decode_vector(octets([0x04, 0x00, 1])), None)
+    test.assert_eq(cp_decode_vector(octets([0x04, 0x00, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0])), None)
+    test.assert_eq(cp_decode_vector(octets([0x01, 0x00, 1, 0, 2])), None)
+    test.assert_eq(cp_decode_vector(octets([0x02, 0x00, 1])), None)
+    test.assert_eq(cp_decode_vector([]), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_control_point_requests_and_responses()
+    test.assert_eq(cp_req_set_cumulative(0x01020304), octets([0x01, 0x04, 0x03, 0x02, 0x01]))
+    test.assert_eq(cp_req_update_location(6), octets([0x02, 0x06]))
+    test.assert_eq(cp_req_list_locations(), octets([0x03]))
+    test.assert_eq(cp_req_set_crank_length(340), octets([0x04, 0x54, 0x01]))
+    test.assert_eq(cp_req_set_chain_length(500), octets([0x06, 0xF4, 0x01]))
+    test.assert_eq(cp_req_set_chain_weight(100), octets([0x08, 0x64, 0x00]))
+    test.assert_eq(cp_req_set_span_length(400), octets([0x0A, 0x90, 0x01]))
+    test.assert_eq(cp_req_mask_content(0x0005), octets([0x0D, 0x05, 0x00]))
+    test.assert_eq(cp_req_plain(OP_START_OFFSET_COMPENSATION), octets([0x0C]))
+    let locations = octets([0x20, 0x03, 0x01, 0x05, 0x06])
+    match cp_decode_response(locations)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 3)
+            test.assert_eq(r.result, RESULT_SUCCESS)
+            test.assert_eq(cp_response_location_count(r), 2)
+            test.assert_eq(cp_response_location_at(locations, r, 1), 6)
+            test.assert_eq(cp_response_location_at(locations, r, 2), -1)
+    let crank = octets([0x20, 0x05, 0x01, 0x54, 0x01])
+    match cp_decode_response(crank)
+        None => test.fail("a crank length")
+        Some(r) => test.assert(cp_response_value(crank, r) == Some(340))
+    let failed = octets([0x20, 0x05, 0x04])
+    match cp_decode_response(failed)
+        None => test.fail("a failure")
+        Some(r) =>
+            test.assert_eq(r.result, RESULT_OPERATION_FAILED)
+            test.assert_eq(cp_response_value(failed, r), None)
+            test.assert_eq(cp_response_location_count(r), 0)
+    let rate = octets([0x20, 0x0E, 0x01, 0x64])
+    match cp_decode_response(rate)
+        None => test.fail("a rate")
+        Some(r) => test.assert(cp_response_value(rate, r) == Some(100))
+    let offset = octets([0x20, 0x0C, 0x01, 0xFE, 0xFF])
+    match cp_decode_response(offset)
+        None => test.fail("an offset")
+        Some(r) => test.assert(cp_response_offset(offset, r) == Some(-2))
+    test.assert_eq(cp_decode_response(octets([0x20, 0x03])), None)
+    test.assert_eq(cp_decode_response(octets([0x21, 0x03, 0x01])), None)
+    test.assert_eq(cp_decode_response([]), None)
+    // A success whose parameter is short.
+    match cp_decode_response(octets([0x20, 0x05, 0x01, 0x54]))
+        None => test.fail("a short parameter")
+        Some(r) => test.assert(cp_response_value(octets([0x20, 0x05, 0x01, 0x54]), r) == None)
+
+@tier(app)
+fn power_server(feature: Int) -> (gatt_server.GattServer, cycling_power.CyclingPowerHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = cycling_power.add_cycling_power_service(var s.db, cycling_power.default_cycling_power_config(feature, sensor_control.SensorLocation.RightCrank))!
+    (s, h)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-003")
+fn test_session_reads_the_feature_and_receives_measurements_and_indications()
+    if not fixtures.client_engine_present()
+        return
+    var built = power_server(cycling_power.FEATURE_WHEEL_REVOLUTION_DATA | cycling_power.FEATURE_CRANK_REVOLUTION_DATA)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(cycling_power.UUID_CYCLING_POWER_SERVICE)
+    var t = both.0
+    var c = cp_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, cp_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The first value event is the Feature read, the second the location.
+    test.assert_eq(seen[1], cycling_power.UUID_CYCLING_POWER_FEATURE)
+    let m = cycling_power.CyclingPowerMeasurement {
+        power: 250, pedal_balance: -1, balance_left: false, accumulated_torque: -1, torque_crank_based: false,
+        has_wheel: true, wheel_revolutions: 7, last_wheel_event: 2048, has_crank: true, crank_revolutions: 3,
+        last_crank_event: 1024, accumulated_energy: -1, offset_compensated: false }
+    let ev = sensor_client.test_deliver(var t, var c, cycling_power.cycling_power_notify(var s.db, var s.link, h, m, 0))
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    let d = must(sensor_client.sc_value(c))
+    test.assert_eq(d.power, 250)
+    test.assert_eq(d.wheel_revs, 7)
+    test.assert_eq(d.crank_time, 1024)
+    // A control point request is answered by an indication the session confirms.
+    var state = sensor_control.new_sc_state(sensor_control.SensorLocation.RightCrank, [5, 6], true, false)
+    let w = cp_client_write(var t, var c, cp_req_list_locations(), 0)
+    var pending = w.pdus[:]
+    var indicated = false
+    for _ in 0..8
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            list.append(next, gatt_server.receive_on(var s.db, var s.link, 0, item[:], 0))
+            if list.len(gatt_server.take_changed(var s.link)) > 0
+                list.append(next, cycling_power.cycling_power_handle_control_point(var s.db, var s.link, h, var state, 0))
+        pending = []
+        for p in next
+            let step = sensor_client.sc_on_pdu(var t, var c, p[:], 0)
+            list.append(pending, step.pdus[:])
+            if (step.event & sensor_client.SE_INDICATION) != 0
+                indicated = true
+    test.assert(indicated)
+    match cp_decode_response(sensor_client.sc_value(c))
+        None => test.fail("the indicated response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 3)
+            test.assert_eq(r.result, RESULT_SUCCESS)
+            test.assert_eq(cp_response_location_count(r), 2)

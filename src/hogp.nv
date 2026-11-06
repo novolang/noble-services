@@ -1,0 +1,411 @@
+// src/hogp.nv — HID over GATT: the HID Service of a HID Device
+// with its Protocol Mode, Control Point and boot reports, and the product's say
+// in what the host's writes do.
+//
+// Mechanism and policy.  What the HID Service fixes belongs to the stack and a
+// product cannot change it: the Report Map is read-only and not empty, the
+// Protocol Mode and the HID Control Point take 0 or 1 and no other value, the
+// Protocol Mode of a connection is Report Protocol (1) when the connection
+// starts and is the connection's own (one host's Boot Protocol does not turn
+// another host's reports into boot reports), a Report Protocol input report goes
+// out only in Report Protocol Mode and a boot input report only in Boot Protocol
+// Mode, and every report goes out with the length the descriptor gave it.  What
+// the service leaves to the product is asked of a `HogpPolicy`: whether to
+// accept a host's change of the Protocol Mode, what to do when the mode or the
+// suspend state changed, whether a suspended host is sent a report (waking the
+// host), and what a host's write to an Output or Feature report or to the
+// Boot Keyboard Output Report means.
+//
+// The module builds on `hid.nv`, which holds the characteristics of the
+// service, and adds the Boot Mouse Input Report, the checks of the
+// configuration (`noble_services_config.MAX_HID_REPORTS`, `noble_services_config.MAX_HID_MAP_OCTETS`), the
+// per-connection state (`HogpLinks`) and the procedures that serve the host's
+// writes (`hogp_serve_writes`).  A HID Device also holds the Device Information
+// Service with a PnP ID and a Battery Service (`add_hogp_device`).
+//
+// What is not built: the External Report Reference descriptor of the Report
+// Map, the Include of a Battery Service in the HID Service, and the Output
+// report Write Without Response flow control.  A Report characteristic always
+// has its Report Reference ([HIDS] 2.5.3.2 requires it for Report Protocol Mode).
+// The rules above are those of HID Service 1.0, HOGP 1.0 and Device Information 1.1,
+// checked against the specifications on 2026-10-18; the check added the rule that a
+// Report ID is nonzero where a type has several reports and the 512-octet limit of
+// the Report Map.  The HIDS and HOGP rows run in PTS: autopts/RESULTS-CORE.md.
+//
+// Satisfies: REQ-BLE-PRF-003, REQ-BLE-PRF-004.
+
+use att
+use gatt_server
+use noble_services_config
+use noble_config
+use links
+use profile_builder
+use hid
+use bas_policy.{ BasError }
+use bas_policy
+use dis_policy.{ DisError }
+use dis_policy
+use device_information
+
+const UUID_BOOT_MOUSE_INPUT_REPORT = 0x2A33
+
+// The Boot Mouse Input Report is three octets: the buttons, then the movement
+// along X and along Y.
+pub const BOOT_MOUSE_REPORT_SIZE = 3
+
+// The longest Report Map the HID Service allows ([HIDS] 2.6.1), whatever `noble_services_config.MAX_HID_MAP_OCTETS` is.
+const MAX_REPORT_MAP_OCTETS = 512
+
+// The bits of the flags octet of HID Information that are not defined.
+const HID_FLAGS_RESERVED = 0xFC
+
+// The configuration of the service: what `hid.nv` takes, and whether the Boot
+// Mouse Input Report is present.
+struct HogpConfig
+    hid: hid.HidConfig
+    boot_mouse: Bool
+
+// The handles of the service.  `sizes` holds the length of each report of
+// `hid.reports`, in the same order; `remote_wake` is the Remote Wake bit of the
+// HID Information flags.
+struct HogpHandles
+    hid: hid.HidHandles
+    boot_mouse_input: Int
+    boot_mouse_cccd: Int
+    sizes: [Int]
+    remote_wake: Bool
+
+// Why the service was refused.  EmptyReportMap: no report descriptor.
+// MapTooLong: a descriptor above `noble_services_config.MAX_HID_MAP_OCTETS` or 512 octets.  TooManyReports:
+// more reports than `noble_services_config.MAX_HID_REPORTS`.  NoReports: neither a report nor a
+// boot report.  DuplicateReport: two reports with the same ID and type.
+// ZeroReportId: a Report ID of 0 on one of several reports of a type ([HIDS] 2.5.3.2:
+// the ID shall be nonzero where a type has more than one Report characteristic).
+// BadFlags: an undefined bit of the HID Information flags.  InvalidValue: a
+// report of no octets or longer than an attribute value.  NoRoom: the attribute
+// table has no handle left.  MissingPnpId: a HID Device whose Device Information
+// Service has no PnP ID.  Information, Battery: the companion service was
+// refused.
+enum HogpError
+    EmptyReportMap
+    MapTooLong
+    TooManyReports
+    NoReports
+    DuplicateReport
+    ZeroReportId
+    BadFlags
+    InvalidValue
+    NoRoom
+    MissingPnpId
+    Information(reason: DisError)
+    Battery(reason: BasError)
+
+impl Error for HogpError
+    fn message(self) -> Str
+        match self
+            EmptyReportMap => "the HID Service has no report descriptor"
+            MapTooLong => "the report descriptor is longer than the profile allows"
+            TooManyReports => "the HID Service has more reports than the profile allows"
+            NoReports => "the HID Service has no report"
+            DuplicateReport => "two reports of the HID Service have the same ID and type"
+            ZeroReportId => "a report of a type that has several reports has the Report ID 0"
+            BadFlags => "the HID Information flags set a bit that is not defined"
+            InvalidValue => "a report of the HID Service has no octets or too many"
+            NoRoom => "the attribute table has no handle left"
+            MissingPnpId => "the Device Information Service of a HID Device has no PnP ID"
+            Information(_) => "the Device Information Service was refused"
+            Battery(_) => "the Battery Service was refused"
+
+// The first rule `config` breaks, or None.
+fn check_config(config: HogpConfig) -> ?HogpError
+    let c = config.hid
+    if list.len(c.report_map) == 0
+        return Some(HogpError.EmptyReportMap)
+    if list.len(c.report_map) > noble_services_config.MAX_HID_MAP_OCTETS or list.len(c.report_map) > MAX_REPORT_MAP_OCTETS
+        return Some(HogpError.MapTooLong)
+    if list.len(c.reports) > noble_services_config.MAX_HID_REPORTS
+        return Some(HogpError.TooManyReports)
+    if list.len(c.reports) == 0 and not c.boot_keyboard and not config.boot_mouse
+        return Some(HogpError.NoReports)
+    for r in c.reports
+        if r.size < 1 or r.size > gatt_server.ATT_VALUE_MAX
+            return Some(HogpError.InvalidValue)
+    if (c.flags & HID_FLAGS_RESERVED) != 0
+        return Some(HogpError.BadFlags)
+    for i in 0..list.len(c.reports)
+        for j in 0..i
+            if c.reports[j].id == c.reports[i].id and c.reports[j].kind == c.reports[i].kind
+                return Some(HogpError.DuplicateReport)
+    // [HIDS] 2.5.3.2: the Report ID is nonzero where a type has more than one report.
+    for r in c.reports
+        if r.id == 0
+            var same_type = 0
+            for q in c.reports
+                if q.kind == r.kind
+                    same_type = same_type + 1
+            if same_type > 1
+                return Some(HogpError.ZeroReportId)
+    None
+
+fn from_profile(e: profile_builder.ProfileError) -> HogpError
+    match e
+        NoRoom => HogpError.NoRoom
+        InvalidValue => HogpError.InvalidValue
+        NotPermitted => HogpError.InvalidValue
+
+// Add the service after the last attribute of `db`.  The Protocol Mode and the
+// Control Point refuse a value above 1 with Value Not Allowed, and the Protocol
+// Mode becomes the connection's own.
+pub fn add_hogp_service(var db: GattDb, config: HogpConfig) -> Result<HogpHandles, HogpError>
+    match check_config(config)
+        Some(e) => return Err(e)
+        None => ()
+    var added = hid.add_hid_service(var db, config.hid)
+    var handles = hid.HidHandles {
+        service: 0, protocol_mode: 0, report_map: 0, information: 0, control_point: 0, reports: [], boot_input: 0,
+        boot_input_cccd: 0, boot_output: 0 }
+    match added
+        Err(e) => return Err(from_profile(e))
+        Ok(h) => handles = h
+    var mouse = 0
+    var mouse_cccd = 0
+    if config.boot_mouse
+        match profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, profile_builder.read_only(config.hid.values.read),
+            gatt_server.le16(UUID_BOOT_MOUSE_INPUT_REPORT), hid.zeros(BOOT_MOUSE_REPORT_SIZE))
+            Err(e) => return Err(from_profile(e))
+            Ok(v) => mouse = v
+        match profile_builder.add_cccd(var db, config.hid.cccd)
+            Err(e) => return Err(from_profile(e))
+            Ok(c) => mouse_cccd = c
+    let _ = gatt_server.restrict_first_octet(var db, handles.protocol_mode, [hid.PROTOCOL_MODE_BOOT, hid.PROTOCOL_MODE_REPORT], att.ATT_ERR_VALUE_NOT_ALLOWED)
+    let _ = gatt_server.restrict_first_octet(var db, handles.control_point, [hid.CONTROL_POINT_SUSPEND, hid.CONTROL_POINT_EXIT_SUSPEND], att.ATT_ERR_VALUE_NOT_ALLOWED)
+    let _ = gatt_server.make_per_link(var db, handles.protocol_mode)
+    var sizes: [Int] = []
+    for r in config.hid.reports
+        list.push(sizes, r.size)
+    Ok(HogpHandles {
+        hid: handles, boot_mouse_input: mouse, boot_mouse_cccd: mouse_cccd, sizes: sizes,
+        remote_wake: (config.hid.flags & hid.HID_FLAG_REMOTE_WAKE) != 0 })
+
+// ── The state of each connection ────────────────────────────────────
+
+// The Protocol Mode and the suspend state of each connection slot:
+// `noble_config.MAX_CONNECTIONS` entries of each.
+struct HogpLinks
+    var mode: [Int]
+    var suspended: [Int]
+
+// Builds the state of every connection slot: Report Protocol Mode, not suspended.
+pub fn new_hogp_links() -> HogpLinks
+    var mode: [Int] = []
+    var suspended: [Int] = []
+    for _ in 0..noble_config.MAX_CONNECTIONS
+        list.push(mode, hid.PROTOCOL_MODE_REPORT)
+        list.push(suspended, 0)
+    HogpLinks { mode: mode, suspended: suspended }
+
+// A connection opened on `slot`: Report Protocol Mode, not suspended.
+pub fn hogp_link_opened(var state: HogpLinks, slot: Int)
+    if slot >= 0 and slot < noble_config.MAX_CONNECTIONS
+        state.mode[slot] = hid.PROTOCOL_MODE_REPORT
+        state.suspended[slot] = 0
+
+// The Protocol Mode of the connection on `slot`; Report Protocol for a slot the
+// state does not hold.
+pub fn hogp_mode(state: HogpLinks, slot: Int) -> Int
+    if slot < 0 or slot >= noble_config.MAX_CONNECTIONS then hid.PROTOCOL_MODE_REPORT else state.mode[slot]
+
+// Whether the host on `slot` told the device to suspend.
+pub fn hogp_suspended(state: HogpLinks, slot: Int) -> Bool
+    slot >= 0 and slot < noble_config.MAX_CONNECTIONS and state.suspended[slot] == 1
+
+// ── Policy ──────────────────────────────────────────────────────────
+
+// The questions a product answers for the service.
+trait HogpPolicy[e]
+    // Whether to accept the host's change to the Protocol Mode `mode`; a mode
+    // the policy declines is put back as the connection's value.
+    fn accept_mode(var self, peer: links.LinkId, mode: Int) -> Bool [e]
+    // The Protocol Mode of the connection changed.
+    fn mode_changed(var self, peer: links.LinkId, mode: Int) [e]
+    // The host suspended the device (`suspended` true) or ended the suspend.
+    fn suspend_changed(var self, peer: links.LinkId, suspended: Bool) [e]
+    // Whether to send an input report to a host that suspended the device;
+    // `remote_wake` is the Remote Wake bit of the HID Information.
+    fn send_while_suspended(var self, peer: links.LinkId, remote_wake: Bool) -> Bool [e]
+    // The host wrote an Output or Feature report; `id` is its Report ID.
+    fn report_written(var self, peer: links.LinkId, id: Int, kind: hid.ReportKind, data: [u8]) [e]
+    // The host wrote the Boot Keyboard Output Report (the LEDs).
+    fn boot_output_written(var self, peer: links.LinkId, data: [u8]) [e]
+
+struct DefaultHogpPolicy
+    placeholder: Int
+
+// Returns the policy of a device with no product code: it accepts every mode, ignores changes and writes,
+// and sends to a suspended host when Remote Wake is set.
+pub fn default_hogp_policy() -> DefaultHogpPolicy
+    DefaultHogpPolicy { placeholder: 0 }
+
+impl HogpPolicy[] for DefaultHogpPolicy
+    fn accept_mode(var self, peer: links.LinkId, mode: Int) -> Bool
+        let _ = peer
+        let _ = mode
+        true
+
+    fn mode_changed(var self, peer: links.LinkId, mode: Int)
+        let _ = peer
+        let _ = mode
+
+    fn suspend_changed(var self, peer: links.LinkId, suspended: Bool)
+        let _ = peer
+        let _ = suspended
+
+    fn send_while_suspended(var self, peer: links.LinkId, remote_wake: Bool) -> Bool
+        let _ = peer
+        remote_wake
+
+    fn report_written(var self, peer: links.LinkId, id: Int, kind: hid.ReportKind, data: [u8])
+        let _ = peer
+        let _ = id
+        let _ = kind
+        let _ = data
+
+    fn boot_output_written(var self, peer: links.LinkId, data: [u8])
+        let _ = peer
+        let _ = data
+
+// ── The host's writes ───────────────────────────────────────────────
+
+// The value the connection of `link` reads at `handle`.
+fn written_value(db: GattDb, link: AttLink, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0
+        return []
+    gatt_server.value_at(db, link, i)
+
+// A change of the Protocol Mode by the host of `peer`.
+fn serve_mode<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, var state: HogpLinks, var policy: P, peer: links.LinkId) [e, mutate]
+    let written = written_value(db, link, handles.hid.protocol_mode)
+    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble_config.MAX_CONNECTIONS
+        return
+    let mode = written[0] as Int
+    let before = state.mode[peer.slot]
+    if mode == before
+        return
+    if policy.accept_mode(peer, mode)
+        state.mode[peer.slot] = mode
+        policy.mode_changed(peer, mode)
+    else
+        let _ = gatt_server.set_link_value(db, var link, handles.hid.protocol_mode, [before as u8])
+
+// A write to the Control Point by the host of `peer`.
+fn serve_control<P: HogpPolicy[e]>(db: GattDb, handles: HogpHandles, var state: HogpLinks, var policy: P, peer: links.LinkId) [e, mutate]
+    let i = gatt_server.index_of(db, handles.hid.control_point)
+    let written = if i < 0 then [] else db.attributes[i].value[:]
+    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble_config.MAX_CONNECTIONS
+        return
+    let suspended = if (written[0] as Int) == hid.CONTROL_POINT_SUSPEND then 1 else 0
+    if suspended == state.suspended[peer.slot]
+        return
+    state.suspended[peer.slot] = suspended
+    policy.suspend_changed(peer, suspended == 1)
+
+// Serve the writes `gatt_server.take_changed` reported for the connection of
+// `link` and `peer`: the Protocol Mode, the Control Point, an Output or
+// Feature report and the Boot Keyboard Output Report.
+pub fn hogp_serve_writes<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, var state: HogpLinks, var policy: P,
+        peer: links.LinkId, changed: [Int]) [e, mutate]
+    for handle in changed
+        if handle == handles.hid.protocol_mode
+            serve_mode(var db, var link, handles, var state, var policy, peer)
+        else if handle == handles.hid.control_point
+            serve_control(db, handles, var state, var policy, peer)
+        else if handle == handles.hid.boot_output and handle != 0
+            policy.boot_output_written(peer, written_value(db, link, handle))
+        else
+            for r in handles.hid.reports
+                if r.value == handle and r.kind != hid.ReportKind.Input
+                    policy.report_written(peer, r.id, r.kind, written_value(db, link, handle))
+
+// ── Input reports ───────────────────────────────────────────────────
+
+// Whether an input report may go to the connection of `peer`: not suspended, or
+// suspended and the policy sends anyway.
+fn may_send<P: HogpPolicy[e]>(handles: HogpHandles, state: HogpLinks, var policy: P, peer: links.LinkId) -> Bool [e, mutate]
+    if not hogp_suspended(state, peer.slot)
+        return true
+    policy.send_while_suspended(peer, handles.remote_wake)
+
+// The octets of the report `id` of `kind` in `handles`, -1 when there is none.
+pub fn report_size(handles: HogpHandles, id: Int) -> Int
+    for k in 0..list.len(handles.hid.reports)
+        let r = handles.hid.reports[k]
+        if r.id == id and r.kind == hid.ReportKind.Input
+            return handles.sizes[k]
+    -1
+
+// Store `data` as the Input report `id` and answer the notification for the
+// connection of `link`.  None goes out in Boot Protocol Mode, for a report the
+// service lacks or one of another length, to a host that has not subscribed,
+// or to a suspended host the policy does not send to.
+pub fn hogp_send_report<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, state: HogpLinks, var policy: P,
+        peer: links.LinkId, id: Int, data: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if hogp_mode(state, peer.slot) != hid.PROTOCOL_MODE_REPORT or list.len(data) != report_size(handles, id)
+        return []
+    if not may_send(handles, state, var policy, peer)
+        return []
+    hid.hid_send_report(var db, var link, handles.hid, id, data, now_ms)
+
+// The same for the Boot Keyboard Input Report, which goes out in Boot Protocol
+// Mode only; eight octets.
+pub fn hogp_send_boot_keyboard<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, state: HogpLinks, var policy: P,
+        peer: links.LinkId, data: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if hogp_mode(state, peer.slot) != hid.PROTOCOL_MODE_BOOT or list.len(data) != hid.BOOT_KEYBOARD_REPORT_SIZE
+        return []
+    if not may_send(handles, state, var policy, peer)
+        return []
+    hid.hid_send_boot_input(var db, var link, handles.hid, data, now_ms)
+
+// The same for the Boot Mouse Input Report, which goes out in Boot Protocol Mode
+// only; three octets.
+pub fn hogp_send_boot_mouse<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, state: HogpLinks, var policy: P,
+        peer: links.LinkId, data: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if handles.boot_mouse_input == 0 or hogp_mode(state, peer.slot) != hid.PROTOCOL_MODE_BOOT or list.len(data) != BOOT_MOUSE_REPORT_SIZE
+        return []
+    if not may_send(handles, state, var policy, peer)
+        return []
+    let _ = gatt_server.set_value(var db, handles.boot_mouse_input, data)
+    gatt_server.send_value(var db, var link, handles.boot_mouse_input, now_ms)
+
+// ── A HID Device ────────────────────────────────────────────────────
+
+// The handles of the three services of a HID Device.
+struct HogpDeviceHandles
+    information: device_information.DeviceInformationHandles
+    batteries: bas_policy.BasHandles
+    hid: HogpHandles
+
+// Add the Device Information Service, the Battery Service and the HID Service,
+// in that order.  The Device Information Service must hold a PnP ID.
+fn add_hogp_device<P: dis_policy.DisPolicy[e]>(var db: GattDb, var information: P, batteries: [bas_policy.BasInstance], config: HogpConfig)
+        -> Result<HogpDeviceHandles, HogpError> [e]
+    match check_config(config)
+        Some(err) => return Err(err)
+        None => ()
+    var info_handles = dis_policy.no_handles()
+    match dis_policy.add_device_information_policy(var db, var information)
+        Err(err) => return Err(HogpError.Information(err))
+        Ok(h) => info_handles = h
+    if info_handles.pnp_id == 0
+        return Err(HogpError.MissingPnpId)
+    var bank = bas_policy.BasHandles { batteries: [], presentation: [] }
+    match bas_policy.add_battery_bank(var db, batteries)
+        Err(err) => return Err(HogpError.Battery(err))
+        Ok(b) => bank = b
+    var service = HogpHandles { hid: hid.HidHandles {
+        service: 0, protocol_mode: 0, report_map: 0, information: 0, control_point: 0, reports: [], boot_input: 0,
+        boot_input_cccd: 0, boot_output: 0 }, boot_mouse_input: 0, boot_mouse_cccd: 0, sizes: [], remote_wake: false }
+    match add_hogp_service(var db, config)
+        Err(err) => return Err(err)
+        Ok(h) => service = h
+    Ok(HogpDeviceHandles { information: info_handles, batteries: bank, hid: service })

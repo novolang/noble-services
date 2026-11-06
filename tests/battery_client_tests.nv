@@ -1,0 +1,67 @@
+// tests/battery_client_tests.nv — the unit tests of src/battery_client.nv.
+//
+//   novo test tests/battery_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use battery
+use sensor_client
+use battery_client.{ battery_client_new, battery_client_read, battery_client_start, battery_decode_level }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-007")
+fn test_the_level_is_one_octet_of_zero_to_one_hundred()
+    test.assert_eq(battery_decode_level(octets([0])), Some(0))
+    test.assert_eq(battery_decode_level(octets([57])), Some(57))
+    test.assert_eq(battery_decode_level(octets([100])), Some(100))
+    test.assert_eq(battery_decode_level(octets([101])), None)
+    test.assert_eq(battery_decode_level(octets([255])), None)
+    test.assert_eq(battery_decode_level([]), None)
+    test.assert_eq(battery_decode_level(octets([50, 50])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-007")
+fn test_session_reads_subscribes_and_follows_notifications()
+    if not fixtures.client_engine_present()
+        return
+    var s = gatt_server.new_server([], 65)
+    let h = battery.add_battery_service(var s.db, battery.default_battery_config(80))!
+    let both = sensor_client.test_open(battery.UUID_BATTERY_SERVICE)
+    var t = both.0
+    var c = battery_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, battery_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert((all & sensor_client.SE_VALUE) != 0)
+    test.assert_eq(seen[1], battery.UUID_BATTERY_LEVEL)
+    // A notification follows the application's update.
+    let ev = sensor_client.test_deliver(var t, var c, battery.set_battery_level(var s.db, var s.link, h, 42, 0))
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    test.assert_eq(battery_decode_level(sensor_client.sc_value(c)), Some(42))
+    // A read after the plan.
+    let again = battery_client_read(var t, var c, 0)
+    let _ = sensor_client.test_pump(var t, var c, var s, again, var seen)
+    test.assert_eq(battery_decode_level(sensor_client.sc_value(c)), Some(42))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-007")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(battery.UUID_BATTERY_SERVICE)
+    var t = both.0
+    var c = battery_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, battery_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

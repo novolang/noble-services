@@ -1,0 +1,426 @@
+// src/physical_activity_monitor_client.nv — the Collector side of the
+// Physical Activity Monitor Service (0x183E): the decoders of its characteristics, the
+// reassembly of segmented Data Records, the Control Point requests and responses, and the
+// client session.
+//
+//   Physical Activity Monitor Features    0x2B3B   decoded by `pam_decode_features`
+//   the seven data characteristics        0x2B3C   notified or indicated segments, put together
+//     to 0x2B42                                    by `pam_segment_push` and decoded by
+//                                                  `pam_decode_record`
+//   Physical Activity Monitor Control Point 0x2B43 requests built by `pam_request_*`, responses
+//                                                  decoded by `pam_decode_response`
+//   Physical Activity Current Session     0x2B44   decoded by `pam_decode_current`
+//   Physical Activity Session Descriptor  0x2B45   decoded by `pam_decode_descriptor`
+//
+// Features ([PAMS] 3.1) is 64 bits in 8 octets.  A value with no bit set is `None` (a server
+// supports at least one feature); bits 55 to 63 are reserved and `pam_features_reserved` tells
+// them.
+//
+// A Data Record is sent in segments ([PAMS] 2.4): each value is a Header field (bit 0 First
+// Segment, bit 1 Last Segment, bits 2 to 7 the Rolling Segment Counter) and a part of the
+// record.  `pam_segment_push` puts the parts of one record together in a `PamAssembly` and
+// answers whether the record is whole.  The counter runs on across records, so a first segment
+// is taken whatever its counter; inside a record each segment has the counter after the one
+// before it (wrapping from 63 to 0), and a segment out of sequence, a first segment inside a
+// record, a segment that is not first when no record is open, and a record over `PAM_RECORD_MAX`
+// octets end the record with `PAM_SEG_ERROR` and drop it.
+//
+// The octets of a whole record are a Flags field of 1 to 4 octets by kind, the Session ID, the
+// Sub-session ID, the Relative Timestamp, the Sequence Number, and the optional fields in the
+// order of the specification's tables, a field being there exactly when its Flags bit is set
+// ([PAMS] 3.2 to 3.8).  The sizes and the Flags bits are the tables of
+// `physical_activity_monitor.nv`, which that module's tests check against the specification.
+// `pam_decode_record` takes the kind (0 to 6, the order of the characteristics) and answers
+// `None` for a length that is not the fixed part plus the fields the Flags name, a Flags bit
+// that no field has (its field would have an unknown size), the Session ID 0xFFFF, an Activity
+// Type sub-field or a Sleep Stage outside its values, and a field outside its octets.  The
+// Elevation is signed; every other field is unsigned.  Units and scaling are the
+// specification's and are not applied.
+//
+// The Session Descriptor ([PAMS] 3.11) and the Current Session ([PAMS] 3.10) hold base times
+// in seconds since 2000-01-01 and offsets in minutes (sint16).  A Control Point response is
+// the success of Enquire Sessions (0xFC), Enquire Sub-sessions (0xFB) or Get Ended Session Data
+// (0xFA) with the number of items reported (1 or more), or the error of one of them
+// (0xFF, 0xFE, 0xFD) with the Undetermined Error 0xFF.  A request the server refuses ends the
+// write with an Application Error of [PAMS] 1.7, which `pam_error_kind` names.
+//
+// The decoders keep no state; the ones that return lists allocate and are `@tier(app)`.  The
+// session (`pam_client_*`) runs on `sensor_client.nv`: discover the service, read the Features
+// (required) and the Current Session, enable the indication of the Control Point, the Current
+// Session and the Session Descriptor and the notification or indication of the data
+// characteristics the peer has.
+//
+// Satisfies: REQ-BLE-PRFC-020.
+
+use gatt_client
+use links
+use physical_activity_monitor
+use sensor_client
+use wire
+
+// The longest Data Record, in octets after the Header field: the longest of the seven kinds
+// ([PAMS] 3.2 to 3.8) with room to spare.
+const PAM_RECORD_MAX = 128
+
+// What `pam_segment_push` answers.
+const PAM_SEG_MORE = 0
+const PAM_SEG_DONE = 1
+const PAM_SEG_ERROR = 2
+
+// The kinds of a Control Point response.
+const PAM_RESP_SESSIONS = 1
+const PAM_RESP_SUB_SESSIONS = 2
+const PAM_RESP_ENDED_DATA = 3
+const PAM_RESP_ERROR = 4
+
+// What an Application Error of a request means.
+const PAM_ERR_NONE = 0
+const PAM_ERR_OP_CODE = 1
+const PAM_ERR_SESSION_ID = 2
+const PAM_ERR_SUB_SESSION_ID = 3
+const PAM_ERR_STILL_RUNNING = 4
+const PAM_ERR_NO_DATA = 5
+const PAM_ERR_NO_SESSIONS = 6
+const PAM_ERR_TYPE = 7
+const PAM_ERR_NO_SESSION_RUNNING = 8
+const PAM_ERR_NOTHING_TO_STOP = 9
+const PAM_ERR_ACTIVITY_TYPE = 10
+const PAM_ERR_OPERATION_FAILED = 11
+const PAM_ERR_CCCD = 12
+const PAM_ERR_IN_PROGRESS = 13
+const PAM_ERR_OTHER = 14
+
+// The Features in `b`: 8 octets with at least one bit set; `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn pam_decode_features(b: [u8]) -> ?Int
+    if list.len(b) != 8
+        return None
+    let f = wire.get(b, 0, 8)
+    if f == 0
+        return None
+    Some(f)
+
+// Whether the Features value holds a reserved bit (55 to 63).
+@tier(embedded)
+@no_alloc
+fn pam_features_reserved(features: Int) -> Bool
+    (features >>> physical_activity_monitor.FEATURE_BITS) != 0
+
+// Whether the Features say the field of Features bit `bit` is supported.
+@tier(embedded)
+@no_alloc
+fn pam_feature_supported(features: Int, bit: Int) -> Bool
+    bit >= 0 and bit < 64 and ((features >>> bit) & 1) != 0
+
+// The reassembly of one data characteristic's records.  `data` holds the octets of the record so
+// far, `open` whether a record is in progress and `next` the Rolling Segment Counter the next
+// segment of it must have.
+struct PamAssembly
+    var data: [u8]
+    var open: Bool
+    var next: Int
+
+@tier(app)
+fn pam_assembly_new() -> PamAssembly
+    PamAssembly { data: [], open: false, next: 0 }
+
+// Take a value `seg` of a data characteristic: `PAM_SEG_DONE` when it ends a record, whose octets
+// are then `a.data`, `PAM_SEG_MORE` when more segments follow, `PAM_SEG_ERROR` as the header says.
+// After `PAM_SEG_DONE` the next call starts a new record and `a.data` is replaced.
+@tier(app)
+fn pam_segment_push(var a: PamAssembly, seg: [u8]) -> Int
+    if list.len(seg) < 2
+        a.open = false
+        a.data = []
+        return PAM_SEG_ERROR
+    let header = seg[0] as Int
+    let first = (header & physical_activity_monitor.HEADER_FIRST_SEGMENT) != 0
+    let last = (header & physical_activity_monitor.HEADER_LAST_SEGMENT) != 0
+    let counter = header >> 2
+    if first == a.open or (a.open and counter != a.next)
+        a.open = false
+        a.data = []
+        return PAM_SEG_ERROR
+    if first
+        a.data = []
+    if list.len(a.data) + list.len(seg) - 1 > PAM_RECORD_MAX
+        a.open = false
+        a.data = []
+        return PAM_SEG_ERROR
+    for k in 1..list.len(seg)
+        list.push(a.data, seg[k])
+    a.next = (counter + 1) & 63
+    a.open = not last
+    if last
+        return PAM_SEG_DONE
+    PAM_SEG_MORE
+
+// One decoded Data Record.  `present` has bit i set when optional field i is in the record (the
+// Flags bit i) and `values[i]` is its value, 0 for a field that is not.  `worn` is the Device Worn
+// flag of the kinds that have it.
+struct PamRecord
+    kind: Int
+    flags: Int
+    worn: Bool
+    session: Int
+    sub_session: Int
+    relative_time: Int
+    sequence: Int
+    present: Int
+    values: [Int]
+
+// The Data Record of `kind` (0 to 6) in `data`, the octets after the Header field.
+@tier(app)
+fn pam_decode_record(kind: Int, data: [u8]) -> ?PamRecord
+    if kind < 0 or kind >= physical_activity_monitor.KIND_COUNT
+        return None
+    let fs = physical_activity_monitor.pams_flags_size(kind)
+    if list.len(data) < fs + 12
+        return None
+    let sizes = physical_activity_monitor.pams_sizes(kind)
+    let n = list.len(sizes)
+    let flags = wire.get(data, 0, fs)
+    let worn_bit = physical_activity_monitor.pams_worn_bit(kind)
+    var defined = (1 << n) - 1
+    if worn_bit >= 0
+        defined = defined | (1 << worn_bit)
+    if (flags & defined) != flags
+        return None
+    let session = wire.get(data, fs, 2)
+    if session == physical_activity_monitor.WHOLE_SESSION
+        return None
+    var at = fs + 12
+    var values: [Int] = []
+    var present = 0
+    for i in 0..n
+        if ((flags >>> i) & 1) != 0
+            if at + sizes[i] > list.len(data)
+                return None
+            let signed = kind == physical_activity_monitor.KIND_GENERAL_INSTANTANEOUS and i == 7
+            let v = if signed then wire.get_signed(data, at, sizes[i]) else wire.get(data, at, sizes[i])
+            if not physical_activity_monitor.pams_value_valid(kind, i, sizes[i], v)
+                return None
+            list.push(values, v)
+            present = present | (1 << i)
+            at = at + sizes[i]
+        else
+            list.push(values, 0)
+    if at != list.len(data)
+        return None
+    Some(PamRecord {
+        kind: kind, flags: flags, worn: worn_bit >= 0 and ((flags >>> worn_bit) & 1) != 0, session: session,
+        sub_session: wire.get(data, fs + 2, 2), relative_time: wire.get(data, fs + 4, 4), sequence: wire.get(data, fs + 8, 4),
+        present: present, values: values })
+
+// The Current Session: whether a session runs, and the session and sub-session it names with their start
+// times.  Before the first session the server sends zeros.  `reserved` says a reserved Flags bit is set.
+@value
+struct PamCurrent
+    running: Bool
+    reserved: Bool
+    session: Int
+    session_start: Int
+    session_offset: Int
+    sub_session: Int
+    sub_start: Int
+    sub_offset: Int
+
+// The Current Session in `b`: 17 octets, `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn pam_decode_current(b: [u8]) -> ?PamCurrent
+    if list.len(b) != physical_activity_monitor.CURRENT_SESSION_SIZE
+        return None
+    let flags = b[0] as Int
+    Some(PamCurrent {
+        running: (flags & 1) != 0, reserved: (flags & 0xFE) != 0, session: wire.get(b, 1, 2),
+        session_start: wire.get(b, 3, 4), session_offset: wire.get_signed(b, 7, 2), sub_session: wire.get(b, 9, 2),
+        sub_start: wire.get(b, 11, 4), sub_offset: wire.get_signed(b, 15, 2) })
+
+// A Session Descriptor: a session (`describes_session`; `sub_session` is -1) or a sub-session of `session`.
+// `end_base` and `end_offset` are 0 while it runs (`has_end` is false).  `reserved` says a reserved Flags
+// bit is set.
+@value
+struct PamDescriptor
+    describes_session: Bool
+    running: Bool
+    deleted: Bool
+    reserved: Bool
+    session: Int
+    sub_session: Int
+    start_base: Int
+    start_offset: Int
+    has_end: Bool
+    end_base: Int
+    end_offset: Int
+
+// The Session Descriptor in `b`: a session is 9 octets running and 15 ended, a sub-session 11 and 17;
+// `None` for another length and for the Session ID 0xFFFF.
+@tier(embedded)
+@no_alloc
+fn pam_decode_descriptor(b: [u8]) -> ?PamDescriptor
+    if list.len(b) < 1
+        return None
+    let flags = b[0] as Int
+    let is_session = (flags & physical_activity_monitor.DESCRIBES_SESSION) != 0
+    let running = (flags & physical_activity_monitor.SESSION_RUNNING) != 0
+    let head = if is_session then 9 else 11
+    let size = if running then head else head + 6
+    if list.len(b) != size or wire.get(b, 1, 2) == physical_activity_monitor.WHOLE_SESSION
+        return None
+    let sub = if is_session then -1 else wire.get(b, 3, 2)
+    let at = if is_session then 3 else 5
+    Some(PamDescriptor {
+        describes_session: is_session, running: running, deleted: (flags & physical_activity_monitor.DELETED_SESSION) != 0,
+        reserved: (flags & 0xF8) != 0, session: wire.get(b, 1, 2), sub_session: sub, start_base: wire.get(b, at, 4),
+        start_offset: wire.get_signed(b, at + 4, 2), has_end: not running,
+        end_base: if running then 0 else wire.get(b, at + 6, 4),
+        end_offset: if running then 0 else wire.get_signed(b, at + 10, 2) })
+
+// A Control Point response: `kind` is one of the `PAM_RESP_` values; `count` is the number of items
+// reported by a success; `procedure` is the opcode of the failed procedure of an error (0xFF Enquire Sessions,
+// 0xFE Enquire Sub-sessions, 0xFD Get Ended Session Data).
+@value
+struct PamResponse
+    kind: Int
+    count: Int
+    procedure: Int
+
+// The Control Point response in `b`: `None` for an opcode that is not a response, a length other than the
+// response has, a count of 0 and an error parameter other than 0xFF.
+@tier(embedded)
+@no_alloc
+fn pam_decode_response(b: [u8]) -> ?PamResponse
+    if list.len(b) == 0
+        return None
+    let op = b[0] as Int
+    if op == physical_activity_monitor.OP_ENQUIRE_SESSIONS_SUCCESS or op == physical_activity_monitor.OP_ENQUIRE_SUB_SESSIONS_SUCCESS
+        if list.len(b) != 3 or wire.get(b, 1, 2) == 0
+            return None
+        let k = if op == physical_activity_monitor.OP_ENQUIRE_SESSIONS_SUCCESS then PAM_RESP_SESSIONS else PAM_RESP_SUB_SESSIONS
+        return Some(PamResponse { kind: k, count: wire.get(b, 1, 2), procedure: op })
+    if op == physical_activity_monitor.OP_GET_ENDED_SESSION_DATA_SUCCESS
+        if list.len(b) != 4 or wire.get(b, 1, 3) == 0
+            return None
+        return Some(PamResponse { kind: PAM_RESP_ENDED_DATA, count: wire.get(b, 1, 3), procedure: op })
+    if op == physical_activity_monitor.OP_ENQUIRE_SESSIONS_ERROR or op == physical_activity_monitor.OP_ENQUIRE_SUB_SESSIONS_ERROR or op == physical_activity_monitor.OP_GET_ENDED_SESSION_DATA_ERROR
+        if list.len(b) != 2 or (b[1] as Int) != physical_activity_monitor.UNDETERMINED_ERROR
+            return None
+        return Some(PamResponse { kind: PAM_RESP_ERROR, count: 0, procedure: op })
+    None
+
+// The request of Enquire Sessions.
+@tier(app)
+fn pam_request_enquire_sessions() -> [u8]
+    [physical_activity_monitor.OP_ENQUIRE_SESSIONS as u8]
+
+// The request of Enquire Sub-sessions for `session`; `None` for the Session ID 0xFFFF or one outside 16 bits.
+@tier(app)
+fn pam_request_enquire_sub_sessions(session: Int) -> ?[u8]
+    if session < 0 or session >= physical_activity_monitor.WHOLE_SESSION
+        return None
+    var out: [u8] = [physical_activity_monitor.OP_ENQUIRE_SUB_SESSIONS as u8]
+    wire.put(var out, session, 2)
+    Some(out)
+
+// The request of Get Ended Session Data for `session`, `sub_session` (0xFFFF for all of the session) and the
+// data characteristic `kind` (0 to 6).  `None` outside those ranges.
+@tier(app)
+fn pam_request_get_ended_session_data(session: Int, sub_session: Int, kind: Int) -> ?[u8]
+    if session < 0 or session >= physical_activity_monitor.WHOLE_SESSION or sub_session < 0 or sub_session > physical_activity_monitor.WHOLE_SESSION
+        return None
+    if kind < 0 or kind >= physical_activity_monitor.KIND_COUNT
+        return None
+    var out: [u8] = [physical_activity_monitor.OP_GET_ENDED_SESSION_DATA as u8]
+    wire.put(var out, session, 2)
+    wire.put(var out, sub_session, 2)
+    wire.put(var out, kind, 1)
+    Some(out)
+
+// The request of Start Session (`sub_session` false) or Start Sub-session (true).
+@tier(app)
+fn pam_request_start(sub_session: Bool) -> [u8]
+    [physical_activity_monitor.OP_START_SESSION as u8, if sub_session then 1 else 0]
+
+// The request of Stop Session.
+@tier(app)
+fn pam_request_stop() -> [u8]
+    [physical_activity_monitor.OP_STOP_SESSION as u8]
+
+// The request of Delete Ended Session for `session`; `None` for the Session ID 0xFFFF or one outside 16 bits.
+@tier(app)
+fn pam_request_delete(session: Int) -> ?[u8]
+    if session < 0 or session >= physical_activity_monitor.WHOLE_SESSION
+        return None
+    var out: [u8] = [physical_activity_monitor.OP_DELETE_ENDED_SESSION as u8]
+    wire.put(var out, session, 2)
+    Some(out)
+
+// The request of Set Average Activity Type: `all_of_session` false names the current sub-session, true all of
+// the current session; `activity` is a user-defined Activity Type, 0 to 0x0E or 0xFF.  `None` otherwise.
+@tier(app)
+fn pam_request_set_average_activity_type(all_of_session: Bool, activity: Int) -> ?[u8]
+    if not physical_activity_monitor.pams_activity_octet_valid(activity)
+        return None
+    Some([physical_activity_monitor.OP_SET_AVERAGE_ACTIVITY_TYPE as u8, if all_of_session then 1 else 0, activity as u8])
+
+// What the Application Error or ATT error `status` of a request means: one of the `PAM_ERR_` values.
+@tier(embedded)
+@no_alloc
+fn pam_error_kind(status: Int) -> Int
+    if status == 0
+        return PAM_ERR_NONE
+    if status == physical_activity_monitor.ERR_OP_CODE_NOT_SUPPORTED
+        return PAM_ERR_OP_CODE
+    if status == physical_activity_monitor.ERR_INVALID_SESSION_ID
+        return PAM_ERR_SESSION_ID
+    if status == physical_activity_monitor.ERR_INVALID_SUB_SESSION_ID
+        return PAM_ERR_SUB_SESSION_ID
+    if status == physical_activity_monitor.ERR_SESSION_STILL_RUNNING
+        return PAM_ERR_STILL_RUNNING
+    if status == physical_activity_monitor.ERR_NO_DATA_AVAILABLE
+        return PAM_ERR_NO_DATA
+    if status == physical_activity_monitor.ERR_NO_SESSIONS_AVAILABLE
+        return PAM_ERR_NO_SESSIONS
+    if status == physical_activity_monitor.ERR_INVALID_TYPE
+        return PAM_ERR_TYPE
+    if status == physical_activity_monitor.ERR_NO_SESSION_RUNNING
+        return PAM_ERR_NO_SESSION_RUNNING
+    if status == physical_activity_monitor.ERR_NOTHING_TO_STOP
+        return PAM_ERR_NOTHING_TO_STOP
+    if status == physical_activity_monitor.ERR_ACTIVITY_TYPE_OUT_OF_RANGE
+        return PAM_ERR_ACTIVITY_TYPE
+    if status == physical_activity_monitor.ERR_OPERATION_FAILED
+        return PAM_ERR_OPERATION_FAILED
+    if status == 0xFD
+        return PAM_ERR_CCCD
+    if status == 0xFE
+        return PAM_ERR_IN_PROGRESS
+    PAM_ERR_OTHER
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn pam_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, physical_activity_monitor.UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE)
+
+// Discover the service, read the Features (required) and the Current Session, and enable the indication of the
+// Control Point, the Current Session and the Session Descriptor and the notification (instantaneous kinds) or
+// indication (summary kinds) of each data characteristic, each optional but the Features.
+@tier(app)
+fn pam_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, physical_activity_monitor.UUID_PAM_FEATURES, true)
+    sensor_client.sc_queue_read(var c, physical_activity_monitor.UUID_PAM_CURRENT_SESSION, false)
+    sensor_client.sc_queue_subscribe(var c, physical_activity_monitor.UUID_PAM_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, physical_activity_monitor.UUID_PAM_CURRENT_SESSION, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, physical_activity_monitor.UUID_PAM_SESSION_DESCRIPTOR, gatt_client.CCCD_INDICATE, false)
+    for k in 0..physical_activity_monitor.KIND_COUNT
+        let mode = if physical_activity_monitor.pams_is_summary(k) then gatt_client.CCCD_INDICATE else gatt_client.CCCD_NOTIFY
+        sensor_client.sc_queue_subscribe(var c, physical_activity_monitor.pams_kind_uuid(k), mode, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write a request built by one of the `pam_request_` functions.  The session must have finished its plan.
+@tier(app)
+fn pam_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, physical_activity_monitor.UUID_PAM_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

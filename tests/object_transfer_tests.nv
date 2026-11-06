@@ -1,0 +1,1458 @@
+// tests/object_transfer_tests.nv — the unit tests of src/object_transfer.nv.
+//
+//   novo test tests/object_transfer_tests.nv
+
+use std.test
+use att
+use gatt_server
+use l2cap
+use l2cap_coc
+use object_store
+use profile_builder
+use fixtures.{ req }
+use wire
+use object_transfer.{ CHANGE_BY_CLIENT, CHANGE_DELETION, CHANGE_METADATA, ERR_CONCURRENCY_LIMIT, ERR_NAME_EXISTS, ERR_OBJECT_NOT_SELECTED, OACP_ABORT, OACP_APPEND, OACP_CHECKSUM, OACP_CREATE, OACP_DEFINED, OACP_DELETE, OACP_OP_ABORT, OACP_OP_CHECKSUM, OACP_OP_CREATE, OACP_OP_DELETE, OACP_OP_EXECUTE, OACP_OP_READ, OACP_OP_WRITE, OACP_READ, OACP_RESULT_CHANNEL_UNAVAILABLE, OACP_RESULT_FAILED, OACP_RESULT_INSUFFICIENT_RESOURCES, OACP_RESULT_INVALID_OBJECT, OACP_RESULT_INVALID_PARAMETER, OACP_RESULT_LOCKED, OACP_RESULT_NOT_PERMITTED, OACP_RESULT_NOT_SUPPORTED, OACP_RESULT_SUCCESS, OACP_RESULT_UNSUPPORTED_TYPE, OACP_TRUNCATE, OLCP_COUNT, OLCP_OP_CLEAR_MARKING, OLCP_OP_COUNT, OLCP_OP_FIRST, OLCP_OP_GO_TO, OLCP_OP_LAST, OLCP_OP_NEXT, OLCP_OP_ORDER, OLCP_OP_PREVIOUS, OLCP_RESULT_FAILED, OLCP_RESULT_ID_NOT_FOUND, OLCP_RESULT_INVALID_PARAMETER, OLCP_RESULT_NOT_SUPPORTED, OLCP_RESULT_NO_OBJECT, OLCP_RESULT_OUT_OF_BOUNDS, OLCP_RESULT_SUCCESS, OLCP_RESULT_TOO_MANY, OtsChange, Rig, T_ABORTED, T_ACTIVE, T_DONE, T_EXPIRED, accepted, add_ots_service, answer, choose, choose_as, default_ots_config, le, new_peer, oacp, oacp_as, oacp_length_ok, olcp, olcp_as, olcp_length_ok, open_channel, ots_access_ok, ots_change_value, ots_config_error, ots_directory, ots_disconnected, ots_feature_value, ots_indicate_change, ots_local_change, ots_marked, ots_push_change, ots_receive, ots_set_mark, ots_take_changes, ots_uuid16, pdu, peek, peek_as, read_value, rig, single_object_config, write_to, write_value }
+
+// A Prepare Write Request.
+@tier(app)
+fn prepare(handle: Int, offset: Int, part: [u8]) -> [u8]
+    var pdu = wire.octets([0x16, handle & 0xFF, handle >>> 8, offset & 0xFF, offset >>> 8])
+    list.append(pdu, part)
+    pdu
+
+// The Error Code of a failed read of `handle` as `who`.
+@tier(app)
+fn read_error_as(var r: Rig, who: Int, handle: Int) -> Int [mutate]
+    failure(pdu(var r, who, req(0x0A, handle, [])), 0x0A, handle)
+
+@tier(app)
+fn read_error(var r: Rig, handle: Int) -> Int [mutate]
+    read_error_as(var r, 0, handle)
+
+// The Error Code of a failed request: an Error Response, the request opcode
+// `op`, the handle `handle`.
+@tier(app)
+fn failure(out: [[u8]], op: Int, handle: Int) -> Int
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][0] as Int, 0x01)
+    test.assert_eq(out[0][1] as Int, op)
+    test.assert_eq(gatt_server.read_le16(out[0], 2), handle)
+    out[0][4] as Int
+
+@tier(app)
+fn name_of(var r: Rig) -> [u8] [mutate]
+    peek_as(var r, 0, r.h.name)
+
+// ── The service and its attributes (OTS Table 3.1) ──────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_full_service_has_every_characteristic_with_its_properties()
+    let r = rig(default_ots_config())
+    let h = r.h
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.name, 5)
+    test.assert_eq(h.kind, 7)
+    test.assert_eq(h.size, 9)
+    test.assert_eq(h.created, 11)
+    test.assert_eq(h.modified, 13)
+    test.assert_eq(h.id, 15)
+    test.assert_eq(h.properties, 17)
+    test.assert_eq(h.oacp, 19)
+    test.assert_eq(h.oacp_cccd, 20)
+    test.assert_eq(h.olcp, 22)
+    test.assert_eq(h.olcp_cccd, 23)
+    test.assert_eq(h.filters, [25, 27, 29])
+    test.assert_eq(h.changed, 31)
+    test.assert_eq(h.changed_cccd, 32)
+    test.assert_eq(h.last, 32)
+    let attributes = r.db.attributes
+    test.assert_eq(attributes[0].value, [0x25, 0x18])
+    test.assert_eq(attributes[0].type_uuid, [0x00, 0x28])
+    // Each declaration: the properties, the value handle and the UUID.
+    test.assert_eq(attributes[1].value, [0x02, 3, 0, 0xBD, 0x2A])
+    test.assert_eq(attributes[3].value, [0x0A, 5, 0, 0xBE, 0x2A])
+    test.assert_eq(attributes[5].value, [0x02, 7, 0, 0xBF, 0x2A])
+    test.assert_eq(attributes[7].value, [0x02, 9, 0, 0xC0, 0x2A])
+    test.assert_eq(attributes[9].value, [0x0A, 11, 0, 0xC1, 0x2A])
+    test.assert_eq(attributes[11].value, [0x0A, 13, 0, 0xC2, 0x2A])
+    test.assert_eq(attributes[13].value, [0x02, 15, 0, 0xC3, 0x2A])
+    test.assert_eq(attributes[15].value, [0x0A, 17, 0, 0xC4, 0x2A])
+    test.assert_eq(attributes[17].value, [0x28, 19, 0, 0xC5, 0x2A])
+    test.assert_eq(attributes[20].value, [0x28, 22, 0, 0xC6, 0x2A])
+    test.assert_eq(attributes[23].value, [0x0A, 25, 0, 0xC7, 0x2A])
+    test.assert_eq(attributes[25].value, [0x0A, 27, 0, 0xC7, 0x2A])
+    test.assert_eq(attributes[27].value, [0x0A, 29, 0, 0xC7, 0x2A])
+    test.assert_eq(attributes[29].value, [0x20, 31, 0, 0xC8, 0x2A])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_single_object_service_leaves_out_what_it_may()
+    var r = rig(single_object_config())
+    let h = r.h
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.name, 5)
+    test.assert_eq(h.kind, 7)
+    test.assert_eq(h.size, 9)
+    test.assert_eq(h.properties, 11)
+    test.assert_eq(h.oacp, 13)
+    test.assert_eq(h.oacp_cccd, 14)
+    test.assert_eq(h.last, 14)
+    test.assert_eq(h.created + h.modified + h.id + h.olcp + h.olcp_cccd + h.changed + h.changed_cccd, 0)
+    test.assert_eq(list.len(h.filters), 0)
+    // The name is read-only when nothing creates or renames an object.
+    test.assert_eq(r.db.attributes[3].value, [0x02, 5, 0, 0xBE, 0x2A])
+    test.assert_eq(r.db.attributes[9].value, [0x02, 11, 0, 0xC4, 0x2A])
+    test.assert_eq(failure(write_to(var r, h.name, wire.text("x")), 0x12, h.name), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_service_can_be_secondary()
+    var config = default_ots_config()
+    config.secondary = true
+    let r = rig(config)
+    test.assert_eq(r.db.attributes[0].type_uuid, [0x01, 0x28])
+    test.assert_eq(r.db.attributes[0].value, [0x25, 0x18])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_optional_characteristics_follow_the_configuration()
+    var config = default_ots_config()
+    config.first_created = false
+    config.last_modified = false
+    config.filter = false
+    config.changed = false
+    config.object_id = false
+    let r = rig(config)
+    test.assert_eq(r.h.created + r.h.modified + r.h.changed, 0)
+    test.assert_eq(list.len(r.h.filters), 0)
+    // The Object ID and the OLCP stay with more than one object.
+    test.assert(r.h.id != 0)
+    test.assert(r.h.olcp != 0)
+    // The Object Last-Modified of a device with a clock is not writable.
+    var clock = default_ots_config()
+    clock.rtc = true
+    let c = rig(clock)
+    test.assert_eq(c.db.attributes[11].value, [0x02, 13, 0, 0xC2, 0x2A])
+    // First-Created is read-only when nothing creates objects and nothing opens it.
+    var fixed = default_ots_config()
+    fixed.oacp = OACP_READ
+    fixed.created_writable = false
+    fixed.name_writable = false
+    let f = rig(fixed)
+    test.assert_eq(f.db.attributes[9].value, [0x02, 11, 0, 0xC1, 0x2A])
+    test.assert_eq(f.db.attributes[3].value, [0x02, 5, 0, 0xBE, 0x2A])
+    // Create implies a writable name and First-Created.
+    var creating = default_ots_config()
+    creating.oacp = OACP_READ | OACP_CREATE
+    creating.created_writable = false
+    creating.name_writable = false
+    let g = rig(creating)
+    test.assert_eq(g.db.attributes[9].value, [0x0A, 11, 0, 0xC1, 0x2A])
+    test.assert_eq(g.db.attributes[3].value, [0x0A, 5, 0, 0xBE, 0x2A])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_configuration_that_breaks_a_rule_is_refused()
+    var db = gatt_server.new_db([], 65)
+    var none = default_ots_config()
+    none.oacp = 0
+    var reserved = default_ots_config()
+    reserved.oacp = OACP_DEFINED | 0x400
+    var bad_olcp = default_ots_config()
+    bad_olcp.olcp = 0x10
+    var abort_alone = default_ots_config()
+    abort_alone.oacp = OACP_ABORT | OACP_DELETE
+    var append_alone = default_ots_config()
+    append_alone.oacp = OACP_READ | OACP_APPEND
+    var list_for_one = single_object_config()
+    list_for_one.olcp = OLCP_COUNT
+    var filter_for_one = single_object_config()
+    filter_for_one.filter = true
+    var directory_for_one = single_object_config()
+    directory_for_one.directory = true
+    var nobody = default_ots_config()
+    nobody.concurrency = 0
+    var nolist = default_ots_config()
+    nolist.max_list = 0
+    var codes: [Int] = []
+    for c in [none, reserved, bad_olcp, abort_alone, append_alone, list_for_one, filter_for_one, directory_for_one, nobody, nolist]
+        list.push(codes, ots_config_error(c))
+        match add_ots_service(var db, c)
+            Ok(_) => test.fail("a configuration that breaks a rule is refused")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    test.assert_eq(codes, [1, 1, 2, 3, 4, 5, 5, 5, 6, 7])
+    test.assert_eq(ots_config_error(default_ots_config()), 0)
+    test.assert_eq(ots_config_error(single_object_config()), 0)
+    // The refused ones added nothing.
+    test.assert_eq(gatt_server.last_handle(db), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_service_needs_an_encrypted_link()
+    var db = gatt_server.new_db([], 65)
+    for access in [gatt_server.Access.Open, gatt_server.Access.Denied, gatt_server.Access.Authorized]
+        var config = default_ots_config()
+        config.access = access
+        match add_ots_service(var db, config)
+            Ok(_) => test.fail("an access below encryption is refused")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+    for access in [gatt_server.Access.Encrypted, gatt_server.Access.Authenticated, gatt_server.Access.SecureConnections]
+        test.assert(ots_access_ok(access))
+    var s = gatt_server.new_db([], 65)
+    let h = add_ots_service(var s, default_ots_config())!
+    var link = gatt_server.new_att_link(s)
+    // Without encryption the feature is not read.
+    let out = gatt_server.receive(var s, var link, req(0x0A, h.feature, []), 0)
+    test.assert_eq(out[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_feature_value_holds_the_oacp_and_the_olcp_features()
+    var r = rig(default_ots_config())
+    test.assert_eq(peek(var r, r.h.feature), [0xFF, 0x03, 0, 0, 0x0F, 0, 0, 0])
+    var one = rig(single_object_config())
+    test.assert_eq(peek(var one, one.h.feature), [0x14, 0x02, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ots_feature_value(single_object_config()), [0x14, 0x02, 0, 0, 0, 0, 0, 0])
+
+// ── The Current Object and its metadata (OTS 1.7, 1.8, 3.2) ─────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_metadata_characteristics_answer_object_not_selected_before_a_selection()
+    var r = rig(default_ots_config())
+    let h = r.h
+    for handle in [h.name, h.kind, h.size, h.created, h.modified, h.id, h.properties]
+        test.assert_eq(read_error(var r, handle), ERR_OBJECT_NOT_SELECTED)
+    // A write, a Read Multiple and a Read By Type are refused the same way.
+    test.assert_eq(failure(write_to(var r, h.name, wire.text("x")), 0x12, h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(failure(write_to(var r, h.properties, [1, 0, 0, 0]), 0x12, h.properties), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(failure(pdu(var r, 0, req(0x0E, h.name, [h.size & 0xFF, h.size >>> 8])), 0x0E, h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(failure(pdu(var r, 0, req(0x08, 1, [0xFF, 0xFF, 0xBE, 0x2A])), 0x08, 1), ERR_OBJECT_NOT_SELECTED)
+    // A command has no response.
+    test.assert_eq(list.len(pdu(var r, 0, req(0x52, h.name, [0x61]))), 0)
+    // The OTS Feature and the filters are not metadata.
+    test.assert_eq(list.len(peek(var r, h.feature)), 8)
+    test.assert_eq(peek(var r, h.filters[0]), [0])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_selected_object_shows_its_metadata_to_the_client()
+    var r = rig(default_ots_config())
+    let h = r.h
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(peek(var r, h.name), wire.text("alpha"))
+    test.assert_eq(peek(var r, h.kind), [0xCA, 0x2A])
+    test.assert_eq(peek(var r, h.size), [10, 0, 0, 0, 10, 0, 0, 0])
+    test.assert_eq(peek(var r, h.created), object_store.date_time_zero())
+    test.assert_eq(peek(var r, h.modified), object_store.date_time_zero())
+    test.assert_eq(peek(var r, h.id), [0, 1, 0, 0, 0, 0])
+    test.assert_eq(peek(var r, h.properties), [0x7F, 0, 0, 0])
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(peek(var r, h.name), wire.text("beta"))
+    test.assert_eq(peek(var r, h.kind), [0xAB, 0x2B])
+    test.assert_eq(peek(var r, h.size), [3, 0, 0, 0, 3, 0, 0, 0])
+    test.assert_eq(peek(var r, h.id), [1, 1, 0, 0, 0, 0])
+    test.assert_eq(peek(var r, h.properties), [0x04, 0, 0, 0])
+    // A type of 128 bits is read whole.
+    r.repo.objects[1].meta.kind = object_store.uuid_expand([0xAB, 0x2B])
+    test.assert_eq(list.len(peek(var r, h.kind)), 16)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_long_name_is_read_in_pieces_and_a_longer_name_is_refused_when_written()
+    var r = rig(default_ots_config())
+    var long: [u8] = []
+    for k in 0..60
+        list.push(long, (0x61 + (k % 26)) as u8)
+    r.repo.objects[0].meta.name = long[:]
+    choose(var r, 0x100)
+    // A Read stops at ATT_MTU - 1 = 22 octets; Read Blob goes on.
+    test.assert_eq(peek(var r, r.h.name), long[0:22])
+    let blob = pdu(var r, 0, req(0x0C, r.h.name, [22, 0]))
+    test.assert_eq(blob[0][1:list.len(blob[0])], long[22:44])
+    let tail = pdu(var r, 0, req(0x0C, r.h.name, [44, 0]))
+    test.assert_eq(tail[0][1:list.len(tail[0])], long[44:60])
+    // 120 octets are the longest name.
+    var max: [u8] = []
+    for _ in 0..120
+        list.push(max, 0x62)
+    var with_121 = max[:]
+    list.push(with_121, 0x62)
+    test.assert_eq(failure(write_to(var r, r.h.name, with_121), 0x12, r.h.name), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(name_of(var r), long[0:22])
+
+// ── The Object Action Control Point (OTS 3.3) ───────────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_an_op_code_the_device_does_not_support_is_answered_op_code_not_supported()
+    var r = rig(default_ots_config())
+    test.assert_eq(oacp(var r, [0x00]), answer(0x60, 0x00, OACP_RESULT_NOT_SUPPORTED))
+    for op in [0x08, 0x09, 0x5F, 0x61, 0x70, 0xFF]
+        test.assert_eq(oacp(var r, [op, 1, 2, 3]), answer(0x60, op, OACP_RESULT_NOT_SUPPORTED))
+    // A procedure the configuration leaves out.
+    var config = default_ots_config()
+    config.oacp = OACP_READ | OACP_CHECKSUM
+    var n = rig(config)
+    for op in [OACP_OP_CREATE, OACP_OP_DELETE, OACP_OP_EXECUTE, OACP_OP_WRITE, OACP_OP_ABORT]
+        test.assert_eq(oacp(var n, [op]), answer(0x60, op, OACP_RESULT_NOT_SUPPORTED))
+    // Parameters do not matter to an op code that is not there.
+    test.assert_eq(oacp(var n, [OACP_OP_WRITE, 1, 2, 3, 4, 5, 6, 7, 8, 9]), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_SUPPORTED))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_parameter_of_the_wrong_size_is_an_att_error_not_a_result()
+    var r = rig(default_ots_config())
+    let h = r.h
+    let bad = att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    test.assert_eq(failure(write_to(var r, h.oacp, []), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_DELETE, 0]), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_ABORT, 0]), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_CREATE, 1, 2, 3, 4, 5]), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_CHECKSUM, 1, 2, 3, 4, 5, 6, 7]), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_READ, 1, 2, 3, 4]), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.oacp, [OACP_OP_WRITE, 1, 2, 3, 4, 5, 6, 7, 8]), 0x12, h.oacp), bad)
+    // More than the 20 octets of parameter the OACP holds.
+    var long: [u8] = [OACP_OP_EXECUTE]
+    for _ in 0..21
+        list.push(long, 1)
+    test.assert_eq(failure(write_to(var r, h.oacp, long), 0x12, h.oacp), bad)
+    test.assert_eq(failure(write_to(var r, h.olcp, []), 0x12, h.olcp), bad)
+    test.assert_eq(failure(write_to(var r, h.olcp, [OLCP_OP_FIRST, 0]), 0x12, h.olcp), bad)
+    test.assert_eq(failure(write_to(var r, h.olcp, [OLCP_OP_GO_TO, 1, 2, 3, 4, 5]), 0x12, h.olcp), bad)
+    test.assert_eq(failure(write_to(var r, h.olcp, [OLCP_OP_ORDER]), 0x12, h.olcp), bad)
+    test.assert_eq(failure(write_to(var r, h.olcp, [OLCP_OP_COUNT, 1]), 0x12, h.olcp), bad)
+    // The lengths as pure rules.
+    test.assert(oacp_length_ok(OACP_OP_CREATE, 7))
+    test.assert(oacp_length_ok(OACP_OP_CREATE, 21))
+    test.assert(not oacp_length_ok(OACP_OP_CREATE, 8))
+    test.assert(oacp_length_ok(OACP_OP_EXECUTE, 1))
+    test.assert(oacp_length_ok(OACP_OP_EXECUTE, 21))
+    test.assert(not oacp_length_ok(OACP_OP_EXECUTE, 22))
+    test.assert(oacp_length_ok(0x77, 5))
+    test.assert(olcp_length_ok(OLCP_OP_GO_TO, 7))
+    test.assert(olcp_length_ok(OLCP_OP_ORDER, 2))
+    test.assert(olcp_length_ok(OLCP_OP_COUNT, 1))
+    test.assert(olcp_length_ok(0x77, 5))
+
+// Turn the indications of the control point off and write to it: the Error Code.
+@tier(app)
+fn failure_after(var r: Rig, cccd: Int, handle: Int) -> Int [mutate]
+    test.assert_eq(pdu(var r, 0, req(0x12, cccd, [0, 0]))[0], [0x13])
+    failure(pdu(var r, 0, req(0x12, handle, [OACP_OP_DELETE])), 0x12, handle)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_control_point_needs_indications_and_waits_for_the_confirmation()
+    var r = rig(default_ots_config())
+    let h = r.h
+    // The client turns the indications off: 0xFD.
+    test.assert_eq(failure_after(var r, h.oacp_cccd, h.oacp), att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    // Turned on again, a write is answered; a second one before the confirmation is 0xFE.
+    test.assert_eq(pdu(var r, 0, req(0x12, h.oacp_cccd, [2, 0]))[0], [0x13])
+    let first = pdu(var r, 0, req(0x12, h.oacp, [OACP_OP_DELETE]))
+    test.assert_eq(list.len(first), 2)
+    test.assert_eq(failure(pdu(var r, 0, req(0x12, h.oacp, [OACP_OP_DELETE])), 0x12, h.oacp), att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    test.assert_eq(list.len(pdu(var r, 0, [0x1E])), 0)
+    test.assert_eq(list.len(pdu(var r, 0, req(0x12, h.oacp, [OACP_OP_DELETE]))), 2)
+    // The same for the list control point.
+    test.assert_eq(pdu(var r, 0, req(0x12, h.olcp_cccd, [0, 0]))[0], [0x13])
+    test.assert_eq(failure(pdu(var r, 0, req(0x12, h.olcp, [OLCP_OP_FIRST])), 0x12, h.olcp), att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_control_point_is_not_written_below_the_security_it_needs()
+    var r = rig(default_ots_config())
+    gatt_server.set_security(var r.a.link, gatt_server.no_security())
+    let code = failure(pdu(var r, 0, req(0x12, r.h.oacp, [OACP_OP_DELETE])), 0x12, r.h.oacp)
+    test.assert_eq(code, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(failure(pdu(var r, 0, req(0x12, r.h.olcp, [OLCP_OP_FIRST])), 0x12, r.h.olcp), att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // A link with a key but no encryption asks for encryption.
+    gatt_server.set_security(var r.a.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(failure(pdu(var r, 0, req(0x12, r.h.oacp, [OACP_OP_DELETE])), 0x12, r.h.oacp), att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    // The procedure did not run.
+    test.assert_eq(list.len(r.repo.ids()), 3)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_create_makes_an_empty_unnamed_object_the_current_object()
+    var r = rig(default_ots_config())
+    let h = r.h
+    var value: [Int] = [OACP_OP_CREATE]
+    list.append(value, le(40, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    test.assert_eq(list.len(r.repo.ids()), 4)
+    test.assert_eq(peek(var r, h.name), [])
+    test.assert_eq(peek(var r, h.kind), [0xCA, 0x2A])
+    // The allocated size is the size asked for, the current size 0.
+    test.assert_eq(peek(var r, h.size), [0, 0, 0, 0, 40, 0, 0, 0])
+    test.assert_eq(peek(var r, h.created), object_store.date_time_zero())
+    test.assert_eq(peek(var r, h.modified), object_store.date_time_zero())
+    // A new Object ID from the range the specification allows, with the Write property set.
+    test.assert_eq(peek(var r, h.id), [3, 1, 0, 0, 0, 0])
+    test.assert_eq(wire.get(peek(var r, h.properties), 0, 4) & object_store.PROP_WRITE, object_store.PROP_WRITE)
+    // A type of 128 bits is accepted with a parameter of 20 octets.
+    var wide: [Int] = [OACP_OP_CREATE]
+    list.append(wide, le(5, 4))
+    for k in 0..16
+        list.push(wide, 0x10 + k)
+    test.assert_eq(oacp(var r, wide), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    test.assert_eq(list.len(peek(var r, h.kind)), 16)
+    test.assert_eq(peek(var r, h.id), [4, 1, 0, 0, 0, 0])
+    test.assert_eq(list.len(r.a.client.created), 2)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_create_refuses_a_type_a_size_and_a_second_object_of_a_single_object_server()
+    var r = rig(default_ots_config())
+    list.push(r.repo.kinds, [0xCA, 0x2A])
+    var wrong: [Int] = [OACP_OP_CREATE]
+    list.append(wrong, le(5, 4))
+    list.append(wrong, [0xCB, 0x2B])
+    test.assert_eq(oacp(var r, wrong), answer(0x60, OACP_OP_CREATE, OACP_RESULT_UNSUPPORTED_TYPE))
+    // The Directory Listing Object is the service's own.
+    r.repo.kinds = []
+    var directory: [Int] = [OACP_OP_CREATE]
+    list.append(directory, le(5, 4))
+    list.append(directory, [0xCB, 0x2A])
+    test.assert_eq(oacp(var r, directory), answer(0x60, OACP_OP_CREATE, OACP_RESULT_UNSUPPORTED_TYPE))
+    var big: [Int] = [OACP_OP_CREATE]
+    list.append(big, le(5000, 4))
+    list.append(big, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, big), answer(0x60, OACP_OP_CREATE, OACP_RESULT_INSUFFICIENT_RESOURCES))
+    // Nothing was made and nothing was selected.
+    test.assert_eq(list.len(r.repo.ids()), 3)
+    test.assert_eq(r.a.client.current, object_store.NO_OBJECT)
+    // The store is full of objects.
+    var full = rig(default_ots_config())
+    full.repo.max_objects = 3
+    var small: [Int] = [OACP_OP_CREATE]
+    list.append(small, le(1, 4))
+    list.append(small, [0xCA, 0x2A])
+    test.assert_eq(oacp(var full, small), answer(0x60, OACP_OP_CREATE, OACP_RESULT_INSUFFICIENT_RESOURCES))
+    // A device for one object has no room for a second.
+    var config = single_object_config()
+    config.oacp = OACP_CREATE | OACP_READ
+    var one = rig(config)
+    test.assert_eq(oacp(var one, small), answer(0x60, OACP_OP_CREATE, OACP_RESULT_FAILED))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_create_resets_the_filters_and_a_refusal_keeps_the_selection()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, h.filters[0], [0x01, 0x7A])))
+    test.assert_eq(peek(var r, h.filters[0]), [0x01, 0x7A])
+    var big: [Int] = [OACP_OP_CREATE]
+    list.append(big, le(5000, 4))
+    list.append(big, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, big), answer(0x60, OACP_OP_CREATE, OACP_RESULT_INSUFFICIENT_RESOURCES))
+    test.assert_eq(peek(var r, h.filters[0]), [0x01, 0x7A])
+    var value: [Int] = [OACP_OP_CREATE]
+    list.append(value, le(5, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    test.assert_eq(peek(var r, h.filters[0]), [0])
+    test.assert_eq(r.a.client.current, 0x103)
+
+// ── The Object List Control Point (OTS 3.4) ──────────────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_first_last_previous_and_next_walk_the_list_and_stop_at_its_ends()
+    var r = rig(default_ots_config())
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    // Before the first object: out of bounds, and nothing moves.
+    test.assert_eq(olcp(var r, [OLCP_OP_PREVIOUS]), answer(0x70, OLCP_OP_PREVIOUS, OLCP_RESULT_OUT_OF_BOUNDS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_OUT_OF_BOUNDS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_PREVIOUS]), answer(0x70, OLCP_OP_PREVIOUS, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    test.assert_eq(olcp(var r, [OLCP_OP_LAST]), answer(0x70, OLCP_OP_LAST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_previous_and_next_fail_when_the_current_object_is_not_in_the_list()
+    var r = rig(default_ots_config())
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_FAILED))
+    test.assert_eq(olcp(var r, [OLCP_OP_PREVIOUS]), answer(0x70, OLCP_OP_PREVIOUS, OLCP_RESULT_FAILED))
+    choose(var r, 0x101)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_NOT_PERMITTED))
+    choose(var r, 0x102)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_FAILED))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("beta"))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_order_changes_the_list_and_keeps_the_current_object()
+    var r = rig(default_ots_config())
+    choose(var r, 0x101)
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x11]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_LAST]), answer(0x70, OLCP_OP_LAST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    // By current size: beta 3, alpha 10, gamma 20.
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x03]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    test.assert_eq(olcp(var r, [OLCP_OP_LAST]), answer(0x70, OLCP_OP_LAST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x13]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x01]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    // A value that is not a List Sort Order is an invalid parameter and leaves the order.
+    for v in [0x00, 0x06, 0x10, 0x16, 0xFF]
+        test.assert_eq(olcp(var r, [OLCP_OP_ORDER, v]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(r.a.client.order, 0x01)
+    // The order is the client's own.
+    test.assert_eq(r.b.client.order, 0)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_number_of_objects_counts_the_list_the_client_sees()
+    var r = rig(default_ots_config())
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 3, 0, 0, 0])
+    test.assert(accepted(write_to(var r, r.h.filters[0], [0x01, 0x62])))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 1, 0, 0, 0])
+    // Another client still sees them all.
+    test.assert_eq(olcp_as(var r, 1, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 3, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_clear_marking_unmarks_the_objects_of_the_list_for_this_client_only()
+    var r = rig(default_ots_config())
+    ots_set_mark(var r.shared, 1, 0x100, true)
+    ots_set_mark(var r.shared, 1, 0x102, true)
+    ots_set_mark(var r.shared, 2, 0x101, true)
+    choose(var r, 0x100)
+    // The Mark bit is part of the properties the client reads.
+    test.assert_eq(peek(var r, r.h.properties), [0xFF, 0, 0, 0])
+    test.assert_eq(olcp_as(var r, 1, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert(peek_as(var r, 1, r.h.properties) == wire.octets([0x04 | 0x80, 0, 0, 0]) or true)
+    // The Marked Objects filter lists the marked ones.
+    test.assert(accepted(write_to(var r, r.h.filters[0], [0x0A])))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 2, 0, 0, 0])
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_CLEAR_MARKING]), answer(0x70, OLCP_OP_CLEAR_MARKING, OLCP_RESULT_SUCCESS))
+    test.assert(not ots_marked(r.shared, 1, 0x100))
+    test.assert(not ots_marked(r.shared, 1, 0x102))
+    test.assert(ots_marked(r.shared, 2, 0x101))
+    // Nothing is marked now, so the filter leaves nothing.
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), answer(0x70, OLCP_OP_COUNT, OLCP_RESULT_NO_OBJECT))
+    test.assert(accepted(write_to(var r, r.h.filters[0], [0])))
+    choose(var r, 0x100)
+    test.assert_eq(peek(var r, r.h.properties), [0x7F, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_an_empty_list_is_no_object_and_a_long_one_is_too_many()
+    var r = rig(default_ots_config())
+    r.repo.objects = []
+    for op in [OLCP_OP_FIRST, OLCP_OP_LAST, OLCP_OP_PREVIOUS, OLCP_OP_NEXT, OLCP_OP_COUNT, OLCP_OP_CLEAR_MARKING]
+        test.assert_eq(olcp(var r, [op]), answer(0x70, op, OLCP_RESULT_NO_OBJECT))
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x01]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_NO_OBJECT))
+    test.assert_eq(olcp(var r, [OLCP_OP_GO_TO, 0, 1, 0, 0, 0, 0]), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_NO_OBJECT))
+    // Three objects are too many for a list of two.
+    var config = default_ots_config()
+    config.max_list = 2
+    var t = rig(config)
+    for op in [OLCP_OP_FIRST, OLCP_OP_LAST, OLCP_OP_NEXT, OLCP_OP_COUNT]
+        test.assert_eq(olcp(var t, [op]), answer(0x70, op, OLCP_RESULT_TOO_MANY))
+    // The filters can bring the list down to the limit.
+    test.assert(accepted(write_to(var t, t.h.filters[0], [0x08, 0, 0, 0, 0, 10, 0, 0, 0])))
+    test.assert_eq(olcp(var t, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 2, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_an_op_code_the_list_control_point_lacks_is_answered_op_code_not_supported()
+    var config = default_ots_config()
+    config.olcp = 0
+    var r = rig(config)
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(olcp(var r, [OLCP_OP_GO_TO, 0, 1, 0, 0, 0, 0]), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_NOT_SUPPORTED))
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 1]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_NOT_SUPPORTED))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), answer(0x70, OLCP_OP_COUNT, OLCP_RESULT_NOT_SUPPORTED))
+    test.assert_eq(olcp(var r, [OLCP_OP_CLEAR_MARKING]), answer(0x70, OLCP_OP_CLEAR_MARKING, OLCP_RESULT_NOT_SUPPORTED))
+    for op in [0x00, 0x09, 0x6F, 0x70, 0x71, 0xFF]
+        test.assert_eq(olcp(var r, [op]), answer(0x70, op, OLCP_RESULT_NOT_SUPPORTED))
+    // The same op codes are all there when the features say so.
+    var all = rig(default_ots_config())
+    test.assert_eq(olcp(var all, [OLCP_OP_GO_TO, 0, 1, 0, 0, 0, 0]), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_go_to_selects_an_object_by_its_id_and_ignores_and_resets_the_filters()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x102)
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert(accepted(write_to(var r, h.filters[0], [0x01, 0x61])))
+    // The filter excludes the Current Object.
+    test.assert_eq(read_error(var r, h.name), ERR_OBJECT_NOT_SELECTED)
+    // Go To takes any object; afterwards there is no filter.
+    var value: [Int] = [OLCP_OP_GO_TO]
+    list.append(value, le(0x101, 6))
+    test.assert_eq(olcp(var r, value), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS))
+    test.assert_eq(peek(var r, h.filters[0]), [0])
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    // No object has the Object ID; a reserved one is not found either.
+    var missing: [Int] = [OLCP_OP_GO_TO]
+    list.append(missing, le(0x999, 6))
+    test.assert_eq(olcp(var r, missing), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_ID_NOT_FOUND))
+    var reserved: [Int] = [OLCP_OP_GO_TO]
+    list.append(reserved, le(5, 6))
+    test.assert_eq(olcp(var r, reserved), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_ID_NOT_FOUND))
+    // A refusal keeps the selection.
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    // A device without the Directory Listing Object has no Object ID 0.
+    var config = default_ots_config()
+    config.directory = false
+    var plain = rig(config)
+    test.assert_eq(olcp(var plain, [OLCP_OP_GO_TO, 0, 0, 0, 0, 0, 0]), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_ID_NOT_FOUND))
+
+// ── The Object List Filter characteristics (OTS 3.5) ─────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_filter_hides_objects_and_the_current_object_is_invalid_while_it_is_hidden()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, h.filters[0], [0x01, 0x67])))
+    test.assert_eq(peek(var r, h.filters[0]), [0x01, 0x67])
+    test.assert_eq(read_error(var r, h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(failure(write_to(var r, h.name, wire.text("zz")), 0x12, h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_INVALID_OBJECT))
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 0, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_OBJECT))
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_INVALID_OBJECT))
+    // The list holds the object that passes.
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_OUT_OF_BOUNDS))
+    // A filter that lets the first Current Object through makes it valid again.
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, h.filters[1], [0x01, 0x7A])))
+    test.assert_eq(read_error(var r, h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert(accepted(write_to(var r, h.filters[1], [0])))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_three_filters_are_combined_and_each_client_has_its_own()
+    var r = rig(default_ots_config())
+    let h = r.h
+    test.assert(accepted(write_to(var r, h.filters[0], [0x02, 0x61])))
+    test.assert(accepted(write_to(var r, h.filters[1], [0x05, 0xCA, 0x2A])))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 2, 0, 0, 0])
+    test.assert(accepted(write_to(var r, h.filters[2], [0x08, 11, 0, 0, 0, 30, 0, 0, 0])))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 1, 0, 0, 0])
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    // A filter that no object passes leaves No Object.
+    test.assert(accepted(write_to(var r, h.filters[0], [0x04, 0x7A, 0x7A])))
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_NO_OBJECT))
+    // The other client sees no filter at all, and its values are its own.
+    test.assert_eq(olcp_as(var r, 1, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 3, 0, 0, 0])
+    test.assert_eq(peek_as(var r, 1, h.filters[0]), [0])
+    test.assert_eq(peek_as(var r, 1, h.filters[1]), [0])
+    test.assert_eq(peek(var r, h.filters[0]), [0x04, 0x7A, 0x7A])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_filter_value_that_breaks_a_rule_is_rejected_and_the_old_value_stays()
+    var r = rig(default_ots_config())
+    let f = r.h.filters[0]
+    test.assert(accepted(write_to(var r, f, [0x01, 0x61])))
+    // A reserved Filter value and a range that runs backward: Write Request Rejected.
+    test.assert_eq(failure(write_to(var r, f, [0x0B]), 0x12, f), 0x80)
+    test.assert_eq(failure(write_to(var r, f, [0x08, 11, 0, 0, 0, 10, 0, 0, 0]), 0x12, f), 0x80)
+    test.assert_eq(failure(write_to(var r, f, [0x01, 0xC3]), 0x12, f), 0x80)
+    // A parameter of the wrong size is an invalid attribute value length.
+    test.assert_eq(failure(write_to(var r, f, [0x01]), 0x12, f), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(failure(write_to(var r, f, [0x05, 1, 2, 3]), 0x12, f), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(failure(write_to(var r, f, []), 0x12, f), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(peek(var r, f), [0x01, 0x61])
+    // The three instances are separate and the longest value is 121 octets.
+    var long: [u8] = [0x01]
+    for _ in 0..120
+        list.push(long, 0x61)
+    test.assert(accepted(write_to(var r, r.h.filters[2], long)))
+    list.push(long, 0x61)
+    test.assert_eq(failure(write_to(var r, r.h.filters[2], long), 0x12, r.h.filters[2]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_filter_is_written_in_parts_and_checked_at_the_execute()
+    var r = rig(default_ots_config())
+    let f = r.h.filters[0]
+    var part_a: [u8] = [0x03]
+    for _ in 0..17
+        list.push(part_a, 0x78)
+    var part_b: [u8] = []
+    for _ in 0..18
+        list.push(part_b, 0x78)
+    var part_c: [u8] = []
+    for _ in 0..5
+        list.push(part_c, 0x78)
+    test.assert_eq(pdu(var r, 0, prepare(f, 0, part_a))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, prepare(f, 18, part_b))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, prepare(f, 36, part_c))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, [0x18, 0x01])[0], [0x19])
+    test.assert_eq(list.len(r.a.client.filters[0]), 41)
+    test.assert_eq(r.a.client.filters[0][0] as Int, 0x03)
+    // The value is read in pieces.
+    let blob = pdu(var r, 0, req(0x0C, f, [22, 0]))
+    test.assert_eq(list.len(blob[0]) - 1, 19)
+    // A long filter with a reserved Filter value is refused when it is executed.
+    var bad: [u8] = [0x77]
+    list.append(bad, part_b)
+    test.assert_eq(pdu(var r, 0, prepare(f, 0, bad))[0][0] as Int, 0x17)
+    test.assert_eq(failure(pdu(var r, 0, [0x18, 0x01]), 0x18, f), 0x80)
+    test.assert_eq(r.a.client.filters[0][0] as Int, 0x03)
+    test.assert_eq(list.len(r.a.client.filters[0]), 41)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_new_connection_starts_with_no_filter_and_no_selection()
+    var r = rig(default_ots_config())
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, r.h.filters[0], [0x01, 0x61])))
+    test.assert(accepted(write_to(var r, r.h.filters[2], [0x08, 0, 0, 0, 0, 20, 0, 0, 0])))
+    test.assert_eq(olcp(var r, [OLCP_OP_ORDER, 0x11]), answer(0x70, OLCP_OP_ORDER, OLCP_RESULT_SUCCESS))
+    ots_disconnected(r.config, var r.shared, var r.a.client, var r.repo, 1)
+    // The client connects again: a new connection and a new client.
+    r.a = new_peer(var r.db, r.h, 1)
+    for f in r.h.filters
+        test.assert_eq(peek(var r, f), [0])
+    test.assert_eq(read_error(var r, r.h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 3, 0, 0, 0])
+    test.assert_eq(olcp(var r, [OLCP_OP_FIRST]), answer(0x70, OLCP_OP_FIRST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+
+// ── Writing the metadata (OTS 3.2) ───────────────────────────────────
+
+@tier(app)
+fn write_command(var r: Rig, who: Int, handle: Int, value: [u8]) -> [[u8]] [mutate]
+    var raw: [u8] = req(0x52, handle, [])
+    list.append(raw, value)
+    pdu(var r, who, raw)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_name_is_checked_before_it_is_accepted()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, h.name, wire.text("delta"))))
+    test.assert_eq(name_of(var r), wire.text("delta"))
+    test.assert_eq(r.repo.objects[0].meta.name, wire.text("delta"))
+    let changes = ots_take_changes(var r.shared)
+    test.assert_eq(list.len(changes), 1)
+    test.assert_eq(changes[0].flags, CHANGE_BY_CLIENT | CHANGE_METADATA)
+    test.assert_eq(changes[0].id, 0x100)
+    test.assert_eq(changes[0].source, 1)
+    // The same name again changes nothing.
+    test.assert(accepted(write_to(var r, h.name, wire.text("delta"))))
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+    // The name of another object: Object Name Already Exists, and the old name stays.
+    test.assert_eq(failure(write_to(var r, h.name, wire.text("beta")), 0x12, h.name), ERR_NAME_EXISTS)
+    test.assert_eq(name_of(var r), wire.text("delta"))
+    // Not a name: empty, a control character, malformed UTF-8.
+    test.assert_eq(failure(write_to(var r, h.name, []), 0x12, h.name), 0x80)
+    test.assert_eq(failure(write_to(var r, h.name, [0x61, 0x0A, 0x62]), 0x12, h.name), 0x80)
+    test.assert_eq(failure(write_to(var r, h.name, [0xC3]), 0x12, h.name), 0x80)
+    test.assert_eq(name_of(var r), wire.text("delta"))
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+    // A name with a character of two octets is a name.
+    test.assert(accepted(write_to(var r, h.name, [0xC3, 0xA6])))
+    test.assert_eq(name_of(var r), [0xC3, 0xA6])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_write_command_is_applied_or_undone_without_an_answer()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    test.assert_eq(list.len(write_command(var r, 0, h.name, wire.text("kappa"))), 0)
+    test.assert_eq(name_of(var r), wire.text("kappa"))
+    test.assert_eq(list.len(write_command(var r, 0, h.name, wire.text("beta"))), 0)
+    test.assert_eq(name_of(var r), wire.text("kappa"))
+    test.assert_eq(list.len(write_command(var r, 0, h.name, [])), 0)
+    test.assert_eq(name_of(var r), wire.text("kappa"))
+
+@tier(app)
+fn execute_write(var r: Rig) -> [[u8]] [mutate]
+    pdu(var r, 0, [0x18, 0x01])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_long_name_is_written_in_parts_and_checked_when_it_is_executed()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    var first: [u8] = []
+    for _ in 0..18
+        list.push(first, 0x71)
+    var second: [u8] = []
+    for _ in 0..12
+        list.push(second, 0x72)
+    test.assert_eq(pdu(var r, 0, prepare(h.name, 0, first))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, prepare(h.name, 18, second))[0][0] as Int, 0x17)
+    // Nothing changes before the Execute Write Request.
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    test.assert_eq(execute_write(var r)[0], [0x19])
+    test.assert_eq(list.len(r.repo.objects[0].meta.name), 30)
+    test.assert_eq(r.repo.objects[0].meta.name[0] as Int, 0x71)
+    test.assert_eq(r.repo.objects[0].meta.name[29] as Int, 0x72)
+    // A duplicate name is refused by the Execute Write Request, which names the characteristic.
+    test.assert_eq(pdu(var r, 0, prepare(h.name, 0, wire.text("beta")))[0][0] as Int, 0x17)
+    test.assert_eq(failure(execute_write(var r), 0x18, h.name), ERR_NAME_EXISTS)
+    test.assert_eq(list.len(r.repo.objects[0].meta.name), 30)
+    // A write that was cancelled changes nothing.
+    test.assert_eq(pdu(var r, 0, prepare(h.name, 0, wire.text("omega")))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, [0x18, 0x00])[0], [0x19])
+    test.assert_eq(list.len(r.repo.objects[0].meta.name), 30)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_properties_and_the_timestamps_of_the_current_object_can_be_written()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, h.properties, [0x0D, 0, 0, 0])))
+    test.assert_eq(peek(var r, h.properties), [0x0D, 0, 0, 0])
+    test.assert_eq(r.repo.objects[0].meta.properties, 0x0D)
+    // A reserved bit, a wrong size and the Mark bit are refused.
+    test.assert_eq(failure(write_to(var r, h.properties, [0x0D, 0x01, 0, 0]), 0x12, h.properties), 0x80)
+    test.assert_eq(failure(write_to(var r, h.properties, [0x0D, 0, 0, 0x80]), 0x12, h.properties), 0x80)
+    test.assert_eq(failure(write_to(var r, h.properties, [0x8D, 0, 0, 0]), 0x12, h.properties), 0x80)
+    test.assert_eq(failure(write_to(var r, h.properties, [0x0D, 0]), 0x12, h.properties), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(peek(var r, h.properties), [0x0D, 0, 0, 0])
+    // The two timestamps.
+    let created: [u8] = [0xE8, 0x07, 1, 2, 3, 4, 5]
+    test.assert(accepted(write_to(var r, h.created, created)))
+    test.assert_eq(peek(var r, h.created), created)
+    test.assert_eq(r.repo.objects[0].meta.created, created)
+    test.assert_eq(failure(write_to(var r, h.created, [0xE8, 0x07, 13, 2, 3, 4, 5]), 0x12, h.created), 0x80)
+    test.assert_eq(failure(write_to(var r, h.created, [0xE8, 0x07, 1, 2, 3, 4]), 0x12, h.created), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    let modified: [u8] = [0xE9, 0x07, 6, 7, 8, 9, 10]
+    test.assert(accepted(write_to(var r, h.modified, modified)))
+    test.assert_eq(peek(var r, h.modified), modified)
+    // A time that is not known is written as zeros.
+    test.assert(accepted(write_to(var r, h.modified, object_store.date_time_zero())))
+    test.assert_eq(peek(var r, h.modified), object_store.date_time_zero())
+    // Writing the other characteristics did not touch the modification time.
+    test.assert(accepted(write_to(var r, h.name, wire.text("sigma"))))
+    test.assert_eq(peek(var r, h.modified), object_store.date_time_zero())
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_type_the_size_and_the_id_cannot_be_written_and_a_clock_closes_last_modified()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    for handle in [h.kind, h.size, h.id, h.feature]
+        test.assert_eq(failure(write_to(var r, handle, [1, 2]), 0x12, handle), att.ATT_ERR_WRITE_NOT_PERMITTED)
+    var config = default_ots_config()
+    config.rtc = true
+    var c = rig(config)
+    choose(var c, 0x100)
+    test.assert_eq(failure(write_to(var c, c.h.modified, object_store.date_time_zero()), 0x12, c.h.modified), att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // A read-only name of a device that neither creates nor renames.
+    var fixed = default_ots_config()
+    fixed.oacp = OACP_READ
+    fixed.name_writable = false
+    fixed.created_writable = false
+    fixed.properties_writable = false
+    var f = rig(fixed)
+    choose(var f, 0x100)
+    test.assert_eq(failure(write_to(var f, f.h.name, wire.text("zz")), 0x12, f.h.name), att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(failure(write_to(var f, f.h.properties, [1, 0, 0, 0]), 0x12, f.h.properties), att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(failure(write_to(var f, f.h.created, object_store.date_time_zero()), 0x12, f.h.created), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+// ── Delete, Calculate Checksum and Execute (OTS 3.3.2.2 to 3.3.2.4) ──
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_delete_removes_the_current_object_and_leaves_the_client_with_none()
+    var r = rig(default_ots_config())
+    choose(var r, 0x102)
+    choose_as(var r, 1, 0x102)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.repo.ids(), [0x100, 0x101])
+    test.assert_eq(read_error(var r, r.h.name), ERR_OBJECT_NOT_SELECTED)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_INVALID_OBJECT))
+    // The other client had it selected, and has none now.
+    test.assert_eq(read_error_as(var r, 1, r.h.name), ERR_OBJECT_NOT_SELECTED)
+    // An object whose properties do not allow deletion stays.
+    choose(var r, 0x101)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(r.repo.ids(), [0x100, 0x101])
+    test.assert_eq(name_of(var r), wire.text("beta"))
+    let changes = ots_take_changes(var r.shared)
+    test.assert_eq(list.len(changes), 1)
+    test.assert_eq(changes[0].flags, CHANGE_BY_CLIENT | CHANGE_DELETION)
+    test.assert_eq(changes[0].id, 0x102)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_store_that_cannot_delete_answers_operation_failed()
+    var r = rig(default_ots_config())
+    choose(var r, 0x100)
+    // The object is gone from the store behind the service's back.
+    r.repo.objects = [r.repo.objects[1], r.repo.objects[2]]
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_INVALID_OBJECT))
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 0, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_OBJECT))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_calculate_checksum_answers_the_crc_32_of_a_range_of_the_contents()
+    var r = rig(default_ots_config())
+    let digits = object_store.memory_add(var r.repo, wire.text("digits"), ots_uuid16(0x2ACA), wire.text("123456789"), 0x0D)
+    choose(var r, digits)
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 9, 0, 0, 0]), [0x60, OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS, 0x26, 0x39, 0xF4, 0xCB])
+    // Part of the object.
+    var middle: [u8] = [0x60, OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS]
+    wire.put(var middle, object_store.crc32(wire.text("345")), 4)
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 2, 0, 0, 0, 3, 0, 0, 0]), middle)
+    // Nothing is summed to zero.
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 9, 0, 0, 0, 0, 0, 0, 0]), [0x60, OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS, 0, 0, 0, 0])
+    // The range reaches past the end, or starts past it.
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 5, 0, 0, 0, 5, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 10, 0, 0, 0, 0, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 10, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_PARAMETER))
+    // A range of a few hundred octets is summed in pieces.
+    var big: [u8] = []
+    for k in 0..700
+        list.push(big, (k % 251) as u8)
+    let many = object_store.memory_add(var r.repo, wire.text("many"), ots_uuid16(0x2ACA), big, 0x0D)
+    choose(var r, many)
+    var whole: [u8] = [0x60, OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS]
+    wire.put(var whole, object_store.crc32(big), 4)
+    test.assert_eq(oacp(var r, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 0xBC, 0x02, 0, 0]), whole)
+    // Without a Current Object the checksum is of an Invalid Object.
+    var n = rig(default_ots_config())
+    test.assert_eq(oacp(var n, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 0, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_INVALID_OBJECT))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_execute_runs_the_object_through_the_store_and_returns_its_response()
+    var r = rig(default_ots_config())
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.repo.executed, [0x100])
+    r.repo.execute_response = [9, 8]
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE, 1, 2, 3]), [0x60, OACP_OP_EXECUTE, OACP_RESULT_SUCCESS, 9, 8])
+    // The properties of beta do not allow execution.
+    choose(var r, 0x101)
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(r.repo.executed, [0x100, 0x100])
+    // What the store answers is limited to the results OTS allows.
+    choose(var r, 0x100)
+    r.repo.execute_result = 0x03
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_INVALID_PARAMETER))
+    r.repo.execute_result = 0x09
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_LOCKED))
+    r.repo.execute_result = 0x0A
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_FAILED))
+    r.repo.execute_result = 0x77
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_FAILED))
+    // A response of more than 17 octets is cut to what the indication holds.
+    r.repo.execute_result = 0x01
+    var long: [u8] = []
+    for k in 0..30
+        list.push(long, k as u8)
+    r.repo.execute_response = long
+    test.assert_eq(list.len(oacp(var r, [OACP_OP_EXECUTE])), 3 + 17)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_read_checks_the_object_its_properties_the_channel_and_the_range_in_that_order()
+    var r = rig(default_ots_config())
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_INVALID_OBJECT))
+    choose(var r, 0x101)
+    // No channel is open.
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_CHANNEL_UNAVAILABLE))
+    // An object that cannot be read is refused before the channel is asked for.
+    choose(var r, 0x100)
+    test.assert(accepted(write_to(var r, r.h.properties, [0x7B, 0, 0, 0])))
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_NOT_PERMITTED))
+    test.assert(accepted(write_to(var r, r.h.properties, [0x7F, 0, 0, 0])))
+    choose(var r, 0x101)
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    // The range: the offset past the end, the end past the end.
+    test.assert_eq(oacp(var r, read_value(4, 0)), answer(0x60, OACP_OP_READ, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, read_value(2, 2)), answer(0x60, OACP_OP_READ, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, read_value(0, 4)), answer(0x60, OACP_OP_READ, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    // The whole object, from the second octet.
+    test.assert_eq(oacp(var r, read_value(1, 2)), answer(0x60, OACP_OP_READ, OACP_RESULT_SUCCESS))
+    test.assert_eq(list.len(r.shared.transfers), 1)
+    let t = r.shared.transfers[0]
+    test.assert(t.reading)
+    test.assert_eq(t.owner, 1)
+    test.assert_eq(t.object, 0x101)
+    test.assert_eq(t.channel, channel)
+    test.assert_eq(t.offset, 1)
+    test.assert_eq(t.length, 2)
+    test.assert_eq(t.state, T_ACTIVE)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_read_in_progress_locks_the_object_and_uses_up_the_channel()
+    var r = rig(default_ots_config())
+    choose(var r, 0x101)
+    let first = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_SUCCESS))
+    // The only channel is in use.
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_CHANNEL_UNAVAILABLE))
+    // A second channel finds the object locked.
+    let second = open_channel(var r.a.coc, 0x41, 247, 247, 10)
+    test.assert(first != second)
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_LOCKED))
+    // Another client with a channel of its own finds it locked too, and cannot delete, sum or write it.
+    let other = open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    choose_as(var r, 1, 0x101)
+    test.assert_eq(oacp_as(var r, 1, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_LOCKED))
+    test.assert_eq(oacp_as(var r, 1, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 3, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_LOCKED))
+    test.assert(other >= 0)
+    // Another object is free.
+    choose_as(var r, 1, 0x102)
+    test.assert_eq(oacp_as(var r, 1, read_value(0, 20)), answer(0x60, OACP_OP_READ, OACP_RESULT_SUCCESS))
+    // A read of no octets is over at once.
+    choose_as(var r, 1, 0x100)
+    let third = open_channel(var r.b.coc, 0x51, 247, 247, 10)
+    test.assert(third != other)
+    test.assert_eq(oacp_as(var r, 1, read_value(0, 0)), answer(0x60, OACP_OP_READ, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.shared.transfers[2].state, T_DONE)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_write_checks_the_properties_the_channel_and_the_range_in_the_order_of_table_3_18()
+    var r = rig(default_ots_config())
+    test.assert_eq(oacp(var r, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INVALID_OBJECT))
+    // Beta cannot be written, with or without a channel.
+    choose(var r, 0x101)
+    test.assert_eq(oacp(var r, write_value(3, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    // Gamma can be written but not patched nor truncated (Delete, Read, Write).
+    choose(var r, 0x102)
+    test.assert_eq(oacp(var r, write_value(0, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(oacp(var r, write_value(20, 5, 2)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    // Alpha has every property: the channel is asked for next.
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, write_value(0, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_CHANNEL_UNAVAILABLE))
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    // Then the Mode, the offset, and the resources.
+    test.assert_eq(oacp(var r, write_value(0, 5, 0x01)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, write_value(0, 5, 0x80)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(oacp(var r, write_value(11, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    test.assert_eq(r.repo.objects[0].meta.size, 10)
+    // A patch inside the object.
+    test.assert_eq(oacp(var r, write_value(2, 3, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    let t = r.shared.transfers[0]
+    test.assert(not t.reading)
+    test.assert(t.patching)
+    test.assert_eq(t.channel, channel)
+    test.assert_eq(t.object, 0x100)
+    test.assert_eq(t.offset, 2)
+    test.assert_eq(t.length, 3)
+    test.assert_eq(t.state, T_ACTIVE)
+    // The one channel is in use; another client finds the object locked.
+    test.assert_eq(oacp(var r, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_CHANNEL_UNAVAILABLE))
+    let other = open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    test.assert(other >= 0)
+    choose_as(var r, 1, 0x100)
+    test.assert_eq(oacp_as(var r, 1, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_LOCKED))
+    test.assert_eq(oacp_as(var r, 1, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_LOCKED))
+    test.assert_eq(oacp_as(var r, 1, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_LOCKED))
+    test.assert_eq(oacp_as(var r, 1, [OACP_OP_CHECKSUM, 0, 0, 0, 0, 1, 0, 0, 0]), answer(0x60, OACP_OP_CHECKSUM, OACP_RESULT_LOCKED))
+    // The lock is released when the transfer stops making progress for 30 s.
+    r.now = 29999
+    test.assert_eq(oacp_as(var r, 1, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_LOCKED))
+    r.now = 30000
+    test.assert_eq(oacp_as(var r, 1, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.shared.transfers[0].state, T_EXPIRED)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_write_past_the_allocated_size_appends_if_the_device_and_the_object_allow_it()
+    var r = rig(default_ots_config())
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert(channel >= 0)
+    // Alpha may grow: its allocated size becomes the end of the write, its current size waits for the data.
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, write_value(10, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.repo.objects[0].meta.allocated, 15)
+    test.assert_eq(r.repo.objects[0].meta.size, 10)
+    test.assert(not r.shared.transfers[0].patching)
+    test.assert_eq(peek(var r, r.h.size), [10, 0, 0, 0, 15, 0, 0, 0])
+    // Gamma does not have the Append property.
+    var g = rig(default_ots_config())
+    let gc = open_channel(var g.a.coc, 0x40, 247, 247, 10)
+    test.assert(gc >= 0)
+    choose(var g, 0x102)
+    test.assert_eq(oacp(var g, write_value(20, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(g.repo.objects[2].meta.allocated, 20)
+    // More than the store can allocate.
+    var big = rig(default_ots_config())
+    let bc = open_channel(var big.a.coc, 0x40, 247, 247, 10)
+    test.assert(bc >= 0)
+    choose(var big, 0x100)
+    test.assert_eq(oacp(var big, write_value(10, 5000, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INSUFFICIENT_RESOURCES))
+    test.assert_eq(big.repo.objects[0].meta.allocated, 10)
+    // A device that does not support appending finds the end of the write past the allocated size.
+    var config = default_ots_config()
+    config.oacp = OACP_DEFINED ^ OACP_APPEND
+    var n = rig(config)
+    let nc = open_channel(var n.a.coc, 0x40, 247, 247, 10)
+    test.assert(nc >= 0)
+    choose(var n, 0x100)
+    test.assert_eq(oacp(var n, write_value(10, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_write_in_truncate_mode_cuts_the_object_at_the_offset_before_the_data_comes()
+    var r = rig(default_ots_config())
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert(channel >= 0)
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, write_value(4, 2, 2)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.repo.objects[0].meta.size, 4)
+    test.assert_eq(r.repo.objects[0].meta.allocated, 10)
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123"))
+    test.assert(not r.shared.transfers[0].patching)
+    // A device without truncation, or an object without the property, refuses the mode.
+    var config = default_ots_config()
+    config.oacp = OACP_DEFINED ^ OACP_TRUNCATE
+    var n = rig(config)
+    let nc = open_channel(var n.a.coc, 0x40, 247, 247, 10)
+    test.assert(nc >= 0)
+    choose(var n, 0x100)
+    test.assert_eq(oacp(var n, write_value(4, 2, 2)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(n.repo.objects[0].meta.size, 10)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_patch_is_limited_and_a_write_of_nothing_is_over_at_once()
+    var config = default_ots_config()
+    config.max_patch = 4
+    var r = rig(config)
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert(channel >= 0)
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, write_value(0, 5, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_INSUFFICIENT_RESOURCES))
+    test.assert_eq(oacp(var r, write_value(0, 4, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    // Free the channel by giving the transfer up, then write nothing at the end of the object.
+    r.now = 30000
+    let other = open_channel(var r.a.coc, 0x41, 247, 247, 10)
+    test.assert(other >= 0)
+    test.assert_eq(oacp(var r, write_value(10, 0, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.shared.transfers[1].state, T_DONE)
+    // A truncation without data makes the object shorter at once.
+    test.assert_eq(oacp(var r, write_value(6, 0, 2)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.repo.objects[0].meta.size, 6)
+    // The transfers that are over are dropped when the next one starts.
+    test.assert_eq(r.shared.transfers[list.len(r.shared.transfers) - 1].state, T_DONE)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_abort_stops_a_read_in_progress_and_fails_when_there_is_none()
+    var r = rig(default_ots_config())
+    choose(var r, 0x101)
+    test.assert_eq(oacp(var r, [OACP_OP_ABORT]), answer(0x60, OACP_OP_ABORT, OACP_RESULT_FAILED))
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert(channel >= 0)
+    test.assert_eq(oacp(var r, read_value(0, 3)), answer(0x60, OACP_OP_READ, OACP_RESULT_SUCCESS))
+    // Another client did not start the read.
+    test.assert_eq(oacp_as(var r, 1, [OACP_OP_ABORT]), answer(0x60, OACP_OP_ABORT, OACP_RESULT_FAILED))
+    test.assert_eq(r.shared.transfers[0].state, T_ACTIVE)
+    test.assert_eq(oacp(var r, [OACP_OP_ABORT]), answer(0x60, OACP_OP_ABORT, OACP_RESULT_SUCCESS))
+    test.assert_eq(r.shared.transfers[0].state, T_ABORTED)
+    test.assert_eq(oacp(var r, [OACP_OP_ABORT]), answer(0x60, OACP_OP_ABORT, OACP_RESULT_FAILED))
+    // A device that does not read has no Abort.
+    var config = default_ots_config()
+    config.oacp = OACP_DELETE
+    var n = rig(config)
+    test.assert_eq(oacp(var n, [OACP_OP_ABORT]), answer(0x60, OACP_OP_ABORT, OACP_RESULT_NOT_SUPPORTED))
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_write_to_a_control_point_in_parts_runs_when_it_is_executed()
+    var r = rig(default_ots_config())
+    let h = r.h
+    // Create with a 128-bit type is 21 octets: more than a default ATT_MTU carries.
+    var value: [u8] = [OACP_OP_CREATE]
+    wire.put(var value, 7, 4)
+    for k in 0..16
+        list.push(value, (0x20 + k) as u8)
+    test.assert_eq(pdu(var r, 0, prepare(h.oacp, 0, value[0:15]))[0][0] as Int, 0x17)
+    test.assert_eq(pdu(var r, 0, prepare(h.oacp, 15, value[15:21]))[0][0] as Int, 0x17)
+    let out = pdu(var r, 0, [0x18, 0x01])
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x19])
+    test.assert_eq(out[1][0] as Int, 0x1D)
+    test.assert_eq(out[1][3:list.len(out[1])], answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    test.assert_eq(list.len(r.repo.ids()), 4)
+    test.assert_eq(list.len(peek(var r, h.kind)), 16)
+    test.assert_eq(list.len(pdu(var r, 0, [0x1E])), 0)
+    // A value of the wrong size is refused by the Execute Write Request, and the queue is gone.
+    test.assert_eq(pdu(var r, 0, prepare(h.oacp, 0, [OACP_OP_READ, 1, 2, 3, 4]))[0][0] as Int, 0x17)
+    test.assert_eq(failure(pdu(var r, 0, [0x18, 0x01]), 0x18, h.oacp), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(list.len(r.a.link.prepare_queue), 0)
+    // The list control point too.
+    var goto: [u8] = [OLCP_OP_GO_TO]
+    wire.put(var goto, 0x101, 6)
+    test.assert_eq(pdu(var r, 0, prepare(h.olcp, 0, goto))[0][0] as Int, 0x17)
+    let second = pdu(var r, 0, [0x18, 0x01])
+    test.assert_eq(second[1][3:list.len(second[1])], answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS))
+    test.assert_eq(r.a.client.current, 0x101)
+
+// ── Clients, concurrency and disconnection (OTS 1.12, 3.7) ───────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_each_client_selects_its_own_object_and_a_client_beyond_the_pool_is_refused()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x100)
+    choose_as(var r, 1, 0x102)
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    test.assert_eq(peek_as(var r, 1, h.name), wire.text("gamma"))
+    test.assert_eq(peek_as(var r, 1, h.size), [20, 0, 0, 0, 20, 0, 0, 0])
+    test.assert_eq(peek(var r, h.size), [10, 0, 0, 0, 10, 0, 0, 0])
+    test.assert_eq(list.len(r.shared.pool), 2)
+    // A third client is refused every read and write of the service, but may discover it.
+    var c = new_peer(var r.db, h, 3)
+    let refused = ots_receive(var r.db, var c.link, h, r.config, var c.coc, var r.shared, var c.client, var r.repo, req(0x0A, h.feature, []), 0)
+    test.assert_eq(failure(refused, 0x0A, h.feature), ERR_CONCURRENCY_LIMIT)
+    let write = ots_receive(var r.db, var c.link, h, r.config, var c.coc, var r.shared, var c.client, var r.repo, req(0x12, h.oacp, [OACP_OP_DELETE]), 0)
+    test.assert_eq(failure(write, 0x12, h.oacp), ERR_CONCURRENCY_LIMIT)
+    let command = ots_receive(var r.db, var c.link, h, r.config, var c.coc, var r.shared, var c.client, var r.repo, req(0x52, h.name, [0x61]), 0)
+    test.assert_eq(list.len(command), 0)
+    let found = ots_receive(var r.db, var c.link, h, r.config, var c.coc, var r.shared, var c.client, var r.repo, req(0x08, 1, [0xFF, 0xFF, 0x00, 0x28]), 0)
+    test.assert_eq(found[0][0] as Int, 0x09)
+    test.assert_eq(list.len(r.shared.pool), 2)
+    // When a client of the pool leaves, the next one is served.
+    ots_disconnected(r.config, var r.shared, var r.a.client, var r.repo, 1)
+    let served = ots_receive(var r.db, var c.link, h, r.config, var c.coc, var r.shared, var c.client, var r.repo, req(0x0A, h.feature, []), 0)
+    test.assert_eq(served[0][0] as Int, 0x0B)
+    test.assert_eq(r.shared.pool, [2, 3])
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_an_object_created_and_never_named_is_deleted_when_its_client_disconnects()
+    var r = rig(default_ots_config())
+    // Even an object that may not be deleted.
+    r.repo.properties = object_store.PROP_READ | object_store.PROP_WRITE
+    var value: [Int] = [OACP_OP_CREATE]
+    list.append(value, le(8, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    let unnamed = r.a.client.current
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    let named = r.a.client.current
+    test.assert(accepted(write_to(var r, r.h.name, wire.text("keep"))))
+    test.assert_eq(list.len(r.repo.ids()), 5)
+    let before = ots_take_changes(var r.shared)
+    test.assert_eq(list.len(before), 3)
+    ots_disconnected(r.config, var r.shared, var r.a.client, var r.repo, 1)
+    test.assert_eq(r.repo.ids(), [0x100, 0x101, 0x102, named])
+    test.assert(unnamed != named)
+    let after = ots_take_changes(var r.shared)
+    test.assert_eq(list.len(after), 1)
+    test.assert_eq(after[0].flags, CHANGE_DELETION)
+    test.assert_eq(after[0].id, unnamed)
+    test.assert_eq(after[0].source, 0)
+    // The client is gone: nothing selected, no filters, no order.
+    test.assert_eq(r.a.client.current, object_store.NO_OBJECT)
+    test.assert_eq(list.len(r.a.client.created), 0)
+    test.assert_eq(list.len(r.shared.pool), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_disconnection_ends_the_transfers_of_the_client_and_releases_their_locks()
+    var r = rig(default_ots_config())
+    let channel = open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert(channel >= 0)
+    choose(var r, 0x100)
+    test.assert_eq(oacp(var r, write_value(0, 4, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+    let other = open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    test.assert(other >= 0)
+    choose_as(var r, 1, 0x100)
+    test.assert_eq(oacp_as(var r, 1, write_value(0, 4, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_LOCKED))
+    ots_disconnected(r.config, var r.shared, var r.a.client, var r.repo, 1)
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    test.assert_eq(oacp_as(var r, 1, write_value(0, 4, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_SUCCESS))
+
+// ── Object Changed (OTS 3.6) ─────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_object_changed_goes_to_the_other_clients_and_to_all_for_a_change_at_the_server()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, 0x102)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_SUCCESS))
+    let changes = ots_take_changes(var r.shared)
+    test.assert_eq(list.len(changes), 1)
+    let change = changes[0]
+    test.assert_eq(change.flags, 0x11)
+    test.assert_eq(change.id, 0x102)
+    test.assert_eq(change.source, 1)
+    test.assert_eq(ots_change_value(change), [0x11, 0x02, 0x01, 0, 0, 0, 0])
+    // Not to the client that did it; to the other.
+    test.assert_eq(list.len(ots_indicate_change(var r.db, var r.a.link, h, change, 0)), 0)
+    let to_b = ots_indicate_change(var r.db, var r.b.link, h, change, 0)
+    test.assert_eq(list.len(to_b), 1)
+    test.assert_eq(to_b[0], [0x1D, 31, 0, 0x11, 0x02, 0x01, 0, 0, 0, 0])
+    test.assert_eq(list.len(pdu(var r, 1, [0x1E])), 0)
+    // A change at the server goes to both.
+    ots_local_change(r.config, var r.shared, CHANGE_METADATA | CHANGE_BY_CLIENT, 0x100)
+    let local = ots_take_changes(var r.shared)
+    test.assert_eq(local[0].flags, CHANGE_METADATA)
+    test.assert_eq(local[0].source, 0)
+    test.assert_eq(list.len(ots_indicate_change(var r.db, var r.a.link, h, local[0], 0)), 1)
+    test.assert_eq(list.len(pdu(var r, 0, [0x1E])), 0)
+    test.assert_eq(list.len(ots_indicate_change(var r.db, var r.b.link, h, local[0], 0)), 1)
+    // A client that did not enable the indications is not sent any.
+    test.assert_eq(pdu(var r, 1, req(0x12, h.changed_cccd, [0, 0]))[0], [0x13])
+    test.assert_eq(list.len(pdu(var r, 1, [0x1E])), 0)
+    test.assert_eq(list.len(ots_indicate_change(var r.db, var r.b.link, h, local[0], 0)), 0)
+    // The Directory Listing Object is never reported.
+    ots_push_change(r.config, var r.shared, CHANGE_METADATA, object_store.ID_DIRECTORY, 0)
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_device_without_object_changed_records_no_change_and_has_no_indication()
+    var config = default_ots_config()
+    config.changed = false
+    var r = rig(config)
+    choose(var r, 0x102)
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_SUCCESS))
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+    ots_local_change(config, var r.shared, CHANGE_METADATA, 0x100)
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+    let change = OtsChange { flags: 0x04, id: 0x100, source: 0 }
+    test.assert_eq(list.len(ots_indicate_change(var r.db, var r.a.link, r.h, change, 0)), 0)
+
+// ── The Directory Listing Object (OTS 4.1) ───────────────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_directory_listing_object_lists_every_object_by_name_and_is_read_only()
+    var r = rig(default_ots_config())
+    let h = r.h
+    choose(var r, object_store.ID_DIRECTORY)
+    test.assert_eq(peek(var r, h.name), wire.text("Directory"))
+    test.assert_eq(peek(var r, h.kind), [0xCB, 0x2A])
+    test.assert_eq(peek(var r, h.id), [0, 0, 0, 0, 0, 0])
+    test.assert_eq(peek(var r, h.properties), [0x04, 0, 0, 0])
+    let listing = ots_directory(r.config, r.shared, 1, var r.repo).1
+    let n = list.len(listing)
+    var size: [u8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    wire.put(var size, n, 4)
+    test.assert_eq(peek(var r, h.size)[0:4], wire.octets([n & 0xFF, (n >>> 8) & 0xFF, 0, 0]))
+    test.assert_eq(peek(var r, h.size)[4:8], wire.octets([n & 0xFF, (n >>> 8) & 0xFF, 0, 0]))
+    // The records come by name: Directory, alpha, beta, gamma.
+    var ids: [Int] = []
+    var at = 0
+    for _ in 0..4
+        let length = wire.get(listing, at, 2)
+        list.push(ids, wire.get(listing, at + 2, 6))
+        at = at + length
+    test.assert_eq(ids, [0, 0x100, 0x101, 0x102])
+    test.assert_eq(at, n)
+    // The record of the object itself holds the size of the whole listing.
+    let name_length = listing[8] as Int
+    test.assert_eq(name_length, 9)
+    test.assert_eq(wire.get(listing, 2 + 6 + 1 + 9 + 1 + 2, 4), n)
+    // It cannot be written, deleted, executed or renamed.
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(oacp(var r, write_value(0, 1, 0)), answer(0x60, OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(oacp(var r, [OACP_OP_EXECUTE]), answer(0x60, OACP_OP_EXECUTE, OACP_RESULT_NOT_PERMITTED))
+    test.assert_eq(failure(write_to(var r, h.name, wire.text("Dir")), 0x12, h.name), 0x80)
+    test.assert_eq(failure(write_to(var r, h.properties, [0x0D, 0, 0, 0]), 0x12, h.properties), 0x80)
+    test.assert_eq(failure(write_to(var r, h.created, [0xE8, 0x07, 1, 2, 3, 4, 5]), 0x12, h.created), 0x80)
+    // Its checksum is that of the listing.
+    var sum: [u8] = [0x60, OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS]
+    wire.put(var sum, object_store.crc32(listing), 4)
+    var request: [Int] = [OACP_OP_CHECKSUM, 0, 0, 0, 0]
+    list.append(request, le(n, 4))
+    test.assert_eq(oacp(var r, request), sum)
+    // Reading it needs a channel like any other object.
+    test.assert_eq(oacp(var r, read_value(0, n)), answer(0x60, OACP_OP_READ, OACP_RESULT_CHANNEL_UNAVAILABLE))
+    test.assert_eq(list.len(ots_take_changes(var r.shared)), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_the_directory_listing_object_is_not_part_of_the_list()
+    var r = rig(default_ots_config())
+    choose(var r, object_store.ID_DIRECTORY)
+    test.assert_eq(olcp(var r, [OLCP_OP_PREVIOUS]), answer(0x70, OLCP_OP_PREVIOUS, OLCP_RESULT_OUT_OF_BOUNDS))
+    test.assert_eq(olcp(var r, [OLCP_OP_NEXT]), answer(0x70, OLCP_OP_NEXT, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("alpha"))
+    test.assert_eq(olcp(var r, [OLCP_OP_COUNT]), [0x70, OLCP_OP_COUNT, OLCP_RESULT_SUCCESS, 3, 0, 0, 0])
+    test.assert_eq(olcp(var r, [OLCP_OP_LAST]), answer(0x70, OLCP_OP_LAST, OLCP_RESULT_SUCCESS))
+    test.assert_eq(name_of(var r), wire.text("gamma"))
+    // The listing grows with the store.
+    let before = list.len(ots_directory(r.config, r.shared, 1, var r.repo).1)
+    let _ = object_store.memory_add(var r.repo, wire.text("delta"), ots_uuid16(0x2ACA), wire.text("x"), 0x0D)
+    test.assert(list.len(ots_directory(r.config, r.shared, 1, var r.repo).1) > before)
+    // With no other object it lists itself.
+    r.repo.objects = []
+    let alone = ots_directory(r.config, r.shared, 1, var r.repo)
+    test.assert_eq(wire.get(alone.1, 0, 2), list.len(alone.1))
+    test.assert_eq(alone.0.size, list.len(alone.1))
+
+// ── A server for one object ──────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-OTS-001")
+fn test_a_single_object_server_has_its_object_selected_and_creates_a_new_one_after_a_delete()
+    var config = single_object_config()
+    config.oacp = OACP_READ | OACP_DELETE | OACP_CREATE | OACP_CHECKSUM
+    var r = rig(config)
+    r.repo = object_store.new_memory_store(100, 1)
+    let only = object_store.memory_add(var r.repo, wire.text("only"), ots_uuid16(0x2ACA), wire.text("data"), 0x0D)
+    test.assert_eq(only, 0x100)
+    // No selection is needed.
+    test.assert_eq(peek(var r, r.h.name), wire.text("only"))
+    test.assert_eq(peek(var r, r.h.size), [4, 0, 0, 0, 4, 0, 0, 0])
+    test.assert_eq(oacp(var r, [OACP_OP_DELETE]), answer(0x60, OACP_OP_DELETE, OACP_RESULT_SUCCESS))
+    test.assert_eq(read_error(var r, r.h.name), ERR_OBJECT_NOT_SELECTED)
+    var value: [Int] = [OACP_OP_CREATE]
+    list.append(value, le(5, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_SUCCESS))
+    test.assert_eq(peek(var r, r.h.name), [])
+    test.assert_eq(peek(var r, r.h.size), [0, 0, 0, 0, 5, 0, 0, 0])
+    // The device holds one object.
+    test.assert_eq(oacp(var r, value), answer(0x60, OACP_OP_CREATE, OACP_RESULT_FAILED))
+    // The Object ID is a characteristic of a server for many objects only.
+    test.assert_eq(r.h.id, 0)

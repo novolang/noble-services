@@ -1,0 +1,548 @@
+// src/user_data.nv — the User Data Service (0x181C), a GATT
+// server that keeps the data of several users and gives a client the data of
+// one of them after that user consented.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Database Change Increment  0x2A99  Read, Write, Notify; uint32
+//   User Index                 0x2A9A  Read; uint8, 0xFF is Unknown User
+//   User Control Point         0x2A9F  Write, Indicate
+//   Registered User            0x2A9B  Indicate (optional)
+//   UDS Characteristics        the product's list, each Read and Write
+//
+// The product lists the UDS Characteristics it supports (First Name, Weight,
+// ...) in `UdsConfig.characteristics`, each with the value a new user starts
+// with.  `UdsState` holds the users: for each one the User Index, the Consent
+// Code, the failed consent attempts, the Database Change Increment and one
+// value for each UDS Characteristic.  The values of the server's attributes
+// are those of the current user, the one that consented; with no consent
+// they are the defaults and a client that reads or writes a UDS Characteristic
+// or writes the Database Change Increment is answered User Data Access Not
+// Permitted (0x80, Section 1.6).  The consent ends with the connection:
+// `uds_disconnected`.
+//
+// The ATT server cannot refuse by consent, so the requests go through
+// `uds_receive`, which runs the consent check, the ATT server, the control
+// point procedure the request wrote, and then copies the attribute values
+// the client wrote into the user's record.
+//
+// Procedures of the User Control Point: Register New User (0x01), Consent
+// (0x02), Delete User Data (0x03), List All Users (0x04, needs the Registered
+// User characteristic) and Delete User(s) (0x05).  Register New User with no
+// space left answers Operation Failed.  A Consent Code is 0 to 9999; after
+// `max_tries` failed consents the user is locked until `uds_unlock`, and
+// Consent answers Operation Failed for it.
+//
+// Out-of-band updates (the user interface of the product): `uds_set_value`
+// stores a value, `uds_end_update` increments the Database Change Increment
+// once for the whole update and notifies it when the user is the current one.
+//
+// One ATT link is served; the notification of a second client of the same user
+// (Section 3.2.1) is NOT IMPLEMENTED.  Registered User names come from
+// `uds_set_name`, truncated to `UdsConfig.name_max` octets.
+//
+// Specification checked against: User Data Service 1.1.1.
+//
+// Satisfies: REQ-BLE-UDS-001.
+
+use att
+use gatt_server
+use links
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer }
+use wire
+
+const UUID_USER_DATA_SERVICE = 0x181C
+const UUID_DATABASE_CHANGE_INCREMENT = 0x2A99
+const UUID_USER_INDEX = 0x2A9A
+const UUID_REGISTERED_USER = 0x2B37
+const UUID_USER_CONTROL_POINT = 0x2A9F
+
+const UNKNOWN_USER = 0xFF
+const CONSENT_CODE_MAX = 9999
+
+// The Application Error Code of Section 1.6.
+const ERR_USER_DATA_ACCESS_NOT_PERMITTED = 0x80
+
+const OP_REGISTER_NEW_USER = 0x01
+const OP_CONSENT = 0x02
+const OP_DELETE_USER_DATA = 0x03
+const OP_LIST_ALL_USERS = 0x04
+const OP_DELETE_USERS = 0x05
+const OP_RESPONSE_CODE = 0x20
+
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_PARAMETER = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+const RESULT_USER_NOT_AUTHORIZED = 0x05
+
+trait UdsPolicy[e]
+    // Whether the device registers a new user for `peer`, who asked with
+    // Register New User; false is answered Operation Failed, as for a device
+    // with no space left.  It is asked when the request is valid and a slot is free.
+    fn register_user(var self, peer: links.LinkId) -> Bool [e]
+
+// The policy of a device that registers every user it has room for (`accept`)
+// or none.
+@value
+struct DefaultUdsPolicy
+    accept: Bool
+
+@tier(embedded)
+fn default_uds_policy() -> DefaultUdsPolicy
+    DefaultUdsPolicy { accept: true }
+
+impl UdsPolicy[] for DefaultUdsPolicy
+    fn register_user(var self, _peer: links.LinkId) -> Bool
+        self.accept
+
+// One UDS Characteristic the product supports and the value a new user has.
+struct UdsCharacteristic
+    uuid: Int
+    default_value: [u8]
+
+// The configuration: the access to the attributes (encryption is mandatory,
+// C.2), the characteristics, whether the Registered User characteristic is
+// present, the longest name it carries, the number of users and of consent
+// attempts.
+struct UdsConfig
+    access: gatt_server.Access
+    characteristics: [UdsCharacteristic]
+    var registered_user: Bool
+    var name_max: Int
+    var max_users: Int
+    max_tries: Int
+
+@tier(app)
+fn default_uds_config(characteristics: [UdsCharacteristic]) -> UdsConfig
+    UdsConfig { access: gatt_server.Access.Encrypted, characteristics: characteristics, registered_user: true, name_max: 32, max_users: 4, max_tries: 3 }
+
+// The handles of the service.  `registered` and `registered_cccd` are 0 for a
+// service without the Registered User characteristic.
+struct UdsHandles
+    service: Int
+    increment: Int
+    increment_cccd: Int
+    user_index: Int
+    control_point: Int
+    control_point_cccd: Int
+    registered: Int
+    registered_cccd: Int
+    characteristics: [Int]
+
+// The users.  A slot with `used` 0 is free.  `values` holds the value of
+// characteristic c of slot s at s * count + c.  `current` is the slot that
+// consented, -1 for none.  `locked` is 1 for a slot whose consent attempts are
+// used up.
+struct UdsState
+    var used: [Int]
+    var indexes: [Int]
+    var codes: [Int]
+    var tries: [Int]
+    var locked: [Int]
+    var increments: [Int]
+    var values: [[u8]]
+    var names: [[u8]]
+    var current: Int
+    var rolling: Int
+    var defaults: [[u8]]
+    count: Int
+    max_tries: Int
+    var name_max: Int
+
+@tier(app)
+fn new_uds_state(config: UdsConfig) -> UdsState
+    var s = UdsState {
+        used: [], indexes: [], codes: [], tries: [], locked: [], increments: [], values: [], names: [],
+        current: -1, rolling: 0, defaults: [], count: list.len(config.characteristics),
+        max_tries: config.max_tries, name_max: config.name_max }
+    for c in config.characteristics
+        list.push(s.defaults, c.default_value[:])
+    for _ in 0..config.max_users
+        list.push(s.used, 0)
+        list.push(s.indexes, UNKNOWN_USER)
+        list.push(s.codes, 0)
+        list.push(s.tries, 0)
+        list.push(s.locked, 0)
+        list.push(s.increments, 0)
+        list.push(s.names, [])
+        for d in s.defaults
+            list.push(s.values, d[:])
+    s
+
+@tier(app)
+fn uds_value(v: Int, octets: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, v, octets)
+    out
+
+// Add the service to `db` after its last attribute.  A product with no UDS
+// Characteristic is refused (Section 3: at least one).
+@tier(app)
+fn add_uds_service(var db: GattDb, config: UdsConfig) -> Result<UdsHandles, profile_builder.ProfileError>
+    if list.len(config.characteristics) == 0 or config.max_users < 1 or config.max_users > 255
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_USER_DATA_SERVICE))!
+    let increment = profile_builder.add_value(
+        var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE | gatt_server.PROP_NOTIFY, gatt_server.both_ways(config.access),
+        gatt_server.le16(UUID_DATABASE_CHANGE_INCREMENT), uds_value(0, 4))!
+    let increment_cccd = profile_builder.add_cccd(var db, gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access })!
+    if not gatt_server.require_value_format(var db, increment, 4, 0, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+        return Err(profile_builder.ProfileError.NoRoom)
+    let user_index = profile_builder.add_value(
+        var db, gatt_server.PROP_READ, profile_builder.read_only(config.access), gatt_server.le16(UUID_USER_INDEX), [UNKNOWN_USER])!
+    let cp = sensor_control.add_control_point_with_errors(
+        var db, UUID_USER_CONTROL_POINT, config.access, gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access },
+        att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+    var registered = 0
+    var registered_cccd = 0
+    if config.registered_user
+        registered = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_REGISTERED_USER), [])!
+        registered_cccd = profile_builder.add_cccd(var db, gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access })!
+    var chars: [Int] = []
+    for c in config.characteristics
+        list.push(chars, profile_builder.add_value(
+            var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE, gatt_server.both_ways(config.access), gatt_server.le16(c.uuid), c.default_value)!)
+    Ok(UdsHandles {
+        service: service, increment: increment, increment_cccd: increment_cccd, user_index: user_index,
+        control_point: cp.0, control_point_cccd: cp.1, registered: registered, registered_cccd: registered_cccd, characteristics: chars })
+
+@tier(embedded)
+@no_alloc
+fn slot_of_index(state: UdsState, index: Int) -> Int
+    for k in 0..list.len(state.used)
+        if state.used[k] == 1 and state.indexes[k] == index
+            return k
+    -1
+
+@tier(embedded)
+@no_alloc
+fn free_slot(state: UdsState) -> Int
+    for k in 0..list.len(state.used)
+        if state.used[k] == 0
+            return k
+    -1
+
+// The lowest User Index, 0 to 0xFE, no registered user has.
+@tier(embedded)
+@no_alloc
+fn free_index(state: UdsState) -> Int
+    for i in 0..UNKNOWN_USER
+        if slot_of_index(state, i) < 0
+            return i
+    UNKNOWN_USER
+
+// The number of registered users.
+@tier(embedded)
+@no_alloc
+fn uds_user_count(state: UdsState) -> Int
+    var n = 0
+    for u in state.used
+        n = n + u
+    n
+
+// Whether a user consented on this connection.
+@tier(embedded)
+@no_alloc
+fn uds_has_consent(state: UdsState) -> Bool
+    state.current >= 0
+
+@tier(app)
+fn control_value(db: GattDb, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// Put the values of the current user, or the defaults and Unknown User when
+// there is none, into the attributes.
+@tier(app)
+fn load_current(var db: GattDb, handles: UdsHandles, state: UdsState)
+    let s = state.current
+    let _ = gatt_server.set_value(var db, handles.user_index, [(if s < 0 then UNKNOWN_USER else state.indexes[s]) as u8])
+    let _ = gatt_server.set_value(var db, handles.increment, uds_value(if s < 0 then 0 else state.increments[s], 4))
+    for c in 0..state.count
+        let _ = gatt_server.set_value(var db, handles.characteristics[c], if s < 0 then state.defaults[c][:] else state.values[s * state.count + c][:])
+
+// Copy what a client wrote into the attributes into the record of the current
+// user.
+@tier(app)
+fn store_current(db: GattDb, handles: UdsHandles, var state: UdsState)
+    let s = state.current
+    if s < 0
+        return
+    state.increments[s] = wire.get(control_value(db, handles.increment), 0, 4)
+    for c in 0..state.count
+        state.values[s * state.count + c] = control_value(db, handles.characteristics[c])
+
+// The consent ends with the connection: the attributes show Unknown User
+// again and a user must give consent again.
+@tier(app)
+fn uds_disconnected(var db: GattDb, handles: UdsHandles, var state: UdsState)
+    state.current = -1
+    load_current(var db, handles, state)
+
+// Unlock the user `index` after the failed consent attempts, which the product
+// does on an action of the user at the device ("any other mechanism",
+// Section 3.5.2.6).  False for no such user.
+@tier(embedded)
+@no_alloc
+fn uds_unlock(var state: UdsState, index: Int) -> Bool
+    let s = slot_of_index(state, index)
+    if s < 0
+        return false
+    state.tries[s] = 0
+    state.locked[s] = 0
+    true
+
+// The name of the user `index` for the Registered User characteristic; false
+// for no such user.
+@tier(app)
+fn uds_set_name(var state: UdsState, index: Int, name: [u8]) -> Bool
+    let s = slot_of_index(state, index)
+    if s < 0
+        return false
+    state.names[s] = name[:]
+    true
+
+// ── The control point ───────────────────────────────────────────────
+
+// The Registered User Data of slot `s`: the flags, the index and the name cut
+// to `name_max` octets.
+@tier(app)
+fn registered_user_data(state: UdsState, s: Int) -> [u8]
+    let name = state.names[s]
+    let cut = list.len(name) > state.name_max
+    var out: [u8] = [((if list.len(name) > 0 then 1 else 0) | (if cut then 2 else 0)) as u8, state.indexes[s] as u8]
+    let n = if cut then state.name_max else list.len(name)
+    for k in 0..n
+        list.push(out, name[k])
+    out
+
+// The segments of `data` for an ATT_MTU of `mtu`, each with its Segmentation
+// Header (Table 3.3): First, Last and the Rolling Segment Number.
+@tier(app)
+fn registered_segments(var state: UdsState, data: [u8], mtu: Int) -> [[u8]]
+    let room = if mtu - 4 < 1 then 1 else mtu - 4
+    var out: [[u8]] = []
+    var at = 0
+    let n = list.len(data)
+    while at < n
+        let take = if n - at < room then n - at else room
+        let header = (if at == 0 then 1 else 0) | (if at + take >= n then 2 else 0) | (state.rolling << 2)
+        var seg: [u8] = [header as u8]
+        for k in 0..take
+            list.push(seg, data[at + k])
+        list.push(out, seg)
+        state.rolling = (state.rolling + 1) % 64
+        at = at + take
+    out
+
+@tier(app)
+fn delete_slot(var db: GattDb, handles: UdsHandles, var state: UdsState, s: Int)
+    state.used[s] = 0
+    state.indexes[s] = UNKNOWN_USER
+    state.codes[s] = 0
+    state.tries[s] = 0
+    state.locked[s] = 0
+    state.increments[s] = 0
+    state.names[s] = []
+    for c in 0..state.count
+        state.values[s * state.count + c] = state.defaults[c][:]
+    if state.current == s
+        state.current = -1
+        load_current(var db, handles, state)
+
+// The result and parameter of Register New User with the request `p` of `peer`.
+@tier(app)
+fn register_user<P: UdsPolicy[e]>(var state: UdsState, var policy: P, peer: links.LinkId, p: [u8]) -> (Int, [u8]) [e, mutate]
+    if list.len(p) != 2 or wire.get(p, 0, 2) > CONSENT_CODE_MAX
+        return (RESULT_INVALID_PARAMETER, [])
+    let s = free_slot(state)
+    if s < 0 or not policy.register_user(peer)
+        return (RESULT_OPERATION_FAILED, [])
+    let index = free_index(state)
+    state.used[s] = 1
+    state.indexes[s] = index
+    state.codes[s] = wire.get(p, 0, 2)
+    (RESULT_SUCCESS, [index as u8])
+
+// The result of Consent with the request `p`: the User Index and the code.
+@tier(app)
+fn consent(var db: GattDb, handles: UdsHandles, var state: UdsState, p: [u8]) -> Int
+    if list.len(p) != 3 or p[0] as Int == UNKNOWN_USER or wire.get(p, 1, 2) > CONSENT_CODE_MAX
+        return RESULT_INVALID_PARAMETER
+    let s = slot_of_index(state, p[0] as Int)
+    if s < 0
+        return RESULT_USER_NOT_AUTHORIZED
+    if state.locked[s] == 1
+        return RESULT_OPERATION_FAILED
+    if state.codes[s] != wire.get(p, 1, 2)
+        state.tries[s] = state.tries[s] + 1
+        if state.tries[s] >= state.max_tries
+            state.locked[s] = 1
+            return RESULT_OPERATION_FAILED
+        return RESULT_USER_NOT_AUTHORIZED
+    state.tries[s] = 0
+    state.current = s
+    load_current(var db, handles, state)
+    RESULT_SUCCESS
+
+// The result and parameter of Delete User(s) with the request `p`.
+@tier(app)
+fn delete_users(var db: GattDb, handles: UdsHandles, var state: UdsState, p: [u8]) -> (Int, [u8])
+    if list.len(p) != 1
+        return (RESULT_INVALID_PARAMETER, [])
+    let index = p[0] as Int
+    if index == UNKNOWN_USER
+        for s in 0..list.len(state.used)
+            delete_slot(var db, handles, var state, s)
+        return (RESULT_SUCCESS, [UNKNOWN_USER])
+    let s = slot_of_index(state, index)
+    if s < 0
+        return (RESULT_INVALID_PARAMETER, [])
+    delete_slot(var db, handles, var state, s)
+    (RESULT_SUCCESS, [index as u8])
+
+// Store the response and answer its indication.
+@tier(app)
+fn uds_respond(var db: GattDb, var link: AttLink, handles: UdsHandles, op: Int, result: Int, parameter: [u8], now_ms: Int) -> [[u8]]
+    var value: [u8] = [OP_RESPONSE_CODE as u8, op as u8, result as u8]
+    list.append(value, parameter)
+    let _ = gatt_server.set_value(var db, handles.control_point, value)
+    gatt_server.send_value(var db, var link, handles.control_point, now_ms)
+
+// Run the procedure `request` (the value written to the control point) and
+// answer the PDUs the server sends after the Write Response: for List All
+// Users one indication of the Registered User characteristic for each
+// segment of each user, then the response.
+@tier(app)
+fn uds_procedure<P: UdsPolicy[e]>(var db: GattDb, var link: AttLink, handles: UdsHandles, var state: UdsState, var policy: P, peer: links.LinkId, request: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let op = if list.len(request) == 0 then 0 else request[0] as Int
+    let p = if list.len(request) > 1 then request[1:list.len(request)] else []
+    var out: [[u8]] = []
+    var result = RESULT_OP_CODE_NOT_SUPPORTED
+    var parameter: [u8] = []
+    if op == OP_REGISTER_NEW_USER
+        let r = register_user(var state, var policy, peer, p)
+        result = r.0
+        parameter = r.1[:]
+    else if op == OP_CONSENT
+        result = consent(var db, handles, var state, p)
+    else if op == OP_DELETE_USER_DATA
+        if state.current < 0
+            result = RESULT_USER_NOT_AUTHORIZED
+        else
+            delete_slot(var db, handles, var state, state.current)
+            result = RESULT_SUCCESS
+    else if op == OP_DELETE_USERS
+        let r = delete_users(var db, handles, var state, p)
+        result = r.0
+        parameter = r.1[:]
+    else if op == OP_LIST_ALL_USERS and handles.registered != 0
+        for s in 0..list.len(state.used)
+            if state.used[s] == 1
+                for seg in registered_segments(var state, registered_user_data(state, s), gatt_server.mtu_of(link, 0))
+                    let _ = gatt_server.set_value(var db, handles.registered, seg)
+                    list.append(out, gatt_server.send_value(var db, var link, handles.registered, now_ms))
+        result = RESULT_SUCCESS
+        parameter = [uds_user_count(state) as u8]
+    list.append(out, uds_respond(var db, var link, handles, op, result, parameter, now_ms))
+    out
+
+// Whether `handle` is a UDS Characteristic.
+@tier(embedded)
+@no_alloc
+fn is_uds_characteristic(handles: UdsHandles, handle: Int) -> Bool
+    for h in handles.characteristics
+        if h == handle
+            return true
+    false
+
+// Answer one ATT PDU of `peer`, the client: the consent check, the ATT server,
+// and the procedure a write to the User Control Point started.  The PDUs are the
+// responses and the indications that follow them.
+@tier(app)
+fn uds_receive<P: UdsPolicy[e]>(var db: GattDb, var link: AttLink, handles: UdsHandles, var state: UdsState, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) < 3
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let op = pdu[0] as Int
+    let handle = gatt_server.read_le16(pdu, 1)
+    let reads = op == 0x0A or op == 0x0C
+    let writes = op == 0x12 or op == 0x16 or op == 0x52
+    if state.current < 0 and (((reads or writes) and is_uds_characteristic(handles, handle)) or (writes and handle == handles.increment))
+        return if op == 0x52 then [] else gatt_server.error(op, handle, ERR_USER_DATA_ACCESS_NOT_PERMITTED)
+    let request = if op == 0x12 and handle == handles.control_point then pdu[3:list.len(pdu)] else []
+    if list.len(request) > 0 and request[0] as Int == OP_LIST_ALL_USERS and handles.registered != 0
+        if (gatt_server.configuration(link, handles.registered_cccd) & gatt_server.CCC_INDICATION) == 0
+            return gatt_server.error(op, handle, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    store_current(db, handles, var state)
+    if op == 0x12 and handle == handles.control_point and list.len(out) > 0 and out[0][0] as Int == att.ATT_OP_WRITE_RSP
+        list.append(out, uds_procedure(var db, var link, handles, var state, var policy, peer, request, now_ms))
+    out
+
+// ── Out-of-band updates ─────────────────────────────────────────────
+
+// Store `value` as characteristic `c` of the user `index`, the update of the
+// user interface; false for no such user or characteristic.  The Database
+// Change Increment changes at `uds_end_update`.
+@tier(app)
+fn uds_set_value(var db: GattDb, handles: UdsHandles, var state: UdsState, index: Int, c: Int, value: [u8]) -> Bool
+    let s = slot_of_index(state, index)
+    if s < 0 or c < 0 or c >= state.count
+        return false
+    state.values[s * state.count + c] = value[:]
+    if state.current == s
+        return gatt_server.set_value(var db, handles.characteristics[c], value)
+    true
+
+// End an update of the user `index`: the Database Change Increment goes up by
+// one, once for all the values set, and is notified when the user is the
+// current one.
+@tier(app)
+fn uds_end_update(var db: GattDb, var link: AttLink, handles: UdsHandles, var state: UdsState, index: Int, now_ms: Int) -> [[u8]]
+    let s = slot_of_index(state, index)
+    if s < 0
+        return []
+    state.increments[s] = (state.increments[s] + 1) & 0xFFFFFFFF
+    if state.current != s
+        return []
+    let _ = gatt_server.set_value(var db, handles.increment, uds_value(state.increments[s], 4))
+    gatt_server.send_value(var db, var link, handles.increment, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn test_characteristics() -> [UdsCharacteristic]
+    [UdsCharacteristic { uuid: 0x2A8A, default_value: [0x41] },
+     UdsCharacteristic { uuid: 0x2A98, default_value: [0, 0] }]
+
+// `uds_receive` with the default policy, for the tests that do not look at it.
+@tier(app)
+fn receive_default(var s: GattServer, h: UdsHandles, var st: UdsState, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_uds_policy()
+    uds_receive(var s.db, var s.link, h, var st, var policy, peer(), pdu, now_ms)
+
+// A server with the service on an encrypted link and the indications of the
+// control point and the Registered User characteristic, and the notification
+// of the Database Change Increment, enabled.
+@tier(app)
+fn server(config: UdsConfig) -> (GattServer, UdsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_uds_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point_cccd, [2, 0]), 0)
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.increment_cccd, [1, 0]), 0)
+    if h.registered_cccd != 0
+        let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.registered_cccd, [2, 0]), 0)
+    (s, h)
+
+@tier(app)
+fn ack(var s: GattServer) -> [[u8]]
+    gatt_server.receive(var s.db, var s.link, [0x1E], 0)

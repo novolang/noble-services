@@ -1,0 +1,130 @@
+// src/link_loss.nv — the Link Loss Service (0x1803).
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+// A tag, a key finder or a pet collar lets its phone say how it alerts when
+// the link is lost.  The service has one characteristic:
+//
+//   Alert Level   0x2A06   Read, Write; No Alert (0), Mild Alert (1) or
+//                          High Alert (2); starts as No Alert
+//
+// The characteristic returns the level the device alerts with when the
+// connection is lost ([LLS] 3.1.1).  A connection lost without prior warning
+// starts the alert; a connection ended by a Link Layer procedure (the peer or
+// the Host terminated it) does not, and the level is then ignored ([LLS] 4.1).
+// The Link Layer tells the two apart by the disconnect reason: the loss with
+// no warning is the Connection Timeout (0x08).  `link_loss_alerts` names it.
+// The alert continues until a product timeout, a user interaction or the
+// reconnection; `LlsPolicy.alert` starts it and `LlsPolicy.stop` ends it on
+// the reconnection.  What the alert is (light, sound, motion) and for how
+// long is the product's ([LLS] 4.1).
+//
+// A value that is none of the three levels is Reserved for Future Use and a
+// write of it is answered Value Not Allowed (0x13); the specification defines
+// no Application Error Code (1.6) and no security requirement (3).  A
+// product may raise the access of the characteristic with `LlsConfig.access`.
+// The level is one for the device, not one for each peer.
+//
+// Specification checked against: Link Loss Service 1.0.1, and the Alert Level
+// values of the GATT Specification Supplement v9, Section 3.8.
+//
+// Satisfies: REQ-BLE-LLS-001.
+
+use att
+use links
+use gatt_server
+use control_common
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+
+const UUID_LINK_LOSS_SERVICE = 0x1803
+const UUID_ALERT_LEVEL = 0x2A06
+
+const ALERT_NONE = 0
+const ALERT_MILD = 1
+const ALERT_HIGH = 2
+
+// The disconnect reason of a connection that timed out ([Vol 1] Part F,
+// Section 1.3, Connection Timeout).
+const REASON_CONNECTION_TIMEOUT = 0x08
+
+trait LlsPolicy[e]
+    // The link to `peer` was lost without warning and the level was `level`
+    // (Mild or High Alert; No Alert never reaches the policy).
+    fn alert(var self, peer: links.LinkId, level: Int) [e]
+    // The link to `peer` is back: the alert ends.
+    fn stop(var self, peer: links.LinkId) [e]
+
+// The policy of a device with no alert to give.
+@value
+struct DefaultLlsPolicy
+    placeholder: Int
+
+@tier(embedded)
+fn default_lls_policy() -> DefaultLlsPolicy
+    DefaultLlsPolicy { placeholder: 0 }
+
+impl LlsPolicy[] for DefaultLlsPolicy
+    fn alert(var self, peer: links.LinkId, level: Int)
+        let _ = level
+    fn stop(var self, peer: links.LinkId)
+        let _ = peer
+
+// The access to read and to write the Alert Level.
+struct LlsConfig
+    access: gatt_server.Access
+
+// Any client reads and writes it (the specification imposes no security).
+@tier(app)
+fn default_lls_config() -> LlsConfig
+    LlsConfig { access: gatt_server.Access.Open }
+
+@value
+struct LlsHandles
+    service: u16
+    level: u16
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_lls_service(var db: GattDb, config: LlsConfig) -> Result<LlsHandles, profile_builder.ProfileError>
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_LINK_LOSS_SERVICE))!
+    let level = profile_builder.add_value(
+        var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE, gatt_server.Permissions { read: config.access, write: config.access },
+        gatt_server.le16(UUID_ALERT_LEVEL), [ALERT_NONE])!
+    if not gatt_server.restrict_first_octet(var db, level, [ALERT_NONE, ALERT_MILD, ALERT_HIGH], att.ATT_ERR_VALUE_NOT_ALLOWED)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    Ok(LlsHandles { service: service as u16, level: level as u16 })
+
+// Whether `level` is one of the three Alert Level values.
+@tier(embedded)
+@no_alloc
+fn alert_level_valid(level: Int) -> Bool
+    level >= ALERT_NONE and level <= ALERT_HIGH
+
+// The level the characteristic holds.
+fn link_loss_level(db: GattDb, handles: LlsHandles) -> Int
+    wire.get(control_common.attr(db, handles.level), 0, 1)
+
+// Whether a connection that ended with the disconnect reason `reason` was
+// lost without warning, which is when the alert starts.
+@tier(embedded)
+@no_alloc
+fn link_loss_alerts(reason: Int) -> Bool
+    reason == REASON_CONNECTION_TIMEOUT
+
+// The connection to `peer` ended with `reason`: the alert starts for a loss
+// without warning and a level above No Alert.  True when the policy was told.
+@tier(app)
+fn lls_link_ended<P: LlsPolicy[e]>(db: GattDb, handles: LlsHandles, var policy: P, peer: links.LinkId, reason: Int) -> Bool [e, mutate]
+    let level = link_loss_level(db, handles)
+    if not link_loss_alerts(reason) or level == ALERT_NONE
+        return false
+    policy.alert(peer, level)
+    true
+
+// The connection to `peer` is back.
+@tier(app)
+fn lls_reconnected<P: LlsPolicy[e]>(var policy: P, peer: links.LinkId) [e, mutate]
+    policy.stop(peer)

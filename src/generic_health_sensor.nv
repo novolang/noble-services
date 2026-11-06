@@ -1,0 +1,1893 @@
+// src/generic_health_sensor.nv — the Generic Health Sensor
+// Service (0x1840), with which a personal health device sends the observations
+// of its sensors to a collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Health Sensor Features       0x2BF3  Read, optionally Indicate; the
+//                                        observation types the sensor can
+//                                        generate and its device specializations
+//   Live Health Observations     0x2B8B  Indicate and/or Notify; one observation
+//                                        in segments, started by the GHS Control Point
+//   Stored Health Observations   0x2BDD  Indicate and/or Notify; one record in
+//                                        segments, the answer of the Record Access
+//                                        Control Point
+//   Record Access Control Point  0x2A52  Write, Indicate; reports, counts and
+//                                        deletes the stored records
+//   GHS Control Point            0x2BF4  Write, Indicate; starts and stops the live
+//                                        observations
+//   Observation Schedule Changed 0x2BF1  Indicate; a schedule changed
+//
+//   Observation Schedule         0x2910  descriptor of the features: Read, optionally
+//                                        Write; the type, period and interval
+//   Valid Range and Accuracy     0x2911  descriptor of the features: Read
+//
+// The service carries ACOM observations (IEEE 11073-10206) without knowing
+// what they mean.  An observation is a Health Observation Body ([GHSS] 3.2.1.2):
+// the Observation Class Type, the Length, the Flags, the optional fields the
+// flags name, and the Observation Value of the class.  `GhsObservation` holds one
+// and `ghs_body` encodes it; `ghs_numeric_value`, `ghs_discrete_value`,
+// `ghs_string_value`, `ghs_sample_array_value`, `ghs_compound_discrete_value`,
+// `ghs_state_event_value`, `ghs_compound_value` with `ghs_component`,
+// `ghs_tlv_value` and `ghs_bundle_value` encode the nine classes, and
+// `ghs_body_error` checks a body octet by octet, so a body made elsewhere is
+// refused when it breaks a rule of the format.  A FLOAT is the raw 32-bit
+// value of `wire.float`; a code of the IEEE 11073-10101 nomenclature is the
+// number the standard lists.
+//
+// Live observations.  `ghs_submit` queues a body for the collector and
+// `ghs_pump` sends the oldest one when the collector has enabled the Live
+// Health Observations characteristic and has written Start sending live
+// observations (0x01) to the GHS Control Point, which the service answers with
+// the indication 0x80 even when the characteristic is not enabled ([GHSS] 3.5.2).
+// A body is cut into segments of ATT_MTU - 4 octets, each with the
+// Segmentation Header (first, last, Rolling Segment Counter), and the segments go
+// out as notifications when the collector enabled those and as indications
+// otherwise; the server never mixes the two in one observation.  An observation leaves the
+// queue when the collector has confirmed its last indication, or at the next
+// call after its notifications went out.
+//
+// Stored observations.  `ghs_store` keeps a body with the next record number,
+// the Record Access Control Point reports (Combined Report), counts and deletes
+// them by record number, and `ghs_pump` sends one record at a time and then the
+// Combined Report Response.  The operators are those of `GhsConfig`; the filter
+// type is the record number.  A second command while a report runs is answered
+// Procedure Already In Progress, a Combined Report without the Stored Health
+// Observations enabled is answered Client Characteristic Configuration
+// Descriptor Improperly Configured, a procedure that starts while live
+// observations are being sent is answered Server Busy unless the product says it
+// can do both.  A procedure ends when the link is lost or when the collector
+// does not confirm an indication within 30 seconds; it is not resumed.
+//
+// Security.  The service imposes none ([GHSS] Table 3.1); the Generic Health
+// Sensor Profile 1.0 asks for security mode 1 and level 2 or higher for medical
+// devices ([GHSP] 6.1).  `add_ghs_service` takes the access as Encrypted,
+// Authenticated or SecureConnections, refuses the others with `NotPermitted`,
+// and puts it on every value that is read or written and on every Client
+// Characteristic Configuration descriptor, which is where a value that is only
+// indicated or notified gets its protection.
+//
+// The Application Error Codes are 0x81 Command Not Supported (a GHS Control
+// Point write that is neither Start nor Stop) and, from the Common Profile and
+// Service Error Codes, 0xFD, 0xFE and 0xFF.  `ghs_receive` evaluates every
+// write to the GHS Control Point, the Record Access Control Point and an
+// Observation Schedule descriptor before its Write Response.
+//
+// NOT IMPLEMENTED: the Time filter type of the Record Access Control Point (the
+// Elapsed Time layout is in the Elapsed Time Service, which is not on disk; the
+// operators on a Time operand are answered Operand Not Supported, which
+// [GHSS] 3.4.2.2 allows because the type is optional) and the Time Stamp field
+// as a structure (the nine octets of the Elapsed Time are carried as the product
+// gives them and checked for their count only); a record number sequence for each
+// user ([GHSP] 3.6, a "should": the records of all users share one sequence); the
+// Elapsed Time, Device Information, Battery, Reconnection Configuration and User
+// Data services of the profile, which the product composes from their modules; the
+// LE GATT Security Levels characteristic and the advertising data of the profile
+// except the Service Data payload (`ghs_service_data`); the BR/EDR SDP record.
+//
+// Specification checked against: Generic Health Sensor Service 1.0 (GHSS),
+// Generic Health Sensor Profile 1.0 (GHSP) and the GATT Specification
+// Supplement v9, Section 3.177 (Record Access Control Point).
+//
+// Satisfies: REQ-BLE-GHS-001.
+
+use att
+use gatt_server
+use links
+use dis_policy
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer, subscribe }
+use wire
+
+const UUID_GENERIC_HEALTH_SENSOR_SERVICE = 0x1840
+const UUID_HEALTH_SENSOR_FEATURES = 0x2BF3
+const UUID_LIVE_HEALTH_OBSERVATIONS = 0x2B8B
+const UUID_STORED_HEALTH_OBSERVATIONS = 0x2BDD
+const UUID_RECORD_ACCESS_CONTROL_POINT = 0x2A52
+const UUID_GHS_CONTROL_POINT = 0x2BF4
+const UUID_OBSERVATION_SCHEDULE_CHANGED = 0x2BF1
+const UUID_OBSERVATION_SCHEDULE = 0x2910
+const UUID_VALID_RANGE_AND_ACCURACY = 0x2911
+
+// The Application Error Code of [GHSS] Table 2.1; the others of the table are the
+// Common Profile and Service Error Codes of `att` (0xFD, 0xFE and 0xFF).
+const ERR_COMMAND_NOT_SUPPORTED = 0x81
+
+// The Op Codes of the GHS Control Point ([GHSS] Table 3.35) and the value its
+// indication carries for a request that was carried out.
+const OP_START = 0x01
+const OP_STOP = 0x02
+const RESULT_CONTROL_POINT_SUCCESS = 0x80
+
+// The Observation Class Types ([GHSS] Table 3.11).
+const CLASS_NUMERIC = 1
+const CLASS_DISCRETE = 2
+const CLASS_STRING = 3
+const CLASS_SAMPLE_ARRAY = 4
+const CLASS_COMPOUND_DISCRETE = 5
+const CLASS_COMPOUND_STATE_EVENT = 6
+const CLASS_COMPOUND = 7
+const CLASS_TLV = 8
+const CLASS_BUNDLE = 255
+
+// The Flags of a Health Observation Body ([GHSS] Table 3.12).
+const FLAG_TYPE = 0x0001
+const FLAG_TIME_STAMP = 0x0002
+const FLAG_DURATION = 0x0004
+const FLAG_STATUS = 0x0008
+const FLAG_ID = 0x0010
+const FLAG_PATIENT = 0x0020
+const FLAG_SUPPLEMENTAL = 0x0040
+const FLAG_DERIVED_FROM = 0x0080
+const FLAG_MEMBER_OF = 0x0100
+const FLAG_TLVS = 0x0200
+const FLAGS_DEFINED = 0x03FF
+
+// The Measurement Status bits ([GHSS] Table 3.13).  Bits 8 to 13 are RFU, and bit
+// 14 and bit 15 are not both set.
+const STATUS_INVALID = 0x0001
+const STATUS_QUESTIONABLE = 0x0002
+const STATUS_NOT_AVAILABLE = 0x0004
+const STATUS_CALIBRATING = 0x0008
+const STATUS_TEST_DATA = 0x0010
+const STATUS_EARLY_ESTIMATE = 0x0020
+const STATUS_MANUALLY_ENTERED = 0x0040
+const STATUS_SETTING = 0x0080
+const STATUS_THRESHOLD_ERROR = 0x4000
+const STATUS_THRESHOLDING_DISABLED = 0x8000
+const STATUS_RFU = 0x3F00
+
+// The octets of the Time Stamp: an Elapsed Time structure.
+const TIME_STAMP_OCTETS = 9
+
+// What `ghs_body_error` says is wrong with a body; 0 for nothing.
+const BODY_OK = 0
+const BODY_TOO_SHORT = 1
+const BODY_CLASS = 2
+const BODY_LENGTH = 3
+const BODY_FLAGS = 4
+const BODY_FIELD = 5
+const BODY_VALUE = 6
+const BODY_TRAILING = 7
+const BODY_NO_TYPE = 8
+const BODY_BUNDLE_ID = 9
+const BODY_STATUS = 10
+const BODY_NESTED_BUNDLE = 11
+const BODY_STRING = 12
+
+// The Op Codes, Operators and Response Code Values of the Record Access Control
+// Point ([GSS] 3.177; [GHSS] Tables 3.31 and 3.32) and the Filter Type.
+const RACP_DELETE = 0x02
+const RACP_ABORT = 0x03
+const RACP_REPORT_NUMBER = 0x04
+const RACP_NUMBER_RESPONSE = 0x05
+const RACP_RESPONSE_CODE = 0x06
+const RACP_COMBINED_REPORT = 0x07
+const RACP_COMBINED_RESPONSE = 0x08
+
+const OPERATOR_NULL = 0x00
+const OPERATOR_ALL = 0x01
+const OPERATOR_LESS_OR_EQUAL = 0x02
+const OPERATOR_GREATER_OR_EQUAL = 0x03
+const OPERATOR_WITHIN = 0x04
+const OPERATOR_FIRST = 0x05
+const OPERATOR_LAST = 0x06
+
+// A set of operators is a mask with bit n for the operator n.
+const MASK_ALL = 0x02
+const MASK_LESS_OR_EQUAL = 0x04
+const MASK_GREATER_OR_EQUAL = 0x08
+const MASK_WITHIN = 0x10
+const MASK_FIRST = 0x20
+const MASK_LAST = 0x40
+const MASK_ALL_OPERATORS = 0x7E
+
+const FILTER_RECORD_NUMBER = 0x01
+const FILTER_TIME = 0x02
+
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_OPERATOR = 0x03
+const RESULT_OPERATOR_NOT_SUPPORTED = 0x04
+const RESULT_INVALID_OPERAND = 0x05
+const RESULT_NO_RECORDS_FOUND = 0x06
+const RESULT_ABORT_UNSUCCESSFUL = 0x07
+const RESULT_PROCEDURE_NOT_COMPLETED = 0x08
+const RESULT_OPERAND_NOT_SUPPORTED = 0x09
+const RESULT_SERVER_BUSY = 0x0A
+
+// The longest value a client writes to the Record Access Control Point: the
+// Op Code, the Operator and an Operand of at most 18 octets.
+const RACP_VALUE_MAX = 20
+
+// The record number wraps after 2^32 records ([GHSS] 3.3.1.1).
+const RECORD_NUMBERS = 4294967296
+
+// What `ghs_store` answers when it keeps nothing.
+const STORE_DISABLED = -1
+const STORE_INVALID = -2
+const STORE_NO_TIME_STAMP = -3
+const STORE_FULL = -4
+
+// What `ghs_submit` answers.
+const SUBMIT_OK = 0
+const SUBMIT_DISABLED = 1
+const SUBMIT_INVALID = 2
+const SUBMIT_NO_TIME_STAMP = 3
+const SUBMIT_FULL = 4
+
+// What `ghs_config_error` says is wrong with a configuration, the first thing:
+// CONFIG_OK, CONFIG_NOT_PERMITTED for an access below the profile's,
+// CONFIG_INVALID for any other rule broken.
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+// The kinds of attribute `ghs_receive` evaluates a write to.
+const KIND_NONE = 0
+const KIND_CONTROL_POINT = 1
+const KIND_RACP = 2
+const KIND_SCHEDULE = 3
+
+// The longest value an attribute holds ([Vol 3] Part F, Section 3.2.9).
+const VALUE_MAX = 512
+
+// One Observation Schedule descriptor ([GHSS] 3.7.1).  `period` and `interval`
+// are FLOATs in seconds (0 for unspecified).  A `writable` schedule takes a
+// write whose period lies between `period_min` and `period_max` and whose
+// interval lies between `interval_min` and `interval_max`, in thousandths of a
+// second, and refuses any other with Out of Range.
+struct GhsSchedule
+    var observation_type: Int
+    var period: Int
+    var interval: Int
+    var writable: Bool
+    var period_min: Int
+    var period_max: Int
+    var interval_min: Int
+    var interval_max: Int
+
+// One Valid Range and Accuracy descriptor ([GHSS] 3.7.2): the MDC code of a
+// numeric observation type, the unit code, the lower and upper limit as FLOATs,
+// and the accuracy as a FLOAT when `has_accuracy` is set.
+struct GhsRange
+    var observation_type: Int
+    var unit_code: Int
+    var lower: Int
+    var upper: Int
+    var has_accuracy: Bool
+    var accuracy: Int
+
+// What the sensor has.
+//
+// `access` is the access of the features, the descriptors, the control points
+// and every Client Characteristic Configuration descriptor.  `features` adds
+// Health Sensor Features with the `observation_types` (MDC codes, one to 255)
+// and, when `specialization_codes` is not empty, the device specializations
+// (16-bit MDC term codes) with their `specialization_versions`;
+// `features_indicate` adds the Indicate property for a sensor whose features
+// change.  `live` adds the Live Health Observations and the GHS Control Point,
+// `live_notify` and `live_indicate` say how the observations are sent;
+// `stored` adds the Stored Health Observations and the Record Access Control
+// Point in the same way.  `report_operators` is the set of operators of the
+// Combined Report and Report Number of Stored Records procedures (it holds All
+// records and Greater than or equal to), `delete_operators` the set of the
+// Delete Stored Records procedure (0 when there is none, else it holds All
+// records) and `abort` adds the Abort Operation procedure.  `parallel` says the
+// sensor can report stored observations while it sends live ones.  `schedules`
+// and `ranges` are the descriptors of the features; `schedule_changed` adds the
+// Observation Schedule Changed characteristic, which a writable schedule
+// needs.  `live_capacity` and `store_capacity` bound the observations the queue
+// and the store hold.
+struct GhsConfig
+    var access: gatt_server.Access
+    var features: Bool
+    var observation_types: [Int]
+    var specialization_codes: [Int]
+    var specialization_versions: [Int]
+    var features_indicate: Bool
+    var live: Bool
+    var live_notify: Bool
+    var live_indicate: Bool
+    var stored: Bool
+    var stored_notify: Bool
+    var stored_indicate: Bool
+    var report_operators: Int
+    var delete_operators: Int
+    var abort: Bool
+    var parallel: Bool
+    var schedules: [GhsSchedule]
+    var schedule_changed: Bool
+    var ranges: [GhsRange]
+    var live_capacity: Int
+    var store_capacity: Int
+
+// A sensor that sends live observations of the MDC codes `observation_types`
+// over indications, on an encrypted link, with no stored observations.
+@tier(app)
+fn default_ghs_config(observation_types: [Int]) -> GhsConfig
+    GhsConfig {
+        access: gatt_server.Access.Encrypted, features: true, observation_types: observation_types[:],
+        specialization_codes: [], specialization_versions: [], features_indicate: false,
+        live: true, live_notify: false, live_indicate: true,
+        stored: false, stored_notify: false, stored_indicate: false,
+        report_operators: MASK_ALL_OPERATORS, delete_operators: 0, abort: false, parallel: false,
+        schedules: [], schedule_changed: false, ranges: [], live_capacity: 8, store_capacity: 32 }
+
+// The handles of the service; 0 for what it does not have.  `schedules` and
+// `ranges` follow the order of `GhsConfig.schedules` and `GhsConfig.ranges`.
+struct GhsHandles
+    var service: Int
+    var features: Int
+    var features_cccd: Int
+    var schedules: [Int]
+    var ranges: [Int]
+    var live: Int
+    var live_cccd: Int
+    var stored: Int
+    var stored_cccd: Int
+    var racp: Int
+    var racp_cccd: Int
+    var control_point: Int
+    var control_point_cccd: Int
+    var schedule_changed: Int
+    var schedule_changed_cccd: Int
+
+// ── Fields ──────────────────────────────────────────────────────────
+
+// Whether `raw` is a FLOAT a field may hold: 32 bits and not the value reserved
+// for future use.  A special value (NaN, NRes, an infinity) is sent as it is.
+@tier(embedded)
+@no_alloc
+fn ghs_float_sendable(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFFFFFF and wire.float_kind(raw) != wire.KIND_RESERVED
+
+// Whether `raw` is a FLOAT that holds a number.
+@tier(embedded)
+@no_alloc
+fn ghs_float_number(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFFFFFF and wire.float_kind(raw) == wire.KIND_NUMBER
+
+// Whether `raw` is a FLOAT that holds a number that is not negative.
+@tier(embedded)
+@no_alloc
+fn ghs_float_period(raw: Int) -> Bool
+    ghs_float_number(raw) and wire.float_mantissa(raw) >= 0
+
+// Whether a schedule of `period` and `interval` is inside the limits, in
+// thousandths of a second.
+@tier(embedded)
+@no_alloc
+fn ghs_schedule_supported(period: Int, interval: Int, period_min: Int, period_max: Int, interval_min: Int, interval_max: Int) -> Bool
+    if not ghs_float_period(period) or not ghs_float_period(interval)
+        return false
+    let p = wire.float_scaled(period, 3)
+    let i = wire.float_scaled(interval, 3)
+    p >= period_min and p <= period_max and i >= interval_min and i <= interval_max
+
+// Whether `access` is a security level the Generic Health Sensor Profile allows.
+@tier(embedded)
+@no_alloc
+fn ghs_access_secure(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// The value of the Observation Schedule descriptor and of the Observation
+// Schedule Changed characteristic ([GHSS] Table 3.36): the MDC code, the
+// measurement period and the update interval.
+@tier(app)
+fn ghs_schedule_value(observation_type: Int, period: Int, interval: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, observation_type, 4)
+    wire.put(var out, period, 4)
+    wire.put(var out, interval, 4)
+    out
+
+// The value of the Valid Range and Accuracy descriptor ([GHSS] Table 3.38): 14
+// octets, 18 with the accuracy.
+@tier(app)
+fn ghs_range_value(r: GhsRange) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, r.observation_type, 4)
+    wire.put(var out, r.unit_code, 2)
+    wire.put(var out, r.lower, 4)
+    wire.put(var out, r.upper, 4)
+    if r.has_accuracy
+        wire.put(var out, r.accuracy, 4)
+    out
+
+// The value of Health Sensor Features ([GHSS] Tables 3.2 to 3.7): the Flags, the
+// count and the 4-octet codes of the observation types, then the count and the
+// 2-octet codes with the 1-octet versions of the device specializations when the
+// sensor has any.
+@tier(app)
+fn ghs_features_value(config: GhsConfig) -> [u8]
+    var out: [u8] = []
+    let specs = list.len(config.specialization_codes)
+    wire.put(var out, if specs > 0 then 1 else 0, 1)
+    wire.put(var out, list.len(config.observation_types), 1)
+    for t in config.observation_types
+        wire.put(var out, t, 4)
+    if specs > 0
+        wire.put(var out, specs, 1)
+        for i in 0..specs
+            wire.put(var out, config.specialization_codes[i], 2)
+            wire.put(var out, config.specialization_versions[i], 1)
+    out
+
+// The octets of the value `ghs_features_value` makes for `config`.
+@tier(embedded)
+@no_alloc
+fn ghs_features_length(config: GhsConfig) -> Int
+    let specs = list.len(config.specialization_codes)
+    var n = 2 + 4 * list.len(config.observation_types)
+    if specs > 0
+        n = n + 1 + 3 * specs
+    n
+
+// Whether the descriptors and lists of `config` obey the rules of the
+// Observation Schedule and Valid Range and Accuracy descriptors.
+@tier(app)
+fn ghs_descriptors_valid(config: GhsConfig) -> Bool
+    var any_writable = false
+    for i in 0..list.len(config.schedules)
+        let s = config.schedules[i]
+        if not list.contains(config.observation_types, s.observation_type)
+            return false
+        for j in 0..i
+            if config.schedules[j].observation_type == s.observation_type
+                return false
+        if not ghs_float_period(s.period) or not ghs_float_period(s.interval)
+            return false
+        if s.writable
+            any_writable = true
+            if s.period_min < 0 or s.period_min > s.period_max or s.interval_min < 0 or s.interval_min > s.interval_max
+                return false
+            if not ghs_schedule_supported(s.period, s.interval, s.period_min, s.period_max, s.interval_min, s.interval_max)
+                return false
+    if any_writable and not config.schedule_changed
+        return false
+    if config.schedule_changed and list.len(config.schedules) == 0
+        return false
+    for i in 0..list.len(config.ranges)
+        let r = config.ranges[i]
+        if r.observation_type < 0 or r.observation_type > 0xFFFFFFFF or r.unit_code < 0 or r.unit_code > 0xFFFF
+            return false
+        for j in 0..i
+            if config.ranges[j].observation_type == r.observation_type
+                return false
+        if not ghs_float_number(r.lower) or not ghs_float_number(r.upper)
+            return false
+        if wire.float_scaled(r.lower, 6) > wire.float_scaled(r.upper, 6)
+            return false
+        if r.has_accuracy and not ghs_float_number(r.accuracy)
+            return false
+    true
+
+// What is wrong with `config`, the first thing (CONFIG_OK for nothing).
+@tier(app)
+fn ghs_config_error(config: GhsConfig) -> Int
+    if not ghs_access_secure(config.access)
+        return CONFIG_NOT_PERMITTED
+    if not config.live and not config.stored
+        return CONFIG_INVALID
+    if config.live and not config.live_notify and not config.live_indicate
+        return CONFIG_INVALID
+    if not config.live and (config.live_notify or config.live_indicate)
+        return CONFIG_INVALID
+    if config.stored and not config.stored_notify and not config.stored_indicate
+        return CONFIG_INVALID
+    if not config.stored and (config.stored_notify or config.stored_indicate)
+        return CONFIG_INVALID
+    if (config.live and config.live_capacity < 1) or (config.stored and config.store_capacity < 1)
+        return CONFIG_INVALID
+    if config.stored
+        let r = config.report_operators
+        let required = MASK_ALL | MASK_GREATER_OR_EQUAL
+        if r < 0 or (r | MASK_ALL_OPERATORS) != MASK_ALL_OPERATORS or (r & required) != required
+            return CONFIG_INVALID
+        let d = config.delete_operators
+        if d < 0 or (d | MASK_ALL_OPERATORS) != MASK_ALL_OPERATORS
+            return CONFIG_INVALID
+        if d != 0 and (d & MASK_ALL) == 0
+            return CONFIG_INVALID
+    else
+        if config.delete_operators != 0 or config.abort
+            return CONFIG_INVALID
+    if config.features
+        let n = list.len(config.observation_types)
+        if n < 1 or n > 255
+            return CONFIG_INVALID
+        for t in config.observation_types
+            if t < 0 or t > 0xFFFFFFFF
+                return CONFIG_INVALID
+        let m = list.len(config.specialization_codes)
+        if m > 255 or m != list.len(config.specialization_versions)
+            return CONFIG_INVALID
+        for i in 0..m
+            if config.specialization_codes[i] < 0 or config.specialization_codes[i] > 0xFFFF
+                return CONFIG_INVALID
+            if config.specialization_versions[i] < 0 or config.specialization_versions[i] > 0xFF
+                return CONFIG_INVALID
+        if ghs_features_length(config) > VALUE_MAX
+            return CONFIG_INVALID
+        if not ghs_descriptors_valid(config)
+            return CONFIG_INVALID
+    else
+        if config.features_indicate or config.schedule_changed
+            return CONFIG_INVALID
+        if list.len(config.observation_types) > 0 or list.len(config.specialization_codes) > 0
+            return CONFIG_INVALID
+        if list.len(config.specialization_versions) > 0 or list.len(config.schedules) > 0 or list.len(config.ranges) > 0
+            return CONFIG_INVALID
+    CONFIG_OK
+
+// Add the service to `db` after its last attribute: Health Sensor Features with
+// its descriptors, the Live Health Observations, the Stored Health Observations,
+// the Record Access Control Point, the GHS Control Point and the Observation
+// Schedule Changed characteristic, each where `config` has it.
+@tier(app)
+fn add_ghs_service(var db: GattDb, config: GhsConfig) -> Result<GhsHandles, profile_builder.ProfileError>
+    let problem = ghs_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let access = config.access
+    let cccd = gatt_server.Permissions { read: gatt_server.Access.Open, write: access }
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_GENERIC_HEALTH_SENSOR_SERVICE))!
+    var features = 0
+    var features_cccd = 0
+    var schedules: [Int] = []
+    var ranges: [Int] = []
+    if config.features
+        var properties = gatt_server.PROP_READ
+        if config.features_indicate
+            properties = properties | gatt_server.PROP_INDICATE
+        features = profile_builder.add_value(
+            var db, properties, profile_builder.read_only(access), gatt_server.le16(UUID_HEALTH_SENSOR_FEATURES), ghs_features_value(config))!
+        if config.features_indicate
+            features_cccd = profile_builder.add_cccd(var db, cccd)!
+        for s in config.schedules
+            var write_access = gatt_server.Access.Denied
+            if s.writable
+                write_access = access
+            let permissions = gatt_server.Permissions { read: access, write: write_access }
+            let handle = profile_builder.add_descriptor(
+                var db, permissions, UUID_OBSERVATION_SCHEDULE, ghs_schedule_value(s.observation_type, s.period, s.interval))!
+            list.push(schedules, handle)
+        for r in config.ranges
+            let handle = profile_builder.add_descriptor(var db, profile_builder.read_only(access), UUID_VALID_RANGE_AND_ACCURACY, ghs_range_value(r))!
+            list.push(ranges, handle)
+    var live = 0
+    var live_cccd = 0
+    if config.live
+        var properties = 0
+        if config.live_notify
+            properties = properties | gatt_server.PROP_NOTIFY
+        if config.live_indicate
+            properties = properties | gatt_server.PROP_INDICATE
+        live = profile_builder.add_value(var db, properties, profile_builder.notify_only(), gatt_server.le16(UUID_LIVE_HEALTH_OBSERVATIONS), [])!
+        live_cccd = profile_builder.add_cccd(var db, cccd)!
+    var stored = 0
+    var stored_cccd = 0
+    var racp = 0
+    var racp_cccd = 0
+    if config.stored
+        var properties = 0
+        if config.stored_notify
+            properties = properties | gatt_server.PROP_NOTIFY
+        if config.stored_indicate
+            properties = properties | gatt_server.PROP_INDICATE
+        stored = profile_builder.add_value(var db, properties, profile_builder.notify_only(), gatt_server.le16(UUID_STORED_HEALTH_OBSERVATIONS), [])!
+        stored_cccd = profile_builder.add_cccd(var db, cccd)!
+        let added = sensor_control.add_control_point_with_errors(var db, UUID_RECORD_ACCESS_CONTROL_POINT, access, cccd,
+            att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        racp = added.0
+        racp_cccd = added.1
+    var control_point = 0
+    var control_point_cccd = 0
+    if config.live
+        let added = sensor_control.add_control_point_with_errors(var db, UUID_GHS_CONTROL_POINT, access, cccd,
+            att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        control_point = added.0
+        control_point_cccd = added.1
+    var schedule_changed = 0
+    var schedule_changed_cccd = 0
+    if config.schedule_changed
+        schedule_changed = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_OBSERVATION_SCHEDULE_CHANGED), [])!
+        schedule_changed_cccd = profile_builder.add_cccd(var db, cccd)!
+    Ok(GhsHandles {
+        service: service, features: features, features_cccd: features_cccd, schedules: schedules, ranges: ranges,
+        live: live, live_cccd: live_cccd, stored: stored, stored_cccd: stored_cccd, racp: racp, racp_cccd: racp_cccd,
+        control_point: control_point, control_point_cccd: control_point_cccd,
+        schedule_changed: schedule_changed, schedule_changed_cccd: schedule_changed_cccd })
+
+// ── Observations ────────────────────────────────────────────────────
+
+// One Type-Length-Value attribute of a body ([GHSS] Table 3.18): the MDC code of
+// the attribute, the GATT Format Type of its value, and the encoded value.
+struct GhsTlv
+    var observation_type: Int
+    var format: Int
+    var value: [u8]
+
+// One Health Observation Body ([GHSS] Table 3.10).  A field that is -1, or
+// empty, is absent, and the Flags follow it; the Length is the number of octets
+// of the body.  `time_stamp` is the nine octets of the Elapsed Time, `duration`,
+// the FLOAT seconds of the measurement, `status` the Measurement Status bits,
+// `observation_id` the 32-bit reference other observations use, `patient` the
+// User Index, `supplemental`, `derived_from` and `member_of` lists of MDC codes
+// or observation ids, `tlvs` the extension attributes and `value` the octets of
+// the Observation Value of the class.
+struct GhsObservation
+    var class_type: Int
+    var observation_type: Int
+    var time_stamp: [u8]
+    var duration: Int
+    var status: Int
+    var observation_id: Int
+    var patient: Int
+    var supplemental: [Int]
+    var derived_from: [Int]
+    var member_of: [Int]
+    var tlvs: [GhsTlv]
+    var value: [u8]
+
+// An observation of the class `class_type` and the MDC code `observation_type`
+// whose Observation Value is `value`, with no optional field.
+@tier(app)
+fn ghs_observation(class_type: Int, observation_type: Int, value: [u8]) -> GhsObservation
+    GhsObservation {
+        class_type: class_type, observation_type: observation_type, time_stamp: [], duration: -1, status: -1,
+        observation_id: -1, patient: -1, supplemental: [], derived_from: [], member_of: [], tlvs: [], value: value[:] }
+
+// The Flags of `o`: the bit of each field it has.
+@tier(embedded)
+@no_alloc
+fn ghs_observation_flags(o: GhsObservation) -> Int
+    var f = 0
+    if o.observation_type >= 0
+        f = f | FLAG_TYPE
+    if list.len(o.time_stamp) > 0
+        f = f | FLAG_TIME_STAMP
+    if o.duration >= 0
+        f = f | FLAG_DURATION
+    if o.status >= 0
+        f = f | FLAG_STATUS
+    if o.observation_id >= 0
+        f = f | FLAG_ID
+    if o.patient >= 0
+        f = f | FLAG_PATIENT
+    if list.len(o.supplemental) > 0
+        f = f | FLAG_SUPPLEMENTAL
+    if list.len(o.derived_from) > 0
+        f = f | FLAG_DERIVED_FROM
+    if list.len(o.member_of) > 0
+        f = f | FLAG_MEMBER_OF
+    if list.len(o.tlvs) > 0
+        f = f | FLAG_TLVS
+    f
+
+// A count and that many 4-octet codes: the Supplemental Information, Derived
+// From and Is Member Of fields and the Compound Discrete Event value
+// ([GHSS] Tables 3.14, 3.16 and 3.23).
+@tier(app)
+fn ghs_code_list(codes: [Int]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, list.len(codes), 1)
+    for c in codes
+        wire.put(var out, c, 4)
+    out
+
+// The TLVs field and the TLV-encoded observation value ([GHSS] Tables 3.17 and
+// 3.18): the number of attributes, then for each the 4-octet code, the 2-octet
+// length of the value, the Format Type and the value.
+@tier(app)
+fn ghs_tlv_value(tlvs: [GhsTlv]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, list.len(tlvs), 1)
+    for t in tlvs
+        wire.put(var out, t.observation_type, 4)
+        wire.put(var out, list.len(t.value), 2)
+        wire.put(var out, t.format, 1)
+        list.append(out, t.value)
+    out
+
+// The Health Observation Body of `o`: the class, the Length (the octets of the
+// whole body), the Flags and the fields it has, in the order of the table.
+@tier(app)
+fn ghs_body(o: GhsObservation) -> [u8]
+    let flags = ghs_observation_flags(o)
+    var out: [u8] = []
+    wire.put(var out, o.class_type, 1)
+    wire.put(var out, 0, 2)
+    wire.put(var out, flags, 2)
+    if o.observation_type >= 0
+        wire.put(var out, o.observation_type, 4)
+    list.append(out, o.time_stamp)
+    if o.duration >= 0
+        wire.put(var out, o.duration, 4)
+    if o.status >= 0
+        wire.put(var out, o.status, 2)
+    if o.observation_id >= 0
+        wire.put(var out, o.observation_id, 4)
+    if o.patient >= 0
+        wire.put(var out, o.patient, 1)
+    if list.len(o.supplemental) > 0
+        list.append(out, ghs_code_list(o.supplemental))
+    if list.len(o.derived_from) > 0
+        list.append(out, ghs_code_list(o.derived_from))
+    if list.len(o.member_of) > 0
+        list.append(out, ghs_code_list(o.member_of))
+    if list.len(o.tlvs) > 0
+        list.append(out, ghs_tlv_value(o.tlvs))
+    list.append(out, o.value)
+    let n = list.len(out)
+    out[1] = (n & 0xFF) as u8
+    out[2] = ((n >>> 8) & 0xFF) as u8
+    out
+
+// The Numeric observation value ([GHSS] Table 3.19): the 2-octet unit code and
+// the FLOAT.
+@tier(app)
+fn ghs_numeric_value(unit_code: Int, value: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, unit_code, 2)
+    wire.put(var out, value, 4)
+    out
+
+// The Simple discrete observation value (Table 3.20): the MDC code.
+@tier(app)
+fn ghs_discrete_value(code: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, code, 4)
+    out
+
+// The String observation value (Table 3.21): the 2-octet length and the UTF-8
+// text.
+@tier(app)
+fn ghs_string_value(text: [u8]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, list.len(text), 2)
+    list.append(out, text)
+    out
+
+// The Sample array observation value (Table 3.22): the unit code, the scale
+// factor, the offset and the sample period as FLOATs, the samples per period,
+// the octets per sample, the number of samples and the scaled samples, each
+// `bytes_per_sample` octets (1 to 8) in two's complement.  Empty for a sample
+// size the integers cannot hold.
+@tier(app)
+fn ghs_sample_array_value(unit_code: Int, scale: Int, offset: Int, period: Int, per_period: Int, bytes_per_sample: Int, samples: [Int]) -> [u8]
+    var out: [u8] = []
+    if bytes_per_sample < 1 or bytes_per_sample > 8
+        return out
+    wire.put(var out, unit_code, 2)
+    wire.put(var out, scale, 4)
+    wire.put(var out, offset, 4)
+    wire.put(var out, period, 4)
+    wire.put(var out, per_period, 1)
+    wire.put(var out, bytes_per_sample, 1)
+    wire.put(var out, list.len(samples), 4)
+    for s in samples
+        wire.put(var out, s, bytes_per_sample)
+    out
+
+// The Compound Discrete Event observation value (Table 3.23): the number of
+// events and their MDC codes.
+@tier(app)
+fn ghs_compound_discrete_value(codes: [Int]) -> [u8]
+    ghs_code_list(codes)
+
+// The Compound State/Event observation value (Table 3.24): the size N, then the
+// N octets of the supported mask, of the state-or-event mask and of the value.
+// Empty when the three are not of one length.
+@tier(app)
+fn ghs_state_event_value(supported: [u8], state_or_event: [u8], value: [u8]) -> [u8]
+    var out: [u8] = []
+    let n = list.len(supported)
+    if n > 255 or list.len(state_or_event) != n or list.len(value) != n
+        return out
+    wire.put(var out, n, 1)
+    list.append(out, supported)
+    list.append(out, state_or_event)
+    list.append(out, value)
+    out
+
+// One component of a Compound observation (Table 3.26): the MDC code of the
+// component, the Component Value Type (1 Numeric, 2 Simple discrete, 3 String,
+// 4 Sample array, 5 Compound discrete, 6 Compound state/event, Table 3.27) and
+// the value of that type.
+@tier(app)
+fn ghs_component(component_type: Int, value_type: Int, value: [u8]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, component_type, 4)
+    wire.put(var out, value_type, 1)
+    list.append(out, value)
+    out
+
+// A count of items and the items one after the other.
+@tier(app)
+fn ghs_counted(items: [[u8]]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, list.len(items), 1)
+    for item in items
+        list.append(out, item)
+    out
+
+// The Compound observation value (Table 3.25): the number of components and the
+// components made by `ghs_component`.
+@tier(app)
+fn ghs_compound_value(components: [[u8]]) -> [u8]
+    ghs_counted(components)
+
+// The Observation bundle value (Table 3.28): the number of observations and the
+// bodies, each made by `ghs_body` and not itself a bundle.
+@tier(app)
+fn ghs_bundle_value(bodies: [[u8]]) -> [u8]
+    ghs_counted(bodies)
+
+// ── Checking a body ─────────────────────────────────────────────────
+
+// Whether `c` is an Observation Class Type of Table 3.11.
+@tier(embedded)
+@no_alloc
+fn ghs_class_valid(c: Int) -> Bool
+    (c >= CLASS_NUMERIC and c <= CLASS_TLV) or c == CLASS_BUNDLE
+
+// The octets a value of the GATT Format Type `format` takes when the format has a
+// fixed size, 0 for a format of any size and -1 for a value outside the table
+// of the Assigned Numbers (2.4.1).
+@tier(embedded)
+@no_alloc
+fn ghs_format_octets(format: Int) -> Int
+    if format < 0x01 or format > 0x1C
+        return -1
+    if format == 0x01 or format == 0x02 or format == 0x03 or format == 0x04 or format == 0x0C
+        return 1
+    if format == 0x05 or format == 0x06 or format == 0x0D or format == 0x0E or format == 0x16
+        return 2
+    if format == 0x07 or format == 0x0F
+        return 3
+    if format == 0x08 or format == 0x10 or format == 0x14 or format == 0x17 or format == 0x18
+        return 4
+    if format == 0x09 or format == 0x11
+        return 6
+    if format == 0x0A or format == 0x12 or format == 0x15
+        return 8
+    if format == 0x0B or format == 0x13
+        return 16
+    0
+
+// The offset after the TLV list that starts at `at` in `b` (the count, then the
+// attributes), or -1 when it is cut short, has a Format Type outside the table
+// or has a value whose length is not the size of its fixed-size format.
+@tier(embedded)
+@no_alloc
+fn ghs_tlv_end(b: [u8], at: Int) -> Int
+    let n = list.len(b)
+    if at >= n
+        return -1
+    let count = b[at] as Int
+    var pos = at + 1
+    for _ in 0..count
+        if pos + 7 > n
+            return -1
+        let length = wire.get(b, pos + 4, 2)
+        let size = ghs_format_octets(b[pos + 6] as Int)
+        if size < 0 or (size > 0 and size != length)
+            return -1
+        pos = pos + 7 + length
+        if pos > n
+            return -1
+    pos
+
+// The offset after the optional fields of the body `b` whose Flags are `flags`,
+// -1 when a field is cut short or malformed and -2 when the Measurement Status
+// sets a Reserved bit or both threshold bits.
+@tier(app)
+fn ghs_fields_end(b: [u8], flags: Int) -> Int
+    let n = list.len(b)
+    var at = 5
+    if (flags & FLAG_TYPE) != 0
+        if at + 4 > n
+            return -1
+        at = at + 4
+    if (flags & FLAG_TIME_STAMP) != 0
+        if at + TIME_STAMP_OCTETS > n
+            return -1
+        at = at + TIME_STAMP_OCTETS
+    if (flags & FLAG_DURATION) != 0
+        if at + 4 > n or not ghs_float_sendable(wire.get(b, at, 4))
+            return -1
+        at = at + 4
+    if (flags & FLAG_STATUS) != 0
+        if at + 2 > n
+            return -1
+        let status = wire.get(b, at, 2)
+        if (status & STATUS_RFU) != 0 or (status & (STATUS_THRESHOLD_ERROR | STATUS_THRESHOLDING_DISABLED)) == (STATUS_THRESHOLD_ERROR | STATUS_THRESHOLDING_DISABLED)
+            return -2
+        at = at + 2
+    if (flags & FLAG_ID) != 0
+        if at + 4 > n
+            return -1
+        at = at + 4
+    if (flags & FLAG_PATIENT) != 0
+        if at + 1 > n
+            return -1
+        at = at + 1
+    for flag in [FLAG_SUPPLEMENTAL, FLAG_DERIVED_FROM, FLAG_MEMBER_OF]
+        if (flags & flag) != 0
+            if at >= n
+                return -1
+            let end = at + 1 + 4 * (b[at] as Int)
+            if end > n
+                return -1
+            at = end
+    if (flags & FLAG_TLVS) != 0
+        let end = ghs_tlv_end(b, at)
+        if end < 0
+            return -1
+        at = end
+    at
+
+// The octets of the Observation Value of `class_type` that starts at `at` in
+// `b`, -1 when the value is cut short or breaks a rule of its table (a reserved
+// FLOAT, a sample size of 0, a component of a type Table 3.27 does not list) and
+// -2 when a string is not UTF-8.  A bundle is not a value of this kind.
+@tier(app)
+fn ghs_value_size(class_type: Int, b: [u8], at: Int) -> Int
+    let n = list.len(b)
+    let room = n - at
+    if room < 0
+        return -1
+    if class_type == CLASS_NUMERIC
+        if room < 6 or not ghs_float_sendable(wire.get(b, at + 2, 4))
+            return -1
+        return 6
+    if class_type == CLASS_DISCRETE
+        return if room >= 4 then 4 else -1
+    if class_type == CLASS_STRING
+        if room < 2
+            return -1
+        let length = wire.get(b, at, 2)
+        if room < 2 + length
+            return -1
+        if not dis_policy.valid_utf8(b[at + 2:at + 2 + length])
+            return -2
+        return 2 + length
+    if class_type == CLASS_SAMPLE_ARRAY
+        if room < 20
+            return -1
+        for k in 0..3
+            if not ghs_float_sendable(wire.get(b, at + 2 + 4 * k, 4))
+                return -1
+        let per_period = b[at + 14] as Int
+        let bytes_per_sample = b[at + 15] as Int
+        if per_period < 1 or bytes_per_sample < 1
+            return -1
+        let samples = wire.get(b, at + 16, 4)
+        if samples * bytes_per_sample > room - 20
+            return -1
+        return 20 + samples * bytes_per_sample
+    if class_type == CLASS_COMPOUND_DISCRETE
+        if room < 1
+            return -1
+        let size = 1 + 4 * (b[at] as Int)
+        return if room >= size then size else -1
+    if class_type == CLASS_COMPOUND_STATE_EVENT
+        if room < 1
+            return -1
+        let size = 1 + 3 * (b[at] as Int)
+        return if room >= size then size else -1
+    if class_type == CLASS_COMPOUND
+        if room < 1
+            return -1
+        let count = b[at] as Int
+        var pos = at + 1
+        for _ in 0..count
+            if pos + 5 > n
+                return -1
+            let value_type = b[pos + 4] as Int
+            if value_type < 1 or value_type > 6
+                return -1
+            let size = ghs_value_size(value_type, b, pos + 5)
+            if size < 0
+                return size
+            pos = pos + 5 + size
+        return pos - at
+    if class_type == CLASS_TLV
+        let end = ghs_tlv_end(b, at)
+        return if end < 0 then -1 else end - at
+    -1
+
+// What is wrong with the body `b`, the first thing (BODY_OK for nothing).
+// `in_bundle` says it is a bundled observation and `bundle_typed` that its
+// bundle names the Observation Type for all, which then may be left out.
+@tier(app)
+fn ghs_check_body(b: [u8], in_bundle: Bool, bundle_typed: Bool) -> Int
+    let n = list.len(b)
+    if n < 5
+        return BODY_TOO_SHORT
+    let class_type = b[0] as Int
+    if not ghs_class_valid(class_type)
+        return BODY_CLASS
+    if wire.get(b, 1, 2) != n
+        return BODY_LENGTH
+    let flags = wire.get(b, 3, 2)
+    if (flags | FLAGS_DEFINED) != FLAGS_DEFINED
+        return BODY_FLAGS
+    if class_type == CLASS_BUNDLE
+        if in_bundle
+            return BODY_NESTED_BUNDLE
+        if (flags & FLAG_ID) != 0
+            return BODY_BUNDLE_ID
+    if class_type != CLASS_BUNDLE and (flags & FLAG_TYPE) == 0 and not (in_bundle and bundle_typed)
+        return BODY_NO_TYPE
+    let at = ghs_fields_end(b, flags)
+    if at == -2
+        return BODY_STATUS
+    if at < 0
+        return BODY_FIELD
+    if class_type == CLASS_BUNDLE
+        if at >= n
+            return BODY_VALUE
+        let count = b[at] as Int
+        var pos = at + 1
+        for _ in 0..count
+            if pos + 5 > n
+                return BODY_VALUE
+            let inner = wire.get(b, pos + 1, 2)
+            if inner < 5 or pos + inner > n
+                return BODY_VALUE
+            let e = ghs_check_body(b[pos:pos + inner], true, (flags & FLAG_TYPE) != 0)
+            if e != BODY_OK
+                return e
+            pos = pos + inner
+        return if pos == n then BODY_OK else BODY_TRAILING
+    let size = ghs_value_size(class_type, b, at)
+    if size == -2
+        return BODY_STRING
+    if size < 0
+        return BODY_VALUE
+    if at + size != n
+        return BODY_TRAILING
+    BODY_OK
+
+// What is wrong with the Health Observation Body `body`, BODY_OK for nothing.
+@tier(app)
+fn ghs_body_error(body: [u8]) -> Int
+    ghs_check_body(body, false, false)
+
+// The offset of the Patient field in a body with these Flags, -1 without it.
+@tier(embedded)
+@no_alloc
+fn ghs_patient_at(flags: Int) -> Int
+    if (flags & FLAG_PATIENT) == 0
+        return -1
+    var at = 5
+    if (flags & FLAG_TYPE) != 0
+        at = at + 4
+    if (flags & FLAG_TIME_STAMP) != 0
+        at = at + TIME_STAMP_OCTETS
+    if (flags & FLAG_DURATION) != 0
+        at = at + 4
+    if (flags & FLAG_STATUS) != 0
+        at = at + 2
+    if (flags & FLAG_ID) != 0
+        at = at + 4
+    at
+
+// The User Index in the Patient field of the body, -1 when it has none.
+@tier(embedded)
+@no_alloc
+fn ghs_body_patient(body: [u8]) -> Int
+    if list.len(body) < 5
+        return -1
+    let at = ghs_patient_at(wire.get(body, 3, 2))
+    if at < 0 or at >= list.len(body)
+        return -1
+    body[at] as Int
+
+// Whether the body has a time stamp: its own, or for a bundle one in each
+// bundled observation.
+@tier(app)
+fn ghs_has_time_stamp(body: [u8]) -> Bool
+    let n = list.len(body)
+    if n < 5
+        return false
+    let flags = wire.get(body, 3, 2)
+    if (flags & FLAG_TIME_STAMP) != 0
+        return true
+    if (body[0] as Int) != CLASS_BUNDLE
+        return false
+    let at = ghs_fields_end(body, flags)
+    if at < 0 or at >= n
+        return false
+    let count = body[at] as Int
+    if count == 0
+        return false
+    var pos = at + 1
+    for _ in 0..count
+        if pos + 5 > n
+            return false
+        let inner = wire.get(body, pos + 1, 2)
+        if inner < 5 or pos + inner > n
+            return false
+        if (wire.get(body, pos + 3, 2) & FLAG_TIME_STAMP) == 0
+            return false
+        pos = pos + inner
+    true
+
+// ── Segments ────────────────────────────────────────────────────────
+
+// The number of segments of `total` octets of `room` octets each.
+@tier(embedded)
+@no_alloc
+fn ghs_segment_count(total: Int, room: Int) -> Int
+    if room < 1 or total < 1
+        return 0
+    (total + room - 1) / room
+
+// The Segmentation Header of the segment `index` of `count`: bit 0 the first
+// segment, bit 1 the last, bits 2 to 7 the Rolling Segment Counter, which is
+// `counter` for the first segment and goes up by one for each, from 63 to 0
+// ([GHSS] Table 3.9).
+@tier(embedded)
+@no_alloc
+fn ghs_segment_header(index: Int, count: Int, counter: Int) -> Int
+    var h = ((counter + index) & 63) << 2
+    if index == 0
+        h = h | 0x01
+    if index == count - 1
+        h = h | 0x02
+    h
+
+// The segments of `data`, each the Segmentation Header and at most `room`
+// octets, which is the ATT_MTU less four ([GHSS] 3.2.2.1).
+@tier(app)
+fn ghs_segments(data: [u8], room: Int, counter: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let total = list.len(data)
+    let count = ghs_segment_count(total, room)
+    for k in 0..count
+        let lo = k * room
+        let hi = if lo + room > total then total else lo + room
+        var segment: [u8] = [ghs_segment_header(k, count, counter) as u8]
+        list.append(segment, data[lo:hi])
+        list.push(out, segment)
+    out
+
+// ── State ───────────────────────────────────────────────────────────
+
+// One stored observation: its record number and its Health Observation Body.
+struct GhsRecord
+    var number: Int
+    var body: [u8]
+
+// What the service keeps between calls.  `live_started` is the state the GHS
+// Control Point sets; `live_queue` holds the bodies waiting for the collector,
+// oldest first, of which the one at `live_at` (-1 for none) is being sent;
+// `live_counter` and `stored_counter` are the Rolling Segment Counter of the
+// two characteristics.  `records` are the stored observations, oldest first,
+// and `next_record` is the number the next one gets.  `procedure` is the
+// Op Code of the Record Access Control Point procedure that is running (0 for
+// none), `todo` the record numbers it still has to send and `reported` the
+// number it has sent.  `registered` are the User Index values the User Data
+// Service registered and `consented` those the collector of the connection has
+// consented to ([GHSP] 3.6): an observation of a registered user the collector
+// has not consented to is neither sent nor reported.
+struct GhsState
+    var live_started: Bool
+    var live_queue: [[u8]]
+    var live_at: Int
+    var live_counter: Int
+    var stored_counter: Int
+    var records: [GhsRecord]
+    var next_record: Int
+    var procedure: Int
+    var todo: [Int]
+    var reported: Int
+    var registered: [Int]
+    var consented: [Int]
+
+@tier(app)
+fn new_ghs_state() -> GhsState
+    GhsState {
+        live_started: false, live_queue: [], live_at: -1, live_counter: 0, stored_counter: 0, records: [], next_record: 0,
+        procedure: 0, todo: [], reported: 0, registered: [], consented: [] }
+
+// A connection began or ended: nothing is sent until the collector writes Start
+// sending live observations again, the observation that was being sent is sent
+// again from its first segment, a Record Access Control Point procedure is not
+// resumed ([GHSS] 3.4.5), the Rolling Segment Counter starts at 0 and the
+// collector has consented to no user.  The queue and the records stay.
+@tier(app)
+fn ghs_reset_connection(var state: GhsState)
+    state.live_started = false
+    state.live_at = -1
+    state.live_counter = 0
+    state.stored_counter = 0
+    state.procedure = 0
+    state.todo = []
+    state.reported = 0
+    state.consented = []
+
+// Tell the service which users are registered with the User Data Service and
+// which of them the collector of the connection has consented to.
+@tier(app)
+fn ghs_set_users(var state: GhsState, registered: [Int], consented: [Int])
+    state.registered = registered[:]
+    state.consented = consented[:]
+
+// Queue `body` for the collector: SUBMIT_OK, or why it was not: the service has
+// no live observations, the body breaks a rule of the format (`ghs_body_error`),
+// `temporary` says it was made while no collector was connected, which needs a
+// time stamp ([GHSS] 3.2), or the queue holds `live_capacity` bodies.
+@tier(app)
+fn ghs_submit(var state: GhsState, config: GhsConfig, body: [u8], temporary: Bool) -> Int
+    if not config.live
+        return SUBMIT_DISABLED
+    if ghs_body_error(body) != BODY_OK
+        return SUBMIT_INVALID
+    if temporary and not ghs_has_time_stamp(body)
+        return SUBMIT_NO_TIME_STAMP
+    if list.len(state.live_queue) >= config.live_capacity
+        return SUBMIT_FULL
+    list.push(state.live_queue, body[:])
+    SUBMIT_OK
+
+@tier(embedded)
+@no_alloc
+fn ghs_live_count(state: GhsState) -> Int
+    list.len(state.live_queue)
+
+// Keep `body` as a stored observation: its record number, or why not
+// (STORE_DISABLED, STORE_INVALID, STORE_NO_TIME_STAMP, which [GHSS] 3.3.2
+// demands, and STORE_FULL).  The record numbers start at 0, go up by one and
+// wrap after 2^32 records.
+@tier(app)
+fn ghs_store(var state: GhsState, config: GhsConfig, body: [u8]) -> Int
+    if not config.stored
+        return STORE_DISABLED
+    if ghs_body_error(body) != BODY_OK
+        return STORE_INVALID
+    if not ghs_has_time_stamp(body)
+        return STORE_NO_TIME_STAMP
+    if list.len(state.records) >= config.store_capacity
+        return STORE_FULL
+    let number = state.next_record
+    list.push(state.records, GhsRecord { number: number, body: body[:] })
+    state.next_record = (number + 1) % RECORD_NUMBERS
+    number
+
+@tier(embedded)
+@no_alloc
+fn ghs_store_count(state: GhsState) -> Int
+    list.len(state.records)
+
+// Forget the oldest stored observation, for a product whose store is a ring.
+// The records are not renumbered ([GHSS] 3.4.3.3).
+@tier(app)
+fn ghs_store_drop_oldest(var state: GhsState)
+    if list.len(state.records) > 0
+        state.records = state.records[1:]
+
+// The position of the record `number`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn ghs_record_index(state: GhsState, number: Int) -> Int
+    for i in 0..list.len(state.records)
+        if state.records[i].number == number
+            return i
+    -1
+
+// Whether the collector of the connection may have the observation `body`: it is
+// of no registered user, or of one the collector consented to ([GHSP] 3.6).
+@tier(app)
+fn ghs_visible(state: GhsState, body: [u8]) -> Bool
+    let patient = ghs_body_patient(body)
+    patient < 0 or not list.contains(state.registered, patient) or list.contains(state.consented, patient)
+
+// The record numbers the operator selects among the records the collector may
+// have, oldest first.  `low` and `high` are the filter values.
+@tier(app)
+fn ghs_select(state: GhsState, operator: Int, low: Int, high: Int) -> [Int]
+    var visible: [Int] = []
+    for r in state.records
+        if ghs_visible(state, r.body)
+            list.push(visible, r.number)
+    if operator == OPERATOR_ALL
+        return visible
+    var out: [Int] = []
+    if operator == OPERATOR_FIRST or operator == OPERATOR_LAST
+        if list.len(visible) > 0
+            list.push(out, if operator == OPERATOR_FIRST then visible[0] else visible[list.len(visible) - 1])
+        return out
+    for number in visible
+        if operator == OPERATOR_LESS_OR_EQUAL and number <= low
+            list.push(out, number)
+        if operator == OPERATOR_GREATER_OR_EQUAL and number >= low
+            list.push(out, number)
+        if operator == OPERATOR_WITHIN and number >= low and number <= high
+            list.push(out, number)
+    out
+
+// Delete the records `numbers`; the others keep their numbers.
+@tier(app)
+fn ghs_delete_records(var state: GhsState, numbers: [Int])
+    var kept: [GhsRecord] = []
+    for r in state.records
+        if not list.contains(numbers, r.number)
+            list.push(kept, r)
+    state.records = kept
+
+// The index of the first queued observation the collector may have, -1 for none.
+@tier(app)
+fn ghs_first_sendable(state: GhsState) -> Int
+    for i in 0..list.len(state.live_queue)
+        if ghs_visible(state, state.live_queue[i])
+            return i
+    -1
+
+// Forget the queued observation at `at`.
+@tier(app)
+fn ghs_drop_live(var state: GhsState, at: Int)
+    var kept: [[u8]] = []
+    for i in 0..list.len(state.live_queue)
+        if i != at
+            list.push(kept, state.live_queue[i])
+    state.live_queue = kept
+
+// Whether live observations are being sent: the collector started them and
+// some wait.
+@tier(embedded)
+@no_alloc
+fn ghs_live_active(state: GhsState) -> Bool
+    state.live_started and list.len(state.live_queue) > 0
+
+// ── Record Access Control Point values ──────────────────────────────
+
+// The Response Code indication for the request Op Code `op` with the Response
+// Code Value `code` ([GSS] 3.177.4).
+@tier(app)
+fn ghs_racp_code(op: Int, code: Int) -> [u8]
+    wire.octets([RACP_RESPONSE_CODE, OPERATOR_NULL, op, code])
+
+// The Number of Stored Records Response (`op` RACP_NUMBER_RESPONSE) or the
+// Combined Report Response (RACP_COMBINED_RESPONSE) with the number of records
+// as a uint32.
+@tier(app)
+fn ghs_racp_count(op: Int, count: Int) -> [u8]
+    var out = wire.octets([op, OPERATOR_NULL])
+    wire.put(var out, count, 4)
+    out
+
+// Whether the sensor takes the Op Code `op` ([GHSS] Table 3.31): the Combined
+// Report and Report Number of Stored Records always, the Delete Stored Records
+// and Abort Operation when `config` says so.  Report stored records (0x01) is
+// not there.
+@tier(embedded)
+@no_alloc
+fn ghs_racp_op_supported(config: GhsConfig, op: Int) -> Bool
+    op == RACP_REPORT_NUMBER or op == RACP_COMBINED_REPORT or (op == RACP_DELETE and config.delete_operators != 0) or (op == RACP_ABORT and config.abort)
+
+// Check the request `value` (two octets at least, the Op Code known) against
+// the operators and the Record Number filter: (0, operator, low, high) for a
+// request the sensor can run, else (the Response Code Value, 0, 0, 0).  An
+// operator of 0 is Invalid Operator and one above 6 is not supported; an
+// operator the sensor does not list for the Op Code is not supported; a filter
+// type other than the Record Number is Operand Not Supported ([GHSS] 3.4.2.2,
+// 3.4.4); a missing or surplus operand octet, or a range of a minimum above its
+// maximum, is Invalid Operand.
+@tier(app)
+fn ghs_racp_parse(config: GhsConfig, value: [u8]) -> (Int, Int, Int, Int)
+    let n = list.len(value)
+    let op = value[0] as Int
+    if n < 2
+        return (RESULT_INVALID_OPERATOR, 0, 0, 0)
+    let operator = value[1] as Int
+    if op == RACP_ABORT
+        if operator != OPERATOR_NULL
+            return (RESULT_INVALID_OPERATOR, 0, 0, 0)
+        if n > 2
+            return (RESULT_INVALID_OPERAND, 0, 0, 0)
+        return (0, operator, 0, 0)
+    if operator == OPERATOR_NULL
+        return (RESULT_INVALID_OPERATOR, 0, 0, 0)
+    if operator > OPERATOR_LAST
+        return (RESULT_OPERATOR_NOT_SUPPORTED, 0, 0, 0)
+    let mask = if op == RACP_DELETE then config.delete_operators else config.report_operators
+    if (mask & (1 << operator)) == 0
+        return (RESULT_OPERATOR_NOT_SUPPORTED, 0, 0, 0)
+    if operator == OPERATOR_ALL or operator == OPERATOR_FIRST or operator == OPERATOR_LAST
+        if n != 2
+            return (RESULT_INVALID_OPERAND, 0, 0, 0)
+        return (0, operator, 0, 0)
+    if n < 3
+        return (RESULT_INVALID_OPERAND, 0, 0, 0)
+    if (value[2] as Int) != FILTER_RECORD_NUMBER
+        return (RESULT_OPERAND_NOT_SUPPORTED, 0, 0, 0)
+    if operator == OPERATOR_WITHIN
+        if n != 11
+            return (RESULT_INVALID_OPERAND, 0, 0, 0)
+        let low = wire.get(value, 3, 4)
+        let high = wire.get(value, 7, 4)
+        if low > high
+            return (RESULT_INVALID_OPERAND, 0, 0, 0)
+        return (0, operator, low, high)
+    if n != 7
+        return (RESULT_INVALID_OPERAND, 0, 0, 0)
+    (0, operator, wire.get(value, 3, 4), 0)
+
+// Indicate `value` as the Record Access Control Point value: the PDUs to send,
+// none when the collector has not enabled indications.
+@tier(app)
+fn ghs_racp_reply(var db: GattDb, var link: AttLink, handles: GhsHandles, value: [u8], now_ms: Int) -> [[u8]]
+    if handles.racp == 0 or not gatt_server.set_value(var db, handles.racp, value)
+        return []
+    gatt_server.send_value(var db, var link, handles.racp, now_ms)
+
+// End the Combined Report with the Response Code Value `code`.
+@tier(app)
+fn ghs_racp_finish(var db: GattDb, var link: AttLink, handles: GhsHandles, var state: GhsState, code: Int, now_ms: Int) -> [[u8]]
+    state.procedure = 0
+    state.todo = []
+    state.reported = 0
+    ghs_racp_reply(var db, var link, handles, ghs_racp_code(RACP_COMBINED_REPORT, code), now_ms)
+
+trait GhsPolicy[e]
+    // Whether the sensor deletes `count` stored records for `peer`, who wrote a
+    // Delete Stored Records request the service accepts; false is answered
+    // Procedure Not Completed in the Response Code and the records stay.
+    fn delete_records(var self, peer: links.LinkId, count: Int) -> Bool [e]
+
+// The policy of a sensor that deletes the records it is asked to (`accept`) or
+// none of them.
+@value
+struct DefaultGhsPolicy
+    accept: Bool
+
+@tier(embedded)
+fn default_ghs_policy() -> DefaultGhsPolicy
+    DefaultGhsPolicy { accept: true }
+
+impl GhsPolicy[] for DefaultGhsPolicy
+    fn delete_records(var self, _peer: links.LinkId, _count: Int) -> Bool
+        self.accept
+
+// Run the request `value` the collector wrote to the Record Access Control
+// Point, after its Write Response: the indications that answer it.  A Combined
+// Report answers nothing yet; `ghs_pump` sends its records and its response.
+@tier(app)
+fn ghs_racp_execute<P: GhsPolicy[e]>(var db: GattDb, var link: AttLink, handles: GhsHandles, config: GhsConfig, var state: GhsState, var policy: P, peer: links.LinkId, value: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let n = list.len(value)
+    let op = if n > 0 then value[0] as Int else 0
+    if n == 0 or not ghs_racp_op_supported(config, op)
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_OP_CODE_NOT_SUPPORTED), now_ms)
+    let (error, operator, low, high) = ghs_racp_parse(config, value)
+    if error != 0
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, error), now_ms)
+    if op == RACP_ABORT
+        if state.procedure == 0
+            return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_ABORT_UNSUCCESSFUL), now_ms)
+        state.procedure = 0
+        state.todo = []
+        state.reported = 0
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_SUCCESS), now_ms)
+    if not config.parallel and ghs_live_active(state)
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_SERVER_BUSY), now_ms)
+    let selected = ghs_select(state, operator, low, high)
+    if op == RACP_REPORT_NUMBER
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_count(RACP_NUMBER_RESPONSE, list.len(selected)), now_ms)
+    if list.len(selected) == 0
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_NO_RECORDS_FOUND), now_ms)
+    if op == RACP_DELETE
+        if not policy.delete_records(peer, list.len(selected))
+            return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_PROCEDURE_NOT_COMPLETED), now_ms)
+        ghs_delete_records(var state, selected)
+        return ghs_racp_reply(var db, var link, handles, ghs_racp_code(op, RESULT_SUCCESS), now_ms)
+    state.procedure = RACP_COMBINED_REPORT
+    state.todo = selected[:]
+    state.reported = 0
+    []
+
+// ── Sending ─────────────────────────────────────────────────────────
+
+// Send `data` in segments on the characteristic `handle` to the collector: the
+// PDUs to send now and the number of segments taken.  A segment of an
+// indication waits behind the one before it for its confirmation, so it is in
+// the count but not in the PDUs.  None is taken when the collector has not
+// enabled the characteristic.  A segment is at most ATT_MTU - 3 octets and at
+// most the 512 octets of an attribute value, so a segment holds 511 octets of
+// data at the largest ATT_MTU.
+@tier(app)
+fn ghs_send_segments(var db: GattDb, var link: AttLink, handle: Int, data: [u8], counter: Int, now_ms: Int) -> ([[u8]], Int)
+    var out: [[u8]] = []
+    var taken = 0
+    var room = gatt_server.mtu_of(link, 0) - 4
+    if room > VALUE_MAX - 1
+        room = VALUE_MAX - 1
+    for segment in ghs_segments(data, room, counter)
+        if not gatt_server.set_value(var db, handle, segment)
+            return (out, taken)
+        let pdus = gatt_server.send_value(var db, var link, handle, now_ms)
+        if list.len(pdus) == 0 and not gatt_server.indication_pending(link, handle)
+            return (out, taken)
+        list.append(out, pdus[:])
+        taken = taken + 1
+    (out, taken)
+
+// Send the oldest queued observation the collector may have, when the collector
+// started the live observations and enabled the characteristic, and drop the one
+// sent before once its last indication is confirmed.
+@tier(app)
+fn ghs_pump_live(var db: GattDb, var link: AttLink, handles: GhsHandles, var state: GhsState, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if handles.live == 0
+        return out
+    if state.live_at >= 0
+        if gatt_server.indication_pending(link, handles.live)
+            return out
+        let done = state.live_at
+        state.live_at = -1
+        ghs_drop_live(var state, done)
+    if not state.live_started
+        return out
+    let at = ghs_first_sendable(state)
+    if at < 0
+        return out
+    let sent = ghs_send_segments(var db, var link, handles.live, state.live_queue[at], state.live_counter, now_ms)
+    if sent.1 == 0
+        return out
+    state.live_counter = (state.live_counter + sent.1) & 63
+    state.live_at = at
+    sent.0
+
+// Send the next record of the Combined Report in progress, or its response when
+// every record went out.  A record waits for the confirmation of the one before
+// it.
+@tier(app)
+fn ghs_pump_stored(var db: GattDb, var link: AttLink, handles: GhsHandles, var state: GhsState, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if state.procedure == 0 or handles.stored == 0
+        return out
+    if gatt_server.indication_pending(link, handles.stored)
+        return out
+    while list.len(state.todo) > 0
+        let number = state.todo[0]
+        state.todo = state.todo[1:]
+        let k = ghs_record_index(state, number)
+        if k >= 0
+            var data: [u8] = []
+            wire.put(var data, number, 4)
+            list.append(data, state.records[k].body)
+            let sent = ghs_send_segments(var db, var link, handles.stored, data, state.stored_counter, now_ms)
+            if sent.1 == 0
+                return ghs_racp_finish(var db, var link, handles, var state, RESULT_PROCEDURE_NOT_COMPLETED, now_ms)
+            state.stored_counter = (state.stored_counter + sent.1) & 63
+            state.reported = state.reported + 1
+            return sent.0
+    if state.reported == 0
+        return ghs_racp_finish(var db, var link, handles, var state, RESULT_NO_RECORDS_FOUND, now_ms)
+    let count = state.reported
+    state.procedure = 0
+    state.reported = 0
+    ghs_racp_reply(var db, var link, handles, ghs_racp_count(RACP_COMBINED_RESPONSE, count), now_ms)
+
+// Make the progress the link allows and answer the PDUs to send: the next record
+// of a Combined Report and, when the sensor can do both (`GhsConfig.parallel`) or
+// no report runs, the next live observation.  A procedure whose indication the
+// collector did not confirm within 30 seconds (the bearer timed out,
+// `gatt_server.tick`) is over and sends nothing more ([GHSS] 3.4.5).  Call it
+// after each `ghs_receive`, each confirmation, each queued observation and when
+// the radio has room; it sends at most one observation or one record each time.
+@tier(app)
+fn ghs_pump(var db: GattDb, var link: AttLink, handles: GhsHandles, config: GhsConfig, var state: GhsState, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if state.procedure != 0 and list.len(link.bearers) > 0 and link.bearers[0].timed_out
+        state.procedure = 0
+        state.todo = []
+        state.reported = 0
+    list.append(out, ghs_pump_stored(var db, var link, handles, var state, now_ms))
+    if state.procedure == 0 or config.parallel
+        list.append(out, ghs_pump_live(var db, var link, handles, var state, now_ms))
+    out
+
+// ── Writes ──────────────────────────────────────────────────────────
+
+// Which control point or descriptor the handle is: (KIND_CONTROL_POINT, 0),
+// (KIND_RACP, 0), (KIND_SCHEDULE, the position among the Observation Schedule
+// descriptors) or (KIND_NONE, -1).
+@tier(app)
+fn ghs_locate(handles: GhsHandles, handle: Int) -> (Int, Int)
+    if handle == 0
+        return (KIND_NONE, -1)
+    if handle == handles.control_point
+        return (KIND_CONTROL_POINT, 0)
+    if handle == handles.racp
+        return (KIND_RACP, 0)
+    for i in 0..list.len(handles.schedules)
+        if handles.schedules[i] == handle
+            return (KIND_SCHEDULE, i)
+    (KIND_NONE, -1)
+
+// The Error Code a write of `value` to the GHS Control Point gets: Command Not
+// Supported for any value but one octet of Start (0x01) or Stop (0x02)
+// ([GHSS] 3.5.2).
+@tier(embedded)
+@no_alloc
+fn ghs_control_point_error(value: [u8]) -> Int
+    if list.len(value) == 1 and ((value[0] as Int) == OP_START or (value[0] as Int) == OP_STOP)
+        return 0
+    ERR_COMMAND_NOT_SUPPORTED
+
+// The Error Code a write of `value` to the Record Access Control Point gets
+// before its Write Response, 0 for none: a value longer than the point holds;
+// Procedure Already In Progress for any Op Code but Abort Operation while a
+// report runs; and Client Characteristic Configuration Descriptor Improperly
+// Configured for a Combined Report while the collector has not enabled the
+// Stored Health Observations ([GHSS] 3.4.4).  (The same code for a collector that
+// has not enabled the point itself is the GATT server's, as is Procedure Already
+// In Progress for a response not yet confirmed.)
+@tier(embedded)
+@no_alloc
+fn ghs_racp_write_error(link: AttLink, handles: GhsHandles, state: GhsState, value: [u8]) -> Int
+    if list.len(value) > RACP_VALUE_MAX
+        return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    let op = if list.len(value) > 0 then value[0] as Int else -1
+    if state.procedure != 0 and op != RACP_ABORT
+        return att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+    if op == RACP_COMBINED_REPORT and (gatt_server.configuration(link, handles.stored_cccd) & 3) == 0
+        return att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+    0
+
+// The value of the Observation Schedule descriptor at `index`, empty for none.
+@tier(app)
+fn ghs_schedule_at(db: GattDb, handles: GhsHandles, index: Int) -> [u8]
+    if index < 0 or index >= list.len(handles.schedules)
+        return []
+    let i = gatt_server.index_of(db, handles.schedules[index])
+    if i < 0
+        return []
+    db.attributes[i].value[:]
+
+// The Error Code a write of `value` to the Observation Schedule descriptor at
+// `index` gets: Invalid Attribute Value Length unless it is 12 octets, and Out
+// of Range for another Observation Type or a period or interval the sensor
+// cannot support ([GHSS] 3.7.1.2).
+@tier(app)
+fn ghs_schedule_error(db: GattDb, handles: GhsHandles, config: GhsConfig, index: Int, value: [u8]) -> Int
+    if list.len(value) != 12
+        return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    let current = ghs_schedule_at(db, handles, index)
+    if wire.get(value, 0, 4) != wire.get(current, 0, 4)
+        return att.ATT_ERR_OUT_OF_RANGE
+    let s = config.schedules[index]
+    if not ghs_schedule_supported(wire.get(value, 4, 4), wire.get(value, 8, 4), s.period_min, s.period_max, s.interval_min, s.interval_max)
+        return att.ATT_ERR_OUT_OF_RANGE
+    0
+
+// Forget that the client wrote `handle`; the service has handled the write.
+@tier(app)
+fn ghs_forget_change(var link: AttLink, handle: Int)
+    var kept: [Int] = []
+    for h in link.changed
+        if h != handle
+            list.push(kept, h)
+    link.changed = kept
+
+// A write request to a point or descriptor, evaluated before its Write Response.
+@tier(app)
+fn ghs_write<P: GhsPolicy[e]>(var db: GattDb, var link: AttLink, handles: GhsHandles, config: GhsConfig, var state: GhsState, var policy: P, peer: links.LinkId, kind: Int, index: Int, handle: Int, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let value = pdu[3:]
+    var code = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+    if code == 0 and kind == KIND_CONTROL_POINT
+        code = ghs_control_point_error(value)
+    if code == 0 and kind == KIND_RACP
+        code = ghs_racp_write_error(link, handles, state, value)
+    if code == 0 and kind == KIND_SCHEDULE
+        code = ghs_schedule_error(db, handles, config, index, value)
+    if code != 0
+        return gatt_server.error(att.ATT_OP_WRITE_REQ, handle, code)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    ghs_forget_change(var link, handle)
+    if kind == KIND_CONTROL_POINT
+        let start = (value[0] as Int) == OP_START
+        state.live_started = start
+        let _ = gatt_server.set_value(var db, handle, [RESULT_CONTROL_POINT_SUCCESS])
+        list.append(out, gatt_server.send_value(var db, var link, handle, now_ms))
+    if kind == KIND_RACP
+        list.append(out, ghs_racp_execute(var db, var link, handles, config, var state, var policy, peer, value, now_ms))
+    out
+
+// Answer one ATT PDU of `peer`, the client of `link`.  A Write Request to the GHS
+// Control Point, the Record Access Control Point or an Observation Schedule
+// descriptor is evaluated before its Write Response, in this order: the access
+// of the attribute and the subscription rules of the points, the value; the
+// accepted request then runs (Start or Stop, the Record Access Control Point
+// procedure) and its indication follows the Write Response.  A Write Command or a
+// signed write to them is dropped and a Prepare Write is answered Attribute Not
+// Long.  Any other PDU is the GATT server's.
+@tier(app)
+fn ghs_receive<P: GhsPolicy[e]>(var db: GattDb, var link: AttLink, handles: GhsHandles, config: GhsConfig, var state: GhsState, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) >= 3
+        let op = pdu[0] as Int
+        let handle = gatt_server.read_le16(pdu, 1)
+        let (kind, index) = ghs_locate(handles, handle)
+        if kind != KIND_NONE
+            if op == att.ATT_OP_PREPARE_WRITE_REQ
+                return gatt_server.error(op, handle, att.ATT_ERR_ATTRIBUTE_NOT_LONG)
+            if op == att.ATT_OP_WRITE_CMD or op == att.ATT_OP_SIGNED_WRITE_CMD
+                return []
+            if op == att.ATT_OP_WRITE_REQ
+                return ghs_write(var db, var link, handles, config, var state, var policy, peer, kind, index, handle, pdu, now_ms)
+    gatt_server.receive(var db, var link, pdu, now_ms)
+
+// ── Features and schedules ──────────────────────────────────────────
+
+// Store the Health Sensor Features value of `config` (a sensor whose features
+// changed): false, and the value kept, when the service has no features or
+// `config` breaks a rule.  The collectors that enabled indications hear it with
+// `ghs_indicate_features`, a bonded one after its reconnection ([GHSS] 3.1.2).
+@tier(app)
+fn ghs_set_features(var db: GattDb, handles: GhsHandles, config: GhsConfig) -> Bool
+    handles.features != 0 and ghs_config_error(config) == CONFIG_OK and gatt_server.set_value(var db, handles.features, ghs_features_value(config))
+
+// Indicate Health Sensor Features to the client of `link`: none for a service
+// whose features cannot be indicated or a client that did not enable it.
+@tier(app)
+fn ghs_indicate_features(var db: GattDb, var link: AttLink, handles: GhsHandles, now_ms: Int) -> [[u8]]
+    if handles.features_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.features, now_ms)
+
+// The position of the Observation Schedule descriptor a Write Request in `pdu`
+// writes, -1 for any other PDU: the product tells the other clients with
+// `ghs_indicate_schedule_changed`.
+@tier(app)
+fn ghs_written_schedule(handles: GhsHandles, pdu: [u8]) -> Int
+    if list.len(pdu) < 3 or (pdu[0] as Int) != att.ATT_OP_WRITE_REQ
+        return -1
+    let (kind, index) = ghs_locate(handles, gatt_server.read_le16(pdu, 1))
+    if kind == KIND_SCHEDULE then index else -1
+
+// Change the period and interval of the Observation Schedule descriptor at
+// `index` (the user changed them on the device): false, and the descriptor kept,
+// for a period or interval that is not a number of seconds that is not negative.
+@tier(app)
+fn ghs_set_schedule(var db: GattDb, handles: GhsHandles, index: Int, period: Int, interval: Int) -> Bool
+    let current = ghs_schedule_at(db, handles, index)
+    if list.len(current) != 12 or not ghs_float_period(period) or not ghs_float_period(interval)
+        return false
+    gatt_server.set_value(var db, handles.schedules[index], ghs_schedule_value(wire.get(current, 0, 4), period, interval))
+
+// Indicate the Observation Schedule Changed characteristic to the client of
+// `link`, with the Observation Type, period and interval of the descriptor at
+// `index` ([GHSS] 3.6.2): none for a service without the characteristic, an
+// index that names no descriptor or a client that did not enable it.
+@tier(app)
+fn ghs_indicate_schedule_changed(var db: GattDb, var link: AttLink, handles: GhsHandles, index: Int, now_ms: Int) -> [[u8]]
+    let current = ghs_schedule_at(db, handles, index)
+    if handles.schedule_changed == 0 or list.len(current) != 12
+        return []
+    if not gatt_server.set_value(var db, handles.schedule_changed, current)
+        return []
+    gatt_server.send_value(var db, var link, handles.schedule_changed, now_ms)
+
+// The Service Data AD structure of the profile ([GHSP] Table 3.2): the length,
+// the AD type 0x16, the service UUID, the count and the 16-bit codes of the
+// device specializations to advertise and, for a sensor with the User Data
+// Service, the count and the User Index values of the users that have new
+// observations.  Empty when a value is outside its field or the structure does
+// not fit a legacy advertisement of 31 octets.
+@tier(app)
+fn ghs_service_data(codes: [Int], uds: Bool, users: [Int]) -> [u8]
+    var out: [u8] = []
+    for c in codes
+        if c < 0 or c > 0xFFFF
+            return out
+    for u in users
+        if u < 0 or u > 0xFF
+            return out
+    var length = 4 + 2 * list.len(codes)
+    if uds
+        length = length + 1 + list.len(users)
+    if length > 30 or list.len(codes) > 255
+        return out
+    wire.put(var out, length, 1)
+    wire.put(var out, 0x16, 1)
+    wire.put(var out, UUID_GENERIC_HEALTH_SENSOR_SERVICE, 2)
+    wire.put(var out, list.len(codes), 1)
+    for c in codes
+        wire.put(var out, c, 2)
+    if uds
+        wire.put(var out, list.len(users), 1)
+        for u in users
+            wire.put(var out, u, 1)
+    out
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+const SPO2 = 0x00024BB8
+
+const PULSE = 0x0002481A
+
+const UNIT_PERCENT = 0x0220
+
+// Stored observations only, with the Delete Stored Records and Abort Operation
+// procedures and every operator.
+@tier(app)
+fn stored_config(notify: Bool, indicate: Bool) -> GhsConfig
+    var c = default_ghs_config([SPO2, PULSE])
+    c.live = false
+    c.live_notify = false
+    c.live_indicate = false
+    c.stored = true
+    c.stored_notify = notify
+    c.stored_indicate = indicate
+    c.delete_operators = MASK_ALL_OPERATORS
+    c.abort = true
+    c
+
+// Live observations over notifications and stored ones over notifications.
+@tier(app)
+fn both_config(parallel: Bool) -> GhsConfig
+    var c = stored_config(true, false)
+    c.live = true
+    c.live_notify = true
+    c.parallel = parallel
+    c
+
+// A sensor with every optional part: indicated features, a writable and a
+// read-only schedule, a range with accuracy, live and stored observations over
+// both, and the schedule changed characteristic.
+@tier(app)
+fn full_config() -> GhsConfig
+    var c = both_config(false)
+    c.live_indicate = true
+    c.stored_indicate = true
+    c.features_indicate = true
+    c.specialization_codes = [0x1007]
+    c.specialization_versions = [1]
+    c.schedules = [
+        GhsSchedule {
+            observation_type: SPO2, period: wire.float(30, 0), interval: wire.float(5, 0), writable: true,
+            period_min: 1000, period_max: 3600000, interval_min: 1000, interval_max: 60000 },
+        GhsSchedule {
+            observation_type: PULSE, period: wire.float(30, 0), interval: wire.float(5, 0), writable: false,
+            period_min: 0, period_max: 0, interval_min: 0, interval_max: 0 }]
+    c.schedule_changed = true
+    c.ranges = [
+        GhsRange { observation_type: SPO2, unit_code: UNIT_PERCENT, lower: wire.float(0, 0), upper: wire.float(100, 0), has_accuracy: true, accuracy: wire.float(2, 0) }]
+    c

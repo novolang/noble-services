@@ -1,0 +1,777 @@
+// tests/environmental_sensing_tests.nv — the unit tests of src/environmental_sensing.nv.
+//
+//   novo test tests/environmental_sensing_tests.nv
+
+use std.test
+use att
+use gatt_server
+use links
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+use environmental_sensing.{ DVC_CONFIGURATION, DVC_MEASUREMENT, DVC_SOURCE_CLIENT, DVC_TRIGGER_SETTING, DVC_USER_DESCRIPTION, ERR_CONDITION_NOT_SUPPORTED, ERR_WRITE_REQUEST_REJECTED, EssCharConfig, EssConfig, EssHandles, EssMeasurement, EssPolicy, EssTrigger, KIND_CONFIGURATION, KIND_NONE, LOGIC_AND, LOGIC_OR, TRIGGER_EQUAL, TRIGGER_FIXED_INTERVAL, TRIGGER_GREATER, TRIGGER_GREATER_OR_EQUAL, TRIGGER_INACTIVE, TRIGGER_LESS, TRIGGER_LESS_OR_EQUAL, TRIGGER_MIN_INTERVAL, TRIGGER_NOT_EQUAL, TRIGGER_ON_CHANGE, UUID_HUMIDITY, UUID_PRESSURE, UUID_TEMPERATURE, add_ess_service, default_ess_config, default_ess_policy, ess_characteristic, ess_configuration_error, ess_current, ess_dvc_recipient, ess_dvc_value, ess_indicate_change, ess_locate, ess_logic, ess_notify, ess_range, ess_receive, ess_restore_values, ess_save_values, ess_service_data, ess_set_measurement, ess_set_trigger, ess_should_notify, ess_trigger_error, ess_trigger_fires, ess_trigger_of, ess_trigger_value, ess_triggers, ess_written_flags, server, set_humidity, set_pressure, set_temperature }
+
+@tier(app)
+fn measurement() -> EssMeasurement
+    EssMeasurement { sampling: 2, period_s: 3600, interval_s: 900, application: 1, uncertainty: 25 }
+
+// A temperature of 21.50 degrees Celsius with two triggers, every descriptor
+// and a writable User Description.
+@tier(app)
+fn rich_temperature() -> EssCharConfig
+    var c = ess_characteristic(UUID_TEMPERATURE, 2150)
+    c.has_measurement = true
+    c.measurement = measurement()
+    c.notify = true
+    c.triggers = [EssTrigger { condition: TRIGGER_GREATER, operand: 3000 }, EssTrigger { condition: TRIGGER_MIN_INTERVAL, operand: 60 }]
+    c.logic = LOGIC_AND
+    c.has_range = true
+    c.range_low = -4000
+    c.range_high = 8500
+    c.has_description = true
+    c.description = wire.text("Cellar")
+    c.description_writable = true
+    c
+
+@tier(app)
+fn writable(characteristics: [EssCharConfig]) -> EssConfig
+    EssConfig { characteristics: characteristics, read: gatt_server.Access.Open, trigger_write: true, descriptors_change: true }
+
+@tier(app)
+fn read_of(var s: GattServer, handle: Int) -> [u8]
+    gatt_server.receive(var s.db, var s.link, req(0x0A, handle, []), 0)[0]
+
+@tier(app)
+fn read_link(db: GattDb, var link: AttLink, handle: Int) -> [u8]
+    var d = db
+    gatt_server.receive(var d, var link, req(0x0A, handle, []), 0)[0]
+
+// `ess_receive` for a client that is bonded or not, with the default policy.
+@tier(app)
+fn receive_as(var s: GattServer, h: EssHandles, bonded: Bool, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_ess_policy(bonded)
+    ess_receive(var s.db, var s.link, h, var policy, peer(), pdu, now_ms)
+
+@tier(app)
+fn write_of(var s: GattServer, h: EssHandles, bonded: Bool, handle: Int, value: [Int]) -> [[u8]]
+    receive_as(var s, h, bonded, req(0x12, handle, value), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_minimal_service_has_one_read_only_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let h = add_ess_service(var s.db, default_ess_config([ess_characteristic(UUID_TEMPERATURE, 2150)]))!
+    let ch = h.characteristics[0]
+    test.assert_eq(h.service, 1)
+    test.assert_eq(ch.value, 3)
+    test.assert_eq(ch.cccd, 0)
+    test.assert_eq(h.dvc, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 3)
+    test.assert_eq(s.db.attributes[0].value, [0x1A, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 0x03, 0x00, 0x6E, 0x2A])
+    test.assert_eq(read_of(var s, ch.value), [0x0B, 0x66, 0x08])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, ch.value, [1, 2]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_three_formats_hold_their_ends_and_refuse_the_rest()
+    var s = gatt_server.new_server([], 65)
+    let cs = [ess_characteristic(UUID_TEMPERATURE, 0), ess_characteristic(UUID_PRESSURE, 0), ess_characteristic(UUID_HUMIDITY, 0)]
+    let h = add_ess_service(var s.db, default_ess_config(cs))!
+    let t = h.characteristics[0]
+    let p = h.characteristics[1]
+    let u = h.characteristics[2]
+    // Temperature: sint16, 0.01 degrees, with 0x8000 for "not known".
+    test.assert(set_temperature(var s.db, t, -27315))
+    test.assert_eq(read_of(var s, t.value), [0x0B, 0x4D, 0x95])
+    test.assert(set_temperature(var s.db, t, 32767))
+    test.assert_eq(read_of(var s, t.value), [0x0B, 0xFF, 0x7F])
+    test.assert(set_temperature(var s.db, t, -32768))
+    test.assert_eq(read_of(var s, t.value), [0x0B, 0x00, 0x80])
+    test.assert(set_temperature(var s.db, t, -1))
+    test.assert_eq(read_of(var s, t.value), [0x0B, 0xFF, 0xFF])
+    test.assert(not set_temperature(var s.db, t, -27316))
+    test.assert(not set_temperature(var s.db, t, 32768))
+    test.assert(not set_temperature(var s.db, t, -32767))
+    test.assert_eq(read_of(var s, t.value), [0x0B, 0xFF, 0xFF])
+    // Pressure: uint32, 0.1 pascal.
+    test.assert(set_pressure(var s.db, p, 1013250))
+    test.assert_eq(read_of(var s, p.value), [0x0B, 0x02, 0x76, 0x0F, 0x00])
+    test.assert(set_pressure(var s.db, p, 4294967295))
+    test.assert_eq(read_of(var s, p.value), [0x0B, 0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert(set_pressure(var s.db, p, 0))
+    test.assert(not set_pressure(var s.db, p, -1))
+    test.assert(not set_pressure(var s.db, p, 4294967296))
+    test.assert_eq(read_of(var s, p.value), [0x0B, 0, 0, 0, 0])
+    // Humidity: uint16, 0.01 percent, with 0xFFFF for "not known".
+    test.assert(set_humidity(var s.db, u, 10000))
+    test.assert_eq(read_of(var s, u.value), [0x0B, 0x10, 0x27])
+    test.assert(set_humidity(var s.db, u, 65535))
+    test.assert_eq(read_of(var s, u.value), [0x0B, 0xFF, 0xFF])
+    test.assert(set_humidity(var s.db, u, 0))
+    test.assert(not set_humidity(var s.db, u, 10001))
+    test.assert(not set_humidity(var s.db, u, 65534))
+    test.assert(not set_humidity(var s.db, u, -1))
+    test.assert_eq(read_of(var s, u.value), [0x0B, 0, 0])
+    // A setter for another characteristic does not write.
+    test.assert(not set_humidity(var s.db, t, 100))
+    test.assert(not set_temperature(var s.db, p, 100))
+    test.assert(not set_pressure(var s.db, u, 100))
+    test.assert_eq(ess_current(s.db, p), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_service_the_spec_does_not_allow_is_refused_when_added()
+    // No characteristic, an unknown one, a value outside the format.
+    for config in [default_ess_config([]), default_ess_config([ess_characteristic(0x2A6C, 0)]), default_ess_config([ess_characteristic(UUID_HUMIDITY, 10001)])]
+        var s = gatt_server.new_server([], 65)
+        match add_ess_service(var s.db, config)
+            Ok(_) => test.fail("the service is not valid")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+        test.assert_eq(gatt_server.last_handle(s.db), 0)
+    var full = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var full.db, false, gatt_server.le16(0xAA00)), 1)
+    full.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_ess_service(var full.db, default_ess_config([ess_characteristic(UUID_HUMIDITY, 0)]))
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_es_measurement_descriptor_has_eleven_octets_and_is_read_only()
+    var c = ess_characteristic(UUID_TEMPERATURE, 0)
+    c.has_measurement = true
+    c.measurement = measurement()
+    var (s, h) = server(default_ess_config([c]))
+    let m = h.characteristics[0].measurement
+    test.assert_eq(m, 4)
+    test.assert_eq(s.db.attributes[3].type_uuid, [0x0C, 0x29])
+    test.assert_eq(read_of(var s, m), [0x0B, 0, 0, 2, 0x10, 0x0E, 0x00, 0x84, 0x03, 0x00, 1, 25])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, m, [0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The server changes it; a value the descriptor does not define is kept out.
+    test.assert(ess_set_measurement(var s.db, h.characteristics[0], EssMeasurement { sampling: 7, period_s: 0, interval_s: 0xFFFFFF, application: 0x21, uncertainty: 0xFF }))
+    test.assert_eq(read_of(var s, m), [0x0B, 0, 0, 7, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x21, 0xFF])
+    test.assert(not ess_set_measurement(var s.db, h.characteristics[0], EssMeasurement { sampling: 8, period_s: 0, interval_s: 0, application: 0, uncertainty: 0 }))
+    test.assert(not ess_set_measurement(var s.db, h.characteristics[0], EssMeasurement { sampling: 0, period_s: 0x1000000, interval_s: 0, application: 0, uncertainty: 0 }))
+    test.assert(not ess_set_measurement(var s.db, h.characteristics[0], EssMeasurement { sampling: 0, period_s: 0, interval_s: 0, application: 0x22, uncertainty: 0 }))
+    test.assert_eq(read_of(var s, m), [0x0B, 0, 0, 7, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x21, 0xFF])
+    // A characteristic without the descriptor has nothing to change.
+    var (t, th) = server(default_ess_config([ess_characteristic(UUID_TEMPERATURE, 0)]))
+    test.assert(not ess_set_measurement(var t.db, th.characteristics[0], measurement()))
+    // The builder refuses a descriptor with a Reserved value.
+    var bad = ess_characteristic(UUID_TEMPERATURE, 0)
+    bad.has_measurement = true
+    bad.measurement = EssMeasurement { sampling: 8, period_s: 0, interval_s: 0, application: 0, uncertainty: 0 }
+    var u = gatt_server.new_server([], 65)
+    match add_ess_service(var u.db, default_ess_config([bad]))
+        Ok(_) => test.fail("a Sampling Function of 8 is reserved")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_two_instances_of_one_characteristic_need_different_measurement_descriptors()
+    var a = ess_characteristic(UUID_TEMPERATURE, 2000)
+    a.has_measurement = true
+    a.measurement = EssMeasurement { sampling: 1, period_s: 0, interval_s: 0, application: 1, uncertainty: 0xFF }
+    var b = ess_characteristic(UUID_TEMPERATURE, 2100)
+    b.has_measurement = true
+    b.measurement = EssMeasurement { sampling: 2, period_s: 86400, interval_s: 900, application: 1, uncertainty: 0xFF }
+    var (s, h) = server(default_ess_config([a, b]))
+    test.assert_eq(list.len(h.characteristics), 2)
+    test.assert(h.characteristics[0].value != h.characteristics[1].value)
+    test.assert_eq(read_of(var s, h.characteristics[0].value), [0x0B, 0xD0, 0x07])
+    test.assert_eq(read_of(var s, h.characteristics[1].value), [0x0B, 0x34, 0x08])
+    // The same descriptor twice, and one instance without a descriptor.
+    var same = gatt_server.new_server([], 65)
+    match add_ess_service(var same.db, default_ess_config([a, a]))
+        Ok(_) => test.fail("equal descriptors do not tell the instances apart")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    var plain = gatt_server.new_server([], 65)
+    match add_ess_service(var plain.db, default_ess_config([a, ess_characteristic(UUID_TEMPERATURE, 0)]))
+        Ok(_) => test.fail("an instance without a descriptor cannot be told apart")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    // Different characteristics need none.
+    var other = gatt_server.new_server([], 65)
+    let ok = add_ess_service(var other.db, default_ess_config([ess_characteristic(UUID_TEMPERATURE, 0), ess_characteristic(UUID_HUMIDITY, 0)]))!
+    test.assert_eq(list.len(ok.characteristics), 2)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_notification_needs_one_to_three_triggers_and_a_configuration_for_more_than_one()
+    // One trigger: no Configuration descriptor.
+    var one = ess_characteristic(UUID_HUMIDITY, 5000)
+    one.notify = true
+    one.triggers = [EssTrigger { condition: TRIGGER_ON_CHANGE, operand: 0 }]
+    var (s, h) = server(default_ess_config([one]))
+    let c = h.characteristics[0]
+    test.assert_eq(c.cccd, 4)
+    test.assert_eq(list.len(c.triggers), 1)
+    test.assert_eq(c.triggers[0], 5)
+    test.assert_eq(c.configuration, 0)
+    test.assert_eq(s.db.attributes[1].value, [0x12, 0x03, 0x00, 0x6F, 0x2A])
+    test.assert_eq(read_of(var s, c.triggers[0]), [0x0B, 0x03])
+    // Three triggers: the Configuration descriptor follows them.
+    var three = one
+    three.triggers = [EssTrigger { condition: 0, operand: 0 }, EssTrigger { condition: TRIGGER_FIXED_INTERVAL, operand: 600 }, EssTrigger { condition: TRIGGER_LESS, operand: 2000 }]
+    three.logic = LOGIC_OR
+    var (t, th) = server(default_ess_config([three]))
+    let d = th.characteristics[0]
+    test.assert_eq(list.len(d.triggers), 3)
+    test.assert_eq(d.configuration, d.triggers[2] + 1)
+    test.assert_eq(read_of(var t, d.triggers[0]), [0x0B, 0x00])
+    test.assert_eq(read_of(var t, d.triggers[1]), [0x0B, 0x01, 0x58, 0x02, 0x00])
+    test.assert_eq(read_of(var t, d.triggers[2]), [0x0B, 0x04, 0xD0, 0x07])
+    test.assert_eq(read_of(var t, d.configuration), [0x0B, 0x01])
+    test.assert_eq(t.db.attributes[gatt_server.index_of(t.db, d.configuration)].type_uuid, [0x0B, 0x29])
+    test.assert_eq(t.db.attributes[gatt_server.index_of(t.db, d.triggers[0])].type_uuid, [0x0D, 0x29])
+    // Notification without a trigger, a trigger without notification, four
+    // triggers and a Trigger Logic of 2 are refused.
+    var none = one
+    none.triggers = []
+    var silent = one
+    silent.notify = false
+    var four = one
+    four.triggers = [EssTrigger { condition: 3, operand: 0 }, EssTrigger { condition: 3, operand: 0 }, EssTrigger { condition: 3, operand: 0 }, EssTrigger { condition: 3, operand: 0 }]
+    var logic = three
+    logic.logic = 2
+    for bad in [none, silent, four, logic]
+        var u = gatt_server.new_server([], 65)
+        match add_ess_service(var u.db, default_ess_config([bad]))
+            Ok(_) => test.fail("the service is not valid")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_every_trigger_condition_has_the_operand_the_table_gives()
+    let temp = UUID_TEMPERATURE
+    test.assert_eq(ess_trigger_value(temp, EssTrigger { condition: 0, operand: 77 }), [0x00])
+    test.assert_eq(ess_trigger_value(temp, EssTrigger { condition: 1, operand: 0x010203 }), [0x01, 0x03, 0x02, 0x01])
+    test.assert_eq(ess_trigger_value(temp, EssTrigger { condition: 2, operand: 60 }), [0x02, 60, 0, 0])
+    test.assert_eq(ess_trigger_value(temp, EssTrigger { condition: 3, operand: 77 }), [0x03])
+    for c in [4, 5, 6, 7, 8, 9]
+        test.assert_eq(ess_trigger_value(temp, EssTrigger { condition: c as u8, operand: -100 }), wire.octets([c, 0x9C, 0xFF]))
+        test.assert_eq(ess_trigger_value(UUID_PRESSURE, EssTrigger { condition: c as u8, operand: 1013250 }), wire.octets([c, 0x02, 0x76, 0x0F, 0x00]))
+        test.assert_eq(ess_trigger_value(UUID_HUMIDITY, EssTrigger { condition: c as u8, operand: 5000 }), wire.octets([c, 0x88, 0x13]))
+        // The value decodes back.
+        test.assert_eq(ess_trigger_of(temp, ess_trigger_value(temp, EssTrigger { condition: c as u8, operand: -100 })).operand, -100)
+    test.assert_eq(ess_trigger_of(temp, [0x01, 0x58, 0x02, 0x00]).operand, 600)
+    test.assert_eq(ess_trigger_of(temp, [0x03]).condition, 3)
+    test.assert_eq(ess_trigger_of(temp, []).condition, TRIGGER_INACTIVE)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_trigger_write_is_refused_with_the_code_the_spec_gives()
+    let temp = UUID_TEMPERATURE
+    // Reserved conditions: Condition not supported, whatever follows.
+    for c in [0x0A, 0x0B, 0x7F, 0x80, 0xFF]
+        test.assert_eq(ess_trigger_error(temp, false, 0, 0, wire.octets([c])), ERR_CONDITION_NOT_SUPPORTED)
+        test.assert_eq(ess_trigger_error(temp, false, 0, 0, wire.octets([c, 1, 2, 3])), ERR_CONDITION_NOT_SUPPORTED)
+    // Well formed.
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x00]), 0)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x03]), 0)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x01, 1, 0, 0]), 0)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x02, 0, 0, 0]), 0)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x06, 0x00, 0x00]), 0)
+    // A fixed time of zero seconds is not a valid value.
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x01, 0, 0, 0]), ERR_WRITE_REQUEST_REJECTED)
+    // Improperly formatted: empty, an operand where there is none, a short
+    // or a long operand.
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, []), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x00, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x03, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x01, 1, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x02, 1, 0, 0, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x04, 1]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x04, 1, 0, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(UUID_PRESSURE, false, 0, 0, [0x04, 1, 0]), att.ATT_ERR_OUT_OF_RANGE)
+    // An operand outside the format: below absolute zero, "not known".
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x04, 0x4C, 0x95]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, false, 0, 0, [0x04, 0x00, 0x80]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(UUID_HUMIDITY, false, 0, 0, [0x04, 0xFF, 0xFF]), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(UUID_HUMIDITY, false, 0, 0, [0x04, 0x11, 0x27]), att.ATT_ERR_OUT_OF_RANGE)
+    // The Valid Range descriptor bounds the operand, ends included.
+    test.assert_eq(ess_trigger_error(temp, true, -4000, 8500, ess_trigger_value(temp, EssTrigger { condition: 4, operand: -4000 })), 0)
+    test.assert_eq(ess_trigger_error(temp, true, -4000, 8500, ess_trigger_value(temp, EssTrigger { condition: 4, operand: 8500 })), 0)
+    test.assert_eq(ess_trigger_error(temp, true, -4000, 8500, ess_trigger_value(temp, EssTrigger { condition: 4, operand: -4001 })), att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(ess_trigger_error(temp, true, -4000, 8500, ess_trigger_value(temp, EssTrigger { condition: 9, operand: 8501 })), att.ATT_ERR_OUT_OF_RANGE)
+    // The configuration: one octet, AND or OR.
+    test.assert_eq(ess_configuration_error([0]), 0)
+    test.assert_eq(ess_configuration_error([1]), 0)
+    test.assert_eq(ess_configuration_error([2]), ERR_WRITE_REQUEST_REJECTED)
+    test.assert_eq(ess_configuration_error([0xFF]), ERR_WRITE_REQUEST_REJECTED)
+    test.assert_eq(ess_configuration_error([]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(ess_configuration_error([0, 0]), att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+
+// A policy that holds only the connection in slot 1 as bonded and remembers
+// the slots it was asked about.
+@value
+struct Slot1
+    asked: Int
+    slots: Int
+
+impl EssPolicy[] for Slot1
+    @tier(app)
+    fn bonded(var self, peer: links.LinkId) -> Bool
+        self.asked = self.asked + 1
+        self.slots = self.slots | (1 << peer.slot)
+        peer.slot == 1
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_policy_decides_per_peer_whether_a_write_to_a_descriptor_is_authorized()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    var policy = Slot1 { asked: 0, slots: 0 }
+    let stranger = links.link_id(0, 1)
+    let bonded = links.link_id(1, 1)
+    let denied = ess_receive(var s.db, var s.link, h, var policy, stranger, req(0x12, c.triggers[0], [0x03]), 0)
+    test.assert_eq(denied[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    let accepted = ess_receive(var s.db, var s.link, h, var policy, bonded, req(0x12, c.triggers[0], [0x04, 0x10, 0x0E]), 0)
+    test.assert_eq(accepted[0], [0x13])
+    // A read is the ATT server's and does not ask the policy.
+    test.assert_eq(ess_receive(var s.db, var s.link, h, var policy, stranger, req(0x0A, c.triggers[0], []), 0)[0], [0x0B, 0x04, 0x10, 0x0E])
+    test.assert_eq(policy.asked, 2)
+    test.assert_eq(policy.slots, 3)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_bonded_client_writes_its_own_trigger_and_configuration_values()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    var other = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var other, gatt_server.link_security(true, 3, 16, true))
+    // The server's values until a client writes.
+    test.assert_eq(read_of(var s, c.triggers[0]), [0x0B, 0x06, 0xB8, 0x0B])
+    // A client that is not bonded is not authorized; the value stays.
+    test.assert_eq(write_of(var s, h, false, c.triggers[0], [0x03])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(write_of(var s, h, false, c.configuration, [1])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(read_of(var s, c.triggers[0]), [0x0B, 0x06, 0xB8, 0x0B])
+    // A bonded client writes; the other client still reads the server's.
+    test.assert_eq(write_of(var s, h, true, c.triggers[0], [0x04, 0x10, 0x0E])[0], [0x13])
+    test.assert_eq(write_of(var s, h, true, c.configuration, [1])[0], [0x13])
+    test.assert_eq(read_of(var s, c.triggers[0]), [0x0B, 0x04, 0x10, 0x0E])
+    test.assert_eq(read_of(var s, c.configuration), [0x0B, 0x01])
+    test.assert_eq(read_link(s.db, var other, c.triggers[0]), [0x0B, 0x06, 0xB8, 0x0B])
+    test.assert_eq(read_link(s.db, var other, c.configuration), [0x0B, 0x00])
+    // The triggers and the logic the notification rule reads are the client's.
+    test.assert_eq(ess_triggers(s.db, s.link, c)[0].condition, TRIGGER_LESS)
+    test.assert_eq(ess_triggers(s.db, other, c)[0].condition, TRIGGER_GREATER)
+    test.assert_eq(ess_logic(s.db, s.link, c), LOGIC_OR)
+    test.assert_eq(ess_logic(s.db, other, c), LOGIC_AND)
+    // The server changes what a client that has not written reads.
+    test.assert(ess_set_trigger(var s.db, c, 0, EssTrigger { condition: TRIGGER_NOT_EQUAL, operand: 1000 }))
+    test.assert_eq(read_link(s.db, var other, c.triggers[0]), [0x0B, 0x09, 0xE8, 0x03])
+    test.assert(not ess_set_trigger(var s.db, c, 0, EssTrigger { condition: TRIGGER_NOT_EQUAL, operand: 9000 }))
+    test.assert(not ess_set_trigger(var s.db, c, 2, EssTrigger { condition: TRIGGER_ON_CHANGE, operand: 0 }))
+    test.assert(not ess_set_trigger(var s.db, c, -1, EssTrigger { condition: TRIGGER_ON_CHANGE, operand: 0 }))
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_refused_write_leaves_the_descriptor_and_a_command_is_dropped()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    let before = read_of(var s, c.triggers[1])
+    // 0x81 for a Reserved condition, 0xFF out of the Valid Range, 0x80 for a
+    // Trigger Logic of 2 and for a fixed time of 0.
+    test.assert_eq(write_of(var s, h, true, c.triggers[1], [0x0A])[0][4] as Int, ERR_CONDITION_NOT_SUPPORTED)
+    test.assert_eq(write_of(var s, h, true, c.triggers[1], [0x06, 0x35, 0x21])[0][4] as Int, att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(write_of(var s, h, true, c.triggers[1], [0x01, 0, 0, 0])[0][4] as Int, ERR_WRITE_REQUEST_REJECTED)
+    test.assert_eq(write_of(var s, h, true, c.configuration, [2])[0][4] as Int, ERR_WRITE_REQUEST_REJECTED)
+    test.assert_eq(write_of(var s, h, true, c.configuration, [])[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(read_of(var s, c.triggers[1]), before)
+    test.assert_eq(read_of(var s, c.configuration), [0x0B, 0x00])
+    // The error response names the Write Request and the handle.
+    let r = write_of(var s, h, true, c.triggers[1], [0x0A])[0]
+    test.assert_eq(r, wire.octets([0x01, 0x12, c.triggers[1] & 0xFF, c.triggers[1] >>> 8, ERR_CONDITION_NOT_SUPPORTED]))
+    // A write command has no response: an invalid one is dropped, a valid one stored.
+    test.assert_eq(list.len(receive_as(var s, h, true, req(0x52, c.triggers[1], [0x0A]), 0)), 0)
+    test.assert_eq(read_of(var s, c.triggers[1]), before)
+    test.assert_eq(list.len(receive_as(var s, h, true, req(0x52, c.triggers[1], [0x03]), 0)), 0)
+    test.assert_eq(read_of(var s, c.triggers[1]), [0x0B, 0x03])
+    // A client that is not bonded cannot write by command either.
+    test.assert_eq(list.len(receive_as(var s, h, false, req(0x52, c.triggers[1], [0x00]), 0)), 0)
+    test.assert_eq(read_of(var s, c.triggers[1]), [0x0B, 0x03])
+    // A prepared write and a signed write do not get past the checks.
+    let prepare = receive_as(var s, h, true, req(0x16, c.triggers[1], [0, 0, 0x0A]), 0)
+    test.assert_eq(prepare[0][4] as Int, att.ATT_ERR_ATTRIBUTE_NOT_LONG)
+    test.assert_eq(prepare[0][1] as Int, 0x16)
+    test.assert_eq(list.len(receive_as(var s, h, true, req(0xD2, c.triggers[1], [0x0A]), 0)), 0)
+    test.assert_eq(read_of(var s, c.triggers[1]), [0x0B, 0x03])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_read_only_triggers_cannot_be_written_by_anyone()
+    var c = rich_temperature()
+    c.description_writable = false
+    let config = EssConfig { characteristics: [c], read: gatt_server.Access.Open, trigger_write: false, descriptors_change: false }
+    var (s, h) = server(config)
+    let ch = h.characteristics[0]
+    test.assert_eq(write_of(var s, h, true, ch.triggers[0], [0x03])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(write_of(var s, h, true, ch.configuration, [1])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(write_of(var s, h, false, ch.configuration, [1])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(read_of(var s, ch.triggers[0]), [0x0B, 0x06, 0xB8, 0x0B])
+    test.assert_eq(read_of(var s, ch.configuration), [0x0B, 0x00])
+    // The server's own value is what the client reads.
+    test.assert(ess_set_trigger(var s.db, ch, 1, EssTrigger { condition: TRIGGER_FIXED_INTERVAL, operand: 30 }))
+    test.assert_eq(read_of(var s, ch.triggers[1]), [0x0B, 0x01, 30, 0, 0])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_valid_range_descriptor_holds_the_bounds_in_the_format_of_the_value()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    test.assert_eq(read_of(var s, c.valid_range), [0x0B, 0x60, 0xF0, 0x34, 0x21])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, c.valid_range, [0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    let (has, low, high) = ess_range(s.db, c)
+    test.assert(has)
+    test.assert_eq(low, -4000)
+    test.assert_eq(high, 8500)
+    // A write of an operand outside it is Out of Range.
+    test.assert_eq(write_of(var s, h, true, c.triggers[0], [0x07, 0x35, 0x21])[0][4] as Int, att.ATT_ERR_OUT_OF_RANGE)
+    test.assert_eq(write_of(var s, h, true, c.triggers[0], [0x07, 0x34, 0x21])[0], [0x13])
+    var p = ess_characteristic(UUID_PRESSURE, 1000000)
+    p.has_range = true
+    p.range_low = 300000
+    p.range_high = 1100000
+    var (t, th) = server(default_ess_config([p]))
+    test.assert_eq(read_of(var t, th.characteristics[0].valid_range), [0x0B, 0xE0, 0x93, 0x04, 0x00, 0xE0, 0xC8, 0x10, 0x00])
+    // A lower bound above the upper one, and a bound outside the format.
+    p.range_low = 1100001
+    var u = gatt_server.new_server([], 65)
+    match add_ess_service(var u.db, default_ess_config([p]))
+        Ok(_) => test.fail("the bounds are in the wrong order")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    var q = ess_characteristic(UUID_HUMIDITY, 0)
+    q.has_range = true
+    q.range_low = 0
+    q.range_high = 10001
+    var v = gatt_server.new_server([], 65)
+    match add_ess_service(var v.db, default_ess_config([q]))
+        Ok(_) => test.fail("the upper bound is outside the format")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    // A characteristic without the descriptor has no range.
+    var (r, rh) = server(default_ess_config([ess_characteristic(UUID_TEMPERATURE, 0)]))
+    let (none, _, _) = ess_range(r.db, rh.characteristics[0])
+    test.assert(not none)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_every_trigger_condition_decides_on_the_values()
+    // The comparisons: previous 20.00, current 21.50, operand 21.50 or 30.00.
+    test.assert(ess_trigger_fires(TRIGGER_LESS, 3000, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_LESS, 2150, 2000, 2150, 0))
+    test.assert(ess_trigger_fires(TRIGGER_LESS_OR_EQUAL, 2150, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_LESS_OR_EQUAL, 2149, 2000, 2150, 0))
+    test.assert(ess_trigger_fires(TRIGGER_GREATER, 2149, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_GREATER, 2150, 2000, 2150, 0))
+    test.assert(ess_trigger_fires(TRIGGER_GREATER_OR_EQUAL, 2150, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_GREATER_OR_EQUAL, 2151, 2000, 2150, 0))
+    test.assert(ess_trigger_fires(TRIGGER_EQUAL, 2150, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_EQUAL, 3000, 2000, 2150, 0))
+    test.assert(ess_trigger_fires(TRIGGER_NOT_EQUAL, 3000, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_NOT_EQUAL, 2150, 2000, 2150, 0))
+    // On change compares with the value last sent.
+    test.assert(ess_trigger_fires(TRIGGER_ON_CHANGE, 0, 2000, 2150, 0))
+    test.assert(not ess_trigger_fires(TRIGGER_ON_CHANGE, 0, 2150, 2150, 0))
+    // The two time conditions hold from the operand on, the value aside.
+    test.assert(not ess_trigger_fires(TRIGGER_FIXED_INTERVAL, 60, 2150, 2150, 59))
+    test.assert(ess_trigger_fires(TRIGGER_FIXED_INTERVAL, 60, 2150, 2150, 60))
+    test.assert(not ess_trigger_fires(TRIGGER_MIN_INTERVAL, 60, 2000, 2150, 59))
+    test.assert(ess_trigger_fires(TRIGGER_MIN_INTERVAL, 60, 2000, 2150, 61))
+    // Inactive and Reserved conditions never hold.
+    test.assert(not ess_trigger_fires(TRIGGER_INACTIVE, 0, 0, 1, 1000))
+    test.assert(not ess_trigger_fires(0x0A, 0, 0, 1, 1000))
+    test.assert(not ess_trigger_fires(0xFF, 0, 0, 1, 1000))
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_triggers_combine_with_and_or_and_an_inactive_one_counts_as_absent()
+    let above = EssTrigger { condition: TRIGGER_GREATER, operand: 2000 }
+    let below = EssTrigger { condition: TRIGGER_LESS, operand: 2000 }
+    let wait = EssTrigger { condition: TRIGGER_MIN_INTERVAL, operand: 60 }
+    let off = EssTrigger { condition: TRIGGER_INACTIVE, operand: 0 }
+    // OR: either; AND: both.
+    test.assert(ess_should_notify([above, below], LOGIC_OR, 0, 2150, 0))
+    test.assert(not ess_should_notify([above, below], LOGIC_AND, 0, 2150, 0))
+    test.assert(ess_should_notify([below, above], LOGIC_OR, 0, 2150, 0))
+    test.assert(not ess_should_notify([below, above], LOGIC_OR, 0, 2000, 0))
+    // The time and the value: "no less than 60 s while greater than 20.00".
+    test.assert(not ess_should_notify([wait, above], LOGIC_AND, 0, 2150, 30))
+    test.assert(ess_should_notify([wait, above], LOGIC_AND, 0, 2150, 60))
+    test.assert(not ess_should_notify([wait, above], LOGIC_AND, 0, 1900, 120))
+    // An inactive trigger is as if absent, for AND and for OR.
+    test.assert(ess_should_notify([off, above], LOGIC_AND, 0, 2150, 0))
+    test.assert(ess_should_notify([above, off, off], LOGIC_AND, 0, 2150, 0))
+    test.assert(not ess_should_notify([off, below], LOGIC_AND, 0, 2150, 0))
+    test.assert(not ess_should_notify([off, below], LOGIC_OR, 0, 2150, 0))
+    // All inactive, or none: nothing is ever sent.
+    test.assert(not ess_should_notify([off, off, off], LOGIC_OR, 0, 2150, 1000))
+    test.assert(not ess_should_notify([off], LOGIC_AND, 0, 2150, 1000))
+    test.assert(not ess_should_notify([], LOGIC_AND, 0, 2150, 1000))
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_notification_goes_only_to_a_subscribed_client_whose_triggers_hold()
+    var c = ess_characteristic(UUID_TEMPERATURE, 2000)
+    c.notify = true
+    c.triggers = [EssTrigger { condition: TRIGGER_ON_CHANGE, operand: 0 }]
+    var (s, h) = server(default_ess_config([c]))
+    let ch = h.characteristics[0]
+    test.assert(set_temperature(var s.db, ch, 2150))
+    // Not subscribed: nothing.
+    test.assert_eq(list.len(ess_notify(var s.db, var s.link, ch, 2000, 0, 0)), 0)
+    test.assert_eq(write_of(var s, h, true, ch.cccd, [1, 0])[0], [0x13])
+    // The value changed: the notification carries the latest value.
+    let n = ess_notify(var s.db, var s.link, ch, 2000, 0, 0)
+    test.assert_eq(n[0], wire.octets([0x1B, ch.value, 0, 0x66, 0x08]))
+    // The value is what was sent last: no change, no notification.
+    test.assert_eq(list.len(ess_notify(var s.db, var s.link, ch, 2150, 0, 0)), 0)
+    // The latest value only: a newer one replaces it before it is sent.
+    test.assert(set_temperature(var s.db, ch, 2200))
+    test.assert_eq(ess_notify(var s.db, var s.link, ch, 2150, 0, 0)[0], wire.octets([0x1B, ch.value, 0, 0x98, 0x08]))
+    // A characteristic that does not notify has nothing to send.
+    var (t, th) = server(default_ess_config([ess_characteristic(UUID_TEMPERATURE, 0)]))
+    test.assert_eq(list.len(ess_notify(var t.db, var t.link, th.characteristics[0], 5, 0, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_triggers_of_a_client_decide_for_that_client_only()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    var other = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var other, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(write_of(var s, h, true, c.cccd, [1, 0])[0], [0x13])
+    var d = s.db
+    var bonded = default_ess_policy(true)
+    test.assert_eq(ess_receive(var d, var other, h, var bonded, peer(), req(0x12, c.cccd, [1, 0]), 0)[0], [0x13])
+    // Both hold the server's triggers: greater than 30.00 and 60 s.  The
+    // first client asks for "while equal to 21.50" with OR.
+    test.assert_eq(write_of(var s, h, true, c.triggers[0], [0x08, 0x66, 0x08])[0], [0x13])
+    test.assert_eq(write_of(var s, h, true, c.configuration, [1])[0], [0x13])
+    test.assert_eq(list.len(ess_notify(var s.db, var s.link, c, 0, 0, 0)), 1)
+    test.assert_eq(list.len(ess_notify(var s.db, var other, c, 0, 0, 0)), 0)
+    test.assert_eq(list.len(ess_notify(var s.db, var other, c, 0, 90, 0)), 0)
+    test.assert(set_temperature(var s.db, c, 3100))
+    test.assert_eq(list.len(ess_notify(var s.db, var other, c, 0, 90, 0)), 1)
+    test.assert_eq(list.len(ess_notify(var s.db, var other, c, 0, 30, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_user_description_is_global_long_and_written_only_when_authenticated()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    // Properties: Read, Notify and Extended Properties; the Extended
+    // Properties descriptor says Writable Auxiliaries.
+    test.assert_eq(s.db.attributes[1].value, [0x92, 0x03, 0x00, 0x6E, 0x2A])
+    test.assert_eq(read_of(var s, c.extended), [0x0B, 0x02, 0x00])
+    test.assert_eq(read_of(var s, c.description), [0x0B, 0x43, 0x65, 0x6C, 0x6C, 0x61, 0x72])
+    // A write needs an authenticated link: level 2 is not.
+    var level2 = gatt_server.new_server([], 65)
+    let wh = add_ess_service(var level2.db, writable([rich_temperature()]))!
+    gatt_server.set_security(var level2.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(write_of(var level2, wh, true, wh.characteristics[0].description, [0x41])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    var nokey = gatt_server.new_server([], 65)
+    let nh = add_ess_service(var nokey.db, writable([rich_temperature()]))!
+    test.assert_eq(write_of(var nokey, nh, true, nh.characteristics[0].description, [0x41])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read_of(var level2, wh.characteristics[0].description), [0x0B, 0x43, 0x65, 0x6C, 0x6C, 0x61, 0x72])
+    // Authenticated: it is replaced, for every client.
+    test.assert_eq(write_of(var s, h, false, c.description, [0x41, 0x74, 0x74, 0x69, 0x63])[0], [0x13])
+    var other = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var other, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read_link(s.db, var other, c.description), [0x0B, 0x41, 0x74, 0x74, 0x69, 0x63])
+    // A text longer than the default ATT_MTU is written with the long write
+    // and read with Read Blob.
+    var text: [Int] = []
+    for k in 0..40
+        list.push(text, 0x61 + (k % 26))
+    var first: [Int] = [0, 0]
+    for k in 0..20
+        list.push(first, text[k])
+    var second: [Int] = [20, 0]
+    for k in 20..40
+        list.push(second, text[k])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x16, c.description, first), 0)[0][0] as Int, 0x17)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x16, c.description, second), 0)[0][0] as Int, 0x17)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, [0x18, 0x01], 0)[0], [0x19])
+    let part = gatt_server.receive(var s.db, var s.link, req(0x0C, c.description, [22, 0]), 0)[0]
+    test.assert_eq(part[0] as Int, 0x0D)
+    test.assert_eq(list.len(part), 1 + 18)
+    test.assert_eq(part[1] as Int, text[22])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_user_description_that_cannot_be_written_is_read_only()
+    var c = ess_characteristic(UUID_HUMIDITY, 4000)
+    c.has_description = true
+    c.description = wire.text("Loft")
+    var (s, h) = server(default_ess_config([c]))
+    let ch = h.characteristics[0]
+    test.assert_eq(ch.extended, 0)
+    test.assert_eq(s.db.attributes[1].value, [0x02, 0x03, 0x00, 0x6F, 0x2A])
+    test.assert_eq(write_of(var s, h, true, ch.description, [0x41])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // A writable description needs a description to start from.
+    var bad = ess_characteristic(UUID_HUMIDITY, 0)
+    bad.description_writable = true
+    var u = gatt_server.new_server([], 65)
+    match add_ess_service(var u.db, default_ess_config([bad]))
+        Ok(_) => test.fail("there is no description to write")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_descriptor_value_changed_characteristic_exists_when_a_descriptor_can_change()
+    // Nothing can change: no characteristic.
+    let quiet = default_ess_config([ess_characteristic(UUID_TEMPERATURE, 0)])
+    var (q, qh) = server(quiet)
+    test.assert_eq(qh.dvc, 0)
+    test.assert_eq(list.len(ess_indicate_change(var q.db, var q.link, qh, DVC_MEASUREMENT, UUID_TEMPERATURE, 0)), 0)
+    // The server changes descriptors: Indicate only, with its descriptor.
+    var c = ess_characteristic(UUID_TEMPERATURE, 0)
+    c.has_measurement = true
+    c.measurement = measurement()
+    let config = EssConfig { characteristics: [c], read: gatt_server.Access.Open, trigger_write: false, descriptors_change: true }
+    var (s, h) = server(config)
+    test.assert_eq(h.dvc, 6)
+    test.assert_eq(h.dvc_cccd, 7)
+    test.assert_eq(s.db.attributes[4].value, [0x20, 0x06, 0x00, 0x7D, 0x2A])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.dvc, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.dvc, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // A writable User Description alone adds it.
+    var d = ess_characteristic(UUID_TEMPERATURE, 0)
+    d.has_description = true
+    d.description = wire.text("x")
+    d.description_writable = true
+    let (t, th) = server(default_ess_config([d]))
+    test.assert(th.dvc != 0)
+    test.assert_eq(gatt_server.last_handle(t.db), th.dvc_cccd)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_value_changed_indication_carries_the_flags_and_the_uuid()
+    var c = ess_characteristic(UUID_HUMIDITY, 0)
+    c.has_measurement = true
+    c.measurement = measurement()
+    var (s, h) = server(EssConfig { characteristics: [c], read: gatt_server.Access.Open, trigger_write: false, descriptors_change: true })
+    // Not subscribed: nothing.
+    test.assert_eq(list.len(ess_indicate_change(var s.db, var s.link, h, DVC_MEASUREMENT, UUID_HUMIDITY, 0)), 0)
+    test.assert_eq(write_of(var s, h, true, h.dvc_cccd, [2, 0])[0], [0x13])
+    // Source Server, ES Measurement: flags 0x0008 (Table 3.16 bit 3).
+    let ind = ess_indicate_change(var s.db, var s.link, h, DVC_MEASUREMENT, UUID_HUMIDITY, 0)
+    test.assert_eq(ind[0], wire.octets([0x1D, h.dvc, 0, 0x08, 0x00, 0x6F, 0x2A]))
+    // The next one waits for the confirmation.
+    test.assert_eq(list.len(ess_indicate_change(var s.db, var s.link, h, DVC_TRIGGER_SETTING | DVC_CONFIGURATION, UUID_HUMIDITY, 0)), 0)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 1)
+    // Flags per descriptor, and several in one indication.
+    test.assert_eq(ess_dvc_value(DVC_TRIGGER_SETTING, UUID_TEMPERATURE), [0x02, 0x00, 0x6E, 0x2A])
+    test.assert_eq(ess_dvc_value(DVC_CONFIGURATION, UUID_PRESSURE), [0x04, 0x00, 0x6D, 0x2A])
+    test.assert_eq(ess_dvc_value(DVC_MEASUREMENT, UUID_HUMIDITY), [0x08, 0x00, 0x6F, 0x2A])
+    test.assert_eq(ess_dvc_value(DVC_USER_DESCRIPTION | DVC_SOURCE_CLIENT, UUID_HUMIDITY), [0x11, 0x00, 0x6F, 0x2A])
+    test.assert_eq(ess_dvc_value(DVC_TRIGGER_SETTING | DVC_CONFIGURATION, UUID_TEMPERATURE), [0x06, 0x00, 0x6E, 0x2A])
+    // Reserved flags, no flag at all and a characteristic the service lacks are not sent.
+    for flags in [0x20, 0x100, 0x00, 0x01, -1, 0x3F]
+        test.assert_eq(list.len(ess_indicate_change(var s.db, var s.link, h, flags, UUID_HUMIDITY, 5)), 0)
+    test.assert_eq(list.len(ess_indicate_change(var s.db, var s.link, h, DVC_MEASUREMENT, 0x2A6C, 5)), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_change_reaches_the_clients_table_3_15_names()
+    // At the server: the Trigger Setting or Configuration to the affected client only.
+    test.assert(ess_dvc_recipient(DVC_TRIGGER_SETTING, false, false, true))
+    test.assert(not ess_dvc_recipient(DVC_TRIGGER_SETTING, false, false, false))
+    test.assert(ess_dvc_recipient(DVC_CONFIGURATION, false, false, true))
+    test.assert(not ess_dvc_recipient(DVC_CONFIGURATION, false, false, false))
+    // The ES Measurement and the User Description to all.
+    test.assert(ess_dvc_recipient(DVC_MEASUREMENT, false, false, false))
+    test.assert(ess_dvc_recipient(DVC_MEASUREMENT, false, false, true))
+    test.assert(ess_dvc_recipient(DVC_USER_DESCRIPTION, false, false, false))
+    // At a client: the User Description to every client but the writer.
+    test.assert(ess_dvc_recipient(DVC_USER_DESCRIPTION, true, false, false))
+    test.assert(not ess_dvc_recipient(DVC_USER_DESCRIPTION, true, true, false))
+    // A client's own Trigger Setting, Configuration or Measurement: nobody.
+    for d in [DVC_TRIGGER_SETTING, DVC_CONFIGURATION, DVC_MEASUREMENT]
+        test.assert(not ess_dvc_recipient(d, true, false, true))
+        test.assert(not ess_dvc_recipient(d, true, true, true))
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_a_client_write_of_the_description_is_announced_and_a_trigger_write_is_not()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    test.assert_eq(ess_written_flags(h, req(0x12, c.description, [0x41])), DVC_SOURCE_CLIENT | DVC_USER_DESCRIPTION)
+    test.assert_eq(ess_written_flags(h, req(0x52, c.description, [0x41])), 0x11)
+    test.assert_eq(ess_written_flags(h, req(0x12, c.triggers[0], [0x03])), 0)
+    test.assert_eq(ess_written_flags(h, req(0x12, c.configuration, [1])), 0)
+    test.assert_eq(ess_written_flags(h, req(0x12, c.value, [1])), 0)
+    test.assert_eq(ess_written_flags(h, req(0x0A, c.description, [])), 0)
+    test.assert_eq(ess_written_flags(h, [0x12, 1]), 0)
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_values_of_a_bond_are_saved_and_given_back()
+    var (s, h) = server(writable([rich_temperature()]))
+    let c = h.characteristics[0]
+    test.assert_eq(write_of(var s, h, true, c.triggers[0], [0x08, 0x66, 0x08])[0], [0x13])
+    test.assert_eq(write_of(var s, h, true, c.configuration, [1])[0], [0x13])
+    let saved = ess_save_values(s.link, h)
+    test.assert_eq(list.len(saved), 2)
+    // The next connection starts with the server's values and takes the saved ones.
+    var next = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var next, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read_link(s.db, var next, c.triggers[0]), [0x0B, 0x06, 0xB8, 0x0B])
+    ess_restore_values(s.db, var next, h, saved)
+    test.assert_eq(read_link(s.db, var next, c.triggers[0]), [0x0B, 0x08, 0x66, 0x08])
+    test.assert_eq(read_link(s.db, var next, c.configuration), [0x0B, 0x01])
+    // A value of an attribute that is not a trigger is not given back.
+    let stray = [gatt_server.LinkValue { handle: c.value, value: [1, 2] }]
+    ess_restore_values(s.db, var next, h, stray)
+    test.assert_eq(read_link(s.db, var next, c.value), [0x0B, 0x66, 0x08])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_read_access_can_be_raised()
+    var s = gatt_server.new_server([], 65)
+    let config = EssConfig { characteristics: [rich_temperature()], read: gatt_server.Access.Authenticated, trigger_write: true, descriptors_change: false }
+    let h = add_ess_service(var s.db, config)!
+    let c = h.characteristics[0]
+    test.assert_eq(read_of(var s, c.value)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read_of(var s, c.measurement)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read_of(var s, c.triggers[0])[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read_of(var s, c.value), [0x0B, 0x66, 0x08])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_service_data_carries_the_uuid_and_the_change_index()
+    test.assert_eq(ess_service_data(0x1234), [0x05, 0x16, 0x1A, 0x18, 0x34, 0x12])
+    test.assert_eq(ess_service_data(0), [0x05, 0x16, 0x1A, 0x18, 0x00, 0x00])
+
+@test
+@satisfies("REQ-BLE-ESS-001")
+fn test_the_handles_run_in_the_order_the_descriptors_are_added()
+    var (s, h) = server(writable([rich_temperature(), ess_characteristic(UUID_HUMIDITY, 5000)]))
+    let c = h.characteristics[0]
+    let u = h.characteristics[1]
+    test.assert_eq(h.service, 1)
+    test.assert_eq(c.value, 3)
+    test.assert_eq(c.cccd, 4)
+    test.assert_eq(c.measurement, 5)
+    test.assert_eq(c.triggers[0], 6)
+    test.assert_eq(c.triggers[1], 7)
+    test.assert_eq(c.configuration, 8)
+    test.assert_eq(c.valid_range, 9)
+    test.assert_eq(c.extended, 10)
+    test.assert_eq(c.description, 11)
+    test.assert_eq(u.value, 13)
+    test.assert_eq(h.dvc, 15)
+    test.assert_eq(h.dvc_cccd, 16)
+    test.assert_eq(gatt_server.last_handle(s.db), 16)
+    let (at, kind) = ess_locate(h, c.configuration)
+    test.assert_eq(at, 0)
+    test.assert_eq(kind, KIND_CONFIGURATION)
+    let (at_value, kind_value) = ess_locate(h, c.value)
+    test.assert_eq(kind_value, KIND_NONE)
+    test.assert_eq(at_value, -1)
+    let (at_zero, _) = ess_locate(h, 0)
+    test.assert_eq(at_zero, -1)

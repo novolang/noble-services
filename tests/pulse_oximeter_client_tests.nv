@@ -1,0 +1,319 @@
+// tests/pulse_oximeter_client_tests.nv — the unit tests of src/pulse_oximeter_client.nv.
+//
+//   novo test tests/pulse_oximeter_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use pulse_oximeter
+use sensor_client
+use wire
+use pulse_oximeter_client.{ PlxContinuousReading, PlxFeatures, PlxSpotCheckReading, plx_client_new, plx_client_start, plx_decode_continuous, plx_decode_features, plx_decode_spot_check, plx_scaled, plx_sfloat_kind }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn spot(b: [u8]) -> PlxSpotCheckReading
+    match plx_decode_spot_check(b)
+        Some(m) => m
+        None =>
+            test.fail("a spot-check measurement")
+            PlxSpotCheckReading {
+                spo2: 0, pulse_rate: 0, has_time: false, time: wire.date_time_unknown(), clock_not_set: false,
+                has_measurement_status: false, measurement_status: 0, has_device_status: false, device_status: 0,
+                has_index: false, pulse_amplitude_index: 0 }
+
+@tier(app)
+fn continuous(b: [u8]) -> PlxContinuousReading
+    match plx_decode_continuous(b)
+        Some(m) => m
+        None =>
+            test.fail("a continuous measurement")
+            PlxContinuousReading {
+                spo2: 0, pulse_rate: 0, has_fast: false, fast_spo2: 0, fast_pulse_rate: 0, has_slow: false,
+                slow_spo2: 0, slow_pulse_rate: 0, has_measurement_status: false, measurement_status: 0,
+                has_device_status: false, device_status: 0, has_index: false, pulse_amplitude_index: 0 }
+
+// `flags`, the pair 98 % and 72 per minute, then `rest`.
+@tier(app)
+fn with_pair(flags: Int, rest: [Int]) -> [u8]
+    var out: [u8] = [flags as u8]
+    wire.put(var out, wire.sfloat(98, 0), 2)
+    wire.put(var out, wire.sfloat(72, 0), 2)
+    for x in rest
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_a_spot_check_with_no_optional_field()
+    let m = spot(with_pair(0x00, []))
+    test.assert_eq(plx_scaled(m.spo2, 0), 98)
+    test.assert_eq(plx_scaled(m.pulse_rate, 0), 72)
+    test.assert_eq(m.has_time, false)
+    test.assert_eq(m.has_measurement_status, false)
+    test.assert_eq(m.has_device_status, false)
+    test.assert_eq(m.has_index, false)
+    test.assert_eq(plx_sfloat_kind(m.pulse_amplitude_index), wire.KIND_NAN)
+    // Reserved flag bits 5 to 7 are ignored, and the clock flag means nothing without a time stamp.
+    let r = spot(with_pair(0xF0, []))
+    test.assert_eq(r.clock_not_set, false)
+    test.assert_eq(r.has_time, false)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_a_spot_check_with_every_optional_field_in_the_order_of_the_table()
+    let v = with_pair(0x1F, [0xEA, 0x07, 10, 29, 8, 30, 5, 0x80, 0x01, 0x10, 0x00, 0x08, 0x35, 0xF0])
+    let m = spot(v)
+    test.assert_eq(m.has_time, true)
+    test.assert_eq(m.time.year as Int, 2026)
+    test.assert_eq(m.time.month as Int, 10)
+    test.assert_eq(m.time.day as Int, 29)
+    test.assert_eq(m.time.hours as Int, 8)
+    test.assert_eq(m.time.minutes as Int, 30)
+    test.assert_eq(m.time.seconds as Int, 5)
+    test.assert_eq(m.clock_not_set, true)
+    test.assert_eq(m.measurement_status, 0x0180)
+    test.assert_eq(m.device_status, 0x080010)
+    test.assert_eq(m.has_index, true)
+    test.assert_eq(m.pulse_amplitude_index, 0xF035)
+    // The SFLOAT 0xF035 is 53 times 10^-1.
+    test.assert_eq(plx_scaled(m.pulse_amplitude_index, 1), 53)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_each_spot_check_field_alone()
+    let t = spot(with_pair(0x01, [0xEA, 0x07, 10, 29, 8, 30, 5]))
+    test.assert_eq(t.has_time, true)
+    test.assert_eq(t.clock_not_set, false)
+    test.assert_eq(t.has_measurement_status, false)
+    let ms = spot(with_pair(0x02, [0xFF, 0xFF]))
+    test.assert_eq(ms.measurement_status, 0xFFFF)
+    test.assert_eq(ms.has_time, false)
+    let ds = spot(with_pair(0x04, [0xFF, 0xFF, 0xFF]))
+    test.assert_eq(ds.device_status, 0xFFFFFF)
+    let pai = spot(with_pair(0x08, [0x01, 0x00]))
+    test.assert_eq(pai.pulse_amplitude_index, 1)
+    // A time stamp with unknown year, month and day is a time stamp.
+    test.assert(plx_decode_spot_check(with_pair(0x01, [0, 0, 0, 0, 0, 0, 0])) != None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_special_sfloat_values_in_a_measurement()
+    var v: [u8] = [0]
+    wire.put(var v, wire.SFLOAT_NAN, 2)
+    wire.put(var v, wire.SFLOAT_POSITIVE_INFINITY, 2)
+    let m = spot(v)
+    test.assert_eq(plx_sfloat_kind(m.spo2), wire.KIND_NAN)
+    test.assert_eq(plx_sfloat_kind(m.pulse_rate), wire.KIND_POSITIVE_INFINITY)
+    test.assert_eq(plx_scaled(m.spo2, 0), 0)
+    test.assert_eq(plx_sfloat_kind(wire.SFLOAT_NRES), wire.KIND_NRES)
+    test.assert_eq(plx_sfloat_kind(wire.SFLOAT_NEGATIVE_INFINITY), wire.KIND_NEGATIVE_INFINITY)
+    test.assert_eq(plx_sfloat_kind(wire.sfloat(97, 0)), wire.KIND_NUMBER)
+    // 97.5 % with one decimal.
+    test.assert_eq(plx_scaled(wire.sfloat(975, -1), 1), 975)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_spot_check_truncations_and_bad_time_stamps_answer_none()
+    test.assert_eq(plx_decode_spot_check([]), None)
+    test.assert_eq(plx_decode_spot_check(octets([0, 1, 2, 3])), None)
+    let full = with_pair(0x0F, [0xEA, 0x07, 10, 29, 8, 30, 5, 0x80, 0x01, 0x10, 0x00, 0x08, 0x35, 0xF0])
+    // The fields are in the order of the flags: every prefix shorter than the whole is none.
+    for k in 0..list.len(full)
+        test.assert_eq(plx_decode_spot_check(full[:k]), None)
+    test.assert(plx_decode_spot_check(full) != None)
+    // A month of 13 and an hour of 24 are not a Date Time.
+    test.assert_eq(plx_decode_spot_check(with_pair(0x01, [0xEA, 0x07, 13, 29, 8, 30, 5])), None)
+    test.assert_eq(plx_decode_spot_check(with_pair(0x01, [0xEA, 0x07, 10, 29, 24, 30, 5])), None)
+    // Each field flagged and cut by one octet.
+    test.assert_eq(plx_decode_spot_check(with_pair(0x02, [0xFF])), None)
+    test.assert_eq(plx_decode_spot_check(with_pair(0x04, [0xFF, 0xFF])), None)
+    test.assert_eq(plx_decode_spot_check(with_pair(0x08, [0xFF])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_a_continuous_measurement_and_its_optional_fields()
+    let plain = continuous(with_pair(0x00, []))
+    test.assert_eq(plx_scaled(plain.spo2, 0), 98)
+    test.assert_eq(plain.has_fast, false)
+    test.assert_eq(plx_sfloat_kind(plain.fast_spo2), wire.KIND_NAN)
+    test.assert_eq(plx_sfloat_kind(plain.slow_pulse_rate), wire.KIND_NAN)
+    // Fast, slow, both statuses and the index: the order of the table.
+    var rest: [Int] = []
+    for x in [0x62, 0xF0, 0x48, 0xF0, 0x61, 0xF0, 0x47, 0xF0, 0x80, 0x00, 0x10, 0x00, 0x00, 0x35, 0xF0]
+        list.push(rest, x)
+    let m = continuous(with_pair(0x1F, rest))
+    test.assert_eq(m.has_fast, true)
+    test.assert_eq(m.fast_spo2, 0xF062)
+    test.assert_eq(m.fast_pulse_rate, 0xF048)
+    test.assert_eq(m.has_slow, true)
+    test.assert_eq(m.slow_spo2, 0xF061)
+    test.assert_eq(m.slow_pulse_rate, 0xF047)
+    test.assert_eq(m.measurement_status, 0x0080)
+    test.assert_eq(m.device_status, 0x000010)
+    test.assert_eq(m.pulse_amplitude_index, 0xF035)
+    // Each field alone.
+    test.assert_eq(continuous(with_pair(0x01, [1, 0, 2, 0])).fast_pulse_rate, 2)
+    test.assert_eq(continuous(with_pair(0x02, [3, 0, 4, 0])).slow_spo2, 3)
+    test.assert_eq(continuous(with_pair(0x04, [5, 0])).measurement_status, 5)
+    test.assert_eq(continuous(with_pair(0x08, [6, 0, 0])).device_status, 6)
+    test.assert_eq(continuous(with_pair(0x10, [7, 0])).pulse_amplitude_index, 7)
+    // The flags of bits 5 to 7 are ignored.
+    test.assert_eq(continuous(with_pair(0xE0, [])).has_fast, false)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_continuous_truncations_answer_none()
+    test.assert_eq(plx_decode_continuous([]), None)
+    test.assert_eq(plx_decode_continuous(octets([0x00, 1, 2, 3])), None)
+    var rest: [Int] = []
+    for x in [0x62, 0xF0, 0x48, 0xF0, 0x61, 0xF0, 0x47, 0xF0, 0x80, 0x00, 0x10, 0x00, 0x00, 0x35, 0xF0]
+        list.push(rest, x)
+    let full = with_pair(0x1F, rest)
+    for k in 0..list.len(full)
+        test.assert_eq(plx_decode_continuous(full[:k]), None)
+    test.assert(plx_decode_continuous(full) != None)
+    test.assert_eq(plx_decode_continuous(with_pair(0x02, [1, 0, 2])), None)
+    test.assert_eq(plx_decode_continuous(with_pair(0x04, [1])), None)
+    test.assert_eq(plx_decode_continuous(with_pair(0x08, [1, 0])), None)
+    test.assert_eq(plx_decode_continuous(with_pair(0x10, [1])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_features_have_the_length_the_supported_bits_imply()
+    test.assert(features_are(octets([0x00, 0x00]), 0, 0, 0))
+    test.assert(features_are(octets([0x01, 0x00, 0xE0, 0x01]), 1, 0x01E0, 0))
+    test.assert(features_are(octets([0x02, 0x00, 0x10, 0x20, 0x80]), 2, 0, 0x802010))
+    test.assert(features_are(octets([0xFB, 0x00, 0xE0, 0x01, 0x10, 0x20, 0x80]), 0xFB, 0x01E0, 0x802010))
+    // Too short for the bits, and too long.
+    test.assert_eq(plx_decode_features([]), None)
+    test.assert_eq(plx_decode_features(octets([0x01])), None)
+    test.assert_eq(plx_decode_features(octets([0x01, 0x00, 0xE0])), None)
+    test.assert_eq(plx_decode_features(octets([0x03, 0x00, 0xE0, 0x01, 0x10, 0x20])), None)
+    test.assert_eq(plx_decode_features(octets([0x00, 0x00, 0x00])), None)
+    test.assert_eq(plx_decode_features(octets([0x01, 0x00, 0xE0, 0x01, 0x00])), None)
+
+// Whether `b` decodes to features with these three fields.
+@tier(app)
+fn features_are(b: [u8], supported: Int, ms: Int, ds: Int) -> Bool
+    match plx_decode_features(b)
+        Some(f) => f.supported == supported and f.measurement_status_support == ms and f.device_status_support == ds
+        None => false
+
+@tier(app)
+fn test_server(config: pulse_oximeter.PlxsConfig) -> (gatt_server.GattServer, pulse_oximeter.PlxsHandles)
+    pulse_oximeter.server(config)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    let config = pulse_oximeter.full_config()
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(pulse_oximeter.UUID_PULSE_OXIMETER_SERVICE)
+    var t = both.0
+    var c = plx_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, plx_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The Features read arrived and says what the server was configured with.
+    test.assert_eq(sensor_client.sc_uuid(c), pulse_oximeter.UUID_PLX_FEATURES)
+    var f = PlxFeatures { supported: 0, measurement_status_support: 0, device_status_support: 0 }
+    var features_seen = false
+    for i in 0..(list.len(seen) / 2)
+        if seen[2 * i + 1] == pulse_oximeter.UUID_PLX_FEATURES
+            features_seen = true
+    test.assert(features_seen)
+    match plx_decode_features(sensor_client.sc_value(c))
+        Some(d) => f = d
+        None => test.fail("the features")
+    test.assert_eq(f.supported, pulse_oximeter.plxs_supported_features(config))
+    test.assert_eq(f.measurement_status_support, config.measurement_status_support)
+    test.assert_eq(f.device_status_support, config.device_status_support)
+    // A spot-check measurement is indicated and decoded.
+    var m = pulse_oximeter.usual_spot_check()
+    m = pulse_oximeter.PlxSpotCheck {
+        spo2: m.spo2, pulse_rate: m.pulse_rate, time: wire.date_time(2026, 10, 29, 9, 0, 0), clock_not_set: false,
+        measurement_status: pulse_oximeter.STATUS_VALIDATED_DATA, device_status: pulse_oximeter.DEVICE_POOR_SIGNAL,
+        pulse_amplitude_index: wire.sfloat(53, 0) }
+    let ind = pulse_oximeter.plxs_indicate_spot_check(var s.db, var s.link, h, config, m, 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    // The client confirms the indication; the server then takes the next one.
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    test.assert_eq(sensor_client.sc_uuid(c), pulse_oximeter.UUID_PLX_SPOT_CHECK_MEASUREMENT)
+    let d = spot(sensor_client.sc_value(c))
+    test.assert_eq(plx_scaled(d.spo2, 0), 98)
+    test.assert_eq(d.time.hours as Int, 9)
+    test.assert_eq(d.measurement_status, pulse_oximeter.STATUS_VALIDATED_DATA)
+    test.assert_eq(d.device_status, pulse_oximeter.DEVICE_POOR_SIGNAL)
+    test.assert_eq(plx_scaled(d.pulse_amplitude_index, 0), 53)
+    // A continuous measurement is notified and decoded.
+    let ntf = pulse_oximeter.plxs_notify_continuous(var s.db, var s.link, h, config, pulse_oximeter.plx_continuous(wire.sfloat(96, 0), wire.sfloat(70, 0)), 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), pulse_oximeter.UUID_PLX_CONTINUOUS_MEASUREMENT)
+    let k = continuous(sensor_client.sc_value(c))
+    test.assert_eq(plx_scaled(k.spo2, 0), 96)
+    test.assert_eq(k.has_fast, true)
+    test.assert_eq(k.has_slow, true)
+    // The Features are indicated when they change.
+    let fi = pulse_oximeter.plxs_indicate_features(var s.db, var s.link, h, 0)
+    test.assert_eq(list.len(fi), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, fi), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), pulse_oximeter.UUID_PLX_FEATURES)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_session_with_a_continuous_only_server()
+    if not fixtures.client_engine_present()
+        return
+    let config = pulse_oximeter.PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(pulse_oximeter.UUID_PULSE_OXIMETER_SERVICE)
+    var t = both.0
+    var c = plx_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, plx_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    let ntf = pulse_oximeter.plxs_notify_continuous(var s.db, var s.link, h, config, pulse_oximeter.plx_continuous(wire.sfloat(99, 0), wire.sfloat(60, 0)), 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    let k = continuous(sensor_client.sc_value(c))
+    test.assert_eq(plx_scaled(k.pulse_rate, 0), 60)
+    test.assert_eq(k.has_fast, false)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-010")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(pulse_oximeter.UUID_PULSE_OXIMETER_SERVICE)
+    var t = both.0
+    var c = plx_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, plx_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

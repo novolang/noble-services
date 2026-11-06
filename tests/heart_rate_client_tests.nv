@@ -1,0 +1,208 @@
+// tests/heart_rate_client_tests.nv — the unit tests of src/heart_rate_client.nv.
+//
+//   novo test tests/heart_rate_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use heart_rate
+use sensor_client
+use wire
+use heart_rate_client.{ BSL_CHEST, BSL_FOOT, BSL_WRIST, HrMeasurement, hr_client_new, hr_client_reset_energy, hr_client_start, hr_decode, hr_decode_location, hr_rr_at, hr_rr_ms }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> HrMeasurement
+    match hr_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            HrMeasurement { heart_rate: 0, contact_supported: false, contact_detected: false, has_energy: false, energy_expended: 0, rr_count: 0, rr_at: 0 }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_flags_and_value_width()
+    let a = must(octets([0x00, 72]))
+    test.assert_eq(a.heart_rate, 72)
+    test.assert_eq(a.contact_supported, false)
+    test.assert_eq(a.rr_count, 0)
+    let wide = must(octets([0x01, 0x2C, 0x01]))
+    test.assert_eq(wide.heart_rate, 300)
+    // The 8-bit value is the full octet.
+    test.assert_eq(must(octets([0x00, 255])).heart_rate, 255)
+    // Reserved flag bits 5 to 7 are ignored.
+    test.assert_eq(must(octets([0xE0, 60])).heart_rate, 60)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_sensor_contact_bits()
+    // Not supported: bit 1 carries no meaning.
+    let none = must(octets([0x02, 60]))
+    test.assert_eq(none.contact_supported, false)
+    test.assert_eq(none.contact_detected, false)
+    let lost = must(octets([0x04, 60]))
+    test.assert_eq(lost.contact_supported, true)
+    test.assert_eq(lost.contact_detected, false)
+    let held = must(octets([0x06, 60]))
+    test.assert_eq(held.contact_supported, true)
+    test.assert_eq(held.contact_detected, true)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_energy_expended_and_rr_intervals()
+    let e = must(octets([0x08, 60, 0x02, 0x01]))
+    test.assert_eq(e.has_energy, true)
+    test.assert_eq(e.energy_expended, 0x0102)
+    let v = octets([0x1F, 0x2C, 0x01, 5, 0, 0x00, 0x04, 0x00, 0x02])
+    let all = must(v)
+    test.assert_eq(all.heart_rate, 300)
+    test.assert_eq(all.energy_expended, 5)
+    test.assert_eq(all.rr_count, 2)
+    test.assert_eq(hr_rr_at(v, all, 0), 1024)
+    test.assert_eq(hr_rr_at(v, all, 1), 512)
+    test.assert_eq(hr_rr_at(v, all, 2), 0)
+    test.assert_eq(hr_rr_ms(1024), 1000)
+    // RR-Intervals without Energy Expended.
+    let w = octets([0x10, 60, 0xE8, 0x03])
+    test.assert_eq(hr_rr_at(w, must(w), 0), 1000)
+    // The flag set with no interval after it is an empty list.
+    test.assert_eq(must(octets([0x10, 60])).rr_count, 0)
+    // Octets past the fields with the RR flag clear are not read.
+    test.assert_eq(must(octets([0x00, 60, 9, 9, 9])).rr_count, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_truncated_values_answer_none()
+    test.assert_eq(hr_decode([]), None)
+    test.assert_eq(hr_decode(octets([0x00])), None)
+    // A 16-bit value cut after its first octet.
+    test.assert_eq(hr_decode(octets([0x01, 0x2C])), None)
+    // Energy Expended flagged and cut.
+    test.assert_eq(hr_decode(octets([0x08, 60, 0x02])), None)
+    test.assert_eq(hr_decode(octets([0x08, 60])), None)
+    // An RR-Interval cut in half.
+    test.assert_eq(hr_decode(octets([0x10, 60, 0x00])), None)
+    test.assert_eq(hr_decode(octets([0x18, 60, 1, 0, 0x00])), None)
+    // Every prefix of a full value is either whole or None, never a panic.
+    let full = octets([0x1F, 0x2C, 0x01, 5, 0, 0x00, 0x04, 0x00, 0x02])
+    var whole = 0
+    for k in 0..list.len(full)
+        if hr_decode(full[:k]) != None
+            whole = whole + 1
+    test.assert(whole < list.len(full))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_body_sensor_location()
+    test.assert_eq(hr_decode_location(octets([1])), Some(BSL_CHEST))
+    test.assert_eq(hr_decode_location(octets([6])), Some(BSL_FOOT))
+    test.assert_eq(hr_decode_location([]), None)
+    test.assert_eq(hr_decode_location(octets([1, 2])), None)
+
+@tier(app)
+fn server_with(config: heart_rate.HeartRateConfig) -> (gatt_server.GattServer, heart_rate.HeartRateHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = heart_rate.add_heart_rate_service(var s.db, config)!
+    (s, h)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_session_discovers_subscribes_reads_and_receives_measurements()
+    if not fixtures.client_engine_present()
+        return
+    var built = server_with(heart_rate.HeartRateConfig {
+        location: heart_rate.BodySensorLocation.Wrist, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(heart_rate.UUID_HEART_RATE_SERVICE)
+    var t = both.0
+    var c = hr_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let first = hr_client_start(var t, var c, 0)
+    let all = sensor_client.test_pump(var t, var c, var s, first, var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The location read arrived as a value.
+    test.assert(hr_decode_location(sensor_client.sc_value(c)) == Some(BSL_WRIST) or sensor_client.sc_uuid(c) != heart_rate.UUID_BODY_SENSOR_LOCATION)
+    test.assert_eq(sensor_client.sc_handle(var t, c, heart_rate.UUID_HEART_RATE_MEASUREMENT), h.measurement)
+    // A measurement notified by the server reaches the decoder.
+    let m = heart_rate.HeartRateMeasurement {
+        heart_rate: 80, contact: heart_rate.SensorContact.Detected, energy_expended: 9, rr_intervals: [900] }
+    let ntf = heart_rate.heart_rate_notify(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(ntf), 1)
+    let ev = sensor_client.test_deliver(var t, var c, ntf)
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), heart_rate.UUID_HEART_RATE_MEASUREMENT)
+    let v = sensor_client.sc_value(c)
+    let d = must(v)
+    test.assert_eq(d.heart_rate, 80)
+    test.assert_eq(d.contact_detected, true)
+    test.assert_eq(d.energy_expended, 9)
+    test.assert_eq(hr_rr_at(v, d, 0), 900)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_session_writes_the_control_point_and_skips_an_absent_location()
+    if not fixtures.client_engine_present()
+        return
+    var built = server_with(heart_rate.default_heart_rate_config(heart_rate.BodySensorLocation.Absent))
+    var s = built.0
+    let both = sensor_client.test_open(heart_rate.UUID_HEART_RATE_SERVICE)
+    var t = both.0
+    var c = hr_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, hr_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    // This server has no control point: the required write ends with Not Found.
+    let w = hr_client_reset_energy(var t, var c, 0)
+    test.assert((w.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_session_resets_the_energy_through_the_control_point()
+    if not fixtures.client_engine_present()
+        return
+    var built = server_with(heart_rate.HeartRateConfig {
+        location: heart_rate.BodySensorLocation.Chest, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(heart_rate.UUID_HEART_RATE_SERVICE)
+    var t = both.0
+    var c = hr_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let _ = sensor_client.test_pump(var t, var c, var s, hr_client_start(var t, var c, 0), var seen)
+    let all = sensor_client.test_pump(var t, var c, var s, hr_reset_first(var t, var c), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert(heart_rate.heart_rate_reset_requested(h, gatt_server.take_changed(var s.link)))
+
+@tier(app)
+fn hr_reset_first(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient) -> sensor_client.ScStep
+    hr_client_reset_energy(var t, var c, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-002")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(heart_rate.UUID_HEART_RATE_SERVICE)
+    var t = both.0
+    var c = hr_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, hr_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

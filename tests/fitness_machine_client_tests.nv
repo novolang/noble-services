@@ -1,0 +1,312 @@
+// tests/fitness_machine_client_tests.nv — the unit tests of src/fitness_machine_client.nv.
+//
+//   novo test tests/fitness_machine_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use fitness_machine
+use sensor_client
+use wire
+use fitness_machine_client.{ FTM_SPEED, FtmBike, FtmTreadmill, MACHINE_POWER_MEASUREMENT, NA_S16, NA_U16, NA_U8, RESULT_CONTROL_NOT_PERMITTED, TARGET_POWER, ftm_client_new, ftm_client_start, ftm_client_write, ftm_decode_bike, ftm_decode_feature, ftm_decode_heart_rate_range, ftm_decode_inclination_range, ftm_decode_power_range, ftm_decode_resistance_range, ftm_decode_response, ftm_decode_speed_range, ftm_decode_status, ftm_decode_training_status, ftm_decode_treadmill, ftm_has, ftm_in_range, ftm_na, ftm_req_pause, ftm_req_request_control, ftm_req_reset, ftm_req_set_bike_simulation, ftm_req_set_target_cadence, ftm_req_set_target_heart_rate, ftm_req_set_target_inclination, ftm_req_set_target_power, ftm_req_set_target_resistance, ftm_req_set_target_speed, ftm_req_set_wheel_circumference, ftm_req_start_or_resume, ftm_req_stop, ftm_status_value, ftm_succeeded }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must_bike(b: [u8]) -> FtmBike
+    match ftm_decode_bike(b)
+        Some(m) => m
+        None =>
+            test.fail("an indoor bike record")
+            FtmBike {
+                more_data: false, present: 0, speed: 0, average_speed: 0, cadence: 0, average_cadence: 0, distance: 0, resistance: 0,
+                power: 0, average_power: 0, energy_total: 0, energy_per_hour: 0, energy_per_minute: 0, heart_rate: 0, metabolic: 0,
+                elapsed: 0, remaining: 0 }
+
+@tier(app)
+fn must_treadmill(b: [u8]) -> FtmTreadmill
+    match ftm_decode_treadmill(b)
+        Some(m) => m
+        None =>
+            test.fail("a treadmill record")
+            FtmTreadmill {
+                more_data: false, present: 0, speed: 0, average_speed: 0, distance: 0, inclination: 0, ramp_angle: 0, elevation_gain: 0,
+                elevation_loss: 0, pace: 0, average_pace: 0, energy_total: 0, energy_per_hour: 0, energy_per_minute: 0, heart_rate: 0,
+                metabolic: 0, elapsed: 0, remaining: 0, force_on_belt: 0, power_output: 0 }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_indoor_bike_every_field_alone()
+    let s = must_bike(octets([0x00, 0x00, 0x10, 0x0E]))
+    test.assert_eq(s.speed, 0x0E10)
+    test.assert(ftm_has(s.present, FTM_SPEED))
+    test.assert_eq(s.more_data, false)
+    test.assert_eq(must_bike(octets([0x02, 0x00, 1, 0, 2, 0])).average_speed, 2)
+    test.assert_eq(must_bike(octets([0x04, 0x00, 1, 0, 0xB4, 0x00])).cadence, 180)
+    test.assert_eq(must_bike(octets([0x08, 0x00, 1, 0, 0x64, 0x00])).average_cadence, 100)
+    test.assert_eq(must_bike(octets([0x10, 0x00, 1, 0, 0x56, 0x34, 0x12])).distance, 0x123456)
+    test.assert_eq(must_bike(octets([0x20, 0x00, 1, 0, 33])).resistance, 33)
+    test.assert_eq(must_bike(octets([0x40, 0x00, 1, 0, 0x38, 0xFF])).power, -200)
+    test.assert_eq(must_bike(octets([0x80, 0x00, 1, 0, 0x2C, 0x01])).average_power, 300)
+    let e = must_bike(octets([0x00, 0x01, 1, 0, 0x64, 0x00, 0xC8, 0x00, 0x05]))
+    test.assert_eq(e.energy_total, 100)
+    test.assert_eq(e.energy_per_hour, 200)
+    test.assert_eq(e.energy_per_minute, 5)
+    test.assert_eq(must_bike(octets([0x00, 0x02, 1, 0, 150])).heart_rate, 150)
+    test.assert_eq(must_bike(octets([0x00, 0x04, 1, 0, 25])).metabolic, 25)
+    test.assert_eq(must_bike(octets([0x00, 0x08, 1, 0, 0x10, 0x0E])).elapsed, 0x0E10)
+    test.assert_eq(must_bike(octets([0x00, 0x10, 1, 0, 0x20, 0x1C])).remaining, 0x1C20)
+    // Reserved bits 13 to 15 are ignored.
+    test.assert_eq(must_bike(octets([0x00, 0xE0, 1, 0])).present, FTM_SPEED)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_indoor_bike_all_fields_and_not_available_values()
+    let v = octets([0xFF, 0x1F,
+        0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x05, 0x06, 0x00, 0x07, 0x00,
+        0xFF, 0xFF, 0x09, 0x00, 0xFF,
+        0x0A, 0x0B, 0x0C, 0x00, 0x0D, 0x00])
+    let m = must_bike(v)
+    // Bit 0 is More Data: the speed is absent.
+    test.assert_eq(m.more_data, true)
+    test.assert(not ftm_has(m.present, FTM_SPEED))
+    test.assert_eq(m.average_speed, 1)
+    test.assert_eq(m.cadence, 2)
+    test.assert_eq(m.average_cadence, 3)
+    test.assert_eq(m.distance, 4)
+    test.assert_eq(m.resistance, 5)
+    test.assert_eq(m.power, 6)
+    test.assert_eq(m.average_power, 7)
+    test.assert_eq(ftm_na(m.energy_total, NA_U16), true)
+    test.assert_eq(m.energy_per_hour, 9)
+    test.assert_eq(ftm_na(m.energy_per_minute, NA_U8), true)
+    test.assert_eq(m.heart_rate, 10)
+    test.assert_eq(m.metabolic, 11)
+    test.assert_eq(m.elapsed, 12)
+    test.assert_eq(m.remaining, 13)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_treadmill_every_field()
+    let s = must_treadmill(octets([0x00, 0x00, 0x20, 0x03]))
+    test.assert_eq(s.speed, 800)
+    test.assert_eq(must_treadmill(octets([0x02, 0x00, 1, 0, 2, 0])).average_speed, 2)
+    test.assert_eq(must_treadmill(octets([0x04, 0x00, 1, 0, 0x10, 0x27, 0x00])).distance, 10000)
+    let i = must_treadmill(octets([0x08, 0x00, 1, 0, 0xF6, 0xFF, 0xFF, 0x7F]))
+    test.assert_eq(i.inclination, -10)
+    test.assert_eq(ftm_na(i.ramp_angle, NA_S16), true)
+    let g = must_treadmill(octets([0x10, 0x00, 1, 0, 5, 0, 7, 0]))
+    test.assert_eq(g.elevation_gain, 5)
+    test.assert_eq(g.elevation_loss, 7)
+    test.assert_eq(must_treadmill(octets([0x20, 0x00, 1, 0, 9, 0])).pace, 9)
+    test.assert_eq(must_treadmill(octets([0x40, 0x00, 1, 0, 8, 0])).average_pace, 8)
+    let e = must_treadmill(octets([0x80, 0x00, 1, 0, 0x64, 0x00, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(e.energy_total, 100)
+    test.assert_eq(ftm_na(e.energy_per_hour, NA_U16), true)
+    test.assert_eq(ftm_na(e.energy_per_minute, NA_U8), true)
+    test.assert_eq(must_treadmill(octets([0x00, 0x01, 1, 0, 120])).heart_rate, 120)
+    test.assert_eq(must_treadmill(octets([0x00, 0x02, 1, 0, 30])).metabolic, 30)
+    test.assert_eq(must_treadmill(octets([0x00, 0x04, 1, 0, 0x2C, 0x01])).elapsed, 300)
+    test.assert_eq(must_treadmill(octets([0x00, 0x08, 1, 0, 0x58, 0x02])).remaining, 600)
+    let f = must_treadmill(octets([0x00, 0x10, 1, 0, 0xFE, 0xFF, 0x32, 0x00]))
+    test.assert_eq(f.force_on_belt, -2)
+    test.assert_eq(f.power_output, 50)
+    // A second notification of a record: More Data, no speed.
+    let more = must_treadmill(octets([0x05, 0x00, 0x10, 0x27, 0x00]))
+    test.assert_eq(more.more_data, true)
+    test.assert_eq(ftm_has(more.present, FTM_SPEED), false)
+    test.assert_eq(more.distance, 10000)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_truncated_records_answer_none()
+    test.assert_eq(ftm_decode_bike([]), None)
+    test.assert_eq(ftm_decode_bike(octets([0x00, 0x00, 1])), None)
+    test.assert_eq(ftm_decode_bike(octets([0x10, 0x00, 1, 0, 1, 2])), None)
+    test.assert_eq(ftm_decode_bike(octets([0x00, 0x01, 1, 0, 1, 2, 3, 4])), None)
+    test.assert_eq(ftm_decode_treadmill(octets([0x00, 0x00, 1])), None)
+    test.assert_eq(ftm_decode_treadmill(octets([0x08, 0x00, 1, 0, 1, 2, 3])), None)
+    test.assert_eq(ftm_decode_treadmill(octets([0x00, 0x10, 1, 0, 1, 2, 3])), None)
+    let full = octets([0x0C, 0x13, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x00])
+    var whole = 0
+    for k in 0..list.len(full)
+        if ftm_decode_bike(full[:k]) != None
+            whole = whole + 1
+    test.assert(whole < list.len(full))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_feature_ranges_training_status_and_status()
+    match ftm_decode_feature(octets([0x0B, 0x44, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00]))
+        None => test.fail("a feature")
+        Some(f) =>
+            test.assert_eq(f.machine, 0x440B)
+            test.assert_eq(f.targets, 0x0D)
+            test.assert((f.machine & MACHINE_POWER_MEASUREMENT) != 0)
+            test.assert((f.targets & TARGET_POWER) != 0)
+    test.assert_eq(ftm_decode_feature(octets([1, 2, 3, 4, 5, 6, 7])), None)
+    match ftm_decode_speed_range(octets([0x64, 0x00, 0xE8, 0x03, 0x0A, 0x00]))
+        None => test.fail("a speed range")
+        Some(r) =>
+            test.assert_eq(r.max, 1000)
+            test.assert(ftm_in_range(r, 110))
+            test.assert(not ftm_in_range(r, 105))
+            test.assert(not ftm_in_range(r, 1010))
+            test.assert(not ftm_in_range(r, 90))
+    match ftm_decode_inclination_range(octets([0xF6, 0xFF, 0x64, 0x00, 0x0A, 0x00]))
+        None => test.fail("an inclination range")
+        Some(r) =>
+            test.assert_eq(r.min, -10)
+            test.assert_eq(r.max, 100)
+    match ftm_decode_power_range(octets([0x00, 0x00, 0xE8, 0x03, 0x01, 0x00]))
+        None => test.fail("a power range")
+        Some(r) => test.assert_eq(r.max, 1000)
+    match ftm_decode_resistance_range(octets([1, 100, 1]))
+        None => test.fail("a resistance range")
+        Some(r) => test.assert_eq(r.max, 100)
+    match ftm_decode_heart_rate_range(octets([40, 220, 1]))
+        None => test.fail("a heart rate range")
+        Some(r) => test.assert_eq(r.max, 220)
+    test.assert_eq(ftm_decode_speed_range(octets([1, 2, 3, 4, 5])), None)
+    test.assert_eq(ftm_decode_resistance_range(octets([1, 2])), None)
+    test.assert_eq(ftm_decode_heart_rate_range(octets([1, 2, 3, 4])), None)
+    match ftm_decode_training_status(octets([0x01, 0x0D, 0x41, 0x42]))
+        None => test.fail("a training status")
+        Some(s) =>
+            test.assert_eq(s.status, fitness_machine.TRAINING_MANUAL_MODE)
+            test.assert_eq(s.has_string, true)
+            test.assert_eq(s.string_len, 2)
+            test.assert_eq(s.extended, false)
+    match ftm_decode_training_status(octets([0x03, 0x01]))
+        None => test.fail("an extended status")
+        Some(s) => test.assert_eq(s.extended, true)
+    test.assert_eq(ftm_decode_training_status(octets([0x00, 0x01, 0x41])), None)
+    test.assert_eq(ftm_decode_training_status(octets([0x00])), None)
+    let st = octets([0x05, 0x20, 0x03])
+    match ftm_decode_status(st)
+        None => test.fail("a status")
+        Some(s) =>
+            test.assert_eq(s.op, 5)
+            test.assert_eq(ftm_status_value(st, s), Some(800))
+    let incline = octets([0x06, 0xF6, 0xFF])
+    match ftm_decode_status(incline)
+        None => test.fail("an incline status")
+        Some(s) => test.assert(ftm_status_value(incline, s) == Some(-10))
+    let paused = octets([0x02, 0x02])
+    match ftm_decode_status(paused)
+        None => test.fail("a pause status")
+        Some(s) => test.assert(ftm_status_value(paused, s) == Some(2))
+    match ftm_decode_status(octets([0x05, 0x20]))
+        None => test.fail("a short status")
+        Some(s) => test.assert(ftm_status_value(octets([0x05, 0x20]), s) == None)
+    test.assert_eq(ftm_decode_status([]), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_control_point_requests_and_responses()
+    test.assert_eq(ftm_req_request_control(), octets([0x00]))
+    test.assert_eq(ftm_req_reset(), octets([0x01]))
+    test.assert_eq(ftm_req_set_target_speed(800), octets([0x02, 0x20, 0x03]))
+    test.assert_eq(ftm_req_set_target_inclination(-10), octets([0x03, 0xF6, 0xFF]))
+    test.assert_eq(ftm_req_set_target_resistance(25), octets([0x04, 25]))
+    test.assert_eq(ftm_req_set_target_power(250), octets([0x05, 0xFA, 0x00]))
+    test.assert_eq(ftm_req_set_target_power(-5), octets([0x05, 0xFB, 0xFF]))
+    test.assert_eq(ftm_req_set_target_heart_rate(140), octets([0x06, 140]))
+    test.assert_eq(ftm_req_start_or_resume(), octets([0x07]))
+    test.assert_eq(ftm_req_stop(), octets([0x08, 0x01]))
+    test.assert_eq(ftm_req_pause(), octets([0x08, 0x02]))
+    test.assert_eq(ftm_req_set_bike_simulation(-1000, 500, 40, 51), octets([0x11, 0x18, 0xFC, 0xF4, 0x01, 40, 51]))
+    test.assert_eq(ftm_req_set_wheel_circumference(21000), octets([0x12, 0x08, 0x52]))
+    test.assert_eq(ftm_req_set_target_cadence(180), octets([0x14, 0xB4, 0x00]))
+    match ftm_decode_response(octets([0x80, 0x05, 0x01]))
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 5)
+            test.assert(ftm_succeeded(r))
+            test.assert_eq(r.param_len, 0)
+    match ftm_decode_response(octets([0x80, 0x07, 0x05]))
+        None => test.fail("a refusal")
+        Some(r) =>
+            test.assert_eq(r.result, RESULT_CONTROL_NOT_PERMITTED)
+            test.assert(not ftm_succeeded(r))
+    match ftm_decode_response(octets([0x80, 0x13, 0x01, 0x10, 0x00, 0x20, 0x00]))
+        None => test.fail("a spin down response")
+        Some(r) => test.assert_eq(r.param_len, 4)
+    test.assert_eq(ftm_decode_response(octets([0x80, 0x05])), None)
+    test.assert_eq(ftm_decode_response(octets([0x81, 0x05, 0x01])), None)
+
+@tier(app)
+fn exchange_pdus(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var s: gatt_server.GattServer, h: fitness_machine.FitnessMachineHandles, var state: fitness_machine.FitnessMachineState, first: sensor_client.ScStep) -> Int [mutate]
+    // The client's write reaches the server, the server's handler answers with the indication and the status
+    // notification, and the client takes them (and confirms the indication).
+    var seen = 0
+    var pending = first.pdus[:]
+    for _ in 0..12
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            list.append(next, gatt_server.receive_on(var s.db, var s.link, 0, item[:], 0))
+            if list.len(gatt_server.take_changed(var s.link)) > 0
+                list.append(next, fitness_machine.fitness_handle_control_point(var s.db, var s.link, h, var state, 0))
+        pending = []
+        for p in next
+            let step = sensor_client.sc_on_pdu(var t, var c, p[:], 0)
+            list.append(pending, step.pdus[:])
+            seen = seen | step.event
+    seen
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-006")
+fn test_session_drives_a_trainer_through_request_control_and_target_power()
+    if not fixtures.client_engine_present()
+        return
+    var s = gatt_server.new_server([], 65)
+    let config = fitness_machine.default_indoor_bike_config(
+        fitness_machine.MACHINE_CADENCE | fitness_machine.MACHINE_POWER_MEASUREMENT, fitness_machine.TARGET_POWER)
+    let h = fitness_machine.add_fitness_machine_service(var s.db, config)!
+    var state = fitness_machine.fitness_state_for(config)
+    fitness_machine.secure(var s)
+    let both = sensor_client.test_open(fitness_machine.UUID_FITNESS_MACHINE_SERVICE)
+    var t = both.0
+    var c = ftm_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ftm_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(seen[1], fitness_machine.UUID_FITNESS_MACHINE_FEATURE)
+    // Data from the trainer reaches the decoder.
+    let data = fitness_machine.IndoorBikeData {
+        speed: 3000, average_speed: -1, cadence: 180, average_cadence: -1, total_distance: -1, has_power: true, power: 210,
+        average_power: -1, has_energy: false, energy: fitness_machine.ExpendedEnergy { total: 0, per_hour: 0, per_minute: 0 },
+        heart_rate: -1, elapsed_time: -1, remaining_time: -1 }
+    let ev = sensor_client.test_deliver(var t, var c, fitness_machine.indoor_bike_notify(var s.db, var s.link, h, data, 0))
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    let d = must_bike(sensor_client.sc_value(c))
+    test.assert_eq(d.speed, 3000)
+    test.assert_eq(d.cadence, 180)
+    test.assert_eq(d.power, 210)
+    // Target power before control is refused, Request Control is granted, then the target is set.
+    let denied = exchange_pdus(var t, var c, var s, h, var state, ftm_client_write(var t, var c, ftm_req_set_target_power(200), 0))
+    test.assert((denied & sensor_client.SE_INDICATION) != 0)
+    match ftm_decode_response(sensor_client.sc_value(c))
+        None => test.fail("the refusal")
+        Some(r) => test.assert_eq(r.result, RESULT_CONTROL_NOT_PERMITTED)
+    let _ = exchange_pdus(var t, var c, var s, h, var state, ftm_client_write(var t, var c, ftm_req_request_control(), 0))
+    match ftm_decode_response(sensor_client.sc_value(c))
+        None => test.fail("the grant")
+        Some(r) => test.assert(ftm_succeeded(r))
+    let _ = exchange_pdus(var t, var c, var s, h, var state, ftm_client_write(var t, var c, ftm_req_set_target_power(200), 0))
+    test.assert_eq(state.target_power, 200)
+    let _ = exchange_pdus(var t, var c, var s, h, var state, ftm_client_write(var t, var c, ftm_req_start_or_resume(), 0))
+    test.assert(state.running)

@@ -1,0 +1,152 @@
+// tests/device_information_tests.nv — the unit tests of src/device_information.nv.
+//
+//   novo test tests/device_information_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use device_information.{ DeviceInformation, DeviceInformationHandles, PNP_SOURCE_BLUETOOTH_SIG, PNP_SOURCE_USB_IF, add_device_information_service, empty_device_information, pnp_id_value, system_id_value }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn text(s: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(s)
+        list.push(out, str.byte_at(s, i) as u8)
+    out
+
+fn zero_handles() -> DeviceInformationHandles
+    DeviceInformationHandles { service: 0, manufacturer: 0, model: 0, serial: 0, hardware: 0, firmware: 0, software: 0, system_id: 0, pnp_id: 0 }
+
+fn added(var s: GattServer, info: DeviceInformation) -> DeviceInformationHandles
+    match add_device_information_service(var s.db, info)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            zero_handles()
+
+fn full_information() -> DeviceInformation
+    full_information_at(gatt_server.Access.Open)
+
+fn full_information_at(read: gatt_server.Access) -> DeviceInformation
+    DeviceInformation {
+        read: read, manufacturer: text("Novo"), model: text("N-1"), serial: text("SN0042"), hardware: text("rev B"),
+        firmware: text("1.2.3"), software: text("2.0"), system_id: system_id_value(0x0102030405, 0xA1B2C3),
+        pnp_id: pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100) }
+
+fn read_value(var s: GattServer, handle: Int) -> [u8]
+    let out = gatt_server.receive(var s.db, var s.link, octets([0x0A, handle & 0xFF, handle >>> 8]), 0)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][0] as Int, 0x0B)
+    out[0][1:]
+
+@test
+fn test_value_encodings()
+    test.assert(gatt_server.same_bytes(system_id_value(0x0102030405, 0xA1B2C3), octets([5, 4, 3, 2, 1, 0xC3, 0xB2, 0xA1])))
+    test.assert(gatt_server.same_bytes(pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100), octets([2, 0x15, 0x19, 0x0F, 0x52, 0x00, 0x01])))
+
+@test
+fn test_full_layout_and_permissions()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, full_information())
+    // The service, then a declaration and a value for each of eight characteristics.
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.manufacturer, 3)
+    test.assert_eq(h.model, 5)
+    test.assert_eq(h.serial, 7)
+    test.assert_eq(h.hardware, 9)
+    test.assert_eq(h.firmware, 11)
+    test.assert_eq(h.software, 13)
+    test.assert_eq(h.system_id, 15)
+    test.assert_eq(h.pnp_id, 17)
+    test.assert_eq(gatt_server.last_handle(s.db), 17)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 17)
+    test.assert(gatt_server.same_bytes(s.db.attributes[0].value, octets([0x0A, 0x18])))
+    // Declarations: Read only, naming the value handle and the UUID.
+    test.assert(gatt_server.same_bytes(s.db.attributes[1].value, octets([0x02, 0x03, 0x00, 0x29, 0x2A])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[15].value, octets([0x02, 0x11, 0x00, 0x50, 0x2A])))
+    // Every value is read-only, and the service has no descriptor.
+    for i in 0..list.len(s.db.attributes)
+        let a = s.db.attributes[i]
+        test.assert_eq(a.permissions, gatt_server.PERM_READ)
+        test.assert(a.handle > 0)
+        test.assert(not gatt_server.is_type(a, gatt_server.UUID_CLIENT_CHARACTERISTIC_CONFIGURATION))
+
+@test
+fn test_reads_through_the_server()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, full_information())
+    test.assert(gatt_server.same_bytes(read_value(s, h.manufacturer), text("Novo")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.model), text("N-1")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.serial), text("SN0042")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.hardware), text("rev B")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.firmware), text("1.2.3")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.software), text("2.0")))
+    test.assert(gatt_server.same_bytes(read_value(s, h.system_id), system_id_value(0x0102030405, 0xA1B2C3)))
+    test.assert(gatt_server.same_bytes(read_value(s, h.pnp_id), pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100)))
+    // A write is refused on a read-only value, as a request and as a command.
+    let refused = gatt_server.receive(var s.db, var s.link, octets([0x12, h.model & 0xFF, h.model >>> 8, 0x41]), 0)
+    test.assert(gatt_server.same_bytes(refused[0], octets([0x01, 0x12, h.model & 0xFF, h.model >>> 8, att.ATT_ERR_WRITE_NOT_PERMITTED])))
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, octets([0x52, h.model & 0xFF, h.model >>> 8, 0x41]), 0)), 0)
+    test.assert(gatt_server.same_bytes(read_value(s, h.model), text("N-1")))
+    // A subscription has nothing to attach to: the characteristic carries no descriptor.
+    let info = gatt_server.receive(var s.db, var s.link, octets([0x04, h.model & 0xFF, h.model >>> 8, h.model & 0xFF, h.model >>> 8]), 0)
+    test.assert_eq(info[0][0] as Int, 0x05)
+    // Discovery finds the service by its UUID, and the group is the whole service.
+    let found = gatt_server.receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x0A, 0x18]), 0)
+    test.assert(gatt_server.same_bytes(found[0], octets([0x07, 0x01, 0x00, 0x11, 0x00])))
+
+@test
+fn test_empty_values_leave_characteristics_out()
+    var s = gatt_server.new_server([], 65)
+    let info = DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: text("Novo"), model: [], serial: [], hardware: [], firmware: [], software: [], system_id: [],
+        pnp_id: pnp_id_value(PNP_SOURCE_BLUETOOTH_SIG, 0x0059, 1, 1) }
+    let h = added(var s, info)
+    test.assert_eq(h.manufacturer, 3)
+    test.assert_eq(h.model, 0)
+    test.assert_eq(h.serial, 0)
+    test.assert_eq(h.system_id, 0)
+    test.assert_eq(h.pnp_id, 5)
+    test.assert_eq(list.len(s.db.attributes), 5)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 5)
+    // A service with no characteristic is a bare declaration.
+    var bare = gatt_server.new_server([], 65)
+    let b = added(var bare, empty_device_information())
+    test.assert_eq(b.service, 1)
+    test.assert_eq(list.len(bare.db.attributes), 1)
+
+@test
+fn test_a_long_value_is_refused()
+    var s = gatt_server.new_server([], 65)
+    var long: [u8] = []
+    for _ in 0..600
+        list.push(long, 'x')
+    let info = DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: [], model: [], serial: long, hardware: [], firmware: [], software: [], system_id: [], pnp_id: [] }
+    match add_device_information_service(var s.db, info)
+        Ok(_) => test.fail("a 600 octet value does not fit an attribute")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+fn test_every_value_takes_the_access_chosen()
+    var enc = gatt_server.new_server([], 65)
+    let h = added(var enc, full_information_at(gatt_server.Access.Encrypted))
+    test.assert_eq(enc.db.attributes[2].permissions, gatt_server.PERM_READ_ENCRYPT)
+    let clear = gatt_server.receive(var enc.db, var enc.link, octets([0x0A, h.model, 0]), 0)
+    test.assert_eq(clear[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var enc.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var enc.db, var enc.link, octets([0x0A, h.model, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var enc.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert(gatt_server.same_bytes(read_value(enc, h.model), text("N-1")))
+    var sc = gatt_server.new_server([], 65)
+    let hs = added(var sc, full_information_at(gatt_server.Access.SecureConnections))
+    gatt_server.set_security(var sc.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var sc.db, var sc.link, octets([0x0A, hs.model, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var sc.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert(gatt_server.same_bytes(read_value(sc, hs.model), text("N-1")))

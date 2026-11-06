@@ -1,0 +1,269 @@
+// src/hid.nv — the HID Service (0x1812), HID over GATT.
+//
+// The service lets a device present itself to a host as a keyboard, a
+// mouse or another human interface device. Its characteristics, in the
+// order the builder adds them:
+//
+//   Protocol Mode            0x2A4E   Read, Write Without Response; 0 boot, 1 report
+//   Report Map               0x2A4B   Read; the HID report descriptor
+//   HID Information          0x2A4A   Read; bcdHID, country code, flags
+//   HID Control Point        0x2A4C   Write Without Response; 0 suspend, 1 exit suspend
+//   Report                   0x2A4D   one per report: an Input report reads
+//                                     and notifies, an Output report reads and
+//                                     writes, a Feature report reads and writes;
+//                                     each has a Report Reference descriptor
+//                                     (0x2908) holding the report ID and type
+//                                     and an Input report a Client
+//                                     Characteristic Configuration descriptor
+//   Boot Keyboard Input      0x2A22   Read, Notify, with its configuration descriptor
+//   Boot Keyboard Output     0x2A32   Read, Write, Write Without Response
+//
+// The boot reports are added when `HidConfig.boot_keyboard` is set.
+// `HidConfig.values` is the access to the report values, to the Protocol
+// Mode and, for writing, to the Control Point; the Report Map and HID
+// Information are readable on any link. `HidConfig.cccd` is the access to
+// the Client Characteristic Configuration descriptors, and an Input report
+// is notified only while the link grants the write of its descriptor, so a
+// host cannot subscribe to keystrokes on a link that does not meet it.
+//
+// `add_hid_device` adds a Device Information Service and a Battery Service
+// before the HID Service, the companions a host expects of a keyboard.
+
+use gatt_server
+use profile_builder
+use battery
+use device_information
+
+const UUID_HID_SERVICE = 0x1812
+const UUID_HID_INFORMATION = 0x2A4A
+const UUID_REPORT_MAP = 0x2A4B
+const UUID_HID_CONTROL_POINT = 0x2A4C
+const UUID_REPORT = 0x2A4D
+const UUID_PROTOCOL_MODE = 0x2A4E
+const UUID_BOOT_KEYBOARD_INPUT_REPORT = 0x2A22
+const UUID_BOOT_KEYBOARD_OUTPUT_REPORT = 0x2A32
+
+// Protocol Mode values.
+pub const PROTOCOL_MODE_BOOT = 0
+// The Protocol Mode value for Report Protocol Mode, the mode in which the Report characteristics carry data.
+pub const PROTOCOL_MODE_REPORT = 1
+
+// HID Control Point values.
+const CONTROL_POINT_SUSPEND = 0
+const CONTROL_POINT_EXIT_SUSPEND = 1
+
+// The flags octet of HID Information.
+const HID_FLAG_REMOTE_WAKE = 0x01
+const HID_FLAG_NORMALLY_CONNECTABLE = 0x02
+
+// The type a Report Reference descriptor names.
+enum ReportKind
+    Input
+    Output
+    Feature
+
+// The octet a Report Reference descriptor holds for the report type.
+fn report_type_value(kind: ReportKind) -> Int
+    match kind
+        Input => 1
+        Output => 2
+        Feature => 3
+
+// The properties of a Report characteristic of that type.
+fn report_properties(kind: ReportKind) -> Int
+    match kind
+        Input => gatt_server.PROP_READ | gatt_server.PROP_NOTIFY
+        Output => gatt_server.PROP_READ | gatt_server.PROP_WRITE | gatt_server.PROP_WRITE_WO_RESP
+        Feature => gatt_server.PROP_READ | gatt_server.PROP_WRITE
+
+// One report the service offers: its report ID (0 when the report map
+// uses none), its type and the length of its value in octets.
+struct HidReport
+    id: Int
+    kind: ReportKind
+    size: Int
+
+// The configuration of the service: the HID specification release
+// `bcd_hid` (0x0111 is 1.11), the `country_code`, the flags of HID
+// Information, the report descriptor `report_map`, the `reports` the
+// descriptor defines, whether the boot keyboard reports are present, the
+// access a client needs to the report values and the access to the
+// configuration descriptors.
+struct HidConfig
+    bcd_hid: Int
+    country_code: Int
+    flags: Int
+    report_map: [u8]
+    reports: [HidReport]
+    boot_keyboard: Bool
+    values: gatt_server.Permissions
+    cccd: gatt_server.Permissions
+
+// The handles of one Report characteristic. `cccd` is 0 for a report that
+// is not an Input report.
+struct HidReportHandles
+    id: Int
+    kind: ReportKind
+    value: Int
+    reference: Int
+    cccd: Int
+
+// The handles of the service, in the order of `HidConfig.reports`. The
+// two boot handles and `boot_input_cccd` are 0 without the boot keyboard.
+struct HidHandles
+    service: Int
+    protocol_mode: Int
+    report_map: Int
+    information: Int
+    control_point: Int
+    reports: [HidReportHandles]
+    boot_input: Int
+    boot_input_cccd: Int
+    boot_output: Int
+
+fn zeros(n: Int) -> [u8]
+    var out: [u8] = []
+    for _ in 0..n
+        list.push(out, 0)
+    out
+
+// The HID Information value: bcdHID, country code and flags.
+fn hid_information_value(bcd_hid: Int, country_code: Int, flags: Int) -> [u8]
+    [(bcd_hid & 0xFF) as u8, ((bcd_hid >>> 8) & 0xFF) as u8, country_code as u8, flags as u8]
+
+// Add one Report characteristic with its Report Reference descriptor and,
+// for an Input report, its configuration descriptor.
+fn add_report(var db: GattDb, report: HidReport, config: HidConfig) -> Result<HidReportHandles, profile_builder.ProfileError>
+    if report.size < 1
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let permissions = match report.kind
+        Input => profile_builder.read_only(config.values.read)
+        Output => config.values
+        Feature => config.values
+    let value = profile_builder.add_value(var db, report_properties(report.kind), permissions, gatt_server.le16(UUID_REPORT), zeros(report.size))!
+    let reference = profile_builder.add_descriptor(var db, profile_builder.read_only(config.values.read),
+        profile_builder.UUID_REPORT_REFERENCE, [report.id as u8, report_type_value(report.kind) as u8])!
+    let cccd = match report.kind
+        Input => profile_builder.add_cccd(var db, config.cccd)!
+        Output => 0
+        Feature => 0
+    Ok(HidReportHandles { id: report.id, kind: report.kind, value: value, reference: reference, cccd: cccd })
+
+// Add the HID Service after the last attribute of `server`.
+fn add_hid_service(var db: GattDb, config: HidConfig) -> Result<HidHandles, profile_builder.ProfileError>
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_HID_SERVICE))!
+    let protocol_mode = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE_WO_RESP,
+        config.values, gatt_server.le16(UUID_PROTOCOL_MODE), [PROTOCOL_MODE_REPORT])!
+    let report_map = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(UUID_REPORT_MAP), config.report_map)!
+    let information = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(UUID_HID_INFORMATION), hid_information_value(config.bcd_hid, config.country_code, config.flags))!
+    let control_point = profile_builder.add_value(var db, gatt_server.PROP_WRITE_WO_RESP, profile_builder.write_only(config.values.write),
+        gatt_server.le16(UUID_HID_CONTROL_POINT), [CONTROL_POINT_SUSPEND])!
+    var reports: [HidReportHandles] = []
+    for report in config.reports
+        list.push(reports, add_report(var db, report, config)!)
+    var boot_input = 0
+    var boot_input_cccd = 0
+    var boot_output = 0
+    if config.boot_keyboard
+        boot_input = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, profile_builder.read_only(config.values.read),
+            gatt_server.le16(UUID_BOOT_KEYBOARD_INPUT_REPORT), zeros(BOOT_KEYBOARD_REPORT_SIZE))!
+        boot_input_cccd = profile_builder.add_cccd(var db, config.cccd)!
+        boot_output = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE | gatt_server.PROP_WRITE_WO_RESP,
+            config.values, gatt_server.le16(UUID_BOOT_KEYBOARD_OUTPUT_REPORT), zeros(1))!
+    Ok(HidHandles {
+        service: service, protocol_mode: protocol_mode, report_map: report_map, information: information,
+        control_point: control_point, reports: reports, boot_input: boot_input, boot_input_cccd: boot_input_cccd,
+        boot_output: boot_output })
+
+// The boot keyboard input report is 8 octets: modifier keys, a reserved
+// octet and six key codes.
+pub const BOOT_KEYBOARD_REPORT_SIZE = 8
+
+// The Protocol Mode the host wrote.
+fn hid_protocol_mode(db: GattDb, handles: HidHandles) -> Int
+    let i = gatt_server.index_of(db, handles.protocol_mode)
+    if i < 0 then PROTOCOL_MODE_REPORT else db.attributes[i].value[0] as Int
+
+// Store `data` as the Input report `id` and answer the notification PDUs:
+// none when the host has not enabled them or the service has no such report.
+fn hid_send_report(var db: GattDb, var link: AttLink, handles: HidHandles, id: Int, data: [u8], now_ms: Int) -> [[u8]]
+    for r in handles.reports
+        if r.id == id and r.kind == ReportKind.Input
+            let _ = gatt_server.set_value(var db, r.value, data)
+            return gatt_server.send_value(var db, var link, r.value, now_ms)
+    []
+
+// The same for the Boot Keyboard Input Report.
+fn hid_send_boot_input(var db: GattDb, var link: AttLink, handles: HidHandles, data: [u8], now_ms: Int) -> [[u8]]
+    if handles.boot_input == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.boot_input, data)
+    gatt_server.send_value(var db, var link, handles.boot_input, now_ms)
+
+// ── An example: a keyboard with consumer control keys ───────────────
+//
+// The report descriptor defines two top-level collections. Report 1 is the
+// keyboard: an input of one octet of modifier keys, one reserved octet and
+// six key codes, and an output of five LED bits padded to an octet. Report
+// 2 is the consumer control: one 16-bit usage, 0 to 0x03FF, as an input.
+fn keyboard_consumer_report_map() -> [u8]
+    [
+        // Usage Page (Generic Desktop), Usage (Keyboard), Collection (Application), Report ID (1)
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
+        // Usage Page (Keyboard), Usage Minimum (224), Usage Maximum (231), Logical 0..1
+        0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+        // Report Size (1), Report Count (8), Input (Data, Variable, Absolute): the modifier keys
+        0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+        // Report Count (1), Report Size (8), Input (Constant): the reserved octet
+        0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+        // Report Count (5), Report Size (1), Usage Page (LEDs), Usage Minimum (1), Usage Maximum (5), Output: the LEDs
+        0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
+        // Report Count (1), Report Size (3), Output (Constant): the LED padding
+        0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
+        // Report Count (6), Report Size (8), Logical 0..101, Usage Page (Keyboard), Usage 0..101, Input (Data, Array): the key codes
+        0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+        0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+        // End Collection
+        0xC0,
+        // Usage Page (Consumer), Usage (Consumer Control), Collection (Application), Report ID (2)
+        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x02,
+        // Logical 0..0x03FF, Usage 0..0x03FF, Report Size (16), Report Count (1), Input (Data, Array)
+        0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03,
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+        // End Collection
+        0xC0]
+
+// The report IDs of the example.
+const KEYBOARD_REPORT_ID = 1
+const CONSUMER_REPORT_ID = 2
+
+// The configuration for the example report map: HID 1.11, no country,
+// normally connectable, the boot keyboard present. The report values need
+// `access` to read and to write, and so does writing a configuration
+// descriptor, which any client may read.
+pub fn keyboard_consumer_config(access: gatt_server.Access) -> HidConfig
+    HidConfig {
+        bcd_hid: 0x0111, country_code: 0, flags: HID_FLAG_NORMALLY_CONNECTABLE,
+        report_map: keyboard_consumer_report_map(),
+        reports: [
+            HidReport { id: KEYBOARD_REPORT_ID, kind: ReportKind.Input, size: 8 },
+            HidReport { id: KEYBOARD_REPORT_ID, kind: ReportKind.Output, size: 1 },
+            HidReport { id: CONSUMER_REPORT_ID, kind: ReportKind.Input, size: 2 }],
+        boot_keyboard: true, values: gatt_server.both_ways(access),
+        cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: access } }
+
+// The handles of a device built by `add_hid_device`.
+struct HidDeviceHandles
+    information: DeviceInformationHandles
+    battery: BatteryHandles
+    hid: HidHandles
+
+// Add a Device Information Service, a Battery Service and the HID Service,
+// in that order.
+fn add_hid_device(var db: GattDb, info: DeviceInformation, battery_config: BatteryConfig, config: HidConfig) -> Result<HidDeviceHandles, profile_builder.ProfileError>
+    let information = device_information.add_device_information_service(var db, info)!
+    let battery = battery.add_battery_service(var db, battery_config)!
+    let hid = add_hid_service(var db, config)!
+    Ok(HidDeviceHandles { information: information, battery: battery, hid: hid })

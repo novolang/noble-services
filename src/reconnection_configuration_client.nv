@@ -1,0 +1,394 @@
+// src/reconnection_configuration_client.nv — the client of the Reconnection
+// Configuration Service (0x1829): the decoders of RC Feature, RC Settings and the
+// Control Point responses, the builders of the Control Point requests, and the client
+// session.
+//
+//   RC Feature                   0x2B1D   decoded by `rc_decode_feature`
+//   RC Settings                  0x2B1E   decoded by `rc_decode_settings`
+//   Reconnection Configuration
+//   Control Point                0x2B1F   requests built by `rc_request*`, indications
+//                                         decoded by `rc_decode_response`
+//
+// RC Feature ([RCS] 3.1) is the E2E-CRC field (two octets, 0xFFFF without E2E-CRC) and the
+// Feature field of three octets plus one octet for every Feature Extension: bit 23 of the
+// field, and bit 7 of an extension octet, say another octet follows.  The value is exactly
+// that long.  With E2E-CRC supported (bit 0) the CRC is the one of `reconnection_configuration.crc16`
+// over the Feature field.  A bit that is reserved (18 to 22) is kept and told by
+// `rc_feature_reserved`; the extension octets are counted and not read.
+//
+// RC Settings ([RCS] 3.2) is the Length octet (the size of the whole value), the Settings
+// field of two or more octets and, with E2E-CRC, the CRC over the octets before it.  The
+// client passes whether the peer supports E2E-CRC, which RC Feature says.  Octets of the
+// Settings field after the second are not read.
+//
+// A Control Point request is the opcode, its operand and, with E2E-CRC, the CRC over both
+// ([RCS] 3.3 and Table 3.7); the builders take `e2e` and answer `None` for an operand outside
+// its range.  A response is an indication of the same shape.  `rc_decode_response` answers
+// the four kinds of Table 3.7 (Procedure Response, Communication Parameter Response, Filter
+// Accept List Timer Response and Client Parameter Indication) with the fields of each, and
+// `None` for a CRC that does not match, a length other than the kind has, a reserved opcode,
+// result code or request opcode, and a parameter outside the range of Table 3.8 (0xFFFF
+// keeps the parameter and stands for one the device does not support).
+//
+// The E2E-CRC errors 0x80 (Missing CRC) and 0x81 (Invalid CRC) and the other ATT errors of a
+// request arrive as the status of the write; `rc_error_kind` names them.
+//
+// The decoders allocate nothing and keep no state.  The session (`rc_client_*`) runs on
+// `sensor_client.nv`: discover the service, read RC Feature (required) and RC Settings,
+// enable the indication of RC Feature, the notification of RC Settings and the indication of
+// the Control Point, each optional where Table 3.1 makes the characteristic optional;
+// `rc_client_write` writes a request.
+//
+// Satisfies: REQ-BLE-PRFC-019.
+
+use att
+use gatt_client
+use gatt_server
+use links
+use reconnection_configuration
+use sensor_client
+use wire
+
+// The kinds of a Control Point indication.
+const RC_RESP_PROCEDURE = 1
+const RC_RESP_PARAMETERS = 2
+const RC_RESP_FILTER_TIMER = 3
+const RC_RESP_CLIENT = 4
+
+// The sizes of the values, in octets.
+const RC_PARAMETER_OCTETS = 16
+const RC_FEATURE_FIELD_MIN = 3
+const RC_SETTINGS_MIN = 3
+
+// What an ATT error of a request means.
+const RC_ERR_NONE = 0
+const RC_ERR_MISSING_CRC = 1
+const RC_ERR_INVALID_CRC = 2
+const RC_ERR_AUTHORIZATION = 3
+const RC_ERR_IN_PROGRESS = 4
+const RC_ERR_CCCD = 5
+const RC_ERR_OTHER = 6
+
+// The Feature field the peer reports: the bits of Table 3.3 (bits 0 to 22 and 23 for the extension), the
+// number of extension octets and whether the peer supports E2E-CRC.
+@value
+struct RcFeature
+    features: Int
+    extension: Int
+    e2e: Bool
+
+// The settings of RC Settings: the bits of Table 3.5 and the Advertisement Mode (0 to 3 for the
+// configurations 1 to 4).
+@value
+struct RcSettings
+    lesc_only: Bool
+    use_oob: Bool
+    ready_for_disconnect: Bool
+    limited_access: Bool
+    access_permitted: Bool
+    adv_mode: Int
+
+// The eight parameters of Table 3.8 in the order of the table; 0xFFFF is "keep" or "not supported".
+@value
+struct RcParameters
+    reconnection_timeout: Int
+    min_interval: Int
+    max_interval: Int
+    latency: Int
+    supervision_timeout: Int
+    adv_interval: Int
+    adv_count: Int
+    adv_repetition: Int
+
+// One decoded Control Point indication.  `kind` is one of the `RC_RESP_` values.  A Procedure
+// Response holds `request` and `result`, and `fields` (the bits of the parameter fields at fault)
+// for the results 0x05 and 0x06, -1 otherwise.  A parameter response holds `parameters`, and
+// `request` for kind `RC_RESP_PARAMETERS`.  A Filter Accept List Timer Response holds the three
+// values in seconds.
+@value
+struct RcResponse
+    kind: Int
+    request: Int
+    result: Int
+    fields: Int
+    parameters: RcParameters
+    timer: Int
+    timer_min: Int
+    timer_max: Int
+
+@tier(embedded)
+@no_alloc
+fn rc_none_parameters() -> RcParameters
+    RcParameters {
+        reconnection_timeout: reconnection_configuration.KEEP, min_interval: reconnection_configuration.KEEP,
+        max_interval: reconnection_configuration.KEEP, latency: reconnection_configuration.KEEP,
+        supervision_timeout: reconnection_configuration.KEEP, adv_interval: reconnection_configuration.KEEP,
+        adv_count: reconnection_configuration.KEEP, adv_repetition: reconnection_configuration.KEEP }
+
+// The CRC of the first `n` octets of `b`: the E2E-CRC of [RCS] 3.4.
+@tier(embedded)
+@no_alloc
+fn rc_crc(b: [u8], n: Int) -> Int
+    var c = 0xFFFF
+    for i in 0..n
+        c = c ^ (b[i] as Int)
+        for _ in 0..8
+            if (c & 1) != 0
+                c = (c >>> 1) ^ 0x8408
+            else
+                c = c >>> 1
+    c
+
+// The RC Feature in `b`, `None` for a value that is not the CRC field and the Feature field with the
+// extension its bits name, for a CRC field that is not 0xFFFF without E2E-CRC, and for a CRC that does
+// not match with it.
+@tier(embedded)
+@no_alloc
+fn rc_decode_feature(b: [u8]) -> ?RcFeature
+    let n = list.len(b)
+    if n < 2 + RC_FEATURE_FIELD_MIN
+        return None
+    let features = wire.get(b, 2, 3)
+    var ext = 0
+    if (features & reconnection_configuration.F_EXTENSION) != 0
+        var more = true
+        for _ in 0..(n - 5)
+            if more
+                if 5 + ext >= n
+                    return None
+                ext = ext + 1
+                more = ((b[4 + ext] as Int) & 0x80) != 0
+        if more
+            return None
+    if n != 5 + ext
+        return None
+    let e2e = (features & reconnection_configuration.F_E2E_CRC) != 0
+    let crc = wire.get(b, 0, 2)
+    if e2e
+        if crc != rc_crc(b[2:n], n - 2)
+            return None
+    else if crc != 0xFFFF
+        return None
+    Some(RcFeature { features: features, extension: ext, e2e: e2e })
+
+// Whether the Feature holds a reserved bit (18 to 22).
+@tier(embedded)
+@no_alloc
+fn rc_feature_reserved(f: RcFeature) -> Bool
+    (f.features & 0x7C0000) != 0
+
+// Whether the peer supports the procedure `op` (Table 3.7).
+@tier(embedded)
+@no_alloc
+fn rc_supports(f: RcFeature, op: Int) -> Bool
+    reconnection_configuration.rcs_supported(f.features, op)
+
+// Whether the peer has the RC Settings characteristic (Table 3.1) and the Control Point.
+@tier(embedded)
+@no_alloc
+fn rc_has_settings(f: RcFeature) -> Bool
+    reconnection_configuration.rcs_has_settings(f.features)
+
+@tier(embedded)
+@no_alloc
+fn rc_has_control_point(f: RcFeature) -> Bool
+    reconnection_configuration.rcs_has_control_point(f.features)
+
+// The RC Settings in `b` for a peer with (`e2e`) or without E2E-CRC: `None` for a value shorter than the
+// Length, the Settings field and the CRC, for a Length other than the size of the value, and for a CRC that
+// does not match.
+@tier(embedded)
+@no_alloc
+fn rc_decode_settings(b: [u8], e2e: Bool) -> ?RcSettings
+    let n = list.len(b)
+    let least = if e2e then RC_SETTINGS_MIN + 2 else RC_SETTINGS_MIN
+    if n < least or (b[0] as Int) != n
+        return None
+    if e2e and wire.get(b, n - 2, 2) != rc_crc(b, n - 2)
+        return None
+    let s0 = b[1] as Int
+    let s1 = b[2] as Int
+    Some(RcSettings {
+        lesc_only: (s0 & reconnection_configuration.S_LESC_ONLY) != 0, use_oob: (s0 & reconnection_configuration.S_USE_OOB) != 0,
+        ready_for_disconnect: (s0 & reconnection_configuration.S_READY_FOR_DISCONNECT) != 0,
+        limited_access: (s0 & reconnection_configuration.S_LIMITED_ACCESS) != 0,
+        access_permitted: (s0 & reconnection_configuration.S_ACCESS_PERMITTED) != 0, adv_mode: s1 & 3 })
+
+// The parameters of the 16 octets of `b` from `at`, `None` for one outside the range of Table 3.8.
+@tier(embedded)
+@no_alloc
+fn rc_parameters_at(b: [u8], at: Int) -> ?RcParameters
+    for f in 0..reconnection_configuration.PARAMETERS
+        if not reconnection_configuration.rcs_field_in_range(f, wire.get(b, at + 2 * f, 2))
+            return None
+    Some(RcParameters {
+        reconnection_timeout: wire.get(b, at, 2), min_interval: wire.get(b, at + 2, 2), max_interval: wire.get(b, at + 4, 2),
+        latency: wire.get(b, at + 6, 2), supervision_timeout: wire.get(b, at + 8, 2), adv_interval: wire.get(b, at + 10, 2),
+        adv_count: wire.get(b, at + 12, 2), adv_repetition: wire.get(b, at + 14, 2) })
+
+// Whether `op` is an opcode a client writes: 0x00 to 0x0C.
+@tier(embedded)
+@no_alloc
+fn rc_request_opcode(op: Int) -> Bool
+    op >= reconnection_configuration.OP_ENABLE_DISCONNECT and op <= reconnection_configuration.OP_LIMITED_ACCESS
+
+// The Control Point indication in `b` for a peer with (`e2e`) or without E2E-CRC, `None` as the header says.
+@tier(embedded)
+@no_alloc
+fn rc_decode_response(b: [u8], e2e: Bool) -> ?RcResponse
+    var n = list.len(b)
+    if e2e
+        if n < 3 or wire.get(b, n - 2, 2) != rc_crc(b, n - 2)
+            return None
+        n = n - 2
+    if n == 0
+        return None
+    let op = b[0] as Int
+    let none = rc_none_parameters()
+    if op == reconnection_configuration.OP_PROCEDURE_RESPONSE
+        if n < 3 or not rc_request_opcode(b[1] as Int)
+            return None
+        let result = b[2] as Int
+        if result < reconnection_configuration.RESULT_SUCCESS or result > reconnection_configuration.RESULT_PROPOSAL_ACCEPTED
+            return None
+        let with_fields = result == reconnection_configuration.RESULT_OUT_OF_RANGE or result == reconnection_configuration.RESULT_INVALID_COMBINATION
+        if n != (if with_fields then 4 else 3)
+            return None
+        return Some(RcResponse {
+            kind: RC_RESP_PROCEDURE, request: b[1] as Int, result: result, fields: if with_fields then b[3] as Int else -1,
+            parameters: none, timer: 0, timer_min: 0, timer_max: 0 })
+    if op == reconnection_configuration.OP_PARAMETER_RESPONSE
+        let request = if n > 1 then b[1] as Int else 0
+        if n != 2 + RC_PARAMETER_OCTETS or (request != reconnection_configuration.OP_GET_MAX and request != reconnection_configuration.OP_GET_MIN and request != reconnection_configuration.OP_GET_STORED)
+            return None
+        let p = rc_parameters_at(b, 2)
+        if p == None
+            return None
+        return Some(RcResponse {
+            kind: RC_RESP_PARAMETERS, request: request, result: 0, fields: -1, parameters: p!,
+            timer: 0, timer_min: 0, timer_max: 0 })
+    if op == reconnection_configuration.OP_CLIENT_PARAMETERS
+        if n != 1 + RC_PARAMETER_OCTETS
+            return None
+        let p = rc_parameters_at(b, 1)
+        if p == None
+            return None
+        return Some(RcResponse {
+            kind: RC_RESP_CLIENT, request: 0, result: 0, fields: -1, parameters: p!,
+            timer: 0, timer_min: 0, timer_max: 0 })
+    if op == reconnection_configuration.OP_FILTER_TIMER_RESPONSE
+        if n != 13 or wire.get(b, 5, 4) > wire.get(b, 9, 4)
+            return None
+        return Some(RcResponse {
+            kind: RC_RESP_FILTER_TIMER, request: 0, result: 0, fields: -1, parameters: none,
+            timer: wire.get(b, 1, 4), timer_min: wire.get(b, 5, 4), timer_max: wire.get(b, 9, 4) })
+    None
+
+// `value` with the CRC appended for a peer with E2E-CRC.
+@tier(app)
+fn rc_framed(value: [u8], e2e: Bool) -> [u8]
+    if not e2e
+        return value[:]
+    var out: [u8] = value[:]
+    wire.put(var out, rc_crc(value, list.len(value)), 2)
+    out
+
+// The request for a procedure with no operand: Enable Disconnect, Get Actual Communication Parameters,
+// Get Max Values, Get Min Values and Get Filter Accept List Timer.  `None` for another opcode.
+@tier(app)
+fn rc_request(op: Int, e2e: Bool) -> ?[u8]
+    if reconnection_configuration.rcs_operand_length(op) != 0
+        return None
+    Some(rc_framed([op as u8], e2e))
+
+// The Propose Settings request for the eight parameters `v` (0xFFFF keeps one).  `None` for a list of
+// another length, a parameter outside its range, and a minimum connection interval above the maximum.
+@tier(app)
+fn rc_request_propose(v: [Int], e2e: Bool) -> ?[u8]
+    if list.len(v) != reconnection_configuration.PARAMETERS
+        return None
+    var out: [u8] = [reconnection_configuration.OP_PROPOSE_SETTINGS as u8]
+    for f in 0..reconnection_configuration.PARAMETERS
+        if not reconnection_configuration.rcs_field_in_range(f, v[f])
+            return None
+        wire.put(var out, v[f], 2)
+    let keep = reconnection_configuration.KEEP
+    if v[1] != keep and v[2] != keep and v[1] > v[2]
+        return None
+    Some(rc_framed(out, e2e))
+
+// The request of Activate Stored Settings (0x03) or Get Stored Values (0x06) for the Parameter-Set `set`
+// (0 to 255).  `None` for another opcode or a set outside the octet.
+@tier(app)
+fn rc_request_set(op: Int, set: Int, e2e: Bool) -> ?[u8]
+    if op != reconnection_configuration.OP_ACTIVATE_STORED and op != reconnection_configuration.OP_GET_STORED
+        return None
+    if set < 0 or set > 255
+        return None
+    Some(rc_framed([op as u8, set as u8], e2e))
+
+// The Set Filter Accept List Timer request for `seconds`: 0 disables the list, 0xFFFFFFFE mandates no
+// timeout.  `None` outside 32 bits and for the reserved value 0xFFFFFFFF.
+@tier(app)
+fn rc_request_filter_timer(seconds: Int, e2e: Bool) -> ?[u8]
+    if seconds < 0 or seconds >= 0xFFFFFFFF
+        return None
+    var out: [u8] = [reconnection_configuration.OP_SET_FILTER_TIMER as u8]
+    wire.put(var out, seconds, 4)
+    Some(rc_framed(out, e2e))
+
+// The Set Advertisement Configuration request for the configuration 1 to 4 ([RCS] Table 3.9).
+@tier(app)
+fn rc_request_advertisement(configuration: Int, e2e: Bool) -> ?[u8]
+    if configuration < 1 or configuration > 4
+        return None
+    Some(rc_framed([reconnection_configuration.OP_SET_ADVERTISEMENT as u8, (configuration - 1) as u8], e2e))
+
+// The request of Upgrade to LESC Only (0x0A), Switch OOB Pairing (0x0B) or Limited Access (0x0C): 0xFF for
+// `on`, 0x00 for off.  `None` for another opcode.
+@tier(app)
+fn rc_request_switch(op: Int, on: Bool, e2e: Bool) -> ?[u8]
+    if op < reconnection_configuration.OP_LESC_ONLY or op > reconnection_configuration.OP_LIMITED_ACCESS
+        return None
+    Some(rc_framed([op as u8, if on then 0xFF else 0x00], e2e))
+
+// What the ATT error `status` of a request means: one of the `RC_ERR_` values.
+@tier(embedded)
+@no_alloc
+fn rc_error_kind(status: Int) -> Int
+    if status == 0
+        return RC_ERR_NONE
+    if status == reconnection_configuration.ERR_MISSING_CRC
+        return RC_ERR_MISSING_CRC
+    if status == reconnection_configuration.ERR_INVALID_CRC
+        return RC_ERR_INVALID_CRC
+    if status == att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+        return RC_ERR_AUTHORIZATION
+    if status == 0xFE
+        return RC_ERR_IN_PROGRESS
+    if status == 0xFD
+        return RC_ERR_CCCD
+    RC_ERR_OTHER
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn rc_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, reconnection_configuration.UUID_RECONNECTION_CONFIGURATION_SERVICE)
+
+// Discover the service, read RC Feature (required) and RC Settings (optional), enable the indication of RC Feature, the
+// notification of RC Settings and the indication of the Control Point (each optional).
+@tier(app)
+fn rc_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, reconnection_configuration.UUID_RC_FEATURE, true)
+    sensor_client.sc_queue_read(var c, reconnection_configuration.UUID_RC_SETTINGS, false)
+    sensor_client.sc_queue_subscribe(var c, reconnection_configuration.UUID_RC_FEATURE, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, reconnection_configuration.UUID_RC_SETTINGS, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, reconnection_configuration.UUID_RC_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write a request built by one of the `rc_request` functions.  The session must have finished its plan.  The
+// response arrives as an indication of the Control Point.
+@tier(app)
+fn rc_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, reconnection_configuration.UUID_RC_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

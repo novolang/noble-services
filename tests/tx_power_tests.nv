@@ -1,0 +1,64 @@
+// tests/tx_power_tests.nv — the unit tests of src/tx_power.nv.
+//
+//   novo test tests/tx_power_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use fixtures.{ req }
+use tx_power.{ TpsConfig, add_tps_service, default_tps_config, set_tx_power }
+
+@test
+@satisfies("REQ-BLE-TPS-001")
+fn test_the_service_has_one_read_only_level_without_a_descriptor()
+    var s = gatt_server.new_server([], 65)
+    let h = add_tps_service(var s.db, default_tps_config(4))!
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.level, 3)
+    test.assert_eq(gatt_server.last_handle(s.db), 3)
+    test.assert_eq(s.db.attributes[0].value, [0x04, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 0x03, 0x00, 0x07, 0x2A])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 4])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-TPS-001")
+fn test_the_level_is_a_signed_octet_between_minus_100_and_plus_20()
+    var s = gatt_server.new_server([], 65)
+    let h = add_tps_service(var s.db, default_tps_config(-100))!
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 0x9C])
+    test.assert(set_tx_power(var s.db, h, 20))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 20])
+    test.assert(set_tx_power(var s.db, h, -8))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 0xF8])
+    // Outside the range the level stays.
+    test.assert(not set_tx_power(var s.db, h, 21))
+    test.assert(not set_tx_power(var s.db, h, -101))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 0xF8])
+    var r = gatt_server.new_server([], 65)
+    match add_tps_service(var r.db, default_tps_config(21))
+        Ok(_) => test.fail("a level above +20 is reserved")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    test.assert_eq(gatt_server.last_handle(r.db), 0)
+
+@test
+@satisfies("REQ-BLE-TPS-001")
+fn test_the_read_access_can_be_raised()
+    var s = gatt_server.new_server([], 65)
+    let h = add_tps_service(var s.db, TpsConfig { level: 0, read: gatt_server.Access.Authenticated })!
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 0])
+
+@test
+@satisfies("REQ-BLE-TPS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_tps_service(var s.db, default_tps_config(0))
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

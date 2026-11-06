@@ -1,0 +1,382 @@
+// tests/pulse_oximeter_tests.nv — the unit tests of src/pulse_oximeter.nv.
+//
+//   novo test tests/pulse_oximeter_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use fixtures.{ req, subscribe, read }
+use wire
+use pulse_oximeter.{ DEVICE_DEFINED, DEVICE_LOW_PERFUSION, DEVICE_POOR_SIGNAL, DEVICE_SENSOR_DISPLACED, FEATURE_FAST, FEATURE_MULTIPLE_BONDS, FEATURE_PULSE_AMPLITUDE_INDEX, FEATURE_SLOW, FEATURE_STORAGE, FEATURE_TIMESTAMP, PlxContinuous, PlxSpotCheck, PlxsConfig, STATUS_DATA_FROM_STORAGE, STATUS_FULLY_QUALIFIED_DATA, STATUS_SUPPORTABLE, STATUS_VALIDATED_DATA, UUID_RECORD_ACCESS_CONTROL_POINT, add_plxs_service, default_plxs_config, full_config, plx_continuous, plx_spot_check, plxs_continuous_valid, plxs_continuous_value, plxs_features_value, plxs_indicate_features, plxs_indicate_spot_check, plxs_notify_continuous, plxs_spot_check_valid, plxs_spot_check_value, plxs_supported_features, server, server_at, usual_spot_check }
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_service_lists_the_measurements_then_the_features_with_their_properties()
+    let (s, h) = server(default_plxs_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.spot_check, 3)
+    test.assert_eq(h.spot_check_cccd, 4)
+    test.assert_eq(h.continuous, 6)
+    test.assert_eq(h.continuous_cccd, 7)
+    test.assert_eq(h.features, 9)
+    test.assert_eq(h.features_cccd, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 9)
+    test.assert_eq(s.db.attributes[0].value, [0x22, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x20, 3, 0, 0x5E, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x10, 6, 0, 0x5F, 0x2A])
+    test.assert_eq(s.db.attributes[7].value, [0x02, 9, 0, 0x60, 0x2A])
+    // The Indicate property of PLX Features adds its descriptor.
+    let (t, g) = server(full_config())
+    test.assert_eq(g.features_cccd, 10)
+    test.assert_eq(t.db.attributes[7].value, [0x22, 9, 0, 0x60, 0x2A])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_one_measurement_is_enough_and_the_other_is_left_out()
+    let spot_only = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: false,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    let (s, h) = server(spot_only)
+    test.assert_eq(h.continuous, 0)
+    test.assert_eq(h.continuous_cccd, 0)
+    test.assert_eq(h.features, 6)
+    test.assert_eq(gatt_server.last_handle(s.db), 6)
+    let continuous_only = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    let (t, g) = server(continuous_only)
+    test.assert_eq(g.spot_check, 0)
+    test.assert_eq(g.continuous, 3)
+    test.assert_eq(g.features, 6)
+    // Indicating a measurement the service does not have sends nothing.
+    var u = t
+    test.assert_eq(list.len(plxs_indicate_spot_check(var u.db, var u.link, g, continuous_only, usual_spot_check(), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_features_value_has_two_four_five_or_seven_octets()
+    test.assert_eq(plxs_features_value(default_plxs_config()), [0x00, 0x00])
+    let ms = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: STATUS_FULLY_QUALIFIED_DATA, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_features_value(ms), [0x01, 0x00, 0x00, 0x01])
+    let ds = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: -1, device_status_support: DEVICE_SENSOR_DISPLACED, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_features_value(ds), [0x02, 0x00, 0x00, 0x20, 0x00])
+    // Both, in the order of the table: the features, the Measurement Status Support, the Device and Sensor Status Support.
+    test.assert_eq(plxs_features_value(full_config()), [0xFB, 0x00, 0x80, 0xC1, 0x30, 0x80, 0x00])
+    var (s, h) = server(full_config())
+    test.assert_eq(read(var s, h.features), [0x0B, 0xFB, 0x00, 0x80, 0xC1, 0x30, 0x80, 0x00])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_each_feature_sets_its_bit_and_the_storage_bit_is_never_set()
+    test.assert_eq(plxs_supported_features(default_plxs_config()), 0)
+    test.assert_eq(plxs_supported_features(full_config()), 0xFB)
+    test.assert_eq(plxs_supported_features(full_config()) & FEATURE_STORAGE, 0)
+    let ts = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: false,
+        measurement_status_support: -1, device_status_support: -1, timestamp: true,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_supported_features(ts), FEATURE_TIMESTAMP)
+    let fast = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: true, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_supported_features(fast), FEATURE_FAST)
+    let slow_pai_bonds = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: true, pulse_amplitude_index: true, multiple_bonds: true, features_indicate: false }
+    test.assert_eq(plxs_supported_features(slow_pai_bonds), FEATURE_SLOW | FEATURE_PULSE_AMPLITUDE_INDEX | FEATURE_MULTIPLE_BONDS)
+    // There is no Record Access Control Point, whatever the configuration.
+    let (s, _) = server(full_config())
+    for a in s.db.attributes
+        test.assert(not gatt_server.is_type(a, UUID_RECORD_ACCESS_CONTROL_POINT))
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_spot_check_value_has_the_flags_spo2_and_pulse_rate()
+    let plain = default_plxs_config()
+    test.assert_eq(plxs_spot_check_value(plain, usual_spot_check()), [0x00, 0x62, 0x00, 0x48, 0x00])
+    // 97.5 % and 61.5 beats per minute: mantissa and exponent.
+    let tenth = plx_spot_check(wire.sfloat(975, -1), wire.sfloat(615, -1))
+    test.assert_eq(plxs_spot_check_value(plain, tenth), [0x00, 0xCF, 0xF3, 0x67, 0xF2])
+    // A value the oximeter cannot give is the SFLOAT NaN.
+    let nan = plx_spot_check(wire.SFLOAT_NAN, wire.SFLOAT_NAN)
+    test.assert_eq(plxs_spot_check_value(plain, nan), [0x00, 0xFF, 0x07, 0xFF, 0x07])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_spot_check_value_adds_the_supported_fields_in_the_order_of_the_table()
+    let config = full_config()
+    let m = PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time(2026, 10, 27, 13, 5, 9), clock_not_set: false,
+        measurement_status: STATUS_FULLY_QUALIFIED_DATA | STATUS_VALIDATED_DATA, device_status: DEVICE_POOR_SIGNAL,
+        pulse_amplitude_index: wire.sfloat(55, -1) }
+    // Flags: time stamp, measurement status, device status, pulse amplitude index.
+    test.assert(plxs_spot_check_value(config, m) == [
+        0x0F, 0x62, 0x00, 0x48, 0x00, 0xEA, 0x07, 10, 27, 13, 5, 9, 0x80, 0x01, 0x10, 0x00, 0x00, 0x37, 0xF0])
+    // The clock flag, with the time stamp as it is when the clock is not set.
+    let unset = PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time_unknown(), clock_not_set: true,
+        measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.SFLOAT_NAN }
+    let v = plxs_spot_check_value(config, unset)
+    test.assert_eq(v[0] as Int, 0x1F)
+    test.assert_eq(v[5:12], [0, 0, 0, 0, 0, 0, 0])
+    // A service without the time stamp has no clock to be unset.
+    let no_clock = plxs_spot_check_value(default_plxs_config(), unset)
+    test.assert_eq(no_clock[0] as Int, 0)
+    test.assert_eq(list.len(no_clock), 5)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_status_bit_the_support_field_does_not_list_is_sent_as_zero()
+    let config = full_config()
+    // Everything set: only the supported bits (and none of the RFU ones) get through.
+    let m = PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time(2026, 1, 1, 0, 0, 0), clock_not_set: false,
+        measurement_status: 0xFFFF, device_status: 0xFFFFFF, pulse_amplitude_index: wire.sfloat(1, 0) }
+    let v = plxs_spot_check_value(config, m)
+    test.assert_eq(v[12:14], [0x80, 0xC1])
+    test.assert_eq(v[14:17], [0x30, 0x80, 0x00])
+    let c = PlxContinuous {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), fast_spo2: wire.sfloat(97, 0), fast_pulse_rate: wire.sfloat(73, 0),
+        slow_spo2: wire.sfloat(96, 0), slow_pulse_rate: wire.sfloat(71, 0), measurement_status: 0xFFFF, device_status: 0xFFFFFF,
+        pulse_amplitude_index: wire.sfloat(1, 0) }
+    let w = plxs_continuous_value(config, c)
+    test.assert_eq(w[13:15], [0x80, 0xC1])
+    test.assert_eq(w[15:18], [0x30, 0x80, 0x00])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_continuous_value_has_the_normal_pair_then_the_fast_and_slow_pairs()
+    let plain = default_plxs_config()
+    test.assert_eq(plxs_continuous_value(plain, plx_continuous(wire.sfloat(98, 0), wire.sfloat(72, 0))), [0x00, 0x62, 0x00, 0x48, 0x00])
+    let c = PlxContinuous {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), fast_spo2: wire.sfloat(97, 0), fast_pulse_rate: wire.sfloat(73, 0),
+        slow_spo2: wire.sfloat(96, 0), slow_pulse_rate: wire.sfloat(71, 0), measurement_status: STATUS_FULLY_QUALIFIED_DATA,
+        device_status: DEVICE_LOW_PERFUSION, pulse_amplitude_index: wire.sfloat(55, -1) }
+    // Flags 0x1F: fast, slow, measurement status, device status, pulse amplitude index.
+    test.assert(plxs_continuous_value(full_config(), c) == [
+        0x1F, 0x62, 0x00, 0x48, 0x00, 0x61, 0x00, 0x49, 0x00, 0x60, 0x00, 0x47, 0x00, 0x00, 0x01, 0x20, 0x00, 0x00, 0x37, 0xF0])
+    test.assert_eq(list.len(plxs_continuous_value(full_config(), c)), 20)
+    let fast_only = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: true, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_continuous_value(fast_only, c), [0x01, 0x62, 0x00, 0x48, 0x00, 0x61, 0x00, 0x49, 0x00])
+    let slow_only = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: false, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: true, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    test.assert_eq(plxs_continuous_value(slow_only, c), [0x02, 0x62, 0x00, 0x48, 0x00, 0x60, 0x00, 0x47, 0x00])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_measurement_with_a_bad_field_is_not_sent_but_an_unused_field_is_not_looked_at()
+    let config = full_config()
+    let good = usual_spot_check()
+    // The default has the time stamp 0, 0, 0, 0:0:0, a Date Time of unknown parts.
+    test.assert(plxs_spot_check_valid(config, good))
+    test.assert(not plxs_spot_check_valid(config, plx_spot_check(wire.SFLOAT_RESERVED, wire.sfloat(72, 0))))
+    test.assert(not plxs_spot_check_valid(config, plx_spot_check(wire.sfloat(98, 0), 0x10000)))
+    test.assert(not plxs_spot_check_valid(config, plx_spot_check(-1, wire.sfloat(72, 0))))
+    test.assert(not plxs_spot_check_valid(config, PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time(2026, 13, 1, 0, 0, 0),
+        clock_not_set: false, measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.SFLOAT_NAN }))
+    test.assert(not plxs_spot_check_valid(config, PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time_unknown(),
+        clock_not_set: false, measurement_status: 0, device_status: 0x1000000, pulse_amplitude_index: wire.SFLOAT_NAN }))
+    test.assert(not plxs_spot_check_valid(config, PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time_unknown(),
+        clock_not_set: false, measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.SFLOAT_RESERVED }))
+    // The same fields are not looked at where the service does not send them.
+    let plain = default_plxs_config()
+    test.assert(plxs_spot_check_valid(plain, PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time(2026, 13, 99, 0, 0, 0),
+        clock_not_set: false, measurement_status: 0xFFFFFF, device_status: 0x1000000, pulse_amplitude_index: wire.SFLOAT_RESERVED }))
+    let c = plx_continuous(wire.sfloat(98, 0), wire.sfloat(72, 0))
+    test.assert(plxs_continuous_valid(config, c))
+    test.assert(plxs_continuous_valid(plain, PlxContinuous {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), fast_spo2: wire.SFLOAT_RESERVED, fast_pulse_rate: 0x10000,
+        slow_spo2: -5, slow_pulse_rate: 0x12345, measurement_status: 0x10000, device_status: 0x1000000, pulse_amplitude_index: -1 }))
+    test.assert(not plxs_continuous_valid(config, PlxContinuous {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), fast_spo2: wire.SFLOAT_RESERVED, fast_pulse_rate: wire.sfloat(1, 0),
+        slow_spo2: wire.sfloat(1, 0), slow_pulse_rate: wire.sfloat(1, 0), measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.sfloat(1, 0) }))
+    test.assert(not plxs_continuous_valid(config, PlxContinuous {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), fast_spo2: wire.sfloat(1, 0), fast_pulse_rate: wire.sfloat(1, 0),
+        slow_spo2: wire.sfloat(1, 0), slow_pulse_rate: 0x10000, measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.sfloat(1, 0) }))
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_spot_check_measurement_is_indicated_once_to_a_subscribed_client()
+    let config = default_plxs_config()
+    var (s, h) = server(config)
+    let m = usual_spot_check()
+    // Before the client enables indications nothing is sent.
+    test.assert_eq(list.len(plxs_indicate_spot_check(var s.db, var s.link, h, config, m, 0)), 0)
+    subscribe(var s, h.spot_check_cccd, 2)
+    let out = plxs_indicate_spot_check(var s.db, var s.link, h, config, m, 0)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], [0x1D, 3, 0, 0x00, 0x62, 0x00, 0x48, 0x00])
+    // A second measurement waits for the confirmation of the first.
+    test.assert_eq(list.len(plxs_indicate_spot_check(var s.db, var s.link, h, config, plx_spot_check(wire.sfloat(97, 0), wire.sfloat(70, 0)), 1)), 0)
+    let confirmed = gatt_server.receive(var s.db, var s.link, [0x1E], 2)
+    test.assert_eq(confirmed[0], [0x1D, 3, 0, 0x00, 0x61, 0x00, 0x46, 0x00])
+    // A measurement the service cannot send changes nothing and sends nothing.
+    test.assert_eq(list.len(plxs_indicate_spot_check(var s.db, var s.link, h, config, plx_spot_check(wire.SFLOAT_RESERVED, 0), 3)), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_continuous_measurement_is_notified_each_time_without_waiting()
+    let config = full_config()
+    var (s, h) = server(config)
+    let c = plx_continuous(wire.sfloat(98, 0), wire.sfloat(72, 0))
+    test.assert_eq(list.len(plxs_notify_continuous(var s.db, var s.link, h, config, c, 0)), 0)
+    subscribe(var s, h.continuous_cccd, 1)
+    let first = plxs_notify_continuous(var s.db, var s.link, h, config, c, 0)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0][0] as Int, 0x1B)
+    test.assert_eq(first[0][1] as Int, h.continuous)
+    // The value is the flags and 19 octets, the largest the default MTU of 23 sends.
+    test.assert_eq(list.len(first[0]), 3 + 20)
+    test.assert_eq(list.len(plxs_notify_continuous(var s.db, var s.link, h, config, c, 1)), 1)
+    // Indicating the spot-check measurement does not stop the notifications.
+    subscribe(var s, h.spot_check_cccd, 2)
+    test.assert_eq(list.len(plxs_indicate_spot_check(var s.db, var s.link, h, config, usual_spot_check(), 2)), 1)
+    test.assert_eq(list.len(plxs_notify_continuous(var s.db, var s.link, h, config, c, 3)), 1)
+    // A measurement that cannot be sent is not.
+    let bad = PlxContinuous {
+        spo2: 0x10000, pulse_rate: 0, fast_spo2: 0, fast_pulse_rate: 0, slow_spo2: 0, slow_pulse_rate: 0,
+        measurement_status: 0, device_status: 0, pulse_amplitude_index: 0 }
+    test.assert_eq(list.len(plxs_notify_continuous(var s.db, var s.link, h, config, bad, 4)), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_spot_check_value_with_every_field_fits_the_default_mtu()
+    let m = PlxSpotCheck {
+        spo2: wire.sfloat(98, 0), pulse_rate: wire.sfloat(72, 0), time: wire.date_time(2026, 10, 27, 13, 5, 9), clock_not_set: true,
+        measurement_status: 0xFFFF, device_status: 0xFFFFFF, pulse_amplitude_index: wire.sfloat(55, -1) }
+    test.assert_eq(list.len(plxs_spot_check_value(full_config(), m)), 19)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_measurements_cannot_be_read_and_the_features_cannot_be_written()
+    var (s, h) = server(full_config())
+    test.assert_eq(read(var s, h.spot_check)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(read(var s, h.continuous)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.features, [0, 0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.spot_check, [0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The descriptors read back what the client wrote.
+    subscribe(var s, h.continuous_cccd, 1)
+    subscribe(var s, h.features_cccd, 2)
+    test.assert_eq(read(var s, h.continuous_cccd), [0x0B, 1, 0])
+    test.assert_eq(read(var s, h.features_cccd), [0x0B, 2, 0])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_features_are_indicated_to_a_client_that_enabled_it()
+    let config = full_config()
+    var (s, h) = server(config)
+    test.assert_eq(list.len(plxs_indicate_features(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.features_cccd, 2)
+    let out = plxs_indicate_features(var s.db, var s.link, h, 0)
+    test.assert_eq(out[0], [0x1D, 9, 0, 0xFB, 0x00, 0x80, 0xC1, 0x30, 0x80, 0x00])
+    // A service whose PLX Features cannot be indicated has nothing to send.
+    var (t, g) = server(default_plxs_config())
+    test.assert_eq(list.len(plxs_indicate_features(var t.db, var t.link, g, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_every_attribute_needs_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let config = full_config()
+    let h = add_plxs_service(var s.db, config)!
+    test.assert_eq(read(var s, h.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.spot_check_cccd)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.spot_check_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.continuous_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // Nothing goes to a client that could not subscribe.
+    test.assert_eq(list.len(plxs_indicate_spot_check(var s.db, var s.link, h, config, usual_spot_check(), 0)), 0)
+    test.assert_eq(list.len(plxs_notify_continuous(var s.db, var s.link, h, config, plx_continuous(0, 0), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_higher_access_is_kept_and_a_lower_one_is_refused()
+    let strong = PlxsConfig {
+        access: gatt_server.Access.Authenticated, spot_check: true, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    var (s, h) = server_at(strong, 2)
+    test.assert_eq(read(var s, h.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read(var s, h.features), [0x0B, 0x00, 0x00])
+    for a in [gatt_server.Access.Open, gatt_server.Access.Denied, gatt_server.Access.Authorized]
+        var r = gatt_server.new_server([], 65)
+        match add_plxs_service(var r.db, PlxsConfig {
+            access: a, spot_check: true, continuous: true, measurement_status_support: -1, device_status_support: -1, timestamp: false,
+            fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false })
+            Ok(_) => test.fail("an access below security level 2 is refused")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_a_configuration_the_service_cannot_describe_is_refused_before_anything_is_added()
+    let bad = [
+        // Neither measurement.
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: false, continuous: false, measurement_status_support: -1, device_status_support: -1, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        // A time stamp without the spot-check measurement; fast and slow without the continuous one.
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: false, continuous: true, measurement_status_support: -1, device_status_support: -1, timestamp: true, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: false, measurement_status_support: -1, device_status_support: -1, timestamp: false, fast: true, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: false, measurement_status_support: -1, device_status_support: -1, timestamp: false, fast: false, slow: true, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        // A Measurement Status Support with an RFU bit (bit 4), with the storage bit (bit 9), out of 16 bits, below -1.
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: 0x0010, device_status_support: -1, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: STATUS_DATA_FROM_STORAGE, device_status_support: -1, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: 0x10000, device_status_support: -1, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: -2, device_status_support: -1, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        // A Device and Sensor Status Support with a bit above 15, and below -1.
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: -1, device_status_support: 0x10000, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false },
+        PlxsConfig { access: gatt_server.Access.Encrypted, spot_check: true, continuous: true, measurement_status_support: -1, device_status_support: -2, timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }]
+    for config in bad
+        var r = gatt_server.new_server([], 65)
+        match add_plxs_service(var r.db, config)
+            Ok(_) => test.fail("the configuration is not one the service can describe")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // The extremes that are allowed: every defined status bit, and an empty support field.
+    let ok = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: STATUS_SUPPORTABLE, device_status_support: DEVICE_DEFINED,
+        timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    var s = gatt_server.new_server([], 65)
+    let h = add_plxs_service(var s.db, ok)!
+    test.assert(gatt_server.last_handle(s.db) > 0)
+    test.assert_eq(h.features, 9)
+    test.assert_eq(plxs_features_value(ok), [0x03, 0x00, 0xE0, 0xFD, 0xFF, 0xFF, 0x00])
+    var z = gatt_server.new_server([], 65)
+    let zero = PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: 0, device_status_support: 0,
+        timestamp: false, fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+    let _ = add_plxs_service(var z.db, zero)!
+    test.assert_eq(plxs_features_value(zero), [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+@test
+@satisfies("REQ-BLE-PLXS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_plxs_service(var s.db, full_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

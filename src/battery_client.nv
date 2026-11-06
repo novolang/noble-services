@@ -1,0 +1,42 @@
+// src/battery_client.nv — the Collector side of the Battery Service
+// (0x180F): the decoder of the Battery Level and the client session that reads it and
+// subscribes to its notifications.
+//
+// The Battery Level characteristic (0x2A19) is one octet, a percentage of 0 to 100
+// ([GSS] 3.27); a value of any other length, or above 100, is no level and the decoder
+// answers `None`.  Notification is optional in the service, so the session reads the level
+// first and subscribes only when the peer has the descriptor.
+//
+// The decoder allocates nothing.  The session runs on `sensor_client.nv`.
+
+use gatt_client
+use links
+use battery
+use sensor_client
+
+// The battery level in `b`, `None` unless it is one octet of 0 to 100.
+@tier(embedded)
+@no_alloc
+fn battery_decode_level(b: [u8]) -> ?Int
+    if list.len(b) != 1 or (b[0] as Int) > battery.BATTERY_LEVEL_MAX
+        return None
+    Some(b[0] as Int)
+
+@tier(app)
+fn battery_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, battery.UUID_BATTERY_SERVICE)
+
+// Discover the service, read the level (required) and subscribe to its notifications (optional).
+@tier(app)
+fn battery_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient,
+                        now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, battery.UUID_BATTERY_LEVEL, true)
+    sensor_client.sc_queue_subscribe(var c, battery.UUID_BATTERY_LEVEL, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Read the level again, after the plan finished.
+@tier(app)
+fn battery_client_read(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient,
+                       now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, battery.UUID_BATTERY_LEVEL, true)
+    sensor_client.sc_kick(var t, var c, now_ms)

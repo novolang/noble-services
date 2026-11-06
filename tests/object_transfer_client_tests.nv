@@ -1,0 +1,495 @@
+// tests/object_transfer_client_tests.nv — the unit tests of src/object_transfer_client.nv.
+//
+//   novo test tests/object_transfer_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use object_list
+use object_store
+use object_transfer
+use sensor_client
+use wire
+use object_transfer_client.{ OTC_ERR_CCCD, OTC_ERR_CONCURRENCY, OTC_ERR_INVALID_LENGTH, OTC_ERR_IN_PROGRESS, OTC_ERR_NAME_EXISTS, OTC_ERR_NONE, OTC_ERR_NOT_SELECTED, OTC_ERR_OTHER, OTC_ERR_WRITE_REJECTED, otc_change_reserved, otc_client_new, otc_client_oacp, otc_client_olcp, otc_client_read_current, otc_client_start, otc_decode_changed, otc_decode_feature, otc_decode_id, otc_decode_listing, otc_decode_name, otc_decode_oacp, otc_decode_olcp, otc_decode_properties, otc_decode_record, otc_decode_size, otc_decode_time, otc_decode_type, otc_error_kind, otc_feature_reserved, otc_filter_marked, otc_filter_name, otc_filter_none, otc_filter_sizes, otc_filter_times, otc_filter_type, otc_name_value, otc_oacp_abort, otc_oacp_create, otc_oacp_delete, otc_oacp_execute, otc_oacp_range, otc_oacp_supported, otc_oacp_write, otc_olcp_go_to, otc_olcp_order, otc_olcp_request, otc_olcp_supported, otc_properties_reserved, otc_properties_value }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_feature_and_the_bits_it_names()
+    let f = otc_decode_feature(octets([0xFF, 0x03, 0, 0, 0x0F, 0, 0, 0]))!
+    test.assert_eq(f.oacp, 0x3FF)
+    test.assert_eq(f.olcp, 0x0F)
+    test.assert(not otc_feature_reserved(f))
+    for op in 1..8
+        test.assert(otc_oacp_supported(f, op))
+    test.assert(not otc_oacp_supported(f, 0))
+    test.assert(not otc_oacp_supported(f, 8))
+    for op in 1..9
+        test.assert(otc_olcp_supported(f, op))
+    test.assert(not otc_olcp_supported(f, 9))
+    // One bit at a time: Read alone, Go To alone, and the movements need no bit.
+    let r = otc_decode_feature(octets([0x10, 0, 0, 0, 0, 0, 0, 0]))!
+    test.assert(otc_oacp_supported(r, 5))
+    test.assert(not otc_oacp_supported(r, 6))
+    test.assert(otc_olcp_supported(r, 1) and otc_olcp_supported(r, 4))
+    test.assert(not otc_olcp_supported(r, 5))
+    // Reserved bits are told.
+    test.assert(otc_feature_reserved(otc_decode_feature(octets([0, 0x04, 0, 0, 0, 0, 0, 0]))!))
+    test.assert(otc_feature_reserved(otc_decode_feature(octets([0, 0, 0, 0, 0x10, 0, 0, 0]))!))
+    test.assert_eq(otc_decode_feature(octets([0, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_feature(octets([0, 0, 0, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_feature([]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_name_type_size_id_and_properties()
+    let none: [u8] = []
+    test.assert_eq(otc_decode_name(none), Some(none))
+    test.assert_eq(otc_decode_name(wire.text("alpha")), Some(wire.text("alpha")))
+    var long: [u8] = []
+    for _ in 0..120
+        list.push(long, 0x61)
+    test.assert(otc_decode_name(long) != None)
+    list.push(long, 0x61)
+    test.assert_eq(otc_decode_name(long), None)
+    test.assert_eq(otc_decode_name(octets([0xC3])), None)
+    test.assert_eq(otc_decode_name(octets([0xC3, 0xA9])), Some(octets([0xC3, 0xA9])))
+    // A name to write.
+    test.assert_eq(otc_name_value(wire.text("beta")), Some(wire.text("beta")))
+    test.assert_eq(otc_name_value([]), None)
+    test.assert_eq(otc_name_value(octets([0x61, 0x0A])), None)
+    test.assert_eq(otc_name_value(octets([0xFF])), None)
+    test.assert_eq(otc_name_value(long), None)
+    // Types of 2 and 16 octets.
+    test.assert_eq(otc_decode_type(octets([0xCA, 0x2A])), Some(octets([0xCA, 0x2A])))
+    var u128: [u8] = []
+    for k in 0..16
+        list.push(u128, k as u8)
+    test.assert(otc_decode_type(u128) != None)
+    test.assert_eq(otc_decode_type(octets([0xCA])), None)
+    test.assert_eq(otc_decode_type(octets([1, 2, 3])), None)
+    test.assert_eq(otc_decode_type([]), None)
+    // Size.
+    let s = otc_decode_size(octets([10, 0, 0, 0, 0x00, 0x01, 0, 0]))!
+    test.assert_eq(s.size, 10)
+    test.assert_eq(s.allocated, 256)
+    test.assert_eq(otc_decode_size(octets([1, 2, 3, 4, 5, 6, 7])), None)
+    // ID: 0, the first and the last valid, and the reserved range.
+    test.assert_eq(otc_decode_id(octets([0, 0, 0, 0, 0, 0])), Some(0))
+    test.assert_eq(otc_decode_id(octets([0, 1, 0, 0, 0, 0])), Some(0x100))
+    test.assert_eq(otc_decode_id(octets([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])), Some(0xFFFFFFFFFFFF))
+    test.assert_eq(otc_decode_id(octets([1, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_id(octets([0xFF, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_id(octets([0, 1, 0, 0, 0])), None)
+    // Properties and their reserved bits.
+    test.assert_eq(otc_decode_properties(octets([0xFF, 0, 0, 0])), Some(0xFF))
+    test.assert(not otc_properties_reserved(0xFF))
+    test.assert(otc_properties_reserved(0x100))
+    test.assert_eq(otc_decode_properties(octets([0xFF, 0, 0])), None)
+    test.assert_eq(otc_properties_value(0x7F), Some(octets([0x7F, 0, 0, 0])))
+    test.assert_eq(otc_properties_value(0x100), None)
+    test.assert_eq(otc_properties_value(-1), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_date_times_and_object_changed()
+    let t = otc_decode_time(octets([0xEA, 0x07, 10, 29, 8, 30, 0]))!
+    test.assert_eq(t.year as Int, 2026)
+    test.assert_eq(t.month as Int, 10)
+    test.assert_eq(t.day as Int, 29)
+    // A part that is not known is 0; a month of 13, an hour of 24 and a short value are none.
+    test.assert(otc_decode_time(octets([0, 0, 0, 0, 0, 0, 0])) != None)
+    test.assert_eq(otc_decode_time(octets([0xEA, 0x07, 13, 29, 8, 30, 0])), None)
+    test.assert_eq(otc_decode_time(octets([0xEA, 0x07, 10, 29, 24, 30, 0])), None)
+    test.assert_eq(otc_decode_time(octets([0xEA, 0x07, 10, 29, 8, 30])), None)
+    test.assert_eq(otc_decode_time([]), None)
+    // Object Changed: flags then a 6-octet ID.
+    let c = otc_decode_changed(octets([0x03, 0x00, 0x01, 0, 0, 0, 0]))!
+    test.assert_eq(c.flags, 3)
+    test.assert_eq(c.id, 0x100)
+    test.assert(not otc_change_reserved(c))
+    test.assert(otc_change_reserved(otc_decode_changed(octets([0x20, 0x00, 0x01, 0, 0, 0, 0]))!))
+    test.assert_eq(otc_decode_changed(octets([0x03, 0x00, 0x00, 0, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_changed(octets([0x03, 0x00, 0x01, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_changed(octets([0x03, 0x00, 0x01, 0, 0, 0, 0, 0])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_oacp_requests()
+    test.assert_eq(otc_oacp_create(100, octets([0xCA, 0x2A])), Some(octets([1, 100, 0, 0, 0, 0xCA, 0x2A])))
+    var u128: [u8] = []
+    for k in 0..16
+        list.push(u128, k as u8)
+    test.assert_eq(list.len(otc_oacp_create(0xFFFFFFFF, u128)!), 21)
+    test.assert_eq(otc_oacp_create(-1, octets([0xCA, 0x2A])), None)
+    test.assert_eq(otc_oacp_create(0x100000000, octets([0xCA, 0x2A])), None)
+    test.assert_eq(otc_oacp_create(1, octets([1, 2, 3])), None)
+    test.assert_eq(otc_oacp_delete(), octets([2]))
+    test.assert_eq(otc_oacp_abort(), octets([7]))
+    test.assert_eq(otc_oacp_range(3, 1, 2), Some(octets([3, 1, 0, 0, 0, 2, 0, 0, 0])))
+    test.assert_eq(otc_oacp_range(5, 0xFFFFFFFF, 0), Some(octets([5, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0])))
+    test.assert_eq(otc_oacp_range(6, 1, 2), None)
+    test.assert_eq(otc_oacp_range(5, -1, 2), None)
+    test.assert_eq(otc_oacp_range(5, 1, 0x100000000), None)
+    test.assert_eq(otc_oacp_write(4, 8, false), Some(octets([6, 4, 0, 0, 0, 8, 0, 0, 0, 0])))
+    test.assert_eq(otc_oacp_write(4, 8, true), Some(octets([6, 4, 0, 0, 0, 8, 0, 0, 0, 2])))
+    test.assert_eq(otc_oacp_write(-1, 8, true), None)
+    test.assert_eq(otc_oacp_execute([]), Some(octets([4])))
+    var param: [u8] = []
+    for _ in 0..20
+        list.push(param, 1)
+    test.assert_eq(list.len(otc_oacp_execute(param)!), 21)
+    list.push(param, 1)
+    test.assert_eq(otc_oacp_execute(param), None)
+
+@tier(app)
+fn oacp_is(b: [u8], request: Int, result: Int, checksum: Int, param_len: Int) -> Bool
+    match otc_decode_oacp(b)
+        Some(r) => r.request == request and r.result == result and r.checksum == checksum and list.len(r.param) == param_len
+        None => false
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_oacp_responses()
+    for op in 1..8
+        for result in 1..11
+            let ok = result == 1
+            let plain = oacp_is(octets([0x60, op, result]), op, result, -1, 0)
+            // A success of Calculate Checksum carries the checksum, so the bare value is none; Execute may carry nothing.
+            test.assert_eq(plain, not (op == 3 and ok))
+    test.assert(oacp_is(octets([0x60, 3, 1, 0x78, 0x56, 0x34, 0x12]), 3, 1, 0x12345678, 0))
+    test.assert(oacp_is(octets([0x60, 4, 1, 9, 8, 7]), 4, 1, -1, 3))
+    var most: [Int] = [0x60, 4, 1]
+    for _ in 0..17
+        list.push(most, 1)
+    test.assert(oacp_is(octets(most), 4, 1, -1, 17))
+    list.push(most, 1)
+    test.assert_eq(otc_decode_oacp(octets(most)), None)
+    // A parameter on a failure or on another op code, a short checksum and a long one.
+    test.assert_eq(otc_decode_oacp(octets([0x60, 3, 5, 1, 2, 3, 4])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 5, 1, 0])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 3, 1, 1, 2, 3])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 3, 1, 1, 2, 3, 4, 5])), None)
+    // Reserved codes.
+    test.assert_eq(otc_decode_oacp(octets([0x60, 0, 1])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 8, 1])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 1, 0])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 1, 11])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x70, 1, 1])), None)
+    test.assert_eq(otc_decode_oacp(octets([0x60, 1])), None)
+    test.assert_eq(otc_decode_oacp([]), None)
+
+@tier(app)
+fn olcp_is(b: [u8], request: Int, result: Int, count: Int) -> Bool
+    match otc_decode_olcp(b)
+        Some(r) => r.request == request and r.result == result and r.count == count
+        None => false
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_olcp_requests_and_responses()
+    for op in [1, 2, 3, 4, 7, 8]
+        test.assert_eq(otc_olcp_request(op), Some(octets([op])))
+    for op in [0, 5, 6, 9, 0x70]
+        test.assert_eq(otc_olcp_request(op), None)
+    test.assert_eq(otc_olcp_go_to(0), Some(octets([5, 0, 0, 0, 0, 0, 0])))
+    test.assert_eq(otc_olcp_go_to(0x100), Some(octets([5, 0, 1, 0, 0, 0, 0])))
+    test.assert_eq(otc_olcp_go_to(0xFFFFFFFFFFFF), Some(octets([5, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])))
+    test.assert_eq(otc_olcp_go_to(1), None)
+    test.assert_eq(otc_olcp_go_to(0xFF), None)
+    test.assert_eq(otc_olcp_go_to(0x1000000000000), None)
+    test.assert_eq(otc_olcp_go_to(-1), None)
+    for order in [1, 2, 3, 4, 5, 0x11, 0x12, 0x13, 0x14, 0x15]
+        test.assert_eq(otc_olcp_order(order), Some(octets([6, order])))
+    for order in [0, 6, 0x10, 0x16, 0xFF]
+        test.assert_eq(otc_olcp_order(order), None)
+    for op in 1..9
+        for result in 1..9
+            let count_op = op == 7 and result == 1
+            test.assert_eq(olcp_is(octets([0x70, op, result]), op, result, -1), not count_op)
+    test.assert(olcp_is(octets([0x70, 7, 1, 5, 0, 0, 0]), 7, 1, 5))
+    test.assert(olcp_is(octets([0x70, 7, 1, 0xFF, 0xFF, 0xFF, 0xFF]), 7, 1, 0xFFFFFFFF))
+    test.assert_eq(otc_decode_olcp(octets([0x70, 7, 1, 5, 0, 0])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 7, 3, 5, 0, 0, 0])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 1, 1, 0])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 0, 1])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 9, 1])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 1, 0])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 1, 9])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x60, 1, 1])), None)
+    test.assert_eq(otc_decode_olcp(octets([0x70, 1])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_filter_values()
+    test.assert_eq(otc_filter_none(), octets([0]))
+    test.assert_eq(otc_filter_marked(), octets([0x0A]))
+    for kind in 1..5
+        test.assert_eq(otc_filter_name(kind, wire.text("ab")), Some(octets([kind, 0x61, 0x62])))
+    test.assert_eq(otc_filter_name(0, wire.text("ab")), None)
+    test.assert_eq(otc_filter_name(5, wire.text("ab")), None)
+    test.assert_eq(otc_filter_name(1, []), None)
+    test.assert_eq(otc_filter_name(1, octets([0xFF])), None)
+    test.assert_eq(otc_filter_type(octets([0xCA, 0x2A])), Some(octets([5, 0xCA, 0x2A])))
+    test.assert_eq(otc_filter_type(octets([1])), None)
+    let a = octets([0xE9, 0x07, 1, 1, 0, 0, 0])
+    let b = octets([0xEA, 0x07, 1, 1, 0, 0, 0])
+    test.assert_eq(otc_filter_times(6, a, b), Some(octets([6, 0xE9, 7, 1, 1, 0, 0, 0, 0xEA, 7, 1, 1, 0, 0, 0])))
+    test.assert(otc_filter_times(7, a, a) != None)
+    test.assert_eq(otc_filter_times(7, b, a), None)
+    test.assert_eq(otc_filter_times(8, a, b), None)
+    test.assert_eq(otc_filter_times(6, a, octets([1, 2])), None)
+    test.assert_eq(otc_filter_sizes(8, 1, 100), Some(octets([8, 1, 0, 0, 0, 100, 0, 0, 0])))
+    test.assert(otc_filter_sizes(9, 5, 5) != None)
+    test.assert_eq(otc_filter_sizes(8, 100, 1), None)
+    test.assert_eq(otc_filter_sizes(6, 1, 100), None)
+    test.assert_eq(otc_filter_sizes(8, -1, 100), None)
+    test.assert_eq(otc_filter_sizes(8, 1, 0x100000000), None)
+
+@tier(app)
+fn record_octets(id: Int, name: [u8], flags: Int, kind: [u8], rest: [u8]) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, id, 6)
+    wire.put(var body, list.len(name), 1)
+    list.append(body, name)
+    wire.put(var body, flags, 1)
+    list.append(body, kind)
+    list.append(body, rest)
+    var out: [u8] = []
+    wire.put(var out, list.len(body) + 2, 2)
+    list.append(out, body)
+    out
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_object_records_of_the_directory_listing()
+    // The records the server makes (object_list.directory_record) decode back, with and without the timestamps.
+    var m = object_store.new_meta(0x100, octets([0xCA, 0x2A]), 10, 12, 0x7F)
+    m.name = wire.text("alpha")
+    m.created = octets([0xEA, 0x07, 10, 29, 8, 30, 0])
+    m.modified = octets([0xEA, 0x07, 10, 30, 9, 0, 0])
+    for flags in [0, 1, 2, 3]
+        let rec = object_list.directory_record(m, (flags & 1) != 0, (flags & 2) != 0)
+        let r = otc_decode_record(rec, 0)!
+        test.assert_eq(r.1, list.len(rec))
+        test.assert_eq(r.0.id, 0x100)
+        test.assert_eq(r.0.name, wire.text("alpha"))
+        test.assert_eq(r.0.kind, octets([0xCA, 0x2A]))
+        test.assert_eq(r.0.size, 10)
+        test.assert_eq(r.0.allocated, 12)
+        test.assert_eq(r.0.properties, 0x7F)
+        test.assert_eq(list.len(r.0.created), if (flags & 1) != 0 then 7 else 0)
+        test.assert_eq(list.len(r.0.modified), if (flags & 2) != 0 then 7 else 0)
+    // A 128-bit type.
+    var u128: [u8] = []
+    for k in 0..16
+        list.push(u128, k as u8)
+    m.kind = u128
+    let wide = otc_decode_record(object_list.directory_record(m, false, false), 0)!
+    test.assert_eq(wide.0.kind, u128)
+    // Fields left out by the flags are -1: a record of the name and the type alone.
+    let bare = otc_decode_record(record_octets(0x101, wire.text("x"), 0, octets([1, 2]), []), 0)!
+    test.assert_eq(bare.0.size, -1)
+    test.assert_eq(bare.0.allocated, -1)
+    test.assert_eq(bare.0.properties, -1)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_a_listing_of_several_records_and_its_malformed_forms()
+    var a = object_store.new_meta(0x100, octets([0xCA, 0x2A]), 10, 12, 0x7F)
+    a.name = wire.text("alpha")
+    var b = object_store.new_meta(0x101, octets([0xAB, 0x2B]), 3, 3, 0x04)
+    b.name = wire.text("beta")
+    let listing = object_list.directory_contents([a, b], false, false)
+    let l = otc_decode_listing(listing)!
+    test.assert_eq(list.len(l), 2)
+    test.assert_eq(l[0].name, wire.text("alpha"))
+    test.assert_eq(l[1].id, 0x101)
+    test.assert_eq(otc_decode_listing([]), None)
+    // Every prefix that ends inside a record is none; an extra octet after the last is none.
+    let first_end = list.len(object_list.directory_record(a, false, false))
+    for k in 1..list.len(listing)
+        if k != first_end
+            test.assert_eq(otc_decode_listing(listing[:k]), None)
+    var longer = listing[:]
+    list.push(longer, 0)
+    test.assert_eq(otc_decode_listing(longer), None)
+    // Records that break a rule: an empty name, a name over 120 octets, a name that is not UTF-8, the reserved and the
+    // extended Flags bits, a Length of Record that is too large or too small, a Date Time out of range.
+    test.assert_eq(otc_decode_record(record_octets(0x100, [], 0, octets([1, 2]), []), 0), None)
+    var long: [u8] = []
+    for _ in 0..121
+        list.push(long, 0x61)
+    test.assert_eq(otc_decode_record(record_octets(0x100, long, 0, octets([1, 2]), []), 0), None)
+    test.assert_eq(otc_decode_record(record_octets(0x100, octets([0xFF]), 0, octets([1, 2]), []), 0), None)
+    test.assert_eq(otc_decode_record(record_octets(0x100, wire.text("a"), 0x40, octets([1, 2]), []), 0), None)
+    test.assert_eq(otc_decode_record(record_octets(0x100, wire.text("a"), 0x80, octets([1, 2]), []), 0), None)
+    var big = record_octets(0x100, wire.text("a"), 0, octets([1, 2]), [])
+    big[0] = big[0] + 1
+    test.assert_eq(otc_decode_record(big, 0), None)
+    var small = record_octets(0x100, wire.text("a"), 0x02, octets([1, 2]), octets([9, 0, 0, 0]))
+    test.assert(otc_decode_record(small, 0) != None)
+    small[0] = small[0] - 1
+    test.assert_eq(otc_decode_record(small, 0), None)
+    // A Length that is one too small for a record with no field after the type leaves an octet over, which no record starts on.
+    var stray = record_octets(0x100, wire.text("a"), 0, octets([1, 2]), octets([9]))
+    stray[0] = stray[0] - 1
+    test.assert_eq(otc_decode_listing(stray), None)
+    test.assert_eq(otc_decode_record(record_octets(0x100, wire.text("a"), 0x08, octets([1, 2]), octets([0xEA, 0x07, 13, 1, 0, 0, 0])), 0), None)
+    // The offset past the end and a negative one.
+    test.assert_eq(otc_decode_record(listing, list.len(listing)), None)
+    test.assert_eq(otc_decode_record(listing, -1), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_errors_of_a_write_are_named()
+    test.assert_eq(otc_error_kind(0), OTC_ERR_NONE)
+    test.assert_eq(otc_error_kind(0x80), OTC_ERR_WRITE_REJECTED)
+    test.assert_eq(otc_error_kind(0x81), OTC_ERR_NOT_SELECTED)
+    test.assert_eq(otc_error_kind(0x82), OTC_ERR_CONCURRENCY)
+    test.assert_eq(otc_error_kind(0x83), OTC_ERR_NAME_EXISTS)
+    test.assert_eq(otc_error_kind(0xFD), OTC_ERR_CCCD)
+    test.assert_eq(otc_error_kind(0xFE), OTC_ERR_IN_PROGRESS)
+    test.assert_eq(otc_error_kind(0x0D), OTC_ERR_INVALID_LENGTH)
+    test.assert_eq(otc_error_kind(0x03), OTC_ERR_OTHER)
+
+// Carry `first` to the server of the rig for its first client; the answers go back to the session and
+// every value event is appended to `uuids` and `values`.
+@tier(app)
+fn otc_pump(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var r: object_transfer.Rig, first: sensor_client.ScStep, var uuids: [Int], var values: [[u8]]) -> Int [mutate]
+    var all = first.event
+    var pending = first.pdus[:]
+    for _ in 0..200
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            for a in object_transfer.pdu(var r, 0, item[:])
+                let step = sensor_client.sc_on_pdu(var t, var c, a, 0)
+                list.append(next, step.pdus[:])
+                all = all | step.event
+                if (step.event & sensor_client.SE_VALUE) != 0
+                    list.push(uuids, sensor_client.sc_uuid(c))
+                    list.push(values, sensor_client.sc_value(c))
+        pending = next
+    all
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let both = sensor_client.test_open(object_transfer.UUID_OBJECT_TRANSFER_SERVICE)
+    var t = both.0
+    var c = otc_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let all = otc_pump(var t, var c, var r, otc_client_start(var t, var c, 0), var uuids, var values)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    let f = otc_decode_feature(values[0])!
+    test.assert_eq(f.oacp, object_transfer.OACP_DEFINED)
+    test.assert_eq(sensor_client.sc_handle(var t, c, object_transfer.UUID_OACP), r.h.oacp)
+    // Go To the object 0x100, then read its metadata.
+    var u2: [Int] = []
+    var v2: [[u8]] = []
+    let go = otc_pump(var t, var c, var r, otc_client_olcp(var t, var c, otc_olcp_go_to(0x100)!, 0), var u2, var v2)
+    test.assert((go & sensor_client.SE_DONE) != 0)
+    test.assert(olcp_is(v2[0], 5, 1, -1))
+    var u3: [Int] = []
+    var v3: [[u8]] = []
+    let meta = otc_pump(var t, var c, var r, otc_client_read_current(var t, var c, 0), var u3, var v3)
+    test.assert((meta & sensor_client.SE_DONE) != 0)
+    test.assert_eq(otc_decode_name(v3[0]), Some(wire.text("alpha")))
+    test.assert_eq(u3[0], object_transfer.UUID_OBJECT_NAME)
+    test.assert_eq(otc_decode_type(v3[1]), Some(octets([0xCA, 0x2A])))
+    test.assert_eq(otc_decode_size(v3[2])!.size, 10)
+    test.assert_eq(otc_decode_id(v3[5]), Some(0x100))
+    test.assert_eq(otc_decode_properties(v3[6]), Some(0x7F))
+    // Calculate Checksum of the whole object: the checksum of the server's CRC-32.
+    var u4: [Int] = []
+    var v4: [[u8]] = []
+    let _ = otc_pump(var t, var c, var r, otc_client_oacp(var t, var c, otc_oacp_range(3, 0, 10)!, 0), var u4, var v4)
+    let crc = otc_decode_oacp(v4[0])!
+    test.assert_eq(crc.result, 1)
+    test.assert_eq(crc.checksum, object_store.crc32(wire.text("0123456789")))
+    // Request Number of Objects: three.
+    var u5: [Int] = []
+    var v5: [[u8]] = []
+    let _ = otc_pump(var t, var c, var r, otc_client_olcp(var t, var c, otc_olcp_request(7)!, 0), var u5, var v5)
+    test.assert(olcp_is(v5[0], 7, 1, 3))
+    // Go To an object that does not exist: Object ID Not Found.
+    var u6: [Int] = []
+    var v6: [[u8]] = []
+    let _ = otc_pump(var t, var c, var r, otc_client_olcp(var t, var c, otc_olcp_go_to(0x9999)!, 0), var u6, var v6)
+    test.assert(olcp_is(v6[0], 5, 8, -1))
+    // A name that is already in use is written: Object Name Already Exists.
+    var u7: [Int] = []
+    var v7: [[u8]] = []
+    let _ = otc_pump(var t, var c, var r, otc_client_olcp(var t, var c, otc_olcp_go_to(0x101)!, 0), var u7, var v7)
+    sensor_client.sc_queue_write(var c, object_transfer.UUID_OBJECT_NAME, wire.text("alpha"))
+    let dup = otc_pump(var t, var c, var r, sensor_client.sc_kick(var t, var c, 0), var u7, var v7)
+    test.assert((dup & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(otc_error_kind(sensor_client.sc_status(c)), OTC_ERR_NAME_EXISTS)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_the_directory_listing_object_is_read_and_decoded()
+    if not fixtures.client_engine_present()
+        return
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let both = sensor_client.test_open(object_transfer.UUID_OBJECT_TRANSFER_SERVICE)
+    var t = both.0
+    var c = otc_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let _ = otc_pump(var t, var c, var r, otc_client_start(var t, var c, 0), var uuids, var values)
+    // Go To the Directory Listing Object (ID 0); its contents, which the channel carries, are decoded: the listing itself and the three fixture objects.
+    let go = otc_pump(var t, var c, var r, otc_client_olcp(var t, var c, otc_olcp_go_to(0)!, 0), var uuids, var values)
+    test.assert((go & sensor_client.SE_DONE) != 0)
+    let lst = object_transfer.ots_directory(r.config, r.shared, 1, var r.repo)
+    let records = otc_decode_listing(lst.1)!
+    test.assert_eq(list.len(records), 4)
+    test.assert_eq(records[0].id, 0)
+    test.assert_eq(records[1].name, wire.text("alpha"))
+    test.assert_eq(records[3].name, wire.text("gamma"))
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_a_single_object_server_has_the_read_procedures_only()
+    if not fixtures.client_engine_present()
+        return
+    var r = object_transfer.rig(object_transfer.single_object_config())
+    let both = sensor_client.test_open(object_transfer.UUID_OBJECT_TRANSFER_SERVICE)
+    var t = both.0
+    var c = otc_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let all = otc_pump(var t, var c, var r, otc_client_start(var t, var c, 0), var uuids, var values)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    let f = otc_decode_feature(values[0])!
+    test.assert(otc_oacp_supported(f, 3) and otc_oacp_supported(f, 5) and otc_oacp_supported(f, 7))
+    test.assert(not otc_oacp_supported(f, 1))
+    test.assert(not otc_olcp_supported(f, 5))
+    // No OLCP: the write ends with Not Found.
+    let w = otc_client_olcp(var t, var c, otc_olcp_request(1)!, 0)
+    test.assert((w.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@test
+@satisfies("REQ-BLE-PRFC-022")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(object_transfer.UUID_OBJECT_TRANSFER_SERVICE)
+    var t = both.0
+    var c = otc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, otc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

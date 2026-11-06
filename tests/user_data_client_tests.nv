@@ -1,0 +1,284 @@
+// tests/user_data_client_tests.nv — the unit tests of src/user_data_client.nv.
+//
+//   novo test tests/user_data_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use sensor_client
+use user_data
+use wire
+use user_data_client.{ UDS_COMPLETE, UDS_MORE, UDS_RESULT_SUCCESS, UDS_RESULT_USER_NOT_AUTHORIZED, UDS_SEQUENCE_ERROR, UDS_UNKNOWN_USER, uds_assembly_new, uds_assembly_value, uds_client_new, uds_client_read_data, uds_client_start, uds_client_write_data, uds_decode_increment, uds_decode_index, uds_decode_registered, uds_decode_response, uds_increment_value, uds_registered_name, uds_req_consent, uds_req_delete_data, uds_req_delete_users, uds_req_list_all, uds_req_register, uds_response_value, uds_segment_push }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_increment_and_index()
+    test.assert_eq(uds_decode_increment(octets([0, 0, 0, 0])), Some(0))
+    test.assert_eq(uds_decode_increment(octets([0x78, 0x56, 0x34, 0x12])), Some(0x12345678))
+    test.assert_eq(uds_decode_increment(octets([0xFF, 0xFF, 0xFF, 0xFF])), Some(0xFFFFFFFF))
+    test.assert_eq(uds_decode_increment(octets([0, 0, 0])), None)
+    test.assert_eq(uds_decode_increment(octets([0, 0, 0, 0, 0])), None)
+    test.assert_eq(uds_increment_value(0x12345678), octets([0x78, 0x56, 0x34, 0x12]))
+    test.assert_eq(uds_increment_value(-1), octets([0, 0, 0, 0]))
+    test.assert_eq(uds_increment_value(0x100000000), octets([0xFF, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(uds_decode_index(octets([0])), Some(0))
+    test.assert_eq(uds_decode_index(octets([0xFF])), Some(UDS_UNKNOWN_USER))
+    test.assert_eq(uds_decode_index([]), None)
+    test.assert_eq(uds_decode_index(octets([1, 2])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_the_requests_and_the_responses()
+    test.assert_eq(uds_req_register(1234), octets([0x01, 0xD2, 0x04]))
+    test.assert_eq(uds_req_register(0), octets([0x01, 0, 0]))
+    test.assert_eq(uds_req_register(9999), octets([0x01, 0x0F, 0x27]))
+    test.assert_eq(uds_req_register(10000), octets([0x01, 0x0F, 0x27]))
+    test.assert_eq(uds_req_register(-1), octets([0x01, 0, 0]))
+    test.assert_eq(uds_req_consent(2, 1234), octets([0x02, 2, 0xD2, 0x04]))
+    test.assert_eq(uds_req_consent(300, 20000), octets([0x02, 255, 0x0F, 0x27]))
+    test.assert_eq(uds_req_delete_data(), octets([0x03]))
+    test.assert_eq(uds_req_list_all(), octets([0x04]))
+    test.assert_eq(uds_req_delete_users(3), octets([0x05, 3]))
+    test.assert_eq(uds_req_delete_users(UDS_UNKNOWN_USER), octets([0x05, 0xFF]))
+    let ok = octets([0x20, 0x01, 0x01, 0x02])
+    match uds_decode_response(ok)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 1)
+            test.assert_eq(r.result, UDS_RESULT_SUCCESS)
+            test.assert_eq(uds_response_value(ok, r), 2)
+    let refused = octets([0x20, 0x02, 0x05])
+    match uds_decode_response(refused)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.result, UDS_RESULT_USER_NOT_AUTHORIZED)
+            test.assert_eq(uds_response_value(refused, r), -1)
+    // A success with a parameter of two octets has no single value.
+    let two = octets([0x20, 0x04, 0x01, 1, 2])
+    match uds_decode_response(two)
+        None => test.fail("a response")
+        Some(r) => test.assert_eq(uds_response_value(two, r), -1)
+    test.assert_eq(uds_decode_response(octets([0x20, 0x01])), None)
+    test.assert_eq(uds_decode_response(octets([0x21, 0x01, 0x01])), None)
+    test.assert_eq(uds_decode_response([]), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_the_registered_user_value()
+    let named = octets([0x01, 3, 0x41, 0x6E, 0x6E])
+    match uds_decode_registered(named)
+        None => test.fail("a registered user")
+        Some(r) =>
+            test.assert_eq(r.index, 3)
+            test.assert_eq(r.has_name, true)
+            test.assert_eq(r.truncated, false)
+            test.assert_eq(uds_registered_name(named, r), wire.text("Ann"))
+    let cut = octets([0x03, 0, 0x41])
+    match uds_decode_registered(cut)
+        None => test.fail("a registered user")
+        Some(r) => test.assert_eq(r.truncated, true)
+    let nameless = octets([0x00, 1])
+    match uds_decode_registered(nameless)
+        None => test.fail("a registered user")
+        Some(r) =>
+            test.assert_eq(r.has_name, false)
+            test.assert_eq(list.len(uds_registered_name(nameless, r)), 0)
+    test.assert_eq(uds_decode_registered([]), None)
+    test.assert_eq(uds_decode_registered(octets([0x00])), None)
+    // A name flagged and missing, and octets after a user without a name.
+    test.assert_eq(uds_decode_registered(octets([0x01, 3])), None)
+    test.assert_eq(uds_decode_registered(octets([0x00, 3, 0x41])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_segments_join_in_sequence_and_a_break_resets()
+    var a = uds_assembly_new()
+    // One segment: first and last, number 0.
+    test.assert_eq(uds_segment_push(var a, octets([0x03, 0x01, 0x00])), UDS_COMPLETE)
+    test.assert_eq(uds_assembly_value(a), octets([0x01, 0x00]))
+    // Two segments, numbers 1 and 2.
+    test.assert_eq(uds_segment_push(var a, octets([0x05, 0x01, 0x05, 0x41])), UDS_MORE)
+    test.assert_eq(uds_segment_push(var a, octets([0x0A, 0x42])), UDS_COMPLETE)
+    test.assert_eq(uds_assembly_value(a), octets([0x01, 0x05, 0x41, 0x42]))
+    // Three segments with a middle one.
+    test.assert_eq(uds_segment_push(var a, octets([0x0D, 1])), UDS_MORE)
+    test.assert_eq(uds_segment_push(var a, octets([0x10, 2])), UDS_MORE)
+    test.assert_eq(uds_segment_push(var a, octets([0x16, 3])), UDS_COMPLETE)
+    test.assert_eq(uds_assembly_value(a), octets([1, 2, 3]))
+    // A number out of sequence, a first segment inside a value, a middle segment without a first one, an empty segment.
+    test.assert_eq(uds_segment_push(var a, octets([0x19, 1])), UDS_MORE)
+    test.assert_eq(uds_segment_push(var a, octets([0x6A, 2])), UDS_SEQUENCE_ERROR)
+    test.assert_eq(uds_segment_push(var a, octets([0x01, 1])), UDS_MORE)
+    test.assert_eq(uds_segment_push(var a, octets([0x01, 1])), UDS_SEQUENCE_ERROR)
+    test.assert_eq(uds_segment_push(var a, octets([0x00, 1])), UDS_SEQUENCE_ERROR)
+    test.assert_eq(uds_segment_push(var a, []), UDS_SEQUENCE_ERROR)
+    // After a reset the next procedure starts at any number.
+    test.assert_eq(uds_segment_push(var a, octets([0x7F, 9])), UDS_COMPLETE)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_the_rolling_segment_number_wraps_after_63()
+    var a = uds_assembly_new()
+    test.assert_eq(uds_segment_push(var a, octets([0xFD, 1])), UDS_MORE)
+    // The number after 63 is 0.
+    test.assert_eq(uds_segment_push(var a, octets([0x02, 2])), UDS_COMPLETE)
+    test.assert_eq(uds_assembly_value(a), octets([1, 2]))
+
+@tier(app)
+fn test_server(config: user_data.UdsConfig) -> (gatt_server.GattServer, user_data.UdsHandles)
+    user_data.server(config)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_session_against_the_server_registers_consents_and_lists()
+    if not fixtures.client_engine_present()
+        return
+    let config = user_data.default_uds_config(user_data.test_characteristics())
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var st = user_data.new_uds_state(config)
+    let both = sensor_client.test_open(user_data.UUID_USER_DATA_SERVICE)
+    var t = both.0
+    var c = uds_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, uds_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The last read of the plan is the Database Change Increment.
+    test.assert_eq(sensor_client.sc_uuid(c), user_data.UUID_DATABASE_CHANGE_INCREMENT)
+    test.assert_eq(uds_decode_increment(sensor_client.sc_value(c)), Some(0))
+    // Register a user: the request the client builds, the response indication decoded.
+    let reg = uds_serve(var s, h, var st, uds_req_register(1234))
+    test.assert_eq(list.len(reg), 2)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [reg[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), user_data.UUID_USER_CONTROL_POINT)
+    var index = -1
+    let v = sensor_client.sc_value(c)
+    match uds_decode_response(v)
+        None => test.fail("a response")
+        Some(r) => index = uds_response_value(v, r)
+    test.assert_eq(index, 0)
+    let _ = user_data.ack(var s)
+    // A wrong code is not authorized, the right one is accepted.
+    let bad = uds_serve(var s, h, var st, uds_req_consent(index, 1))
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [bad[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    match uds_decode_response(sensor_client.sc_value(c))
+        None => test.fail("a response")
+        Some(r) => test.assert_eq(r.result, UDS_RESULT_USER_NOT_AUTHORIZED)
+    let _ = user_data.ack(var s)
+    let good = uds_serve(var s, h, var st, uds_req_consent(index, 1234))
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [good[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    match uds_decode_response(sensor_client.sc_value(c))
+        None => test.fail("a response")
+        Some(r) => test.assert_eq(r.result, UDS_RESULT_SUCCESS)
+    let _ = user_data.ack(var s)
+    // List All Users: one Registered User segment, then the response with the count.
+    test.assert(user_data.uds_set_name(var st, index, wire.text("Ann Lee")))
+    let listed = uds_serve(var s, h, var st, uds_req_list_all())
+    test.assert_eq(list.len(listed), 2)
+    var a = uds_assembly_new()
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [listed[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), user_data.UUID_REGISTERED_USER)
+    test.assert_eq(uds_segment_push(var a, sensor_client.sc_value(c)), UDS_COMPLETE)
+    let whole = uds_assembly_value(a)
+    match uds_decode_registered(whole)
+        None => test.fail("a registered user")
+        Some(r) =>
+            test.assert_eq(r.index, 0)
+            test.assert_eq(uds_registered_name(whole, r), wire.text("Ann Lee"))
+    let last = user_data.ack(var s)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, last), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    let count = sensor_client.sc_value(c)
+    match uds_decode_response(count)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, user_data.OP_LIST_ALL_USERS)
+            test.assert_eq(uds_response_value(count, r), 1)
+
+// Write `request` to the control point of the server and answer the PDUs it sends: the Write Response and
+// the first indication.
+@tier(app)
+fn uds_serve(var s: gatt_server.GattServer, h: user_data.UdsHandles, var st: user_data.UdsState, request: [u8]) -> [[u8]]
+    var pdu: [u8] = [0x12, (h.control_point & 0xFF) as u8, (h.control_point >>> 8) as u8]
+    for x in request
+        list.push(pdu, x)
+    user_data.receive_default(var s, h, var st, pdu, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_session_without_the_registered_user_characteristic()
+    if not fixtures.client_engine_present()
+        return
+    var config = user_data.default_uds_config(user_data.test_characteristics())
+    config.registered_user = false
+    var built = test_server(config)
+    var s = built.0
+    let both = sensor_client.test_open(user_data.UUID_USER_DATA_SERVICE)
+    var t = both.0
+    var c = uds_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, uds_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_a_uds_characteristic_of_the_user_who_consented_is_read_and_written()
+    if not fixtures.client_engine_present()
+        return
+    let config = user_data.default_uds_config(user_data.test_characteristics())
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var st = user_data.new_uds_state(config)
+    let both = sensor_client.test_open(user_data.UUID_USER_DATA_SERVICE)
+    var t = both.0
+    var c = uds_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let _ = sensor_client.test_pump(var t, var c, var s, uds_client_start(var t, var c, 0), var seen)
+    // Register and consent on the server side of the loopback.
+    let _ = uds_serve(var s, h, var st, uds_req_register(1234))
+    let _ = user_data.ack(var s)
+    let _ = uds_serve(var s, h, var st, uds_req_consent(0, 1234))
+    let _ = user_data.ack(var s)
+    // The first UDS Characteristic starts with the default of the server (0x41), and the client writes another.
+    let r = sensor_client.test_pump(var t, var c, var s, uds_client_read_data(var t, var c, 0x2A8A, 0), var seen)
+    test.assert((r & sensor_client.SE_VALUE) != 0)
+    test.assert_eq(sensor_client.sc_uuid(c), 0x2A8A)
+    test.assert_eq(sensor_client.sc_value(c), octets([0x41]))
+    let w = sensor_client.test_pump(var t, var c, var s, uds_client_write_data(var t, var c, 0x2A8A, octets([0x42]), 0), var seen)
+    test.assert((w & sensor_client.SE_DONE) != 0)
+    test.assert_eq((w & sensor_client.SE_FAILED), 0)
+    let again = sensor_client.test_pump(var t, var c, var s, uds_client_read_data(var t, var c, 0x2A8A, 0), var seen)
+    test.assert((again & sensor_client.SE_VALUE) != 0)
+    test.assert_eq(sensor_client.sc_value(c), octets([0x42]))
+    // A characteristic the peer does not list ends the step with Not Found.
+    let missing = uds_client_read_data(var t, var c, 0x2A8B, 0)
+    test.assert((missing.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-015")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(user_data.UUID_USER_DATA_SERVICE)
+    var t = both.0
+    var c = uds_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, uds_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

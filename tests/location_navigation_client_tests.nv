@@ -1,0 +1,353 @@
+// tests/location_navigation_client_tests.nv — the unit tests of src/location_navigation_client.nv.
+//
+//   novo test tests/location_navigation_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use location_navigation
+use sensor_client
+use wire
+use location_navigation_client.{ LN_DISTANCE, LN_ELEVATION, LN_HEADING, LN_LOCATION, LN_LOCATION_FIELDS, LN_NAV_ETA, LN_NAV_SELECT_NEAREST, LN_NAV_START, LN_Q_EHPE, LN_Q_EVPE, LN_Q_HDOP, LN_Q_IN_SOLUTION, LN_Q_IN_VIEW, LN_Q_TTFF, LN_Q_VDOP, LN_RESULT_INVALID_PARAMETER, LN_RESULT_SUCCESS, LN_ROLLING_TIME, LN_SPEED, LN_UTC, LnLocation, LnNavigation, LnQuality, ln_client_new, ln_client_start, ln_client_write, ln_decode_features, ln_decode_location, ln_decode_navigation, ln_decode_quality, ln_decode_response, ln_location_merge, ln_req_elevation, ln_req_fix_rate, ln_req_mask, ln_req_navigation, ln_req_number_of_routes, ln_req_route_name, ln_req_select_route, ln_req_set_cumulative, ln_response_name, ln_response_routes }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn loc(b: [u8]) -> LnLocation
+    match ln_decode_location(b)
+        Some(m) => m
+        None =>
+            test.fail("a location and speed value")
+            LnLocation {
+                present: 0, speed: 0, distance: 0, latitude: 0, longitude: 0, elevation: 0, heading: 0, rolling_time: 0,
+                time: wire.date_time_unknown(), position_status: 0, three_d: false, elevation_source: 0, heading_compass: false }
+
+@tier(app)
+fn quality(b: [u8]) -> LnQuality
+    match ln_decode_quality(b)
+        Some(m) => m
+        None =>
+            test.fail("a position quality value")
+            LnQuality {
+                present: 0, in_solution: 0, in_view: 0, time_to_first_fix: 0, ehpe: 0, evpe: 0, hdop: 0, vdop: 0, position_status: 0 }
+
+@tier(app)
+fn navigation(b: [u8]) -> LnNavigation
+    match ln_decode_navigation(b)
+        Some(m) => m
+        None =>
+            test.fail("a navigation value")
+            LnNavigation {
+                present: 0, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time_unknown(),
+                position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false }
+
+// The flags `flags` as two octets, then `rest`.
+@tier(app)
+fn flagged(flags: Int, rest: [Int]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, flags, 2)
+    for x in rest
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_every_location_field_alone()
+    test.assert_eq(loc(flagged(LN_SPEED, [0x34, 0x12])).speed, 0x1234)
+    test.assert_eq(loc(flagged(LN_DISTANCE, [0x56, 0x34, 0x12])).distance, 0x123456)
+    let l = loc(flagged(LN_LOCATION, [0x00, 0x65, 0xCD, 0x1D, 0x00, 0xCA, 0x9A, 0x3B]))
+    test.assert_eq(l.latitude, 500000000)
+    test.assert_eq(l.longitude, 1000000000)
+    test.assert_eq(loc(flagged(LN_ELEVATION, [0x78, 0x56, 0x34])).elevation, 0x345678)
+    test.assert_eq(loc(flagged(LN_HEADING, [0x34, 0x12])).heading, 0x1234)
+    test.assert_eq(loc(flagged(LN_ROLLING_TIME, [200])).rolling_time, 200)
+    let u = loc(flagged(LN_UTC, [0xEA, 0x07, 10, 27, 9, 5, 3]))
+    test.assert_eq(u.time.year as Int, 2026)
+    test.assert_eq(u.time.seconds as Int, 3)
+    test.assert_eq(loc(flagged(0, [])).present, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_signed_fields_and_range_limits()
+    // Latitude -90 degrees, longitude -180 degrees (the lowest values), elevation -1 (0xFFFFFF).
+    let low = loc(flagged(LN_LOCATION | LN_ELEVATION, [0x00, 0x17, 0x5B, 0xCA, 0x00, 0x2E, 0xB6, 0x94, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(low.latitude, -900000000)
+    test.assert_eq(low.longitude, -1800000000)
+    test.assert_eq(low.elevation, -1)
+    test.assert_eq(loc(flagged(LN_ELEVATION, [0x00, 0x00, 0x80])).elevation, -8388608)
+    // A latitude of 90.0000001 degrees, a longitude of 180.0000001 degrees, a heading of 360 degrees.
+    test.assert_eq(ln_decode_location(flagged(LN_LOCATION, [0x01, 0xE9, 0xA4, 0x35, 0, 0, 0, 0])), None)
+    test.assert_eq(ln_decode_location(flagged(LN_LOCATION, [0, 0, 0, 0, 0x01, 0xD2, 0x49, 0x6B])), None)
+    test.assert_eq(ln_decode_location(flagged(LN_HEADING, [0xA0, 0x8C])), None)
+    test.assert_eq(loc(flagged(LN_HEADING, [0x9F, 0x8C])).heading, 35999)
+    test.assert_eq(loc(flagged(LN_LOCATION, [0x00, 0xE9, 0xA4, 0x35, 0, 0, 0, 0])).latitude, 900000000)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_the_status_bits_of_the_flags()
+    for status in 0..4
+        test.assert_eq(loc(flagged(status << 7, [])).position_status, status)
+        test.assert_eq(loc(flagged(status << 10, [])).elevation_source, status)
+    test.assert_eq(loc(flagged(0x200, [])).three_d, true)
+    test.assert_eq(loc(flagged(0x1000, [])).heading_compass, true)
+    test.assert_eq(loc(flagged(0, [])).three_d, false)
+    test.assert_eq(loc(flagged(0, [])).heading_compass, false)
+    // Reserved flag bits 13 to 15 are ignored.
+    test.assert_eq(loc(flagged(0xE000, [])).present, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_all_location_fields_in_order_every_prefix_and_a_bad_utc_time()
+    // Speed (2), distance (3), location (8), elevation (3), heading (2), rolling time (1), UTC time (7).
+    var rest: [Int] = [1, 0, 2, 0, 0]
+    for _ in 0..13
+        list.push(rest, 0)
+    for x in [5, 0xEA, 0x07, 10, 27, 9, 5, 3]
+        list.push(rest, x)
+    let full = flagged(LN_LOCATION_FIELDS, rest)
+    test.assert_eq(list.len(full), 2 + 2 + 3 + 8 + 3 + 2 + 1 + 7)
+    for k in 0..list.len(full)
+        test.assert_eq(ln_decode_location(full[:k]), None)
+    let m = loc(full)
+    test.assert_eq(m.speed, 1)
+    test.assert_eq(m.distance, 2)
+    test.assert_eq(m.rolling_time, 5)
+    test.assert_eq(m.time.day as Int, 27)
+    test.assert_eq(ln_decode_location(flagged(LN_UTC, [0xEA, 0x07, 13, 27, 9, 5, 3])), None)
+    test.assert_eq(ln_decode_location(flagged(LN_UTC, [0xEA, 0x07, 10, 27, 24, 5, 3])), None)
+    test.assert_eq(ln_decode_location([]), None)
+    test.assert_eq(ln_decode_location(octets([1])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_two_notifications_of_one_value_merge()
+    let a = loc(flagged(LN_SPEED | LN_DISTANCE | 0x80, [1, 0, 2, 0, 0]))
+    let b = loc(flagged(LN_HEADING | LN_ROLLING_TIME | 0x100, [0x34, 0x12, 9]))
+    let m = ln_location_merge(a, b)
+    test.assert_eq(m.present, LN_SPEED | LN_DISTANCE | LN_HEADING | LN_ROLLING_TIME)
+    test.assert_eq(m.speed, 1)
+    test.assert_eq(m.distance, 2)
+    test.assert_eq(m.heading, 0x1234)
+    test.assert_eq(m.rolling_time, 9)
+    test.assert_eq(m.position_status, 2)
+    // A field in both is the later one.
+    let c = loc(flagged(LN_SPEED, [7, 0]))
+    test.assert_eq(ln_location_merge(m, c).speed, 7)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_position_quality_fields_and_truncations()
+    test.assert_eq(quality(flagged(LN_Q_IN_SOLUTION, [7])).in_solution, 7)
+    test.assert_eq(quality(flagged(LN_Q_IN_VIEW, [12])).in_view, 12)
+    test.assert_eq(quality(flagged(LN_Q_TTFF, [0x34, 0x12])).time_to_first_fix, 0x1234)
+    test.assert_eq(quality(flagged(LN_Q_EHPE, [1, 2, 3, 4])).ehpe, 0x04030201)
+    test.assert_eq(quality(flagged(LN_Q_EVPE, [5, 6, 7, 8])).evpe, 0x08070605)
+    test.assert_eq(quality(flagged(LN_Q_HDOP, [9])).hdop, 9)
+    test.assert_eq(quality(flagged(LN_Q_VDOP, [10])).vdop, 10)
+    let rest = [7, 12, 0x34, 0x12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let full = flagged(0x7F | (3 << 7), rest)
+    let q = quality(full)
+    test.assert_eq(q.in_view, 12)
+    test.assert_eq(q.evpe, 0x08070605)
+    test.assert_eq(q.vdop, 10)
+    test.assert_eq(q.position_status, 3)
+    for k in 0..list.len(full)
+        test.assert_eq(ln_decode_quality(full[:k]), None)
+    test.assert_eq(quality(flagged(0, [])).present, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_navigation_fields_flags_and_truncations()
+    let plain = navigation(flagged(0, [0x34, 0x12, 0x78, 0x56]))
+    test.assert_eq(plain.bearing, 0x1234)
+    test.assert_eq(plain.heading, 0x5678)
+    test.assert_eq(plain.present, 0)
+    let n = navigation(flagged(0x7 | (2 << 3) | 0x20 | 0x40 | 0x80 | 0x100, [0x10, 0x27, 0xA0, 0x0F, 0x10, 0x27, 0x00, 0xFE, 0xFF, 0xFF, 0xEA, 0x07, 10, 27, 9, 5, 3]))
+    test.assert_eq(n.bearing, 10000)
+    test.assert_eq(n.heading, 4000)
+    test.assert_eq(n.remaining_distance, 10000)
+    test.assert_eq(n.remaining_vertical, -2)
+    test.assert_eq(n.time.month as Int, 10)
+    test.assert_eq(n.position_status, 2)
+    test.assert_eq(n.heading_compass, true)
+    test.assert_eq(n.to_destination, true)
+    test.assert_eq(n.waypoint_reached, true)
+    test.assert_eq(n.destination_reached, true)
+    let bytes = flagged(0x7, [0, 0, 0, 0, 1, 0, 0, 2, 0, 0, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    for k in 0..list.len(bytes)
+        test.assert_eq(ln_decode_navigation(bytes[:k]), None)
+    test.assert(ln_decode_navigation(bytes) != None)
+    // A bearing or a heading of 360 degrees, and a bad arrival time.
+    test.assert_eq(ln_decode_navigation(flagged(0, [0xA0, 0x8C, 0, 0])), None)
+    test.assert_eq(ln_decode_navigation(flagged(0, [0, 0, 0xA0, 0x8C])), None)
+    test.assert_eq(ln_decode_navigation(flagged(LN_NAV_ETA, [0, 0, 0, 0, 0xEA, 0x07, 13, 27, 9, 5, 3])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_the_feature_keeps_the_defined_bits()
+    test.assert_eq(ln_decode_features(octets([0, 0, 0, 0])), Some(0))
+    test.assert_eq(ln_decode_features(octets([0xFF, 0xFF, 0xFF, 0xFF])), Some(location_navigation.F_DEFINED_BITS))
+    test.assert_eq(ln_decode_features(octets([0x04, 0, 0, 0])), Some(location_navigation.F_LOCATION))
+    test.assert_eq(ln_decode_features(octets([0, 0, 0])), None)
+    test.assert_eq(ln_decode_features(octets([0, 0, 0, 0, 0])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_the_requests_and_the_responses()
+    test.assert_eq(ln_req_set_cumulative(0x123456), octets([0x01, 0x56, 0x34, 0x12]))
+    test.assert_eq(ln_req_set_cumulative(-1), octets([0x01, 0, 0, 0]))
+    test.assert_eq(ln_req_set_cumulative(0x1000000), octets([0x01, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(ln_req_mask(LN_SPEED | LN_UTC), octets([0x02, 0x41, 0x00]))
+    test.assert_eq(ln_req_navigation(LN_NAV_START), octets([0x03, 1]))
+    test.assert_eq(ln_req_navigation(LN_NAV_SELECT_NEAREST), octets([0x03, 5]))
+    test.assert_eq(ln_req_number_of_routes(), octets([0x04]))
+    test.assert_eq(ln_req_route_name(2), octets([0x05, 2, 0]))
+    test.assert_eq(ln_req_select_route(0x0102), octets([0x06, 0x02, 0x01]))
+    test.assert_eq(ln_req_fix_rate(10), octets([0x07, 10]))
+    test.assert_eq(ln_req_fix_rate(300), octets([0x07, 255]))
+    test.assert_eq(ln_req_elevation(-2), octets([0x08, 0xFE, 0xFF, 0xFF]))
+    test.assert_eq(ln_req_elevation(100000000), octets([0x08, 0xFF, 0xFF, 0x7F]))
+    let count = octets([0x20, 0x04, 0x01, 0x03, 0x00])
+    match ln_decode_response(count)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 4)
+            test.assert_eq(r.result, LN_RESULT_SUCCESS)
+            test.assert_eq(ln_response_routes(count, r), 3)
+            test.assert_eq(list.len(ln_response_name(count, r)), 0)
+    let name = octets([0x20, 0x05, 0x01, 0x48, 0x6F, 0x6D, 0x65])
+    match ln_decode_response(name)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(ln_response_name(name, r), wire.text("Home"))
+            test.assert_eq(ln_response_routes(name, r), -1)
+    match ln_decode_response(octets([0x20, 0x04, 0x03]))
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.result, LN_RESULT_INVALID_PARAMETER)
+            test.assert_eq(ln_response_routes(octets([0x20, 0x04, 0x03]), r), -1)
+            test.assert_eq(list.len(ln_response_name(octets([0x20, 0x04, 0x03]), r)), 0)
+    test.assert_eq(ln_decode_response(octets([0x20, 0x04])), None)
+    test.assert_eq(ln_decode_response(octets([0x10, 0x04, 0x01])), None)
+    test.assert_eq(ln_decode_response([]), None)
+
+@tier(app)
+fn test_server(config: location_navigation.LnsConfig) -> (gatt_server.GattServer, location_navigation.LnsHandles)
+    location_navigation.server(config)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    let config = location_navigation.full_config()
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = location_navigation.new_lns_state(config)
+    let both = sensor_client.test_open(location_navigation.UUID_LOCATION_AND_NAVIGATION_SERVICE)
+    var t = both.0
+    var c = ln_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ln_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The Feature read arrived.
+    var feature_seen = false
+    for i in 0..(list.len(seen) / 2)
+        if seen[2 * i + 1] == location_navigation.UUID_LN_FEATURE
+            feature_seen = true
+    test.assert(feature_seen)
+    // A location notification reaches the decoder.
+    let notes = location_navigation.lns_notify_location(var s.db, var s.link, h, config, state, location_navigation.full_location(), 0)
+    test.assert(list.len(notes) >= 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, notes), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), location_navigation.UUID_LOCATION_AND_SPEED)
+    // The client starts the navigation through the control point; the server notifies the navigation then.
+    var start = [0x12, h.control_point & 0xFF, h.control_point >>> 8]
+    for x in ln_req_navigation(LN_NAV_START)
+        list.push(start, x as Int)
+    let started = location_navigation.receive_default(var s, h, config, var state, wire.octets(start), 1)
+    test.assert_eq(list.len(started), 2)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 1)
+    let nav = location_navigation.lns_notify_navigation(var s.db, var s.link, h, config, state, location_navigation.full_navigation(), 0)
+    test.assert_eq(list.len(nav), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, nav), sensor_client.SE_VALUE)
+    let n = navigation(sensor_client.sc_value(c))
+    test.assert_eq(n.bearing, 0x0102)
+    test.assert_eq(n.remaining_vertical, -2)
+    // A procedure: the request the client builds, the server's response indication decoded.
+    var request = [0x12, h.control_point & 0xFF, h.control_point >>> 8]
+    for x in ln_req_number_of_routes()
+        list.push(request, x as Int)
+    let out = location_navigation.receive_default(var s, h, config, var state, wire.octets(request), 2)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [out[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), location_navigation.UUID_LN_CONTROL_POINT)
+    let v = sensor_client.sc_value(c)
+    match ln_decode_response(v)
+        None => test.fail("a response")
+        Some(r) => test.assert_eq(ln_response_routes(v, r), 3)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_the_client_writes_a_request_to_the_control_point()
+    if not fixtures.client_engine_present()
+        return
+    let config = location_navigation.full_config()
+    var built = test_server(config)
+    var s = built.0
+    let both = sensor_client.test_open(location_navigation.UUID_LOCATION_AND_NAVIGATION_SERVICE)
+    var t = both.0
+    var c = ln_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let _ = sensor_client.test_pump(var t, var c, var s, ln_client_start(var t, var c, 0), var seen)
+    let w = sensor_client.test_pump(var t, var c, var s, ln_client_write(var t, var c, ln_req_select_route(1), 0), var seen)
+    test.assert((w & sensor_client.SE_DONE) != 0)
+    test.assert_eq((w & sensor_client.SE_FAILED), 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_session_with_a_minimal_sensor_skips_the_optional_characteristics()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(location_navigation.default_lns_config(0))
+    var s = built.0
+    let both = sensor_client.test_open(location_navigation.UUID_LOCATION_AND_NAVIGATION_SERVICE)
+    var t = both.0
+    var c = ln_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ln_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // No control point: the write ends with Not Found.
+    let w = ln_client_write(var t, var c, ln_req_number_of_routes(), 0)
+    test.assert((w.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-012")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(location_navigation.UUID_LOCATION_AND_NAVIGATION_SERVICE)
+    var t = both.0
+    var c = ln_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, ln_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

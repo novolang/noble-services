@@ -1,0 +1,536 @@
+// tests/hogp_tests.nv — the unit tests of src/hogp.nv.
+//
+//   novo test tests/hogp_tests.nv
+//
+// The keyboard and consumer Report Map is 90 octets, so a test that builds it carries @when on `MAX_HID_MAP_OCTETS >= 90` and
+// runs in every configuration whose HID Service holds a map that long.
+
+use std.test
+use att
+use gatt_server
+use noble_services_config
+use noble_config
+use links
+use profile_builder
+use hid
+use bas_policy.{ BasError }
+use bas_policy
+use dis_policy.{ DisError }
+use dis_policy
+use device_information
+use hogp.{ HogpConfig, HogpDeviceHandles, HogpError, HogpHandles, HogpLinks, HogpPolicy, add_hogp_device, add_hogp_service, default_hogp_policy, from_profile, hogp_link_opened, hogp_mode, hogp_send_boot_keyboard, hogp_send_boot_mouse, hogp_send_report, hogp_serve_writes, hogp_suspended, new_hogp_links, report_size }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn peer() -> links.LinkId
+    links.link_id(0, 1)
+
+fn keyboard_config() -> HogpConfig
+    HogpConfig { hid: hid.keyboard_consumer_config(gatt_server.Access.Open), boot_mouse: true }
+
+// A configuration of the wanted report map, reports, flags and boot reports,
+// open to any client.
+fn config_with(map: [u8], reports: [hid.HidReport], flags: Int, boot_keyboard: Bool, boot_mouse: Bool) -> HogpConfig
+    HogpConfig {
+        hid: hid.HidConfig {
+            bcd_hid: 0x0111, country_code: 0, flags: flags, report_map: map, reports: reports, boot_keyboard: boot_keyboard,
+            values: gatt_server.open_permissions(), cccd: gatt_server.open_permissions() },
+        boot_mouse: boot_mouse }
+
+// What a build answered.
+struct BuiltService
+    handles: HogpHandles
+    error: ?HogpError
+
+fn no_service() -> HogpHandles
+    HogpHandles {
+        hid: hid.HidHandles {
+            service: 0, protocol_mode: 0, report_map: 0, information: 0, control_point: 0, reports: [], boot_input: 0,
+            boot_input_cccd: 0, boot_output: 0 },
+        boot_mouse_input: 0, boot_mouse_cccd: 0, sizes: [], remote_wake: false }
+
+fn build_service(var db: GattDb, config: HogpConfig) -> BuiltService
+    match add_hogp_service(var db, config)
+        Ok(h) => BuiltService { handles: h, error: None }
+        Err(e) => BuiltService { handles: no_service(), error: Some(e) }
+
+fn service(var s: GattServer, config: HogpConfig) -> HogpHandles
+    let b = build_service(var s.db, config)
+    test.assert_eq(b.error, None)
+    b.handles
+
+fn write_request(var s: GattServer, handle: Int, value: [Int]) -> [[u8]]
+    var pdu = octets([0x12, handle & 0xFF, handle >>> 8])
+    list.append(pdu, octets(value))
+    gatt_server.receive(var s.db, var s.link, pdu, 0)
+
+fn write_command(var s: GattServer, handle: Int, value: [Int]) -> [[u8]]
+    var pdu = octets([0x52, handle & 0xFF, handle >>> 8])
+    list.append(pdu, octets(value))
+    gatt_server.receive(var s.db, var s.link, pdu, 0)
+
+fn read_value(var s: GattServer, handle: Int) -> [u8]
+    let out = gatt_server.receive(var s.db, var s.link, octets([0x0A, handle & 0xFF, handle >>> 8]), 0)
+    test.assert_eq(list.len(out), 1)
+    out[0][:]
+
+// A policy that counts and keeps what it was told.
+struct Recorder
+    var accept: Bool
+    var wake: Bool
+    var modes: Int
+    var last_mode: Int
+    var suspends: Int
+    var suspended: Bool
+    var reports: Int
+    var last_id: Int
+    var last_kind: Int
+    var last_data: [u8]
+    var boot_outputs: Int
+
+fn recorder() -> Recorder
+    Recorder {
+        accept: true, wake: true, modes: 0, last_mode: -1, suspends: 0, suspended: false, reports: 0, last_id: -1, last_kind: -1,
+        last_data: [], boot_outputs: 0 }
+
+impl HogpPolicy[] for Recorder
+    fn accept_mode(var self, peer: links.LinkId, mode: Int) -> Bool
+        let _ = peer
+        let _ = mode
+        self.accept
+
+    fn mode_changed(var self, peer: links.LinkId, mode: Int)
+        let _ = peer
+        self.modes = self.modes + 1
+        self.last_mode = mode
+
+    fn suspend_changed(var self, peer: links.LinkId, suspended: Bool)
+        let _ = peer
+        self.suspends = self.suspends + 1
+        self.suspended = suspended
+
+    fn send_while_suspended(var self, peer: links.LinkId, remote_wake: Bool) -> Bool
+        let _ = peer
+        self.wake and remote_wake
+
+    fn report_written(var self, peer: links.LinkId, id: Int, kind: hid.ReportKind, data: [u8])
+        let _ = peer
+        self.reports = self.reports + 1
+        self.last_id = id
+        self.last_kind = hid.report_type_value(kind)
+        self.last_data = data[:]
+
+    fn boot_output_written(var self, peer: links.LinkId, data: [u8])
+        let _ = peer
+        self.boot_outputs = self.boot_outputs + 1
+        self.last_data = data[:]
+
+fn serve(var s: GattServer, h: HogpHandles, var state: HogpLinks, var policy: Recorder) [mutate]
+    hogp_serve_writes(var s.db, var s.link, h, var state, var policy, peer(), gatt_server.take_changed(var s.link))
+
+fn subscribe(var s: GattServer, handle: Int)
+    gatt_server.set_configuration(var s.link, handle, gatt_server.CCC_NOTIFICATION)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_boot_mouse_follows_the_boot_keyboard()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    test.assert_eq(h.hid.boot_output, 25)
+    test.assert_eq(h.boot_mouse_input, 27)
+    test.assert_eq(h.boot_mouse_cccd, 28)
+    test.assert_eq(gatt_server.last_handle(s.db), 28)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 28)
+    // Read and Notify, three octets of zeros, readable at the access of the values.
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, 26)].value, octets([0x12, 0x1B, 0x00, 0x33, 0x2A])))
+    test.assert(gatt_server.same_bytes(read_value(s, h.boot_mouse_input)[1:], octets([0, 0, 0])))
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.boot_mouse_input)].permissions, gatt_server.PERM_READ)
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.boot_mouse_cccd)].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE)
+    test.assert_eq(list.len(h.sizes), 3)
+    test.assert_eq(h.sizes[2], 2)
+    test.assert(not h.remote_wake)
+    // Without the mouse the service ends at the boot keyboard.
+    var plain = gatt_server.new_server([], 65)
+    let p = service(var plain, HogpConfig { hid: hid.keyboard_consumer_config(gatt_server.Access.Open), boot_mouse: false })
+    test.assert_eq(p.boot_mouse_input, 0)
+    test.assert_eq(p.boot_mouse_cccd, 0)
+    test.assert_eq(gatt_server.last_handle(plain.db), 25)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_stack_refuses_a_configuration_that_breaks_a_rule()
+    let map = hid.keyboard_consumer_report_map()
+    let input = hid.HidReport { id: 1, kind: hid.ReportKind.Input, size: 8 }
+    let output = hid.HidReport { id: 1, kind: hid.ReportKind.Output, size: 1 }
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(build_service(var s.db, config_with([], [input], 0, true, false)).error, Some(HogpError.EmptyReportMap))
+    var long: [u8] = []
+    for _ in 0..(noble_services_config.MAX_HID_MAP_OCTETS + 1)
+        list.push(long, 0)
+    test.assert_eq(build_service(var s.db, config_with(long, [input], 0, true, false)).error, Some(HogpError.MapTooLong))
+    var many: [hid.HidReport] = []
+    for k in 0..(noble_services_config.MAX_HID_REPORTS + 1)
+        list.push(many, hid.HidReport { id: k + 1, kind: hid.ReportKind.Input, size: 1 })
+    test.assert_eq(build_service(var s.db, config_with(map, many, 0, true, false)).error, Some(HogpError.TooManyReports))
+    test.assert_eq(build_service(var s.db, config_with(map, [], 0, false, false)).error, Some(HogpError.NoReports))
+    test.assert_eq(build_service(var s.db, config_with(map, [input], 0x04, false, false)).error, Some(HogpError.BadFlags))
+    test.assert_eq(build_service(var s.db, config_with(map, [input, output, input], 0, false, false)).error, Some(HogpError.DuplicateReport))
+    test.assert_eq(build_service(var s.db, config_with(map, [hid.HidReport { id: 1, kind: hid.ReportKind.Feature, size: 0 }], 0, false, false)).error,
+        Some(HogpError.InvalidValue))
+    // [HIDS] 2.5.3.2: Report ID 0 is for a type with one report only.
+    let first = hid.HidReport { id: 0, kind: hid.ReportKind.Input, size: 8 }
+    let second = hid.HidReport { id: 0, kind: hid.ReportKind.Input, size: 2 }
+    test.assert_eq(build_service(var s.db, config_with(map, [first, second], 0, false, false)).error, Some(HogpError.DuplicateReport))
+    test.assert_eq(build_service(var s.db, config_with(map, [first, hid.HidReport { id: 2, kind: hid.ReportKind.Input, size: 2 }], 0, false, false)).error,
+        Some(HogpError.ZeroReportId))
+    // Nothing was added by any of them; a boot report alone is a service.
+    test.assert_eq(list.len(s.db.attributes), 0)
+    test.assert_eq(build_service(var s.db, config_with(map, [], 0x03, true, false)).error, None)
+    // The same ID with another type is not a duplicate.
+    var t = gatt_server.new_server([], 65)
+    test.assert_eq(build_service(var t.db, config_with(map, [input, output], 0, false, false)).error, None)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_service(var s.db, keyboard_config()).error, Some(HogpError.NoRoom))
+    // Room for the whole service, then room for everything but the mouse's value,
+    // and for the value but not for its configuration.
+    var tight = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var tight.db, false, gatt_server.le16(0xAA00)), 1)
+    tight.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFC0, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_service(var tight.db, keyboard_config()).error, None)
+    var value_fails = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var value_fails.db, false, gatt_server.le16(0xAA00)), 1)
+    value_fails.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFE5, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_service(var value_fails.db, keyboard_config()).error, Some(HogpError.NoRoom))
+    var cccd_fails = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var cccd_fails.db, false, gatt_server.le16(0xAA00)), 1)
+    cccd_fails.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFE4, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_service(var cccd_fails.db, keyboard_config()).error, Some(HogpError.NoRoom))
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_protocol_mode_is_the_connections_own_and_takes_a_mode()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    var other = gatt_server.new_att_link(s.db)
+    var state = new_hogp_links()
+    var policy = recorder()
+    test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_REPORT)
+    // A value above 1 is refused as a request and ignored as a command.
+    test.assert_eq(write_request(var s, h.hid.protocol_mode, [2])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(list.len(write_command(var s, h.hid.protocol_mode, [2])), 0)
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.modes, 0)
+    // Boot Protocol Mode written without a response.
+    test.assert_eq(list.len(write_command(var s, h.hid.protocol_mode, [0])), 0)
+    serve(var s, h, var state, var policy)
+    test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_BOOT)
+    test.assert_eq(policy.modes, 1)
+    test.assert_eq(policy.last_mode, hid.PROTOCOL_MODE_BOOT)
+    // This connection reads Boot Protocol; the other one still reads Report Protocol.
+    test.assert(gatt_server.same_bytes(read_value(s, h.hid.protocol_mode)[1:], octets([0])))
+    let seen = gatt_server.receive(var s.db, var other, octets([0x0A, h.hid.protocol_mode & 0xFF, 0]), 0)
+    test.assert(gatt_server.same_bytes(seen[0], octets([0x0B, 1])))
+    // The same mode again is not a change; Report Protocol is.
+    let _ = write_command(var s, h.hid.protocol_mode, [0])
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.modes, 1)
+    let _ = write_command(var s, h.hid.protocol_mode, [1])
+    serve(var s, h, var state, var policy)
+    test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_REPORT)
+    test.assert_eq(policy.modes, 2)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_policy_may_decline_a_protocol_mode()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    var state = new_hogp_links()
+    var policy = recorder()
+    policy.accept = false
+    let _ = write_command(var s, h.hid.protocol_mode, [0])
+    serve(var s, h, var state, var policy)
+    test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_REPORT)
+    test.assert_eq(policy.modes, 0)
+    test.assert(gatt_server.same_bytes(read_value(s, h.hid.protocol_mode)[1:], octets([1])))
+    // A slot or a write the state cannot hold is left alone.
+    var bad_slot = HogpLinks { mode: [], suspended: [] }
+    test.assert_eq(hogp_mode(bad_slot, -1), hid.PROTOCOL_MODE_REPORT)
+    let _ = write_command(var s, h.hid.protocol_mode, [0])
+    hogp_serve_writes(var s.db, var s.link, h, var bad_slot, var policy, links.link_id(noble_config.MAX_CONNECTIONS, 1), gatt_server.take_changed(var s.link))
+    test.assert_eq(policy.modes, 0)
+    let _ = write_command(var s, h.hid.control_point, [0])
+    hogp_serve_writes(var s.db, var s.link, h, var bad_slot, var policy, links.link_id(-1, 1), gatt_server.take_changed(var s.link))
+    test.assert_eq(policy.suspends, 0)
+    // Handles another table holds read as no value and are left alone.
+    var elsewhere = gatt_server.new_server([], 65)
+    hogp_serve_writes(var elsewhere.db, var elsewhere.link, h, var state, var policy, peer(), [h.hid.protocol_mode, h.hid.control_point])
+    test.assert_eq(policy.modes, 0)
+    test.assert_eq(policy.suspends, 0)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_control_point_suspends_and_ends_the_suspend()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    var state = new_hogp_links()
+    var policy = recorder()
+    test.assert_eq(write_request(var s, h.hid.control_point, [2])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    // Exit Suspend while not suspended changes nothing.
+    let _ = write_command(var s, h.hid.control_point, [hid.CONTROL_POINT_EXIT_SUSPEND])
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.suspends, 0)
+    let _ = write_command(var s, h.hid.control_point, [hid.CONTROL_POINT_SUSPEND])
+    serve(var s, h, var state, var policy)
+    test.assert(hogp_suspended(state, 0))
+    test.assert_eq(policy.suspends, 1)
+    test.assert(policy.suspended)
+    // Suspend again is no change; Exit Suspend is.
+    let _ = write_command(var s, h.hid.control_point, [hid.CONTROL_POINT_SUSPEND])
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.suspends, 1)
+    let _ = write_command(var s, h.hid.control_point, [hid.CONTROL_POINT_EXIT_SUSPEND])
+    serve(var s, h, var state, var policy)
+    test.assert(not hogp_suspended(state, 0))
+    test.assert(not policy.suspended)
+    test.assert_eq(policy.suspends, 2)
+    // A connection opened on the slot starts in Report Protocol and not suspended.
+    let _ = write_command(var s, h.hid.control_point, [hid.CONTROL_POINT_SUSPEND])
+    let _ = write_command(var s, h.hid.protocol_mode, [0])
+    serve(var s, h, var state, var policy)
+    hogp_link_opened(var state, 0)
+    test.assert(not hogp_suspended(state, 0))
+    test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_REPORT)
+    hogp_link_opened(var state, noble_config.MAX_CONNECTIONS)
+    test.assert(not hogp_suspended(state, noble_config.MAX_CONNECTIONS))
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_the_policy_hears_the_writes_to_the_output_reports()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    var state = new_hogp_links()
+    var policy = recorder()
+    // The LED output report of report ID 1, by request.
+    test.assert(gatt_server.same_bytes(write_request(var s, h.hid.reports[1].value, [0x02])[0], octets([0x13])))
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.reports, 1)
+    test.assert_eq(policy.last_id, 1)
+    test.assert_eq(policy.last_kind, 2)
+    test.assert(gatt_server.same_bytes(policy.last_data, octets([2])))
+    // The Boot Keyboard Output Report.
+    test.assert(gatt_server.same_bytes(write_request(var s, h.hid.boot_output, [0x05])[0], octets([0x13])))
+    serve(var s, h, var state, var policy)
+    test.assert_eq(policy.boot_outputs, 1)
+    test.assert(gatt_server.same_bytes(policy.last_data, octets([5])))
+    test.assert_eq(policy.reports, 1)
+    // An input report cannot be written, and a handle that is no report is not served.
+    test.assert_eq(write_request(var s, h.hid.reports[0].value, [0])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    hogp_serve_writes(var s.db, var s.link, h, var state, var policy, peer(), [h.hid.reports[0].value, h.hid.report_map])
+    test.assert_eq(policy.reports, 1)
+    // A service without the boot keyboard has no boot output to serve: handle 0 is no write.
+    var plain = gatt_server.new_server([], 65)
+    let p = service(var plain, config_with(hid.keyboard_consumer_report_map(), [hid.HidReport { id: 2, kind: hid.ReportKind.Input, size: 2 }], 0, false, false))
+    hogp_serve_writes(var plain.db, var plain.link, p, var state, var policy, peer(), [0])
+    test.assert_eq(policy.boot_outputs, 1)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-004")
+fn test_a_report_goes_out_in_report_protocol_mode_only()
+    var s = gatt_server.new_server([], 65)
+    let h = service(var s, keyboard_config())
+    var state = new_hogp_links()
+    var policy = default_hogp_policy()
+    subscribe(s, h.hid.reports[0].cccd)
+    subscribe(s, h.hid.boot_input_cccd)
+    subscribe(s, h.boot_mouse_cccd)
+    let key = octets([0, 0, 4, 0, 0, 0, 0, 0])
+    let ntf = hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, key, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert(gatt_server.same_bytes(ntf[0], list.append(octets([0x1B, h.hid.reports[0].value, 0]), key)))
+    // The boot reports wait for Boot Protocol Mode.
+    test.assert_eq(list.len(hogp_send_boot_keyboard(var s.db, var s.link, h, state, var policy, peer(), key, 0)), 0)
+    test.assert_eq(list.len(hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([0, 1, 1]), 0)), 0)
+    // A report of another length, or one the service lacks, is not sent.
+    test.assert_eq(list.len(hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, octets([1, 2]), 0)), 0)
+    test.assert_eq(list.len(hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 9, key, 0)), 0)
+    // The output report of the same ID is not an input report.
+    test.assert_eq(report_size(h, 1), 8)
+    test.assert_eq(report_size(h, 2), 2)
+    test.assert_eq(report_size(h, 9), -1)
+    // In Boot Protocol Mode it is the other way round.
+    state.mode[0] = hid.PROTOCOL_MODE_BOOT
+    test.assert_eq(list.len(hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, key, 0)), 0)
+    let boot = hogp_send_boot_keyboard(var s.db, var s.link, h, state, var policy, peer(), key, 0)
+    test.assert_eq(list.len(boot), 1)
+    test.assert_eq(boot[0][1] as Int, h.hid.boot_input)
+    test.assert_eq(list.len(hogp_send_boot_keyboard(var s.db, var s.link, h, state, var policy, peer(), octets([1]), 0)), 0)
+    let mouse = hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([1, 5, 250]), 0)
+    test.assert_eq(list.len(mouse), 1)
+    test.assert(gatt_server.same_bytes(mouse[0], octets([0x1B, h.boot_mouse_input, 0, 1, 5, 250])))
+    test.assert_eq(list.len(hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([1, 5]), 0)), 0)
+    // A service without the mouse sends none.
+    var plain = gatt_server.new_server([], 65)
+    let p = service(var plain, HogpConfig { hid: hid.keyboard_consumer_config(gatt_server.Access.Open), boot_mouse: false })
+    test.assert_eq(list.len(hogp_send_boot_mouse(var plain.db, var plain.link, p, state, var policy, peer(), octets([1, 5, 250]), 0)), 0)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-004")
+fn test_a_suspended_host_is_sent_a_report_only_where_the_policy_wakes_it()
+    var s = gatt_server.new_server([], 65)
+    let base = hid.keyboard_consumer_config(gatt_server.Access.Open)
+    let waking = HogpConfig {
+        hid: hid.HidConfig {
+            bcd_hid: base.bcd_hid, country_code: base.country_code, flags: hid.HID_FLAG_REMOTE_WAKE, report_map: base.report_map,
+            reports: base.reports, boot_keyboard: base.boot_keyboard, values: base.values, cccd: base.cccd },
+        boot_mouse: true }
+    let h = service(var s, waking)
+    test.assert(h.remote_wake)
+    var state = new_hogp_links()
+    var policy = recorder()
+    subscribe(s, h.hid.reports[0].cccd)
+    let key = octets([0, 0, 4, 0, 0, 0, 0, 0])
+    state.suspended[0] = 1
+    // The policy wakes the host, and the device allows remote wake.
+    test.assert_eq(list.len(hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, key, 0)), 1)
+    // The policy keeps the host asleep.
+    policy.wake = false
+    test.assert_eq(list.len(hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, key, 0)), 0)
+    // A device without the Remote Wake bit never wakes the host, whatever the policy says.
+    var quiet = gatt_server.new_server([], 65)
+    let q = service(var quiet, keyboard_config())
+    subscribe(quiet, q.hid.reports[0].cccd)
+    policy.wake = true
+    test.assert_eq(list.len(hogp_send_report(var quiet.db, var quiet.link, q, state, var policy, peer(), 1, key, 0)), 0)
+    state.suspended[0] = 0
+    test.assert_eq(list.len(hogp_send_report(var quiet.db, var quiet.link, q, state, var policy, peer(), 1, key, 0)), 1)
+    // Boot reports follow the same rule.
+    state.mode[0] = hid.PROTOCOL_MODE_BOOT
+    state.suspended[0] = 1
+    subscribe(quiet, q.hid.boot_input_cccd)
+    test.assert_eq(list.len(hogp_send_boot_keyboard(var quiet.db, var quiet.link, q, state, var policy, peer(), key, 0)), 0)
+    subscribe(s, h.hid.boot_input_cccd)
+    subscribe(s, h.boot_mouse_cccd)
+    test.assert_eq(list.len(hogp_send_boot_keyboard(var s.db, var s.link, h, state, var policy, peer(), key, 0)), 1)
+    test.assert_eq(list.len(hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([0, 1, 1]), 0)), 1)
+    policy.wake = false
+    test.assert_eq(list.len(hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([0, 1, 1]), 0)), 0)
+
+fn pnp() -> [u8]
+    device_information.pnp_id_value(device_information.PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100)
+
+fn info_of(model: [u8], pnp_id: [u8]) -> device_information.DeviceInformation
+    device_information.DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: octets([0x4E, 0x6F, 0x76, 0x6F]), model: model, serial: [], hardware: [], firmware: [],
+        software: [], system_id: [], pnp_id: pnp_id }
+
+// What a device build answered.
+struct BuiltDevice
+    handles: ?HogpDeviceHandles
+    error: ?HogpError
+
+fn no_device() -> HogpDeviceHandles
+    HogpDeviceHandles {
+        information: dis_policy.no_handles(), batteries: bas_policy.BasHandles { batteries: [], presentation: [] }, hid: no_service() }
+
+fn build_device_with(var db: GattDb, info: device_information.DeviceInformation, batteries: [bas_policy.BasInstance], config: HogpConfig) -> BuiltDevice
+    match add_hogp_device(var db, dis_policy.information_policy(info), batteries, config)
+        Ok(h) => BuiltDevice { handles: Some(h), error: None }
+        Err(e) => BuiltDevice { handles: None, error: Some(e) }
+
+fn build_device(var db: GattDb, info: device_information.DeviceInformation, batteries: [bas_policy.BasInstance]) -> BuiltDevice
+    build_device_with(var db, info, batteries, keyboard_config())
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_a_hid_device_holds_information_battery_and_hid_in_that_order()
+    var s = gatt_server.new_server([], 65)
+    let built = build_device(var s.db, info_of([], pnp()), [bas_policy.open_instance(0, 90)])
+    test.assert_eq(built.error, None)
+    // The handles are read with `??`: `let m = built.handles!` on an Option field
+    // whose payload holds lists binds a payload with empty lists.
+    let d = built.handles ?? no_device()
+    test.assert_eq(d.information.service, 1)
+    test.assert_eq(d.information.manufacturer, 3)
+    test.assert_eq(d.information.pnp_id, 5)
+    test.assert_eq(list.len(d.batteries.batteries), 1)
+    test.assert_eq(d.batteries.batteries[0].service, 6)
+    test.assert_eq(d.hid.hid.service, 10)
+    // The three services are found in a discovery of the primary services.
+    let groups = gatt_server.receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0)
+    test.assert_eq(groups[0][0] as Int, 0x11)
+
+@when(noble_services_config.MAX_HID_MAP_OCTETS >= 90)
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_a_hid_device_without_a_pnp_id_or_with_a_refused_companion_is_refused()
+    var s = gatt_server.new_server([], 65)
+    let missing = build_device(var s.db, info_of(octets([0x4E]), []), [bas_policy.open_instance(0, 90)])
+    test.assert_eq(missing.error, Some(HogpError.MissingPnpId))
+    test.assert_eq(list.len((missing.handles ?? no_device()).hid.sizes), 0)
+    // The Device Information Service, the Battery Service and the HID Service
+    // each report their own refusal, and a configuration that breaks a rule is
+    // refused before anything is added.
+    var fresh = gatt_server.new_server([], 65)
+    test.assert_eq(build_device(var fresh.db, info_of([], octets([1, 2])), [bas_policy.open_instance(0, 90)]).error,
+        Some(HogpError.Information(dis_policy.DisError.BadPnpId)))
+    var no_battery = gatt_server.new_server([], 65)
+    test.assert_eq(build_device(var no_battery.db, info_of([], pnp()), []).error, Some(HogpError.Battery(bas_policy.BasError.NoInstance)))
+    var bad = gatt_server.new_server([], 65)
+    let broken = config_with([], [], 0, false, false)
+    let refused = build_device_with(var bad.db, info_of([], pnp()), [bas_policy.open_instance(0, 90)], broken)
+    test.assert_eq(refused.error, Some(HogpError.EmptyReportMap))
+    test.assert_eq(list.len(bad.db.attributes), 0)
+    // A table with room for the two companions only refuses the HID Service.
+    var full = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var full.db, false, gatt_server.le16(0xAA00)), 1)
+    full.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFEC, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_device(var full.db, info_of([], pnp()), [bas_policy.open_instance(0, 90)]).error, Some(HogpError.NoRoom))
+
+@test
+@satisfies("REQ-BLE-PRF-003")
+fn test_an_error_names_its_reason()
+    let errors = [
+        HogpError.EmptyReportMap, HogpError.MapTooLong, HogpError.TooManyReports, HogpError.NoReports, HogpError.DuplicateReport,
+        HogpError.ZeroReportId, HogpError.BadFlags, HogpError.InvalidValue, HogpError.NoRoom, HogpError.MissingPnpId,
+        HogpError.Information(dis_policy.DisError.Empty), HogpError.Battery(bas_policy.BasError.TooMany)]
+    for e in errors
+        test.assert(str.len(e.message()) > 10)
+    test.assert_eq(from_profile(profile_builder.ProfileError.NotPermitted), HogpError.InvalidValue)
+    test.assert_eq(from_profile(profile_builder.ProfileError.InvalidValue), HogpError.InvalidValue)
+    var policy = default_hogp_policy()
+    test.assert(not policy.send_while_suspended(peer(), false))
+    test.assert(policy.accept_mode(peer(), 0))
+    policy.mode_changed(peer(), 0)
+    policy.suspend_changed(peer(), true)
+    policy.report_written(peer(), 1, hid.ReportKind.Output, [])
+    policy.boot_output_written(peer(), [])

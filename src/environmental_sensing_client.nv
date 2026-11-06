@@ -1,0 +1,276 @@
+// src/environmental_sensing_client.nv — the Collector side of the
+// Environmental Sensing Service (0x181A): the decoders of the readings and of the
+// descriptors of a characteristic, the builders of the descriptor writes, and the client
+// session.
+//
+// The readings ([GSS] 3.121, 3.175 and 3.211), the same three characteristics as the
+// server module carries:
+//
+//   Temperature   0x2A6E   a sint16, 0.01 degrees Celsius, -273.15 to 327.67 degrees;
+//                          0x8000 says the value is not known
+//   Pressure      0x2A6D   a uint32, 0.1 pascal
+//   Humidity      0x2A6F   a uint16, 0.01 percent, 0 to 100 percent; 0xFFFF says the
+//                          value is not known
+//
+// The descriptors ([ESS] 3.2):
+//
+//   ES Measurement      0x290C   `es_decode_measurement`: the flags (two octets, reserved), the
+//                                Sampling Function, the Measurement Period and the Internal
+//                                Update Interval (two uint24 in seconds, 0 for not in use), the
+//                                Application and the Measurement Uncertainty (0.5 percent steps,
+//                                0xFF for not available)
+//   ES Trigger Setting  0x290D   `es_decode_trigger` reads, `es_trigger_value` builds the write
+//   ES Configuration    0x290B   `es_decode_logic` reads, `es_logic_value` builds the write
+//   Valid Range         0x2906   `es_decode_range`
+//
+// and the Descriptor Value Changed characteristic (0x2A7D, indicated), whose value is the
+// flags (bit 0 source of change, 1 Trigger Setting, 2 Configuration, 3 ES Measurement, 4
+// User Description) and the 16-bit UUID of the characteristic that changed:
+// `es_decode_change`.  A Trigger Setting is a condition octet and its operand: 0x00
+// inactive and 0x03 on change have none, 0x01 a fixed time between transmissions and 0x02 no
+// less than a time between them have a uint24 in seconds, and 0x04 to 0x09 (less than,
+// less than or equal, greater than, greater than or equal, equal, not equal) have a value in
+// the format of the characteristic.
+//
+// A decoder answers `None` for a value of the wrong length, a reading outside the range of its
+// format (the "not known" value excepted), and a condition the table does not define.  It
+// allocates nothing and keeps no state.
+//
+// The session (`es_client_*`) runs on `sensor_client.nv`: discover the service, read each of
+// the three readings the sensor has, enable their notification and the indication of the
+// Descriptor Value Changed characteristic.  The session finds the first characteristic of a
+// UUID; a sensor with two instances of one UUID (told apart by their ES Measurement) is served
+// through the first.  The session reads and writes no descriptor, so the descriptor values are
+// decoded from octets the program reads, and the writes are built here for the program to send.
+//
+// Satisfies: REQ-BLE-PRFC-013.
+
+use gatt_client
+use links
+use environmental_sensing
+use sensor_client
+use wire
+
+// The trigger conditions, as the server module names them.
+const ES_INACTIVE = 0x00
+const ES_FIXED_INTERVAL = 0x01
+const ES_MIN_INTERVAL = 0x02
+const ES_ON_CHANGE = 0x03
+const ES_LESS = 0x04
+const ES_LESS_OR_EQUAL = 0x05
+const ES_GREATER = 0x06
+const ES_GREATER_OR_EQUAL = 0x07
+const ES_EQUAL = 0x08
+const ES_NOT_EQUAL = 0x09
+
+// The Trigger Logic values.
+const ES_LOGIC_AND = 0x00
+const ES_LOGIC_OR = 0x01
+
+// The size of an ES Measurement descriptor, in octets.
+const ES_MEASUREMENT_SIZE = 11
+
+// The uncertainty that says it is not available.
+const ES_UNCERTAINTY_NOT_AVAILABLE = 0xFF
+
+// One reading: `known` is false for the "not known" value, and then `value` is 0.  `value` is the raw
+// value of the characteristic (see the units above).
+@value
+struct EsReading
+    known: Bool
+    value: Int
+
+// The decoded ES Measurement descriptor.
+@value
+struct EsMeasurement
+    sampling: Int
+    period_s: Int
+    interval_s: Int
+    application: Int
+    uncertainty: Int
+
+// A decoded ES Trigger Setting.
+@value
+struct EsTrigger
+    condition: Int
+    operand: Int
+
+// The decoded Valid Range of a characteristic.
+@value
+struct EsRange
+    low: Int
+    high: Int
+
+// A decoded Descriptor Value Changed value.
+@value
+struct EsChange
+    flags: Int
+    uuid: Int
+
+// The Temperature in `b`, `None` unless it is two octets inside -273.15 to 327.67 degrees or 0x8000.
+@tier(embedded)
+@no_alloc
+fn es_decode_temperature(b: [u8]) -> ?EsReading
+    if list.len(b) != 2
+        return None
+    let v = wire.get_signed(b, 0, 2)
+    if v == -32768
+        return Some(EsReading { known: false, value: 0 })
+    if v < -27315
+        return None
+    Some(EsReading { known: true, value: v })
+
+// The Pressure in `b`, `None` unless it is four octets.
+@tier(embedded)
+@no_alloc
+fn es_decode_pressure(b: [u8]) -> ?EsReading
+    if list.len(b) != 4
+        return None
+    Some(EsReading { known: true, value: wire.get(b, 0, 4) })
+
+// The Humidity in `b`, `None` unless it is two octets inside 0 to 100 percent or 0xFFFF.
+@tier(embedded)
+@no_alloc
+fn es_decode_humidity(b: [u8]) -> ?EsReading
+    if list.len(b) != 2
+        return None
+    let v = wire.get(b, 0, 2)
+    if v == 0xFFFF
+        return Some(EsReading { known: false, value: 0 })
+    if v > 10000
+        return None
+    Some(EsReading { known: true, value: v })
+
+// The reading of the characteristic `uuid` in `b`, `None` for a value that is not one or a characteristic
+// this module does not carry.
+@tier(embedded)
+@no_alloc
+fn es_decode_reading(uuid: Int, b: [u8]) -> ?EsReading
+    if uuid == environmental_sensing.UUID_TEMPERATURE
+        return es_decode_temperature(b)
+    if uuid == environmental_sensing.UUID_PRESSURE
+        return es_decode_pressure(b)
+    if uuid == environmental_sensing.UUID_HUMIDITY
+        return es_decode_humidity(b)
+    None
+
+// The number of octets of the value of `uuid`, 0 for a characteristic this module does not carry.
+@tier(embedded)
+@no_alloc
+fn es_value_size(uuid: Int) -> Int
+    environmental_sensing.ess_octets(uuid)
+
+// The ES Measurement descriptor in `b`, `None` unless it is eleven octets.
+@tier(embedded)
+@no_alloc
+fn es_decode_measurement(b: [u8]) -> ?EsMeasurement
+    if list.len(b) != ES_MEASUREMENT_SIZE
+        return None
+    Some(EsMeasurement {
+        sampling: b[2] as Int, period_s: wire.get(b, 3, 3), interval_s: wire.get(b, 6, 3),
+        application: b[9] as Int, uncertainty: b[10] as Int })
+
+// The uncertainty of `m` in tenths of a percent (0.5 percent steps), -1 when it is not available.
+@tier(embedded)
+@no_alloc
+fn es_uncertainty_tenths(m: EsMeasurement) -> Int
+    if m.uncertainty == ES_UNCERTAINTY_NOT_AVAILABLE
+        return -1
+    m.uncertainty * 5
+
+// The ES Trigger Setting of the characteristic `uuid` in `b`, `None` for a condition above 0x09 or an
+// operand of the wrong length.
+@tier(embedded)
+@no_alloc
+fn es_decode_trigger(uuid: Int, b: [u8]) -> ?EsTrigger
+    if list.len(b) == 0
+        return None
+    let c = b[0] as Int
+    let n = list.len(b) - 1
+    if c == ES_INACTIVE or c == ES_ON_CHANGE
+        if n != 0
+            return None
+        return Some(EsTrigger { condition: c, operand: 0 })
+    if c == ES_FIXED_INTERVAL or c == ES_MIN_INTERVAL
+        if n != 3
+            return None
+        return Some(EsTrigger { condition: c, operand: wire.get(b, 1, 3) })
+    if c >= ES_LESS and c <= ES_NOT_EQUAL
+        if n != es_value_size(uuid) or n == 0
+            return None
+        return Some(EsTrigger { condition: c, operand: environmental_sensing.ess_decode(uuid, b, 1) })
+    None
+
+// The Trigger Setting value for the condition `condition` and `operand` on the characteristic `uuid`: the
+// condition, then the operand in seconds (three octets) for 0x01 and 0x02 or in the format of the
+// characteristic for 0x04 to 0x09.  Empty for a condition above 0x09.
+@tier(app)
+fn es_trigger_value(uuid: Int, condition: Int, operand: Int) -> [u8]
+    var out: [u8] = []
+    if condition < 0 or condition > ES_NOT_EQUAL
+        return out
+    wire.put(var out, condition, 1)
+    if condition == ES_FIXED_INTERVAL or condition == ES_MIN_INTERVAL
+        wire.put(var out, wire.clamp(operand, 0, 0xFFFFFF), 3)
+    if condition >= ES_LESS
+        wire.put(var out, operand, es_value_size(uuid))
+    out
+
+// The Trigger Logic in `b`: one octet, 0 (AND) or 1 (OR); `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn es_decode_logic(b: [u8]) -> ?Int
+    if list.len(b) != 1 or (b[0] as Int) > ES_LOGIC_OR
+        return None
+    Some(b[0] as Int)
+
+// The ES Configuration value for the Trigger Logic `logic`.
+@tier(app)
+fn es_logic_value(logic: Int) -> [u8]
+    [wire.clamp(logic, 0, 255) as u8]
+
+// The Valid Range of the characteristic `uuid` in `b`: the lower and the upper bound in the format of the
+// characteristic, `None` for another length or a lower bound above the upper one.
+@tier(embedded)
+@no_alloc
+fn es_decode_range(uuid: Int, b: [u8]) -> ?EsRange
+    let size = es_value_size(uuid)
+    if size == 0 or list.len(b) != 2 * size
+        return None
+    let low = environmental_sensing.ess_decode(uuid, b, 0)
+    let high = environmental_sensing.ess_decode(uuid, b, size)
+    if low > high
+        return None
+    Some(EsRange { low: low, high: high })
+
+// The Descriptor Value Changed value in `b`, `None` unless it is the flags and a 16-bit UUID (four octets).
+@tier(embedded)
+@no_alloc
+fn es_decode_change(b: [u8]) -> ?EsChange
+    if list.len(b) != 4
+        return None
+    Some(EsChange { flags: wire.get(b, 0, 2), uuid: wire.get(b, 2, 2) })
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn es_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, environmental_sensing.UUID_ENVIRONMENTAL_SENSING_SERVICE)
+
+// Discover the service, read the temperature, the pressure and the humidity, enable their notification
+// and the indication of the Descriptor Value Changed characteristic, each optional.
+@tier(app)
+fn es_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, environmental_sensing.UUID_TEMPERATURE, false)
+    sensor_client.sc_queue_read(var c, environmental_sensing.UUID_PRESSURE, false)
+    sensor_client.sc_queue_read(var c, environmental_sensing.UUID_HUMIDITY, false)
+    sensor_client.sc_queue_subscribe(var c, environmental_sensing.UUID_TEMPERATURE, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, environmental_sensing.UUID_PRESSURE, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, environmental_sensing.UUID_HUMIDITY, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, environmental_sensing.UUID_DESCRIPTOR_VALUE_CHANGED, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Read the characteristic `uuid` again, after the plan finished.
+@tier(app)
+fn es_client_read(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, uuid: Int, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, uuid, true)
+    sensor_client.sc_kick(var t, var c, now_ms)

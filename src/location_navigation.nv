@@ -1,0 +1,948 @@
+// src/location_navigation.nv — the Location and Navigation
+// Service (0x1819), with which a positioning sensor (a bicycle computer, a
+// watch, a handheld receiver) sends location, speed and navigation data to a
+// collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   LN Feature            0x2A6A  Read (Indicate when the value can change);
+//                                 32 bits
+//   Location and Speed    0x2A67  Notify; Flags and the optional fields
+//   Position Quality      0x2A69  Read; optional, Flags and the optional fields
+//   LN Control Point      0x2A6B  Write, Indicate; present when a feature needs
+//                                 a procedure
+//   Navigation            0x2A68  Notify; optional, Flags, Bearing, Heading and
+//                                 the optional fields
+//
+// The characteristics come in the order of the specification's table, and each
+// one that notifies or indicates has a Client Characteristic Configuration
+// descriptor.  The LN Feature value lists what the sensor supports: the
+// fields of the Location and Speed value (bits 0 to 6), of the Navigation
+// value (bits 7 to 9) and of the Position Quality value (bits 10 to 16), the
+// three control point procedures that are features (Location and Speed
+// Characteristic Content Masking 17, Fix Rate Setting 18, Elevation Setting 19)
+// and Position Status (20); bits 21 to 31 are reserved and `add_lns_service`
+// refuses a value that sets one.  A field is in a value exactly when its
+// feature bit is set and the product has it (`present`), and the status bits
+// of the Flags field (Position Status, the 2D and 3D format, the Elevation
+// Source and the Heading Source) are 0 when their feature bit is clear.  The
+// Position Quality characteristic is present when `position_quality` is set
+// and has to be when a feature of bits 10 to 16 is; the Navigation
+// characteristic is present when `navigation` is set and has to be when a
+// feature of bits 7 to 9 is; Elevation Setting needs Elevation.
+//
+// Security.  The service imposes none ([LNS] Table 3.1).  The Location and
+// Navigation Profile 1.0.1 raises it ([LNP] 6.1): every characteristic of the
+// service is at LE security mode 1 and level 1, 2 or 3.  So `add_lns_service`
+// takes `LnsConfig.access` as Open, Authorized, Encrypted or Authenticated and
+// refuses Denied and SecureConnections with `NotPermitted`; the access is the
+// read access of the readable values, the write access of the control point
+// and the read and write access of every descriptor, and a notification or
+// indication goes to a client whose link grants the write of its descriptor.
+//
+// Location and Speed.  `lns_notify_location` turns one `LnsLocation` into
+// notifications.  The fields keep the order of the table; the Total Distance
+// and the Rolling Time wrap at 24 and at 8 bits, as the specification has them
+// roll over, and a value outside the range of its format (a latitude beyond
+// 90 degrees, a longitude beyond 180, a heading of 360 degrees or more, an
+// elevation beyond 24 bits, a UTC Time that is not a Date Time with a known
+// date) is not sent.  Over the default ATT_MTU not every field fits: the fields
+// that do not go into a second notification, which holds its own Flags field
+// with the presence bits of its fields and the status bits again.  The value is
+// time-sensitive data ([LNS] 3.6): the service sends the one it is given and
+// keeps none.
+//
+// The control point.  A write starts a procedure and is answered by an
+// indication: the Response Code opcode (0x20), the opcode it answers, the
+// result and the response parameter.
+//
+//   0x01  Set Cumulative Value    3 octets, the Total Distance in 0.1 m; needs
+//                                 Total Distance
+//   0x02  Mask Location and Speed Characteristic Content
+//                                 2 octets, the fields to turn off (bits 0 to 6,
+//                                 the others reserved); needs Content Masking
+//   0x03  Navigation Control      1 octet, 0 to 5; needs the Navigation
+//                                 characteristic
+//   0x04  Request Number of Routes   no parameter; answers a uint16
+//   0x05  Request Name of Route   2 octets, the route number; answers the name
+//   0x06  Select Route            2 octets, the route number
+//   0x07  Set Fix Rate            1 octet, seconds; needs Fix Rate Setting
+//   0x08  Set Elevation           3 octets, signed, 0.01 m; needs Elevation Setting
+//
+// The procedures of 0x04 to 0x06 and 0x03 belong to the Navigation
+// characteristic.  A procedure the sensor lacks, and an opcode the service does
+// not define (0x00 included), is answered Op Code Not Supported; a parameter of
+// the wrong length or outside its range, Invalid Parameter; a route number is
+// valid from 0 to the number of routes less one.  Navigation Control is
+// answered Operation Failed when it cannot be carried out: Start and Select
+// Nearest Waypoint with no route stored, Pause and Skip Waypoint while not
+// navigating, Continue while not paused.  A write while the control point
+// indication is not enabled is refused with the Common Profile Error Code 0xFD,
+// one while an indication is unconfirmed with 0xFE ([LNS] 3.4.3), and so is a
+// Navigation Control write while the Navigation notification is not enabled
+// (0xFD); a long write to the control point is refused.  The application passes
+// each ATT request to `lns_receive` and sends the PDUs it answers: the procedure
+// is evaluated after the Write Response and its indication follows it.
+//
+// What the procedures changed is in `LnsState` for the application to apply:
+// the Total Distance, Elevation and Fix Rate the client set (each with a flag
+// the application clears), the fields turned off, the route and the Navigation
+// Control action.  The mask is not kept for the next connection ([LNS]
+// 3.4.2.2): `lns_disconnected` clears it and stops the navigation.  The first
+// route is selected until the client selects another.
+//
+// NOT IMPLEMENTED: the positioning itself (the fix, the speed, the distance
+// and the position quality come from the product), the storage of routes
+// beyond their names, the waypoints, the bearing and remaining distance
+// calculation, and the Service UUID, Local Name and Appearance items of the
+// advertising data ([LNP] 3.1.1).  The BR/EDR SDP record is not applicable to
+// the LE-only stack.
+//
+// Specification checked against: Location and Navigation Service 1.0.1 (LNS),
+// Location and Navigation Profile 1.0.1 (LNP 3, 6.1) and the GATT Specification
+// Supplement v9, Sections 3.133, 3.134, 3.136, 3.153 and 3.171.
+//
+// Satisfies: REQ-BLE-LNS-001.
+
+use att
+use gatt_server
+use links
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer, subscribe, read }
+use wire
+
+const UUID_LOCATION_AND_NAVIGATION_SERVICE = 0x1819
+const UUID_LN_FEATURE = 0x2A6A
+const UUID_LOCATION_AND_SPEED = 0x2A67
+const UUID_POSITION_QUALITY = 0x2A69
+const UUID_LN_CONTROL_POINT = 0x2A6B
+const UUID_NAVIGATION = 0x2A68
+
+// The bits of the LN Feature value.  Bits 0 to 6 are also the presence bits of
+// the Location and Speed Flags field and the bits of the content mask; bits 7
+// to 9 the presence bits of the Navigation Flags field (shifted by 7); bits 10
+// to 16 those of the Position Quality Flags field (shifted by 10).
+const F_INSTANTANEOUS_SPEED = 0x1
+const F_TOTAL_DISTANCE = 0x2
+const F_LOCATION = 0x4
+const F_ELEVATION = 0x8
+const F_HEADING = 0x10
+const F_ROLLING_TIME = 0x20
+const F_UTC_TIME = 0x40
+const F_REMAINING_DISTANCE = 0x80
+const F_REMAINING_VERTICAL_DISTANCE = 0x100
+const F_ESTIMATED_TIME_OF_ARRIVAL = 0x200
+const F_BEACONS_IN_SOLUTION = 0x400
+const F_BEACONS_IN_VIEW = 0x800
+const F_TIME_TO_FIRST_FIX = 0x1000
+const F_EHPE = 0x2000
+const F_EVPE = 0x4000
+const F_HDOP = 0x8000
+const F_VDOP = 0x10000
+const F_CONTENT_MASKING = 0x20000
+const F_FIX_RATE_SETTING = 0x40000
+const F_ELEVATION_SETTING = 0x80000
+const F_POSITION_STATUS = 0x100000
+
+const F_DEFINED_BITS = 0x1FFFFF
+const F_LOCATION_SPEED_BITS = 0x7F
+const F_NAVIGATION_BITS = 0x380
+const F_QUALITY_BITS = 0x1FC00
+
+// The Flags bits of Location and Speed that are not the presence of a field.
+const FLAG_POSITION_STATUS_SHIFT = 7
+const FLAG_THREE_D = 0x200
+const FLAG_ELEVATION_SOURCE_SHIFT = 10
+const FLAG_HEADING_COMPASS = 0x1000
+
+// The Flags bits of Navigation that are not the presence of a field.
+const NAV_POSITION_STATUS_SHIFT = 3
+const NAV_HEADING_COMPASS = 0x20
+const NAV_TO_DESTINATION = 0x40
+const NAV_WAYPOINT_REACHED = 0x80
+const NAV_DESTINATION_REACHED = 0x100
+
+// The opcodes of the LN Control Point and the code of a response.
+const OP_SET_CUMULATIVE_VALUE = 0x01
+const OP_MASK_CONTENT = 0x02
+const OP_NAVIGATION_CONTROL = 0x03
+const OP_REQUEST_NUMBER_OF_ROUTES = 0x04
+const OP_REQUEST_NAME_OF_ROUTE = 0x05
+const OP_SELECT_ROUTE = 0x06
+const OP_SET_FIX_RATE = 0x07
+const OP_SET_ELEVATION = 0x08
+const OP_RESPONSE_CODE = 0x20
+
+// The actions of Navigation Control.
+const NAV_STOP = 0
+const NAV_START = 1
+const NAV_PAUSE = 2
+const NAV_CONTINUE = 3
+const NAV_SKIP_WAYPOINT = 4
+const NAV_SELECT_NEAREST = 5
+
+// The ranges of the formats: a latitude and a longitude in 1e-7 degrees, a
+// heading or a bearing in 0.01 degrees below 360, a 24-bit signed elevation.
+const LATITUDE_MIN = -900000000
+const LATITUDE_MAX = 900000000
+const LONGITUDE_MIN = -1800000000
+const LONGITUDE_MAX = 1800000000
+const DIRECTION_MAX = 35999
+const SINT24_MIN = -8388608
+const SINT24_MAX = 8388607
+
+// The routes a Request Number of Routes can count: a uint16.
+const ROUTES_MAX = 65535
+
+// The octets of a response that are not its parameter: the Response Code
+// opcode, the opcode it answers and the result.
+const RESPONSE_HEADER = 3
+
+// What the service has.  `features` is the LN Feature value, `access` the access
+// of every value and descriptor (Open, Authorized, Encrypted or Authenticated),
+// `feature_indicate` adds the Indicate property to the LN Feature for a sensor
+// whose features can change, `position_quality` and `navigation` add those
+// characteristics, and `routes` are the names of the routes the sensor stores
+// (UTF-8), which need `navigation`.
+struct LnsConfig
+    var features: Int
+    var access: gatt_server.Access
+    var feature_indicate: Bool
+    var position_quality: Bool
+    var navigation: Bool
+    var routes: [[u8]]
+
+// A sensor on an open link whose characteristics follow `features`: the
+// Position Quality when a feature of bits 10 to 16 is set, the Navigation
+// characteristic when a feature of bits 7 to 9 is set, no route.
+@tier(app)
+fn default_lns_config(features: Int) -> LnsConfig
+    LnsConfig {
+        features: features, access: gatt_server.Access.Open, feature_indicate: false,
+        position_quality: (features & F_QUALITY_BITS) != 0, navigation: (features & F_NAVIGATION_BITS) != 0,
+        routes: [] }
+
+// The handles of the service; 0 for a characteristic or descriptor it does not
+// have.
+@value
+struct LnsHandles
+    service: u16
+    feature: u16
+    feature_cccd: u16
+    location: u16
+    location_cccd: u16
+    quality: u16
+    control_point: u16
+    control_point_cccd: u16
+    navigation: u16
+    navigation_cccd: u16
+
+// One Location and Speed value.  `present` holds the fields the product has now
+// (bit k as the feature bit k, for k 0 to 6); a field is sent when its feature
+// is supported, it is present and the client has not turned it off.  The units
+// are the characteristic's: 0.01 m/s, 0.1 m, 1e-7 degrees, 0.01 m, 0.01 degrees
+// and seconds; the UTC Time is a Date Time.  `position_status` is 0 for no
+// position, 1 for ok, 2 for estimated and 3 for last known; `three_d` says the
+// speed and the distance count the elevation; `elevation_source` is 0 for the
+// positioning system, 1 for barometric air pressure, 2 for a database and 3 for
+// other; `heading_compass` says the heading comes from a magnetic compass.
+@value
+struct LnsLocation
+    present: Int
+    speed: Int
+    distance: Int
+    latitude: Int
+    longitude: Int
+    elevation: Int
+    heading: Int
+    rolling_time: Int
+    time: wire.DateTime
+    position_status: Int
+    three_d: Bool
+    elevation_source: Int
+    heading_compass: Bool
+
+// A value with no optional field and no position.
+@tier(embedded)
+fn lns_location(present: Int) -> LnsLocation
+    LnsLocation {
+        present: present, speed: 0, distance: 0, latitude: 0, longitude: 0, elevation: 0, heading: 0, rolling_time: 0,
+        time: wire.date_time_unknown(),
+        position_status: 0, three_d: false, elevation_source: 0, heading_compass: false }
+
+// One Navigation value.  `present` holds the optional fields the product has
+// (bit 0 Remaining Distance, bit 1 Remaining Vertical Distance, bit 2 Estimated
+// Time of Arrival, the feature bits 7 to 9 shifted down).  The units are 0.01
+// degrees for the bearing and the heading, 0.1 m for the remaining distance and
+// 0.01 m for the vertical one; the Estimated Time of Arrival is a Date Time.
+// `to_destination` says the three optional fields are relative to the final
+// destination and not to the next waypoint.
+@value
+struct LnsNavigation
+    present: Int
+    bearing: Int
+    heading: Int
+    remaining_distance: Int
+    remaining_vertical: Int
+    time: wire.DateTime
+    position_status: Int
+    heading_compass: Bool
+    to_destination: Bool
+    waypoint_reached: Bool
+    destination_reached: Bool
+
+// A value with no optional field.
+@tier(embedded)
+fn lns_navigation(bearing: Int, heading: Int) -> LnsNavigation
+    LnsNavigation {
+        present: 0, bearing: bearing, heading: heading, remaining_distance: 0, remaining_vertical: 0,
+        time: wire.date_time_unknown(),
+        position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false }
+
+// One Position Quality value.  `present` holds the fields the product has (bit k
+// as the feature bit 10 + k).  The units are the characteristic's: a count of
+// beacons, 0.1 s, 0.01 m for both position errors, and 0.2 for the two dilutions.
+@value
+struct LnsQuality
+    present: Int
+    in_solution: Int
+    in_view: Int
+    time_to_first_fix: Int
+    ehpe: Int
+    evpe: Int
+    hdop: Int
+    vdop: Int
+    position_status: Int
+
+// A value with no optional field.
+@tier(embedded)
+fn lns_quality(present: Int) -> LnsQuality
+    LnsQuality {
+        present: present, in_solution: 0, in_view: 0, time_to_first_fix: 0, ehpe: 0, evpe: 0, hdop: 0, vdop: 0,
+        position_status: 0 }
+
+// What the client changed through the control point, for the application to
+// apply.  `mask` is the fields turned off (bits 0 to 6); `navigating` and
+// `paused` the navigation; `route` the selected route, -1 for none;
+// `nav_action` the last Navigation Control action and `nav_requested` that it
+// has not been taken; `total_distance`, `elevation` and `fix_rate` the values
+// the client set and the flag of each, which the application clears.
+struct LnsState
+    var mask: Int
+    var navigating: Bool
+    var paused: Bool
+    var route: Int
+    var nav_action: Int
+    var nav_requested: Bool
+    var total_distance: Int
+    var distance_set: Bool
+    var elevation: Int
+    var elevation_set: Bool
+    var fix_rate: Int
+    var fix_rate_set: Bool
+
+// The state of a new connection: nothing turned off, no navigation, the first
+// route of `config` selected.
+@tier(app)
+fn new_lns_state(config: LnsConfig) -> LnsState
+    LnsState {
+        mask: 0, navigating: false, paused: false, route: if list.len(config.routes) > 0 then 0 else -1,
+        nav_action: 0, nav_requested: false, total_distance: 0, distance_set: false, elevation: 0, elevation_set: false,
+        fix_rate: 0, fix_rate_set: false }
+
+// The connection ended: the mask is not kept and the navigation stops ([LNS]
+// 3.4.2.2).
+@tier(embedded)
+@no_alloc
+fn lns_disconnected(var state: LnsState)
+    state.mask = 0
+    state.navigating = false
+    state.paused = false
+
+// ── Pure helpers ────────────────────────────────────────────────────
+
+@tier(embedded)
+@no_alloc
+fn lns_in_range(v: Int, lo: Int, hi: Int) -> Bool
+    v >= lo and v <= hi
+
+// Whether `access` is a security level the Location and Navigation Profile
+// allows: LE security mode 1, level 1, 2 or 3.
+@tier(embedded)
+@no_alloc
+fn lns_access_conforms(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        SecureConnections => false
+        _ => true
+
+// Whether a sensor with `features` and `navigation` has the control point: when
+// a feature needs a procedure.
+@tier(embedded)
+@no_alloc
+fn lns_needs_control_point(features: Int, navigation: Bool) -> Bool
+    navigation or (features & (F_TOTAL_DISTANCE | F_CONTENT_MASKING | F_FIX_RATE_SETTING | F_ELEVATION_SETTING)) != 0
+
+// What is wrong with `config`, the first thing: CONFIG_OK for a sensor the
+// service can describe, CONFIG_NOT_PERMITTED for an access outside the profile's
+// levels and CONFIG_INVALID for a feature value or a set of parts that breaks a
+// rule of the service.
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+@tier(embedded)
+@no_alloc
+fn lns_config_error(config: LnsConfig) -> Int
+    if not lns_access_conforms(config.access)
+        return CONFIG_NOT_PERMITTED
+    let features = config.features
+    if features < 0 or (features & F_DEFINED_BITS) != features
+        return CONFIG_INVALID
+    if (features & F_ELEVATION_SETTING) != 0 and (features & F_ELEVATION) == 0
+        return CONFIG_INVALID
+    if (features & F_QUALITY_BITS) != 0 and not config.position_quality
+        return CONFIG_INVALID
+    if (features & F_NAVIGATION_BITS) != 0 and not config.navigation
+        return CONFIG_INVALID
+    if list.len(config.routes) > ROUTES_MAX or (list.len(config.routes) > 0 and not config.navigation)
+        return CONFIG_INVALID
+    CONFIG_OK
+
+// The octets of Location and Speed field `k` (the bit of the field).
+@tier(embedded)
+@no_alloc
+fn lns_field_size(k: Int) -> Int
+    if k == 0
+        return 2
+    if k == 1
+        return 3
+    if k == 2
+        return 8
+    if k == 3
+        return 3
+    if k == 4
+        return 2
+    if k == 5
+        return 1
+    7
+
+// The fields of `m` that reach a value: the ones the sensor supports, the
+// product has and the client has not turned off with `mask`.
+@tier(embedded)
+@no_alloc
+fn lns_location_sent(features: Int, present: Int, mask: Int) -> Int
+    features & present & (F_LOCATION_SPEED_BITS ^ (mask & F_LOCATION_SPEED_BITS)) & F_LOCATION_SPEED_BITS
+
+// Whether the service can send `m`: the fields it would send are inside their
+// formats (a field the sensor does not support, or the product does not have, is
+// not looked at).
+@tier(embedded)
+@no_alloc
+fn lns_location_valid(features: Int, m: LnsLocation) -> Bool
+    if not lns_in_range(m.position_status, 0, 3) or not lns_in_range(m.elevation_source, 0, 3)
+        return false
+    let sent = features & m.present & F_LOCATION_SPEED_BITS
+    if (sent & F_INSTANTANEOUS_SPEED) != 0 and not lns_in_range(m.speed, 0, 0xFFFF)
+        return false
+    if (sent & F_TOTAL_DISTANCE) != 0 and m.distance < 0
+        return false
+    if (sent & F_LOCATION) != 0
+        if not lns_in_range(m.latitude, LATITUDE_MIN, LATITUDE_MAX) or not lns_in_range(m.longitude, LONGITUDE_MIN, LONGITUDE_MAX)
+            return false
+    if (sent & F_ELEVATION) != 0 and not lns_in_range(m.elevation, SINT24_MIN, SINT24_MAX)
+        return false
+    if (sent & F_HEADING) != 0 and not lns_in_range(m.heading, 0, DIRECTION_MAX)
+        return false
+    if (sent & F_ROLLING_TIME) != 0 and m.rolling_time < 0
+        return false
+    if (sent & F_UTC_TIME) != 0 and not wire.date_time_known(m.time)
+        return false
+    true
+
+// The Flags field of a Location and Speed value that holds the fields `take`:
+// the presence bits, and the status bits of the features the sensor supports.
+@tier(embedded)
+@no_alloc
+fn lns_location_flags(features: Int, m: LnsLocation, take: Int) -> Int
+    var flags = take
+    if (features & F_POSITION_STATUS) != 0
+        flags = flags | (m.position_status << FLAG_POSITION_STATUS_SHIFT)
+    if (features & (F_INSTANTANEOUS_SPEED | F_TOTAL_DISTANCE)) != 0 and m.three_d
+        flags = flags | FLAG_THREE_D
+    if (features & F_ELEVATION) != 0
+        flags = flags | (m.elevation_source << FLAG_ELEVATION_SOURCE_SHIFT)
+    if (features & F_HEADING) != 0 and m.heading_compass
+        flags = flags | FLAG_HEADING_COMPASS
+    flags
+
+// ── Values ──────────────────────────────────────────────────────────
+
+// The LN Feature value of `features`.
+@tier(app)
+fn lns_feature_value(features: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, features, 4)
+    out
+
+// One Location and Speed value: the Flags field and the fields `take` of `m`.
+@tier(app)
+fn lns_location_pack(features: Int, m: LnsLocation, take: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, lns_location_flags(features, m, take), 2)
+    for k in 0..7
+        if (take & (1 << k)) != 0
+            if k == 0
+                wire.put(var out, m.speed, 2)
+            else if k == 1
+                wire.put(var out, m.distance, 3)
+            else if k == 2
+                wire.put(var out, m.latitude, 4)
+                wire.put(var out, m.longitude, 4)
+            else if k == 3
+                wire.put(var out, m.elevation, 3)
+            else if k == 4
+                wire.put(var out, m.heading, 2)
+            else if k == 5
+                wire.put(var out, m.rolling_time, 1)
+            else
+                wire.put_date_time(var out, m.time)
+    out
+
+// The values to notify for `m` at an ATT_MTU of `mtu` (at least 23) with the
+// fields of `mask` turned off: one value, or when the fields do not fit the value
+// and the ones after it in the order of the table.  Empty when `m` cannot be sent.
+@tier(app)
+fn lns_location_packets(features: Int, m: LnsLocation, mask: Int, mtu: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if mtu < 23 or not lns_location_valid(features, m)
+        return out
+    let room = mtu - 3
+    var rest = lns_location_sent(features, m.present, mask)
+    var first = true
+    while first or rest != 0
+        var take = 0
+        var used = 2
+        var stop = false
+        var k = 0
+        while k < 7 and not stop
+            if (rest & (1 << k)) != 0
+                let size = lns_field_size(k)
+                if used + size <= room
+                    take = take | (1 << k)
+                    used = used + size
+                else
+                    stop = true
+            k = k + 1
+        list.push(out, lns_location_pack(features, m, take))
+        rest = rest & (F_LOCATION_SPEED_BITS ^ take)
+        first = false
+    out
+
+// Whether the service can send the Navigation value `m`.
+@tier(embedded)
+@no_alloc
+fn lns_navigation_valid(features: Int, m: LnsNavigation) -> Bool
+    if not lns_in_range(m.position_status, 0, 3) or not lns_in_range(m.bearing, 0, DIRECTION_MAX)
+        return false
+    if not lns_in_range(m.heading, 0, DIRECTION_MAX)
+        return false
+    let sent = (features >>> 7) & m.present & 0x7
+    if (sent & 1) != 0 and not lns_in_range(m.remaining_distance, 0, 0xFFFFFF)
+        return false
+    if (sent & 2) != 0 and not lns_in_range(m.remaining_vertical, SINT24_MIN, SINT24_MAX)
+        return false
+    if (sent & 4) != 0 and not wire.date_time_known(m.time)
+        return false
+    true
+
+// The Navigation value of `m` for a sensor with `features`: Flags, Bearing,
+// Heading, then the optional fields the sensor supports and the product has.
+// Empty when `m` cannot be sent.
+@tier(app)
+fn lns_navigation_value(features: Int, m: LnsNavigation) -> [u8]
+    var out: [u8] = []
+    if not lns_navigation_valid(features, m)
+        return out
+    let take = (features >>> 7) & m.present & 0x7
+    var flags = take
+    if (features & F_POSITION_STATUS) != 0
+        flags = flags | (m.position_status << NAV_POSITION_STATUS_SHIFT)
+    if m.heading_compass
+        flags = flags | NAV_HEADING_COMPASS
+    if (features & F_NAVIGATION_BITS) != 0 and m.to_destination
+        flags = flags | NAV_TO_DESTINATION
+    if m.waypoint_reached
+        flags = flags | NAV_WAYPOINT_REACHED
+    if m.destination_reached
+        flags = flags | NAV_DESTINATION_REACHED
+    wire.put(var out, flags, 2)
+    wire.put(var out, m.bearing, 2)
+    wire.put(var out, m.heading, 2)
+    if (take & 1) != 0
+        wire.put(var out, m.remaining_distance, 3)
+    if (take & 2) != 0
+        wire.put(var out, m.remaining_vertical, 3)
+    if (take & 4) != 0
+        wire.put_date_time(var out, m.time)
+    out
+
+// Whether the service can hold the Position Quality value `q`.
+@tier(embedded)
+@no_alloc
+fn lns_quality_valid(features: Int, q: LnsQuality) -> Bool
+    if not lns_in_range(q.position_status, 0, 3)
+        return false
+    let sent = (features >>> 10) & q.present & 0x7F
+    if (sent & 1) != 0 and not lns_in_range(q.in_solution, 0, 0xFF)
+        return false
+    if (sent & 2) != 0 and not lns_in_range(q.in_view, 0, 0xFF)
+        return false
+    if (sent & 4) != 0 and not lns_in_range(q.time_to_first_fix, 0, 0xFFFF)
+        return false
+    if (sent & 8) != 0 and not lns_in_range(q.ehpe, 0, 0xFFFFFFFF)
+        return false
+    if (sent & 16) != 0 and not lns_in_range(q.evpe, 0, 0xFFFFFFFF)
+        return false
+    if (sent & 32) != 0 and not lns_in_range(q.hdop, 0, 0xFF)
+        return false
+    if (sent & 64) != 0 and not lns_in_range(q.vdop, 0, 0xFF)
+        return false
+    true
+
+// The Position Quality value of `q` for a sensor with `features`: the Flags field
+// and the fields the sensor supports and the product has, empty when `q` cannot
+// be held.
+@tier(app)
+fn lns_quality_value(features: Int, q: LnsQuality) -> [u8]
+    var out: [u8] = []
+    if not lns_quality_valid(features, q)
+        return out
+    let take = (features >>> 10) & q.present & 0x7F
+    var flags = take
+    if (features & F_POSITION_STATUS) != 0
+        flags = flags | (q.position_status << 7)
+    wire.put(var out, flags, 2)
+    if (take & 1) != 0
+        wire.put(var out, q.in_solution, 1)
+    if (take & 2) != 0
+        wire.put(var out, q.in_view, 1)
+    if (take & 4) != 0
+        wire.put(var out, q.time_to_first_fix, 2)
+    if (take & 8) != 0
+        wire.put(var out, q.ehpe, 4)
+    if (take & 16) != 0
+        wire.put(var out, q.evpe, 4)
+    if (take & 32) != 0
+        wire.put(var out, q.hdop, 1)
+    if (take & 64) != 0
+        wire.put(var out, q.vdop, 1)
+    out
+
+// The octets of `name` that fit `room`, cut before the UTF-8 sequence the limit
+// would split.
+@tier(embedded)
+@no_alloc
+fn lns_name_length(name: [u8], room: Int) -> Int
+    var n = list.len(name)
+    if n <= room
+        return n
+    if room <= 0
+        return 0
+    n = room
+    for _ in 0..3
+        if n > 0 and ((name[n] as Int) & 0xC0) == 0x80
+            n = n - 1
+    n
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Add the service to `db` after its last attribute.  The characteristics come in
+// the order of the specification's table: the feature, the location and speed,
+// the position quality, the control point and the navigation.
+@tier(app)
+fn add_lns_service(var db: GattDb, config: LnsConfig) -> Result<LnsHandles, profile_builder.ProfileError>
+    let problem = lns_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_LOCATION_AND_NAVIGATION_SERVICE))!
+    let feature_props = if config.feature_indicate then gatt_server.PROP_READ | gatt_server.PROP_INDICATE else gatt_server.PROP_READ
+    let feature = profile_builder.add_value(
+        var db, feature_props, profile_builder.read_only(config.access), gatt_server.le16(UUID_LN_FEATURE),
+        lns_feature_value(config.features))!
+    var feature_cccd = 0
+    if config.feature_indicate
+        feature_cccd = profile_builder.add_cccd(var db, both)!
+    let location = profile_builder.add_value(
+        var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_LOCATION_AND_SPEED), [])!
+    let location_cccd = profile_builder.add_cccd(var db, both)!
+    var quality = 0
+    if config.position_quality
+        quality = profile_builder.add_value(
+            var db, gatt_server.PROP_READ, profile_builder.read_only(config.access), gatt_server.le16(UUID_POSITION_QUALITY),
+            lns_quality_value(config.features, lns_quality(0)))!
+    var control_point = 0
+    var control_point_cccd = 0
+    if lns_needs_control_point(config.features, config.navigation)
+        let added = sensor_control.add_control_point_with_errors(
+            var db, UUID_LN_CONTROL_POINT, config.access, both, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED,
+            att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        control_point = added.0
+        control_point_cccd = added.1
+    var navigation = 0
+    var navigation_cccd = 0
+    if config.navigation
+        navigation = profile_builder.add_value(
+            var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_NAVIGATION), [])!
+        navigation_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(LnsHandles {
+        service: service as u16, feature: feature as u16, feature_cccd: feature_cccd as u16, location: location as u16, location_cccd: location_cccd as u16,
+        quality: quality as u16, control_point: control_point as u16, control_point_cccd: control_point_cccd as u16,
+        navigation: navigation as u16, navigation_cccd: navigation_cccd as u16 })
+
+// Store `m` and notify it: one notification, or several when the fields do not
+// fit the ATT_MTU of the link (they go in the order of the table).  Nothing
+// reaches a client that has not enabled the notification, and nothing is stored
+// for a value the service cannot send.
+@tier(app)
+fn lns_notify_location(var db: GattDb, var link: AttLink, handles: LnsHandles, config: LnsConfig, state: LnsState, m: LnsLocation, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for packet in lns_location_packets(config.features, m, state.mask, gatt_server.mtu_of(link, 0))
+        let _ = gatt_server.set_value(var db, handles.location, packet)
+        list.append(out, gatt_server.send_value(var db, var link, handles.location, now_ms))
+    out
+
+// Store `m` as the Navigation value and notify it: only while the client has
+// started the navigation and enabled the notification.
+@tier(app)
+fn lns_notify_navigation(var db: GattDb, var link: AttLink, handles: LnsHandles, config: LnsConfig, state: LnsState, m: LnsNavigation, now_ms: Int) -> [[u8]]
+    if handles.navigation == 0 or not state.navigating
+        return []
+    let value = lns_navigation_value(config.features, m)
+    if list.len(value) == 0 or not gatt_server.set_value(var db, handles.navigation, value)
+        return []
+    gatt_server.send_value(var db, var link, handles.navigation, now_ms)
+
+// Replace the Position Quality value the client reads; false (and the old value
+// kept) for a service without the characteristic or a value it cannot hold.
+@tier(app)
+fn lns_set_quality(var db: GattDb, handles: LnsHandles, config: LnsConfig, q: LnsQuality) -> Bool
+    if handles.quality == 0 or not lns_quality_valid(config.features, q)
+        return false
+    gatt_server.set_value(var db, handles.quality, lns_quality_value(config.features, q))
+
+// Indicate the LN Feature value after a reconnection when the features changed,
+// for a service built with `feature_indicate`.
+@tier(app)
+fn lns_features_changed(var db: GattDb, var link: AttLink, handles: LnsHandles, config: LnsConfig, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.feature, lns_feature_value(config.features))
+    gatt_server.send_value(var db, var link, handles.feature, now_ms)
+
+// ── The control point ───────────────────────────────────────────────
+
+trait LnsPolicy[e]
+    // Whether the device carries out Navigation Control with `action` (a NAV_
+    // value) for `peer`, who wrote it; false is answered Operation Failed, as
+    // for an action the state does not allow.  It is asked for a valid request
+    // of a service with the Navigation characteristic, before the state follows it.
+    fn navigation(var self, peer: links.LinkId, action: Int) -> Bool [e]
+
+// The policy of a device that carries out every Navigation Control the state
+// allows (`accept`) or none.
+@value
+struct DefaultLnsPolicy
+    accept: Bool
+
+@tier(embedded)
+fn default_lns_policy() -> DefaultLnsPolicy
+    DefaultLnsPolicy { accept: true }
+
+impl LnsPolicy[] for DefaultLnsPolicy
+    fn navigation(var self, _peer: links.LinkId, _action: Int) -> Bool
+        self.accept
+
+// Whether `request` is a valid Navigation Control that the policy declines.
+@tier(app)
+fn lns_navigation_declined<P: LnsPolicy[e]>(config: LnsConfig, var policy: P, peer: links.LinkId, request: [u8]) -> Bool [e, mutate]
+    if not config.navigation or list.len(request) != 2 or (request[0] as Int) != OP_NAVIGATION_CONTROL
+        return false
+    let action = request[1] as Int
+    action <= NAV_SELECT_NEAREST and not policy.navigation(peer, action)
+
+// The result of Navigation Control with `action`; the state follows it.
+@tier(embedded)
+@no_alloc
+fn lns_navigation_control(config: LnsConfig, var state: LnsState, action: Int) -> Int
+    if action < 0 or action > NAV_SELECT_NEAREST
+        return sensor_control.RESULT_INVALID_PARAMETER
+    if action == NAV_STOP
+        state.navigating = false
+        state.paused = false
+    else if action == NAV_START or action == NAV_SELECT_NEAREST
+        if list.len(config.routes) == 0
+            return sensor_control.RESULT_OPERATION_FAILED
+        state.navigating = true
+        state.paused = false
+    else if action == NAV_PAUSE
+        if not state.navigating
+            return sensor_control.RESULT_OPERATION_FAILED
+        state.navigating = false
+        state.paused = true
+    else if action == NAV_CONTINUE
+        if not state.paused
+            return sensor_control.RESULT_OPERATION_FAILED
+        state.navigating = true
+        state.paused = false
+    else
+        if not state.navigating
+            return sensor_control.RESULT_OPERATION_FAILED
+    state.nav_action = action
+    state.nav_requested = true
+    sensor_control.RESULT_SUCCESS
+
+// The result and the response parameter of the request written to the control
+// point of a sensor built with `config`; `room` is the longest response
+// parameter that fits the indication.  The state records what the procedure
+// changed.
+@tier(app)
+fn lns_apply(config: LnsConfig, var state: LnsState, request: [u8], room: Int) -> (Int, [u8])
+    if list.len(request) == 0
+        return (sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+    let op = request[0] as Int
+    let p = request[1:]
+    let features = config.features
+    let routes = list.len(config.routes)
+    if op == OP_SET_CUMULATIVE_VALUE and (features & F_TOTAL_DISTANCE) != 0
+        if list.len(p) != 3
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        state.total_distance = wire.get(p, 0, 3)
+        state.distance_set = true
+        return (sensor_control.RESULT_SUCCESS, [])
+    if op == OP_MASK_CONTENT and (features & F_CONTENT_MASKING) != 0
+        if list.len(p) != 2 or (wire.get(p, 0, 2) >>> 7) != 0
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        state.mask = wire.get(p, 0, 2)
+        return (sensor_control.RESULT_SUCCESS, [])
+    if op == OP_NAVIGATION_CONTROL and config.navigation
+        if list.len(p) != 1
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        return (lns_navigation_control(config, var state, p[0] as Int), [])
+    if op == OP_REQUEST_NUMBER_OF_ROUTES and config.navigation
+        if list.len(p) != 0
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        var count: [u8] = []
+        wire.put(var count, routes, 2)
+        return (sensor_control.RESULT_SUCCESS, count)
+    if op == OP_REQUEST_NAME_OF_ROUTE and config.navigation
+        if list.len(p) != 2 or wire.get(p, 0, 2) >= routes
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        let name = config.routes[wire.get(p, 0, 2)]
+        return (sensor_control.RESULT_SUCCESS, name[0:lns_name_length(name, room)])
+    if op == OP_SELECT_ROUTE and config.navigation
+        if list.len(p) != 2 or wire.get(p, 0, 2) >= routes
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        state.route = wire.get(p, 0, 2)
+        return (sensor_control.RESULT_SUCCESS, [])
+    if op == OP_SET_FIX_RATE and (features & F_FIX_RATE_SETTING) != 0
+        if list.len(p) != 1
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        state.fix_rate = p[0] as Int
+        state.fix_rate_set = true
+        return (sensor_control.RESULT_SUCCESS, [])
+    if op == OP_SET_ELEVATION and (features & F_ELEVATION_SETTING) != 0
+        if list.len(p) != 3
+            return (sensor_control.RESULT_INVALID_PARAMETER, [])
+        state.elevation = wire.get_signed(p, 0, 3)
+        state.elevation_set = true
+        return (sensor_control.RESULT_SUCCESS, [])
+    (sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+
+// The procedure the client wrote: apply `request` to `state` and indicate the
+// response (none when the client has not enabled the indication).
+@tier(app)
+fn lns_procedure<P: LnsPolicy[e]>(var db: GattDb, var link: AttLink, handles: LnsHandles, config: LnsConfig, var state: LnsState, var policy: P, peer: links.LinkId, request: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let op = if list.len(request) == 0 then 0 else request[0] as Int
+    let declined = lns_navigation_declined(config, var policy, peer, request)
+    let r = if declined then (sensor_control.RESULT_OPERATION_FAILED, []) else lns_apply(config, var state, request, gatt_server.mtu_of(link, 0) - 3 - RESPONSE_HEADER)
+    let _ = gatt_server.set_value(var db, handles.control_point, sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1))
+    gatt_server.send_value(var db, var link, handles.control_point, now_ms)
+
+// Answer one ATT PDU of `peer`, the client.  A Write Request to the control point
+// is checked for the Navigation notification a Navigation Control needs, answered by
+// the ATT server, and the procedure it started follows the Write Response; a
+// long write to the control point is refused.  Every other PDU is the ATT
+// server's.
+@tier(app)
+fn lns_receive<P: LnsPolicy[e]>(var db: GattDb, var link: AttLink, handles: LnsHandles, config: LnsConfig, var state: LnsState, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if handles.control_point == 0 or list.len(pdu) < 3 or gatt_server.read_le16(pdu, 1) != handles.control_point
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let op = pdu[0] as Int
+    if op == att.ATT_OP_PREPARE_WRITE_REQ
+        return gatt_server.error(op, handles.control_point, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    if op != att.ATT_OP_WRITE_REQ
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let request = pdu[3:list.len(pdu)]
+    let denied = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.control_point), true)
+    if denied != 0
+        return gatt_server.error(op, handles.control_point, denied)
+    if handles.navigation != 0 and list.len(request) > 0 and (request[0] as Int) == OP_NAVIGATION_CONTROL
+        if (gatt_server.configuration(link, handles.navigation_cccd) & gatt_server.CCC_NOTIFICATION) == 0
+            return gatt_server.error(op, handles.control_point, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if list.len(out) > 0 and (out[0][0] as Int) == att.ATT_OP_WRITE_RSP
+        list.append(out, lns_procedure(var db, var link, handles, config, var state, var policy, peer, request, now_ms))
+    out
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// `lns_receive` with the default policy, for the tests that do not look at it.
+@tier(app)
+fn receive_default(var s: GattServer, h: LnsHandles, config: LnsConfig, var st: LnsState, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_lns_policy()
+    lns_receive(var s.db, var s.link, h, config, var st, var policy, peer(), pdu, now_ms)
+
+// A server for `config` whose link is encrypted at `level` (2 encrypted, 3
+// authenticated); level 0 leaves the link in the clear.
+@tier(app)
+fn server_at(config: LnsConfig, level: Int) -> (GattServer, LnsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_lns_service(var s.db, config)!
+    if level > 0
+        gatt_server.set_security(var s.link, gatt_server.link_security(true, level, 16, true))
+    (s, h)
+
+@tier(app)
+fn server(config: LnsConfig) -> (GattServer, LnsHandles)
+    server_at(config, 3)
+
+// Everything the service can have: every feature, the indication of the feature,
+// the Position Quality, the Navigation and three routes.
+@tier(app)
+fn full_config() -> LnsConfig
+    var c = default_lns_config(F_DEFINED_BITS)
+    c.feature_indicate = true
+    c.routes = [wire.text("Home"), wire.text("Work"), wire.text("Hill")]
+    c
+
+// A value with every field.
+@tier(app)
+fn full_location() -> LnsLocation
+    LnsLocation {
+        present: F_LOCATION_SPEED_BITS, speed: 0x0102, distance: 0x030405, latitude: 0x0A0B0C0D, longitude: 0x1A2B3C4D,
+        elevation: 0x0A0B0C, heading: 0x1234, rolling_time: 0x56, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 1, three_d: true, elevation_source: 1, heading_compass: true }
+
+@tier(app)
+fn full_navigation() -> LnsNavigation
+    LnsNavigation {
+        present: 7, bearing: 0x0102, heading: 0x0304, remaining_distance: 0x050607, remaining_vertical: -2, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 1, heading_compass: true,
+        to_destination: true, waypoint_reached: true, destination_reached: true }

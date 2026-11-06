@@ -1,0 +1,258 @@
+// src/cycling_speed_cadence.nv — the Cycling Speed and Cadence
+// Service (0x1816).
+//
+// A speed and cadence sensor on a bicycle reports the revolutions of a
+// wheel and of the crank. The service holds, in the order the builder adds
+// them:
+//
+//   CSC Measurement          0x2A5B   Notify, with a Client Characteristic
+//                                     Configuration descriptor
+//   CSC Feature              0x2A5C   Read; what the sensor measures
+//   Sensor Location          0x2A5D   Read; optional
+//   SC Control Point         0x2A55   Write, Indicate, with a descriptor
+//
+// The Feature value says what the sensor measures and which parts follow
+// from it. The Sensor Location is present when the Feature names Multiple
+// Sensor Locations and optional otherwise; the control point is present
+// exactly when the Feature names Wheel Revolution Data or Multiple Sensor
+// Locations. A measurement carries only the wheel and crank data the
+// Feature names, and a notification of one that carries neither is not
+// sent. Cumulative Wheel Revolutions count from 0 to 0xFFFFFFFF and do not
+// wrap; the crank count and both event times wrap. `add_csc_service`
+// answers `NotPermitted` for a configuration that breaks one of these
+// rules or denies a client an access the service requires (the Feature and
+// Sensor Location read, the read and write of each descriptor, the write
+// of the control point) or asks for more than LE security mode 1 level 3,
+// the highest level the Cycling Speed and Cadence Profile allows; the level
+// below that is the application's choice.
+//
+// The control point carries three procedures, written as an opcode and a
+// parameter, and answers each with an indication:
+//
+//   0x01  Set Cumulative Value          4 octets, the wheel revolutions;
+//                                       needs Wheel Revolution Data
+//   0x03  Update Sensor Location        1 octet, a location in the list;
+//                                       needs Multiple Sensor Locations
+//   0x04  Request Supported Sensor Locations
+//                                       needs Multiple Sensor Locations
+//   0x10  Response Code                 opcode, result, parameter
+//
+// The service does not use opcode 0x02, Start Sensor Calibration, so it
+// answers Op Code Not Supported like any other opcode it lacks.
+//
+// A client that has not enabled indications on the control point is refused
+// with the Error Code 0x81, and one that writes while an indication is
+// unconfirmed with 0x80. The application passes each write to
+// `csc_handle_control_point` and sends the PDUs it answers; the outcome is
+// in the `ScState` it passed.
+
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+
+const UUID_CYCLING_SPEED_AND_CADENCE_SERVICE = 0x1816
+const UUID_CSC_MEASUREMENT = 0x2A5B
+const UUID_CSC_FEATURE = 0x2A5C
+const UUID_SC_CONTROL_POINT = 0x2A55
+
+// The bits of the CSC Feature value and of the flags octet of a
+// measurement.
+const FEATURE_WHEEL_REVOLUTION_DATA = 0x0001
+const FEATURE_CRANK_REVOLUTION_DATA = 0x0002
+const FEATURE_MULTIPLE_SENSOR_LOCATIONS = 0x0004
+const FEATURE_DEFINED_BITS = 0x0007
+const FLAG_WHEEL_REVOLUTION_DATA = 0x01
+const FLAG_CRANK_REVOLUTION_DATA = 0x02
+
+// The opcodes of the SC Control Point and the code of a response.
+const OP_SET_CUMULATIVE_VALUE = 0x01
+const OP_UPDATE_SENSOR_LOCATION = 0x03
+const OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS = 0x04
+const OP_RESPONSE_CODE = 0x10
+
+// One measurement. Wheel data is the count of wheel revolutions since the
+// sensor started, in a 32-bit counter, and the time of the last wheel
+// event; crank data is the same with a 16-bit count. Both times are in
+// units of 1/1024 second and wrap at 65536. A part left out (`wheel` or
+// `crank` false) is not in the value.
+struct CscMeasurement
+    wheel: Bool
+    wheel_revolutions: Int
+    last_wheel_event: Int
+    crank: Bool
+    crank_revolutions: Int
+    last_crank_event: Int
+
+// The most wheel revolutions a measurement counts: the counter does not
+// wrap and does not go below 0.
+const MAX_WHEEL_REVOLUTIONS = 0xFFFFFFFF
+
+// The value of a measurement.
+fn csc_measurement_value(m: CscMeasurement) -> [u8]
+    var flags = 0
+    if m.wheel
+        flags = flags | FLAG_WHEEL_REVOLUTION_DATA
+    if m.crank
+        flags = flags | FLAG_CRANK_REVOLUTION_DATA
+    var out: [u8] = [flags as u8]
+    if m.wheel
+        wire.put(var out, wire.clamp(m.wheel_revolutions, 0, MAX_WHEEL_REVOLUTIONS), 4)
+        wire.put(var out, m.last_wheel_event, 2)
+    if m.crank
+        wire.put(var out, m.crank_revolutions, 2)
+        wire.put(var out, m.last_crank_event, 2)
+    out
+
+// The CSC Feature value for a sensor that measures `wheel` and `crank`
+// revolutions and has several locations when `multiple_locations`.
+fn csc_feature_value(wheel: Bool, crank: Bool, multiple_locations: Bool) -> Int
+    (if wheel then FEATURE_WHEEL_REVOLUTION_DATA else 0)
+        | (if crank then FEATURE_CRANK_REVOLUTION_DATA else 0)
+        | (if multiple_locations then FEATURE_MULTIPLE_SENSOR_LOCATIONS else 0)
+
+// The configuration of the service. `feature` is the CSC Feature value
+// (its reserved bits are dropped), `location` the Sensor Location (Absent
+// leaves it out), `control_point` whether the SC Control Point is present.
+// `read` is the access to the
+// Feature and the location, `measurement_cccd` and `control_point_cccd`
+// the access to the two descriptors, and `control_point_write` the access
+// to the control point.
+struct CscConfig
+    feature: Int
+    location: sensor_control.SensorLocation
+    control_point: Bool
+    read: gatt_server.Access
+    measurement_cccd: gatt_server.Permissions
+    control_point_write: gatt_server.Access
+    control_point_cccd: gatt_server.Permissions
+
+// Whether a service with the Feature value `feature` has the control point:
+// when it measures wheel revolutions or has several locations.
+fn needs_control_point(feature: Int) -> Bool
+    (feature & (FEATURE_WHEEL_REVOLUTION_DATA | FEATURE_MULTIPLE_SENSOR_LOCATIONS)) != 0
+
+// A sensor open to any client, with the control point its Feature value
+// calls for.
+fn default_csc_config(feature: Int, location: sensor_control.SensorLocation) -> CscConfig
+    CscConfig {
+        feature: feature, location: location, control_point: needs_control_point(feature), read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+
+// The handles of the service. `location`, `control_point` and
+// `control_point_cccd` are 0 for what is not present. `feature_bits` is the
+// Feature value the service reads as.
+struct CscHandles
+    feature_bits: Int
+    service: Int
+    measurement: Int
+    measurement_cccd: Int
+    feature: Int
+    location: Int
+    control_point: Int
+    control_point_cccd: Int
+
+// Whether `access` lets a client do something at all.
+fn is_granted(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        _ => true
+
+// Whether `access` is at LE security mode 1 level 1, 2 or 3, the levels the
+// Cycling Speed and Cadence Profile allows a sensor.
+fn is_profile_level(access: gatt_server.Access) -> Bool
+    match access
+        SecureConnections => false
+        _ => true
+
+// Whether a client can use `access`: it is not Denied and not above level 3.
+fn is_usable(access: gatt_server.Access) -> Bool
+    is_granted(access) and is_profile_level(access)
+
+fn descriptor_usable(p: gatt_server.Permissions) -> Bool
+    is_usable(p.read) and is_usable(p.write)
+
+// Whether `config` meets the service: the Feature measures wheel or crank
+// revolutions, has the Sensor Location it names and the control point it
+// calls for, and leaves a client every access the service requires.
+fn config_conforms(config: CscConfig, feature_bits: Int) -> Bool
+    if (feature_bits & (FEATURE_WHEEL_REVOLUTION_DATA | FEATURE_CRANK_REVOLUTION_DATA)) == 0
+        return false
+    if (feature_bits & FEATURE_MULTIPLE_SENSOR_LOCATIONS) != 0 and config.location == sensor_control.SensorLocation.Absent
+        return false
+    if needs_control_point(feature_bits) != config.control_point
+        return false
+    if not is_usable(config.read) or not descriptor_usable(config.measurement_cccd)
+        return false
+    not config.control_point or (is_usable(config.control_point_write) and descriptor_usable(config.control_point_cccd))
+
+// Add the service after the last attribute of `server`.
+fn add_csc_service(var db: GattDb, config: CscConfig) -> Result<CscHandles, profile_builder.ProfileError>
+    let feature_bits = config.feature & FEATURE_DEFINED_BITS
+    if not config_conforms(config, feature_bits)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_CYCLING_SPEED_AND_CADENCE_SERVICE))!
+    let measurement = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(),
+        gatt_server.le16(UUID_CSC_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, config.measurement_cccd)!
+    let feature = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read),
+        gatt_server.le16(UUID_CSC_FEATURE), [(feature_bits & 0xFF) as u8, ((feature_bits >>> 8) & 0xFF) as u8])!
+    let location = sensor_control.add_location(var db, config.location, config.read)!
+    var control_point = 0
+    var control_point_cccd = 0
+    if config.control_point
+        let added = sensor_control.add_control_point(var db, UUID_SC_CONTROL_POINT, config.control_point_write, config.control_point_cccd)!
+        control_point = added.0
+        control_point_cccd = added.1
+    Ok(CscHandles {
+        feature_bits: feature_bits, service: service, measurement: measurement, measurement_cccd: measurement_cccd, feature: feature,
+        location: location, control_point: control_point, control_point_cccd: control_point_cccd })
+
+// `m` limited to the data the Feature value `feature_bits` names.
+fn limited_to_feature(m: CscMeasurement, feature_bits: Int) -> CscMeasurement
+    CscMeasurement {
+        wheel: m.wheel and (feature_bits & FEATURE_WHEEL_REVOLUTION_DATA) != 0,
+        wheel_revolutions: m.wheel_revolutions, last_wheel_event: m.last_wheel_event,
+        crank: m.crank and (feature_bits & FEATURE_CRANK_REVOLUTION_DATA) != 0,
+        crank_revolutions: m.crank_revolutions, last_crank_event: m.last_crank_event }
+
+// Store `m`, limited to the data the Feature value names, as the
+// measurement and answer the notification PDUs: the notification when the
+// client enabled it, none otherwise. A measurement with neither wheel nor
+// crank data is not sent.
+fn csc_notify(var db: GattDb, var link: AttLink, handles: CscHandles, m: CscMeasurement, now_ms: Int) -> [[u8]]
+    let limited = limited_to_feature(m, handles.feature_bits)
+    if not limited.wheel and not limited.crank
+        return []
+    let _ = gatt_server.set_value(var db, handles.measurement, csc_measurement_value(limited))
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// The response value to the request written to the control point of a
+// service whose Feature value is `feature_bits`.
+fn csc_control_point_response(var state: sensor_control.ScState, feature_bits: Int, request: [u8]) -> [u8]
+    if list.len(request) == 0
+        return sensor_control.response(OP_RESPONSE_CODE, 0, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+    let op = request[0] as Int
+    let parameter = request[1:]
+    let wheel = (feature_bits & FEATURE_WHEEL_REVOLUTION_DATA) != 0
+    let locations = (feature_bits & FEATURE_MULTIPLE_SENSOR_LOCATIONS) != 0
+    if op == OP_SET_CUMULATIVE_VALUE and wheel
+        return sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.set_cumulative(var state, parameter), [])
+    if op == OP_UPDATE_SENSOR_LOCATION and locations
+        let r = sensor_control.update_location(var state, parameter)
+        return sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+    if op == OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS and locations
+        let r = sensor_control.list_locations(state)
+        return sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+    sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+
+// Answer the request the client wrote to the control point: apply it to
+// `state`, keep the Sensor Location in step and answer the indication PDUs.
+// Call it once for each write, when `gatt_server.take_changed` names the
+// control point.
+fn csc_handle_control_point(var db: GattDb, var link: AttLink, handles: CscHandles, var state: sensor_control.ScState, now_ms: Int) -> [[u8]]
+    if handles.control_point == 0
+        return []
+    let reply = csc_control_point_response(var state, handles.feature_bits, sensor_control.written(db, handles.control_point))
+    sensor_control.respond(var db, var link, handles.control_point, handles.location, state, reply, now_ms)

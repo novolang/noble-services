@@ -1,0 +1,173 @@
+// tests/cycling_speed_cadence_client_tests.nv — the unit tests of src/cycling_speed_cadence_client.nv.
+//
+//   novo test tests/cycling_speed_cadence_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use cycling_speed_cadence
+use sensor_client
+use sensor_control
+use wire
+use cycling_speed_cadence_client.{ CscMeasurement, SC_RESULT_INVALID_PARAMETER, SC_RESULT_SUCCESS, csc_cadence_rpm_x10, csc_client_new, csc_client_start, csc_crank_delta, csc_crank_ticks, csc_decode, csc_decode_feature, csc_decode_location, csc_distance_mm, csc_has_crank, csc_has_wheel, csc_speed_mm_per_s, csc_wheel_delta, csc_wheel_ticks, sc_decode_response, sc_req_list_locations, sc_req_set_cumulative, sc_req_start_calibration, sc_req_update_location, sc_response_location_at, sc_response_location_count }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> CscMeasurement
+    match csc_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            CscMeasurement { present: 0, wheel_revs: 0, wheel_time: 0, crank_revs: 0, crank_time: 0 }
+
+@tier(app)
+fn sample(wheel_revs: Int, wheel_time: Int, crank_revs: Int, crank_time: Int) -> CscMeasurement
+    CscMeasurement { present: 3, wheel_revs: wheel_revs, wheel_time: wheel_time, crank_revs: crank_revs, crank_time: crank_time }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_wheel_crank_or_both_or_neither()
+    let w = must(octets([0x01, 0x78, 0x56, 0x34, 0x12, 0x00, 0x04]))
+    test.assert(csc_has_wheel(w))
+    test.assert(not csc_has_crank(w))
+    test.assert_eq(w.wheel_revs, 0x12345678)
+    test.assert_eq(w.wheel_time, 0x0400)
+    let k = must(octets([0x02, 0x09, 0x00, 0x00, 0x02]))
+    test.assert(csc_has_crank(k))
+    test.assert(not csc_has_wheel(k))
+    test.assert_eq(k.crank_revs, 9)
+    test.assert_eq(k.crank_time, 0x0200)
+    let both = must(octets([0x03, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0]))
+    test.assert_eq(both.wheel_revs, 1)
+    test.assert_eq(both.wheel_time, 2)
+    test.assert_eq(both.crank_revs, 3)
+    test.assert_eq(both.crank_time, 4)
+    test.assert_eq(must(octets([0x00])).present, 0)
+    // Reserved bits are ignored.
+    test.assert_eq(must(octets([0xFC])).present, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_truncated_measurements_answer_none()
+    test.assert_eq(csc_decode([]), None)
+    test.assert_eq(csc_decode(octets([0x01, 1, 0, 0, 0, 2])), None)
+    test.assert_eq(csc_decode(octets([0x02, 1, 0, 2])), None)
+    test.assert_eq(csc_decode(octets([0x03, 1, 0, 0, 0, 2, 0, 3, 0, 4])), None)
+    let full = octets([0x03, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0])
+    var whole = 0
+    for k in 0..list.len(full)
+        if csc_decode(full[:k]) != None
+            whole = whole + 1
+    test.assert_eq(whole, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_feature_and_location()
+    test.assert_eq(csc_decode_feature(octets([0x07, 0x00])), Some(7))
+    test.assert_eq(csc_decode_feature(octets([0x07])), None)
+    test.assert_eq(csc_decode_location(octets([6])), Some(6))
+    test.assert_eq(csc_decode_location(octets([6, 6])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_speed_and_cadence_from_two_samples()
+    // 10 wheel revolutions of a 2100 mm wheel in one second: 21 m/s.
+    let a = sample(100, 1000, 50, 1000)
+    let b = sample(110, 2024, 51, 2024)
+    test.assert_eq(csc_wheel_delta(a, b), 10)
+    test.assert_eq(csc_distance_mm(a, b, 2100), 21000)
+    test.assert_eq(csc_speed_mm_per_s(a, b, 2100), 21000)
+    // One crank revolution per second: 60 rpm.
+    test.assert_eq(csc_cadence_rpm_x10(a, b), 600)
+    // Half a second between the events.
+    let c = sample(105, 1512, 50, 1512)
+    test.assert_eq(csc_speed_mm_per_s(a, c, 2000), 20000)
+    test.assert_eq(csc_cadence_rpm_x10(a, c), 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_counters_and_times_wrap()
+    // The wheel count wraps at 2^32, the crank count and the times at 2^16.
+    let a = sample(0xFFFFFFFE, 65000, 65535, 65000)
+    let b = sample(3, 488, 1, 488)
+    test.assert_eq(csc_wheel_delta(a, b), 5)
+    test.assert_eq(csc_crank_delta(a, b), 2)
+    test.assert_eq(csc_wheel_ticks(a, b), 1024)
+    test.assert_eq(csc_crank_ticks(a, b), 1024)
+    test.assert_eq(csc_speed_mm_per_s(a, b, 2000), 10000)
+    test.assert_eq(csc_cadence_rpm_x10(a, b), 1200)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_no_new_event_answers_minus_one()
+    let a = sample(5, 100, 5, 100)
+    test.assert_eq(csc_speed_mm_per_s(a, a, 2000), -1)
+    test.assert_eq(csc_cadence_rpm_x10(a, a), -1)
+    // A time that changed with no revolution is a stand still of 0 speed.
+    let b = sample(5, 200, 5, 200)
+    test.assert_eq(csc_speed_mm_per_s(a, b, 2000), 0)
+    test.assert_eq(csc_cadence_rpm_x10(a, b), 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_control_point_requests_and_responses()
+    test.assert_eq(sc_req_set_cumulative(0x01020304), octets([0x01, 0x04, 0x03, 0x02, 0x01]))
+    test.assert_eq(sc_req_start_calibration(), octets([0x02]))
+    test.assert_eq(sc_req_update_location(5), octets([0x03, 0x05]))
+    test.assert_eq(sc_req_list_locations(), octets([0x04]))
+    let list_response = octets([0x10, 0x04, 0x01, 0x05, 0x06])
+    match sc_decode_response(list_response)
+        None => test.fail("a response")
+        Some(r) =>
+            test.assert_eq(r.request_op, 4)
+            test.assert_eq(r.result, SC_RESULT_SUCCESS)
+            test.assert_eq(sc_response_location_count(r), 2)
+            test.assert_eq(sc_response_location_at(list_response, r, 0), 5)
+            test.assert_eq(sc_response_location_at(list_response, r, 2), -1)
+    match sc_decode_response(octets([0x10, 0x01, 0x03]))
+        None => test.fail("an invalid parameter")
+        Some(r) =>
+            test.assert_eq(r.result, SC_RESULT_INVALID_PARAMETER)
+            test.assert_eq(sc_response_location_count(r), 0)
+    test.assert_eq(sc_decode_response(octets([0x10, 0x01])), None)
+    test.assert_eq(sc_decode_response(octets([0x20, 0x01, 0x01])), None)
+
+@tier(app)
+fn server_with(feature: Int) -> (gatt_server.GattServer, cycling_speed_cadence.CscHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = cycling_speed_cadence.add_csc_service(var s.db, cycling_speed_cadence.default_csc_config(feature, sensor_control.SensorLocation.RearHub))!
+    (s, h)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-004")
+fn test_session_reads_the_feature_and_receives_measurements()
+    if not fixtures.client_engine_present()
+        return
+    var built = server_with(cycling_speed_cadence.FEATURE_WHEEL_REVOLUTION_DATA | cycling_speed_cadence.FEATURE_CRANK_REVOLUTION_DATA)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(cycling_speed_cadence.UUID_CYCLING_SPEED_AND_CADENCE_SERVICE)
+    var t = both.0
+    var c = csc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, csc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq(seen[1], cycling_speed_cadence.UUID_CSC_FEATURE)
+    let m = cycling_speed_cadence.CscMeasurement {
+        wheel: true, wheel_revolutions: 40, last_wheel_event: 2048, crank: true, crank_revolutions: 20, last_crank_event: 1024 }
+    let ev = sensor_client.test_deliver(var t, var c, cycling_speed_cadence.csc_notify(var s.db, var s.link, h, m, 0))
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    let d = must(sensor_client.sc_value(c))
+    test.assert_eq(d.wheel_revs, 40)
+    test.assert_eq(d.crank_time, 1024)

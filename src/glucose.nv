@@ -1,0 +1,687 @@
+// src/glucose.nv — the Glucose Service (0x1808), with which a glucose
+// meter keeps measurements and hands them to a collector through the Record Access
+// Control Point.
+//
+// Its builders run at start-up and allocate, so the functions that build lists or
+// records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Glucose Measurement          0x2A18  Notify; sequence number, Date Time, optional
+//                                        time offset, concentration with type and
+//                                        sample location, sensor status
+//   Glucose Measurement Context  0x2A34  Notify; optional, carbohydrates, meal,
+//                                        tester and health, exercise, medication, HbA1c
+//   Glucose Feature              0x2A51  Read; 16 bits, Indicate optional
+//   Record Access Control Point  0x2A52  Indicate and Write; see racp.nv
+//
+// A record is a Glucose Measurement and, when its Context Information flag is set, a
+// Glucose Measurement Context with the same Sequence Number ([GLS] 3.4.1).  The
+// service sends no record on its own: "the Record Access Control Point shall be used
+// to control notifications" ([GLS] 3.1.1).  `GlsStore` keeps the records, oldest
+// first.  The Sequence Number is assigned by the store, increases by one for each
+// record and is not reset by a delete ([GLS] 3.1.1.2).  A store at its capacity drops
+// its oldest record to take a new one ([GLS] 3.5).
+//
+// The transfer.  `gls_receive` answers one ATT PDU of the client.  A write to the
+// control point is checked before it is accepted: while a run is in progress any Op
+// Code but Abort Operation is answered with Procedure Already in Progress (0x80), and
+// Report Stored Records with a descriptor of the measurement, the context or the
+// control point not configured is answered with Client Characteristic Configuration
+// descriptor improperly configured (0x81, [GLS] 1.7, 3.4.4).  The procedure runs when
+// the Write Response has gone: `gls_pump` sends records, a burst at a time, each
+// measurement followed by its context, and the Success response when the last record
+// is out.  The Time Offset is in the first measurement of a transfer and in every one
+// whose offset differs from the one before ([GLS] 3.4.3.4).  A run whose response is
+// not confirmed in the ATT transaction timeout is `gls_abandon`ed ([GLS] 3.4.5).
+//
+// Security.  The Glucose Profile 1.0.1 puts every characteristic at security mode 1,
+// level 2 or 3 ([GLP] 6.1), and [GLS] Table 3.1 asks the Record Access Control Point
+// to be written with authentication.  `access` is the access of every value and
+// descriptor (Encrypted, Authenticated or SecureConnections) and `racp_write` the
+// access to write the control point (Authenticated or SecureConnections).
+//
+// What the product decides: the measurements and when they are taken, the Feature,
+// the capacity of the store, which optional operators the control point offers
+// (`racp.RacpSupport`) and whether Delete Stored Records is offered.  NOT
+// IMPLEMENTED: the User Facing Time filter ([GLS] Table 3.44, optional; answered
+// Operand not supported) and the storage of the records across a power cycle, which
+// is the product's.
+//
+// Specification checked against: Glucose Service 1.0.1 (GLS), Glucose Profile 1.0.1
+// (GLP) and the GATT Specification Supplement v9, Sections 3.105 to 3.107 and 3.177.
+//
+// Satisfies: REQ-BLE-GLS-001.
+
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use racp
+use wire
+
+const UUID_GLUCOSE_SERVICE = 0x1808
+const UUID_GLUCOSE_MEASUREMENT = 0x2A18
+const UUID_GLUCOSE_MEASUREMENT_CONTEXT = 0x2A34
+const UUID_GLUCOSE_FEATURE = 0x2A51
+const UUID_RECORD_ACCESS_CONTROL_POINT = 0x2A52
+
+// The Application Error Codes of [GLS] 1.7.
+const ERR_PROCEDURE_ALREADY_IN_PROGRESS = 0x80
+const ERR_CCC_IMPROPERLY_CONFIGURED = 0x81
+
+// The Flags of the Glucose Measurement ([GSS] Table 3.170).
+const FLAG_TIME_OFFSET = 0x01
+const FLAG_CONCENTRATION = 0x02
+const FLAG_MOL_PER_LITRE = 0x04
+const FLAG_SENSOR_STATUS = 0x08
+const FLAG_CONTEXT_FOLLOWS = 0x10
+
+// The Flags of the Glucose Measurement Context ([GSS] Table 3.177).
+const CONTEXT_CARBOHYDRATE = 0x01
+const CONTEXT_MEAL = 0x02
+const CONTEXT_TESTER_HEALTH = 0x04
+const CONTEXT_EXERCISE = 0x08
+const CONTEXT_MEDICATION = 0x10
+const CONTEXT_MEDICATION_LITRES = 0x20
+const CONTEXT_HBA1C = 0x40
+
+// The Glucose Feature bits ([GSS] Table 3.168) the Sensor Status Annunciation bits
+// depend on.  The Feature bit 10 is Multiple Bond.
+const FEATURE_DEFINED_BITS = 0x07FF
+
+// The Sensor Status Annunciation bits a Feature bit allows ([GLS] 3.3.1): bit 0 to 4
+// of the Feature allow the status bit of the same number; the result and temperature
+// pairs and the three after them move up by one.
+@tier(embedded)
+@no_alloc
+fn gls_status_allowed(features: Int) -> Int
+    var allowed = features & 0x001F
+    if (features & 0x0020) != 0
+        allowed = allowed | 0x0060
+    if (features & 0x0040) != 0
+        allowed = allowed | 0x0180
+    if (features & 0x0080) != 0
+        allowed = allowed | 0x0200
+    if (features & 0x0100) != 0
+        allowed = allowed | 0x0400
+    if (features & 0x0200) != 0
+        allowed = allowed | 0x0800
+    allowed
+
+// One Glucose Measurement.  `sequence` is assigned by the store.  `offset` is the
+// signed Time Offset in minutes and is sent when `has_offset` or when a transfer
+// needs it.  `concentration` is a raw SFLOAT in kg/L, or in mol/L when `mol`;
+// `sample_type` is the Type nibble (1 to 10) and `location` the Sample Location nibble
+// (1 to 4, or 15 for not available).  `status` is the Sensor Status Annunciation.
+// `context` says a Glucose Measurement Context belongs to the record.
+@value
+struct GlsMeasurement
+    sequence: Int
+    base_time: wire.DateTime
+    has_offset: Bool
+    offset: Int
+    has_concentration: Bool
+    concentration: Int
+    mol: Bool
+    sample_type: Int
+    location: Int
+    has_status: Bool
+    status: Int
+    context: Bool
+
+// A measurement of `concentration` (a raw SFLOAT) taken at `base_time`.
+@tier(embedded)
+@no_alloc
+fn gls_measurement(base_time: wire.DateTime, concentration: Int, mol: Bool, sample_type: Int, location: Int) -> GlsMeasurement
+    GlsMeasurement {
+        sequence: 0, base_time: base_time, has_offset: false, offset: 0,
+        has_concentration: true, concentration: concentration, mol: mol, sample_type: sample_type, location: location,
+        has_status: false, status: 0, context: false }
+
+// `m` with the Time Offset `offset` minutes.
+@tier(embedded)
+@no_alloc
+fn gls_with_offset(m: GlsMeasurement, offset: Int) -> GlsMeasurement
+    GlsMeasurement {
+        sequence: m.sequence, base_time: m.base_time, has_offset: true, offset: offset,
+        has_concentration: m.has_concentration, concentration: m.concentration, mol: m.mol,
+        sample_type: m.sample_type, location: m.location, has_status: m.has_status, status: m.status, context: m.context }
+
+// `m` with the Sensor Status Annunciation `status`.
+@tier(embedded)
+@no_alloc
+fn gls_with_status(m: GlsMeasurement, status: Int) -> GlsMeasurement
+    GlsMeasurement {
+        sequence: m.sequence, base_time: m.base_time, has_offset: m.has_offset, offset: m.offset,
+        has_concentration: m.has_concentration, concentration: m.concentration, mol: m.mol,
+        sample_type: m.sample_type, location: m.location, has_status: true, status: status, context: m.context }
+
+// `m` without the concentration and the Type-Sample Location, as a meter that could
+// not measure sends it.
+@tier(embedded)
+@no_alloc
+fn gls_without_concentration(m: GlsMeasurement) -> GlsMeasurement
+    GlsMeasurement {
+        sequence: m.sequence, base_time: m.base_time, has_offset: m.has_offset, offset: m.offset,
+        has_concentration: false, concentration: 0, mol: false,
+        sample_type: 0, location: 0, has_status: m.has_status, status: m.status, context: m.context }
+
+// One Glucose Measurement Context.  Each pair is present with its flag; `tester` and
+// `health` are the two nibbles of the Tester-Health octet.
+@value
+struct GlsContext
+    has_carbohydrate: Bool
+    carbohydrate_id: Int
+    carbohydrate: Int
+    has_meal: Bool
+    meal: Int
+    has_tester_health: Bool
+    tester: Int
+    health: Int
+    has_exercise: Bool
+    duration: Int
+    intensity: Int
+    has_medication: Bool
+    medication_id: Int
+    medication: Int
+    litres: Bool
+    has_hba1c: Bool
+    hba1c: Int
+
+// A context with no field; it is not a valid context until a field is added.
+@tier(embedded)
+@no_alloc
+fn gls_context_empty() -> GlsContext
+    GlsContext {
+        has_carbohydrate: false, carbohydrate_id: 0, carbohydrate: 0, has_meal: false, meal: 0,
+        has_tester_health: false, tester: 0, health: 0, has_exercise: false, duration: 0, intensity: 0,
+        has_medication: false, medication_id: 0, medication: 0, litres: false, has_hba1c: false, hba1c: 0 }
+
+// `c` with the Meal field.
+@tier(embedded)
+@no_alloc
+fn gls_context_meal(c: GlsContext, meal: Int) -> GlsContext
+    GlsContext {
+        has_carbohydrate: c.has_carbohydrate, carbohydrate_id: c.carbohydrate_id, carbohydrate: c.carbohydrate,
+        has_meal: true, meal: meal, has_tester_health: c.has_tester_health, tester: c.tester, health: c.health,
+        has_exercise: c.has_exercise, duration: c.duration, intensity: c.intensity,
+        has_medication: c.has_medication, medication_id: c.medication_id, medication: c.medication, litres: c.litres,
+        has_hba1c: c.has_hba1c, hba1c: c.hba1c }
+
+// `c` with the Carbohydrate ID and Carbohydrate (a raw SFLOAT in kilograms).
+@tier(embedded)
+@no_alloc
+fn gls_context_carbohydrate(c: GlsContext, id: Int, amount: Int) -> GlsContext
+    GlsContext {
+        has_carbohydrate: true, carbohydrate_id: id, carbohydrate: amount,
+        has_meal: c.has_meal, meal: c.meal, has_tester_health: c.has_tester_health, tester: c.tester, health: c.health,
+        has_exercise: c.has_exercise, duration: c.duration, intensity: c.intensity,
+        has_medication: c.has_medication, medication_id: c.medication_id, medication: c.medication, litres: c.litres,
+        has_hba1c: c.has_hba1c, hba1c: c.hba1c }
+
+// `c` with the Tester and Health nibbles.
+@tier(embedded)
+@no_alloc
+fn gls_context_tester_health(c: GlsContext, tester: Int, health: Int) -> GlsContext
+    GlsContext {
+        has_carbohydrate: c.has_carbohydrate, carbohydrate_id: c.carbohydrate_id, carbohydrate: c.carbohydrate,
+        has_meal: c.has_meal, meal: c.meal, has_tester_health: true, tester: tester, health: health,
+        has_exercise: c.has_exercise, duration: c.duration, intensity: c.intensity,
+        has_medication: c.has_medication, medication_id: c.medication_id, medication: c.medication, litres: c.litres,
+        has_hba1c: c.has_hba1c, hba1c: c.hba1c }
+
+// `c` with the Exercise Duration (seconds, 0xFFFF for 18 hours or more) and Intensity (percent).
+@tier(embedded)
+@no_alloc
+fn gls_context_exercise(c: GlsContext, duration: Int, intensity: Int) -> GlsContext
+    GlsContext {
+        has_carbohydrate: c.has_carbohydrate, carbohydrate_id: c.carbohydrate_id, carbohydrate: c.carbohydrate,
+        has_meal: c.has_meal, meal: c.meal, has_tester_health: c.has_tester_health, tester: c.tester, health: c.health,
+        has_exercise: true, duration: duration, intensity: intensity,
+        has_medication: c.has_medication, medication_id: c.medication_id, medication: c.medication, litres: c.litres,
+        has_hba1c: c.has_hba1c, hba1c: c.hba1c }
+
+// `c` with the Medication ID and Medication (a raw SFLOAT in kilograms or, when
+// `litres`, in litres).
+@tier(embedded)
+@no_alloc
+fn gls_context_medication(c: GlsContext, id: Int, amount: Int, litres: Bool) -> GlsContext
+    GlsContext {
+        has_carbohydrate: c.has_carbohydrate, carbohydrate_id: c.carbohydrate_id, carbohydrate: c.carbohydrate,
+        has_meal: c.has_meal, meal: c.meal, has_tester_health: c.has_tester_health, tester: c.tester, health: c.health,
+        has_exercise: c.has_exercise, duration: c.duration, intensity: c.intensity,
+        has_medication: true, medication_id: id, medication: amount, litres: litres,
+        has_hba1c: c.has_hba1c, hba1c: c.hba1c }
+
+// `c` with the HbA1c (a raw SFLOAT in percent).
+@tier(embedded)
+@no_alloc
+fn gls_context_hba1c(c: GlsContext, hba1c: Int) -> GlsContext
+    GlsContext {
+        has_carbohydrate: c.has_carbohydrate, carbohydrate_id: c.carbohydrate_id, carbohydrate: c.carbohydrate,
+        has_meal: c.has_meal, meal: c.meal, has_tester_health: c.has_tester_health, tester: c.tester, health: c.health,
+        has_exercise: c.has_exercise, duration: c.duration, intensity: c.intensity,
+        has_medication: c.has_medication, medication_id: c.medication_id, medication: c.medication, litres: c.litres,
+        has_hba1c: true, hba1c: hba1c }
+
+// A stored record: the measurement and, when `measurement.context`, its context.
+@value
+struct GlsRecord
+    measurement: GlsMeasurement
+    context: GlsContext
+
+@tier(embedded)
+@no_alloc
+fn gls_sfloat_valid(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) != wire.KIND_RESERVED
+
+// Whether the Type nibble is one of [GSS] Table 3.173 and the Sample Location nibble
+// one of Table 3.174.
+@tier(embedded)
+@no_alloc
+fn gls_type_location_valid(sample_type: Int, location: Int) -> Bool
+    sample_type >= 1 and sample_type <= 10 and ((location >= 1 and location <= 4) or location == 15)
+
+// Whether the service with the Feature `features` can send `m`: a known Base Time (the
+// year, month and day are never 0, [GLS] 3.1.1.3), a Time Offset of 16 bits, a valid
+// concentration with its Type-Sample Location, and a Sensor Status Annunciation that
+// uses only the bits the Feature allows, with the reserved bits 0 ([GLS] 3.3.1).
+@tier(embedded)
+@no_alloc
+fn gls_measurement_valid(features: Int, m: GlsMeasurement) -> Bool
+    if not wire.date_time_known(m.base_time)
+        return false
+    if m.has_offset and (m.offset < -32768 or m.offset > 32767)
+        return false
+    if m.has_concentration and (not gls_sfloat_valid(m.concentration) or not gls_type_location_valid(m.sample_type, m.location))
+        return false
+    if m.mol and not m.has_concentration
+        return false
+    if m.has_status and (m.status < 0 or (m.status & gls_status_allowed(features)) != m.status)
+        return false
+    true
+
+// Whether `c` can be sent: at least one field besides the flags and the sequence
+// number ([GLS] 3.2), and each field in its table.
+@tier(embedded)
+@no_alloc
+fn gls_context_valid(c: GlsContext) -> Bool
+    if not (c.has_carbohydrate or c.has_meal or c.has_tester_health or c.has_exercise or c.has_medication or c.has_hba1c)
+        return false
+    if c.has_carbohydrate and (c.carbohydrate_id < 1 or c.carbohydrate_id > 7 or not gls_sfloat_valid(c.carbohydrate))
+        return false
+    if c.has_meal and (c.meal < 1 or c.meal > 5)
+        return false
+    if c.has_tester_health
+        if not ((c.tester >= 1 and c.tester <= 3) or c.tester == 15)
+            return false
+        if not ((c.health >= 1 and c.health <= 5) or c.health == 15)
+            return false
+    if c.has_exercise and (c.duration < 0 or c.duration > 0xFFFF or c.intensity < 0 or c.intensity > 100)
+        return false
+    if c.has_medication and (c.medication_id < 1 or c.medication_id > 5 or not gls_sfloat_valid(c.medication))
+        return false
+    if c.has_hba1c and not gls_sfloat_valid(c.hba1c)
+        return false
+    true
+
+// The value of Glucose Measurement.  `with_offset` puts the Time Offset in even when
+// `m` does not carry one.
+@tier(app)
+fn gls_measurement_value(m: GlsMeasurement, with_offset: Bool) -> [u8]
+    let offset_sent = m.has_offset or with_offset
+    var flags = 0
+    if offset_sent
+        flags = flags | FLAG_TIME_OFFSET
+    if m.has_concentration
+        flags = flags | FLAG_CONCENTRATION
+    if m.mol
+        flags = flags | FLAG_MOL_PER_LITRE
+    if m.has_status
+        flags = flags | FLAG_SENSOR_STATUS
+    if m.context
+        flags = flags | FLAG_CONTEXT_FOLLOWS
+    var out: [u8] = [flags as u8]
+    wire.put(var out, m.sequence, 2)
+    wire.put_date_time(var out, m.base_time)
+    if offset_sent
+        wire.put(var out, m.offset, 2)
+    if m.has_concentration
+        wire.put(var out, m.concentration, 2)
+        wire.put(var out, (m.sample_type & 0x0F) | ((m.location & 0x0F) << 4), 1)
+    if m.has_status
+        wire.put(var out, m.status, 2)
+    out
+
+// The value of Glucose Measurement Context for the record with `sequence`.
+@tier(app)
+fn gls_context_value(sequence: Int, c: GlsContext) -> [u8]
+    var flags = 0
+    if c.has_carbohydrate
+        flags = flags | CONTEXT_CARBOHYDRATE
+    if c.has_meal
+        flags = flags | CONTEXT_MEAL
+    if c.has_tester_health
+        flags = flags | CONTEXT_TESTER_HEALTH
+    if c.has_exercise
+        flags = flags | CONTEXT_EXERCISE
+    if c.has_medication
+        flags = flags | CONTEXT_MEDICATION
+        if c.litres
+            flags = flags | CONTEXT_MEDICATION_LITRES
+    if c.has_hba1c
+        flags = flags | CONTEXT_HBA1C
+    var out: [u8] = [flags as u8]
+    wire.put(var out, sequence, 2)
+    if c.has_carbohydrate
+        wire.put(var out, c.carbohydrate_id, 1)
+        wire.put(var out, c.carbohydrate, 2)
+    if c.has_meal
+        wire.put(var out, c.meal, 1)
+    if c.has_tester_health
+        wire.put(var out, (c.tester & 0x0F) | ((c.health & 0x0F) << 4), 1)
+    if c.has_exercise
+        wire.put(var out, c.duration, 2)
+        wire.put(var out, c.intensity, 1)
+    if c.has_medication
+        wire.put(var out, c.medication_id, 1)
+        wire.put(var out, c.medication, 2)
+    if c.has_hba1c
+        wire.put(var out, c.hba1c, 2)
+    out
+
+@tier(app)
+fn gls_feature_value(features: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, features, 2)
+    out
+
+// The records of a meter, oldest first.  `next_sequence` is the Sequence Number of the
+// next record; it never goes down.  A store at `capacity` drops its oldest record for
+// a new one.
+struct GlsStore
+    var items: [GlsRecord]
+    var next_sequence: Int
+    capacity: Int
+    var features: Int
+    context_supported: Bool
+
+@tier(app)
+fn new_gls_store(capacity: Int, features: Int, context_supported: Bool) -> GlsStore
+    GlsStore { items: [], next_sequence: 0, capacity: capacity, features: features, context_supported: context_supported }
+
+// Keep a record of `m`, with `c` as its context when `with_context`.  The record gets
+// the next Sequence Number, which the call answers; -1 for a record the service cannot
+// send (nothing is kept), a context on a store without the characteristic, or a
+// Sequence Number space that is used up ([GLS] 3.1.1.2: it does not roll over).
+@tier(app)
+fn gls_store_add(var ledger: GlsStore, m: GlsMeasurement, with_context: Bool, c: GlsContext) -> Int
+    if ledger.capacity < 1 or ledger.next_sequence > 0xFFFF or not gls_measurement_valid(ledger.features, m)
+        return -1
+    if with_context and (not ledger.context_supported or not gls_context_valid(c))
+        return -1
+    let sequence = ledger.next_sequence
+    let kept = GlsMeasurement {
+        sequence: sequence, base_time: m.base_time, has_offset: m.has_offset, offset: m.offset,
+        has_concentration: m.has_concentration, concentration: m.concentration, mol: m.mol,
+        sample_type: m.sample_type, location: m.location, has_status: m.has_status, status: m.status, context: with_context }
+    if list.len(ledger.items) >= ledger.capacity
+        ledger.items = ledger.items[1:]
+    list.push(ledger.items, GlsRecord { measurement: kept, context: c })
+    ledger.next_sequence = sequence + 1
+    sequence
+
+@tier(app)
+fn gls_store_keys(ledger: GlsStore) -> [Int]
+    var keys: [Int] = []
+    for r in ledger.items
+        list.push(keys, r.measurement.sequence)
+    keys
+
+@tier(embedded)
+@no_alloc
+fn gls_store_count(ledger: GlsStore) -> Int
+    list.len(ledger.items)
+
+// Remove the records with the Sequence Numbers `keys`.
+@tier(app)
+fn gls_store_delete(var ledger: GlsStore, keys: [Int])
+    var kept: [GlsRecord] = []
+    for r in ledger.items
+        var gone = false
+        for k in keys
+            if k == r.measurement.sequence
+                gone = true
+        if not gone
+            list.push(kept, r)
+    ledger.items = kept
+
+// The record with the Sequence Number `key`, at its index, -1 for none.
+@tier(embedded)
+@no_alloc
+fn gls_store_find(ledger: GlsStore, key: Int) -> Int
+    for i in 0..list.len(ledger.items)
+        if ledger.items[i].measurement.sequence == key
+            return i
+    -1
+
+// What the service has.
+struct GlsConfig
+    access: gatt_server.Access
+    racp_write: gatt_server.Access
+    features: Int
+    feature_indicate: Bool
+    context: Bool
+    support: racp.RacpSupport
+
+// A meter with a Feature of no detection, no context, and every optional operator.
+@tier(app)
+fn default_gls_config() -> GlsConfig
+    GlsConfig {
+        access: gatt_server.Access.Encrypted, racp_write: gatt_server.Access.Authenticated, features: 0,
+        feature_indicate: false, context: false, support: racp.racp_support_all() }
+
+@value
+struct GlsHandles
+    service: u16
+    measurement: u16
+    measurement_cccd: u16
+    context: u16
+    context_cccd: u16
+    feature: u16
+    feature_cccd: u16
+    racp: u16
+    racp_cccd: u16
+
+@tier(embedded)
+@no_alloc
+fn gls_access_secure(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+@tier(embedded)
+@no_alloc
+fn gls_access_authenticated(access: gatt_server.Access) -> Bool
+    match access
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// Add the service to `db` after its last attribute, in the order of [GLS] Table 3.1.
+// An access below the profile's is NotPermitted and a Feature with a reserved bit is
+// InvalidValue.
+@tier(app)
+fn add_gls_service(var db: GattDb, config: GlsConfig) -> Result<GlsHandles, profile_builder.ProfileError>
+    if not gls_access_secure(config.access) or not gls_access_authenticated(config.racp_write)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if config.features < 0 or (config.features & 0xF800) != 0
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_GLUCOSE_SERVICE))!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_GLUCOSE_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, both)!
+    var context = 0
+    var context_cccd = 0
+    if config.context
+        context = profile_builder.add_value(
+            var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_GLUCOSE_MEASUREMENT_CONTEXT), [])!
+        context_cccd = profile_builder.add_cccd(var db, both)!
+    var feature_properties = gatt_server.PROP_READ
+    if config.feature_indicate
+        feature_properties = feature_properties | gatt_server.PROP_INDICATE
+    let feature = profile_builder.add_value(
+        var db, feature_properties, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_GLUCOSE_FEATURE), gls_feature_value(config.features))!
+    var feature_cccd = 0
+    if config.feature_indicate
+        feature_cccd = profile_builder.add_cccd(var db, both)!
+    let control = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.racp_write },
+        gatt_server.le16(UUID_RECORD_ACCESS_CONTROL_POINT), [])!
+    let control_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(GlsHandles {
+        service: service as u16, measurement: measurement as u16, measurement_cccd: measurement_cccd as u16,
+        context: context as u16, context_cccd: context_cccd as u16, feature: feature as u16, feature_cccd: feature_cccd as u16,
+        racp: control as u16, racp_cccd: control_cccd as u16 })
+
+// The procedure in progress and the Time Offset last sent, which the next measurement
+// of the transfer is compared with.
+struct GlsSession
+    var run: racp.RacpRun
+    var last_offset: Int
+
+@tier(app)
+fn new_gls_session() -> GlsSession
+    GlsSession { run: racp.racp_run_new(), last_offset: 0 }
+
+// Whether the descriptor `cccd` of the link holds `bit`.
+@tier(embedded)
+@no_alloc
+fn gls_subscribed(link: AttLink, cccd: Int, bit: Int) -> Bool
+    cccd != 0 and (gatt_server.configuration(link, cccd) & bit) != 0
+
+// The error a write of `value` to the control point is answered with before it is
+// accepted, 0 for none.
+@tier(app)
+fn gls_write_error(link: AttLink, handles: GlsHandles, session: GlsSession, value: [u8], s: racp.RacpSupport) -> Int
+    let r = racp.racp_decode(value, s)
+    if session.run.active and r.op != racp.OP_ABORT_OPERATION
+        return ERR_PROCEDURE_ALREADY_IN_PROGRESS
+    if not gls_subscribed(link, handles.racp_cccd as Int, gatt_server.CCC_INDICATION)
+        return ERR_CCC_IMPROPERLY_CONFIGURED
+    if racp.racp_reports(r)
+        if not gls_subscribed(link, handles.measurement_cccd as Int, gatt_server.CCC_NOTIFICATION)
+            return ERR_CCC_IMPROPERLY_CONFIGURED
+        if handles.context != 0 and not gls_subscribed(link, handles.context_cccd as Int, gatt_server.CCC_NOTIFICATION)
+            return ERR_CCC_IMPROPERLY_CONFIGURED
+    0
+
+// Answer one ATT PDU.  A Write Request to the control point is evaluated first (see
+// the head of the file) and, once the Write Response is out, carried out: Delete
+// removes its records, an answer that needs no records is indicated, and Report Stored
+// Records starts the run `gls_pump` sends.
+@tier(app)
+fn gls_receive(var db: GattDb, var link: AttLink, handles: GlsHandles, support: racp.RacpSupport, var ledger: GlsStore, var session: GlsSession, pdu: [u8], now_ms: Int) -> [[u8]]
+    let for_control = list.len(pdu) >= 3 and (pdu[0] as Int) == att.ATT_OP_WRITE_REQ and gatt_server.read_le16(pdu, 1) == handles.racp as Int
+    if not for_control
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.racp as Int), true)
+    if access == 0
+        let refused = gls_write_error(link, handles, session, pdu[3:], support)
+        if refused != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.racp as Int, refused)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if access != 0 or list.len(out) == 0 or (out[0][0] as Int) != att.ATT_OP_WRITE_RSP
+        return out
+    let request = racp.racp_decode(pdu[3:], support)
+    let outcome = racp.racp_execute(var session.run, request, gls_store_keys(ledger))
+    session.last_offset = 0
+    gls_store_delete(var ledger, outcome.deleted)
+    if list.len(outcome.reply) > 0 and gatt_server.set_value(var db, handles.racp as Int, outcome.reply)
+        list.append(out, gatt_server.send_value(var db, var link, handles.racp as Int, now_ms))
+    out
+
+// Send up to `burst` records of the run to the client, each measurement followed by
+// its context, and, when the last record is out, the Success response.  Nothing is
+// sent while the run is not in progress.  The Time Offset goes in the first
+// measurement and in every one whose offset differs from the one before.
+@tier(app)
+fn gls_pump(var db: GattDb, var link: AttLink, handles: GlsHandles, var ledger: GlsStore, var session: GlsSession, burst: Int, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if not session.run.active
+        return out
+    var sent = 0
+    while sent < burst and session.run.active
+        let first = session.run.fresh
+        let key = racp.racp_next(var session.run)
+        let i = gls_store_find(ledger, key)
+        if i >= 0
+            let record = ledger.items[i]
+            let offset = if record.measurement.has_offset then record.measurement.offset else 0
+            let needs = first or offset != session.last_offset
+            let m = GlsMeasurement {
+                sequence: record.measurement.sequence, base_time: record.measurement.base_time, has_offset: record.measurement.has_offset,
+                offset: offset, has_concentration: record.measurement.has_concentration, concentration: record.measurement.concentration,
+                mol: record.measurement.mol, sample_type: record.measurement.sample_type, location: record.measurement.location,
+                has_status: record.measurement.has_status, status: record.measurement.status, context: record.measurement.context }
+            if gatt_server.set_value(var db, handles.measurement as Int, gls_measurement_value(m, needs))
+                list.append(out, gatt_server.send_value(var db, var link, handles.measurement as Int, now_ms))
+            session.last_offset = offset
+            if m.context and handles.context != 0 and gatt_server.set_value(var db, handles.context as Int, gls_context_value(m.sequence, record.context))
+                list.append(out, gatt_server.send_value(var db, var link, handles.context as Int, now_ms))
+            sent = sent + 1
+        if list.len(session.run.pending) == 0
+            let done = racp.racp_finish(var session.run)
+            if gatt_server.set_value(var db, handles.racp as Int, done)
+                list.append(out, gatt_server.send_value(var db, var link, handles.racp as Int, now_ms))
+    out
+
+// The run cannot be completed: the link ended or the indication of the response was not
+// confirmed in the ATT transaction timeout ([GLS] 3.4.5).
+@tier(app)
+fn gls_abandon(var session: GlsSession)
+    racp.racp_abandon(var session.run)
+    session.last_offset = 0
+
+// Change the Feature at the meter itself; false (and the old value kept) for a value the
+// service cannot describe.
+@tier(app)
+fn gls_set_features(var db: GattDb, var ledger: GlsStore, handles: GlsHandles, features: Int) -> Bool
+    if features < 0 or (features & 0xF800) != 0
+        return false
+    ledger.features = features
+    gatt_server.set_value(var db, handles.feature as Int, gls_feature_value(features))
+
+// Indicate the Feature; none unless the characteristic indicates and the client enabled it.
+@tier(app)
+fn gls_indicate_feature(var db: GattDb, var link: AttLink, handles: GlsHandles, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.feature as Int, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn full_config() -> GlsConfig
+    GlsConfig {
+        access: gatt_server.Access.Encrypted, racp_write: gatt_server.Access.Authenticated, features: 0x07FF,
+        feature_indicate: true, context: true, support: racp.racp_support_all() }
+
+// A server whose link is authenticated, and the handles of `config`.
+@tier(app)
+fn server(config: GlsConfig) -> (GattServer, GlsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_gls_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@tier(app)
+fn reading(minute: Int) -> GlsMeasurement
+    gls_measurement(wire.date_time(2026, 11, 1, 8, minute, 0), wire.sfloat(95, -5), false, 1, 1)

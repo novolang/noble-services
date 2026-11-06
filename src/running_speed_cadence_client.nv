@@ -1,0 +1,115 @@
+// src/running_speed_cadence_client.nv — the Collector side of the
+// Running Speed and Cadence Service (0x1814): the decoders of its characteristics, the
+// helpers for its units and the client session.
+//
+//   RSC Measurement   0x2A53   `rsc_decode`
+//   RSC Feature       0x2A54   `rsc_decode_feature`
+//   Sensor Location   0x2A5D   `rsc_decode_location`
+//   SC Control Point  0x2A55   requests and responses of `cycling_speed_cadence_client`
+//
+// Layout of a measurement ([GSS] 3.191, checked against the Running Speed and Cadence
+// Service 1.0.1 text on disk): the flags octet (bit 0 instantaneous stride length present,
+// bit 1 total distance present, bit 2 running, else walking; bits 3 to 7 reserved and
+// ignored), the instantaneous speed (16 bits, units of 1/256 metre per second), the
+// instantaneous cadence (8 bits, steps per minute), the stride length (16 bits, centimetres)
+// and the total distance (32 bits, units of 1/10 metre).  A value shorter than its flags
+// require answers `None`.  The Set Cumulative Value procedure of the control point sets
+// the total distance in the same unit.
+//
+// The decoders allocate nothing.  The session runs on `sensor_client.nv`.
+
+use gatt_client
+use links
+use running_speed_cadence
+use sensor_client
+use sensor_control
+use wire
+
+const RSCM_STRIDE = 0x01
+const RSCM_DISTANCE = 0x02
+const RSCM_RUNNING = 0x04
+
+// The bits of the RSC Feature value ([GSS] 3.190.1) are `running_speed_cadence.FEATURE_*`.
+
+// One decoded measurement; stride length and total distance are 0 when absent.
+@value
+struct RscMeasurement
+    speed_256: Int
+    cadence: Int
+    has_stride: Bool
+    stride_cm: Int
+    has_distance: Bool
+    distance_dm: Int
+    running: Bool
+
+// The measurement in `b`, `None` when `b` is shorter than its flags require.
+@tier(embedded)
+@no_alloc
+fn rsc_decode(b: [u8]) -> ?RscMeasurement
+    let n = list.len(b)
+    if n < 4
+        return None
+    let flags = b[0] as Int
+    var at = 4
+    var stride = 0
+    var distance = 0
+    if (flags & RSCM_STRIDE) != 0
+        if n < at + 2
+            return None
+        stride = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & RSCM_DISTANCE) != 0
+        if n < at + 4
+            return None
+        distance = wire.get(b, at, 4)
+    Some(RscMeasurement {
+        speed_256: wire.get(b, 1, 2), cadence: b[3] as Int, has_stride: (flags & RSCM_STRIDE) != 0, stride_cm: stride,
+        has_distance: (flags & RSCM_DISTANCE) != 0, distance_dm: distance, running: (flags & RSCM_RUNNING) != 0 })
+
+// The speed in millimetres per second (the value is in 1/256 metre per second), rounded to the nearest.
+@tier(embedded)
+@no_alloc
+fn rsc_speed_mm_per_s(m: RscMeasurement) -> Int
+    (m.speed_256 * 1000 + 128) / 256
+
+// The Feature value (16 bits), `None` unless two octets.
+@tier(embedded)
+@no_alloc
+fn rsc_decode_feature(b: [u8]) -> ?Int
+    if list.len(b) != 2
+        return None
+    Some(wire.get(b, 0, 2))
+
+// The Sensor Location, `None` unless one octet.
+@tier(embedded)
+@no_alloc
+fn rsc_decode_location(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    Some(b[0] as Int)
+
+// The total distance covered between two samples in 1/10 metre, modulo 2^32.
+@tier(embedded)
+@no_alloc
+fn rsc_distance_delta_dm(prev: RscMeasurement, cur: RscMeasurement) -> Int
+    (cur.distance_dm - prev.distance_dm) & 0xFFFFFFFF
+
+@tier(app)
+fn rsc_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, running_speed_cadence.UUID_RUNNING_SPEED_AND_CADENCE_SERVICE)
+
+// Discover the service; read the Feature (required) and the Sensor Location; subscribe to the measurement
+// (required) and, by indication, the SC Control Point (optional).
+@tier(app)
+fn rsc_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, running_speed_cadence.UUID_RSC_FEATURE, true)
+    sensor_client.sc_queue_read(var c, sensor_control.UUID_SENSOR_LOCATION, false)
+    sensor_client.sc_queue_subscribe(var c, running_speed_cadence.UUID_RSC_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, running_speed_cadence.UUID_SC_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (an `sc_req_*` value of `cycling_speed_cadence_client`) to the SC Control Point.
+@tier(app)
+fn rsc_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, running_speed_cadence.UUID_SC_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

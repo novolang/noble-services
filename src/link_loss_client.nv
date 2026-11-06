@@ -1,0 +1,66 @@
+// src/link_loss_client.nv — the client of the Link Loss Service
+// (0x1803): the decoder of its one characteristic, the value to write, and the
+// client session.
+//
+//   Alert Level   0x2A06   decoded by `lls_decode_level`, written by `lls_client_set_level`
+//
+// The characteristic is one octet: 0 No Alert, 1 Mild Alert, 2 High Alert ([GSS]
+// 3.9, [LLS] 3.1).  Every other value is reserved.  The service alerts on the
+// device that holds it when the link is lost; the client only reads the level
+// the device holds and writes the one it wants.
+//
+// A decoder takes the octets of a value and answers `None` for a length other
+// than one octet and for a reserved level.  It allocates nothing and keeps no
+// state.
+//
+// The session (`lls_client_*`) runs on `sensor_client.nv`: discover the
+// service and read the Alert Level, which the service requires.
+//
+// Satisfies: REQ-BLE-PRFC-016.
+
+use gatt_client
+use links
+use link_loss
+use sensor_client
+use wire
+
+// The Alert Level in `b`: 0 to 2, `None` for another length or a reserved level.
+@tier(embedded)
+@no_alloc
+fn lls_decode_level(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    let level = b[0] as Int
+    if not link_loss.alert_level_valid(level)
+        return None
+    Some(level)
+
+// The value to write to set the level `level`; `None` for a reserved level.
+@tier(app)
+fn lls_level_value(level: Int) -> ?[u8]
+    if not link_loss.alert_level_valid(level)
+        return None
+    var out: [u8] = []
+    wire.put(var out, level, 1)
+    Some(out)
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn lls_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, link_loss.UUID_LINK_LOSS_SERVICE)
+
+// Discover the service and read the Alert Level.
+@tier(app)
+fn lls_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, link_loss.UUID_ALERT_LEVEL, true)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write the Alert Level.  The session must have finished its plan.  A reserved level is not written:
+// the step answers `SE_FAILED` with no PDU.
+@tier(app)
+fn lls_client_set_level(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, level: Int, now_ms: Int) -> sensor_client.ScStep
+    match lls_level_value(level)
+        None => sensor_client.ScStep { event: sensor_client.SE_FAILED, pdus: [] }
+        Some(v) =>
+            sensor_client.sc_queue_write(var c, link_loss.UUID_ALERT_LEVEL, v)
+            sensor_client.sc_kick(var t, var c, now_ms)

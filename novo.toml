@@ -1,0 +1,71 @@
+[package]
+name        = "noble-services"
+version     = "0.1.0"
+description = "The generic GATT services and profiles of the noble Bluetooth Low Energy stack: Device Information, Battery, Heart Rate, HID over GATT, Current Time, Link Loss, the cycling, running and fitness services, the health sensors, the sensor control and the Nordic UART Service, each with the policy hooks a product plugs its decisions into, and the client of each.  Runs over the noble Host."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "host"
+tags        = ["bluetooth", "ble", "gatt", "services", "battery", "hid", "heart-rate", "embedded"]
+repository  = "https://github.com/novolang/noble-services"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and effect-checks every module under `src/` and writes no binary.
+
+# The embedded tier of orbit/ble, whose images (the nRF52 and nRF54 peripherals and the earbud) link this package.
+[tier]
+tier = "embedded"
+
+# The modules were written as the embedded tier of orbit/ble and keep their `@tier(embedded)` marks.  Some of their functions
+# build a list, a boxed struct or call `list.append`, which the embedded tier refuses (E4000); orbit/ble carries the same findings
+# under the same knob (owner decision 2026-11-04), and the package reports them as warnings until the services are written over
+# fixed-capacity buffers or the tier of the Host stack is decided.
+sibling_check = "warn"
+
+[docs.pages]
+"README.md"           = "The generic GATT services of the noble stack"
+"docs/services.md"    = "Modules, configuration and the policy hooks"
+
+[publish]
+coverage_floor = 0
+
+[dependencies]
+noble = { path = "../noble" }
+
+# Package configuration (docs/config.md).  One [config.<key>] table for each limit of a service that has a key of its own.  A consumer
+# writes a [noble-services] section in its config file; the generated module is `noble_services_config`, read in the sources as
+# `noble_services_config.MAX_DIS_OCTETS`.  The keys keep the names they had in the schema of orbit/ble, where the section was [ble].
+#
+# A cost formula and a relation read only the keys of their own schema.  `max_bas`, the number of Battery Service instances, multiplies
+# `max_connections`, so it stays in the schema of the package noble and is read here as `noble_config.MAX_BAS`; the keys below read no
+# key of the core.  `services_budget.nv` adds up their storage and holds the sum to the total `novo config explain` prints.
+
+[config.max_dis_octets]
+type    = "int"
+default = 32
+min     = 24
+max     = 64
+unit    = "bytes"
+doc     = "longest string value of the Device Information Service, in octets"
+
+[config.max_hid_reports]
+type    = "int"
+default = 4
+min     = 3
+max     = 8
+doc     = "report characteristics of the HID Service"
+
+[config.max_hid_map_octets]
+type    = "int"
+default = 160
+min     = 64
+max     = 512
+unit    = "bytes"
+doc     = "longest HID report descriptor the HID Service holds, in octets"
+
+[config.max_profiles_btp]
+type    = "bool"
+default = false
+bytes_expr = "512 + max_hid_reports * 64"
+doc     = "on when the BTP session holds the Device Information, Battery and HID Services, off for none"

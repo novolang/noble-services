@@ -1,0 +1,434 @@
+// tests/health_thermometer_tests.nv — the unit tests of src/health_thermometer.nv.
+//
+//   novo test tests/health_thermometer_tests.nv
+
+use std.test
+use att
+use gatt_server
+use links
+use profile_builder
+use fixtures.{ req, peer, subscribe, read }
+use wire
+use health_thermometer.{ DefaultHtsPolicy, ERR_INTERVAL_OUT_OF_RANGE, HtsConfig, HtsHandles, HtsMeasurement, HtsPolicy, TYPE_BODY, TYPE_EAR, TYPE_MOUTH, TYPE_TYMPANUM, add_hts_service, default_hts_config, default_hts_policy, full_config, hts_attribute, hts_indicate, hts_indicate_interval, hts_intermediate_notify, hts_interval, hts_interval_written, hts_measurement, hts_measurement_valid, hts_measurement_value, hts_receive, hts_set_interval }
+
+// A server whose link is encrypted at `level` (2 is encrypted, 3 authenticated).
+@tier(app)
+fn server_at(config: HtsConfig, level: Int) -> (GattServer, HtsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_hts_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, level, 16, true))
+    (s, h)
+
+@tier(app)
+fn server(config: HtsConfig) -> (GattServer, HtsHandles)
+    server_at(config, 3)
+
+// Write the Client Characteristic Configuration descriptor at `cccd`.
+// `hts_receive` with the default policy, for the tests that do not look at it.
+@tier(app)
+fn receive_default(var s: GattServer, h: HtsHandles, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_hts_policy()
+    hts_receive(var s.db, var s.link, h, var policy, peer(), pdu, now_ms)
+
+@tier(app)
+fn write_interval(var s: GattServer, h: HtsHandles, seconds: Int) -> [u8]
+    receive_default(var s, h, req(0x12, h.interval, [seconds & 0xFF, seconds >>> 8]), 0)[0]
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_minimal_service_is_one_indicated_measurement_with_its_descriptor()
+    let (s, h) = server(default_hts_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.temperature_type, 0)
+    test.assert_eq(h.intermediate, 0)
+    test.assert_eq(h.interval, 0)
+    test.assert_eq(h.valid_range, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 4)
+    test.assert_eq(s.db.attributes[0].value, [0x09, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x20, 3, 0, 0x1C, 0x2A])
+    test.assert_eq(hts_interval(s.db, h), -1)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_full_service_lists_its_characteristics_in_the_table_order()
+    let (s, h) = server(full_config())
+    // The measurement and its descriptor, the type, the intermediate
+    // temperature and its descriptor, the interval, its descriptor and the range.
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.temperature_type, 6)
+    test.assert_eq(h.intermediate, 8)
+    test.assert_eq(h.intermediate_cccd, 9)
+    test.assert_eq(h.interval, 11)
+    test.assert_eq(h.interval_cccd, 12)
+    test.assert_eq(h.valid_range, 13)
+    test.assert_eq(gatt_server.last_handle(s.db), 13)
+    test.assert_eq(s.db.attributes[4].value, [0x02, 6, 0, 0x1D, 0x2A])
+    test.assert_eq(s.db.attributes[6].value, [0x10, 8, 0, 0x1E, 0x2A])
+    // Read, Write and Indicate: 0x02 | 0x08 | 0x20.
+    test.assert_eq(s.db.attributes[9].value, [0x2A, 11, 0, 0x21, 0x2A])
+    test.assert_eq(hts_attribute(s.db, h.valid_range), [10, 0, 0x10, 0x0E])
+    test.assert_eq(hts_interval(s.db, h), 60)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_measurement_has_flags_a_float_and_the_optional_fields_in_order()
+    let plain = hts_measurement(wire.float(364, -1), false)
+    test.assert_eq(hts_measurement_value(plain), [0x00, 0x6C, 0x01, 0x00, 0xFF])
+    let fahrenheit = hts_measurement(wire.float(979, -1), true)
+    test.assert_eq(hts_measurement_value(fahrenheit), [0x01, 0xD3, 0x03, 0x00, 0xFF])
+    let stamped = HtsMeasurement {
+        temperature: wire.float(364, -1), fahrenheit: false, has_time: true,
+        time: wire.date_time(2026, 10, 27, 13, 5, 9), temperature_type: 0 }
+    test.assert_eq(hts_measurement_value(stamped), [0x02, 0x6C, 0x01, 0x00, 0xFF, 0xEA, 0x07, 10, 27, 13, 5, 9])
+    let typed = HtsMeasurement {
+        temperature: wire.float(364, -1), fahrenheit: false, has_time: false,
+        time: wire.date_time_unknown(), temperature_type: TYPE_EAR }
+    test.assert_eq(hts_measurement_value(typed), [0x04, 0x6C, 0x01, 0x00, 0xFF, 3])
+    let all = HtsMeasurement {
+        temperature: wire.float(-5, 0), fahrenheit: true, has_time: true,
+        time: wire.date_time(1999, 1, 2, 3, 4, 5), temperature_type: TYPE_TYMPANUM }
+    test.assert_eq(hts_measurement_value(all), [0x07, 0xFB, 0xFF, 0xFF, 0x00, 0xCF, 0x07, 1, 2, 3, 4, 5, 9])
+    // The reserved flag bits stay 0 in every combination.
+    test.assert_eq((hts_measurement_value(all)[0] as Int) & 0xF8, 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_reading_that_is_not_valid_is_the_nan_float()
+    let nan = hts_measurement(wire.FLOAT_NAN, false)
+    test.assert(hts_measurement_valid(nan))
+    test.assert_eq(hts_measurement_value(nan), [0x00, 0xFF, 0xFF, 0x7F, 0x00])
+    // Infinity and not-at-this-resolution are values the float holds; the reserved one is not sent.
+    test.assert(hts_measurement_valid(hts_measurement(wire.FLOAT_NRES, false)))
+    test.assert(hts_measurement_valid(hts_measurement(wire.FLOAT_POSITIVE_INFINITY, false)))
+    test.assert(not hts_measurement_valid(hts_measurement(wire.FLOAT_RESERVED, false)))
+    test.assert(not hts_measurement_valid(hts_measurement(-1, false)))
+    test.assert(not hts_measurement_valid(hts_measurement(0x100000000, false)))
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_time_stamp_has_a_month_and_a_day_and_a_type_is_one_to_nine()
+    let base = HtsMeasurement {
+        temperature: 0, fahrenheit: false, has_time: true,
+        time: wire.date_time(2026, 10, 27, 13, 5, 9), temperature_type: 0 }
+    test.assert(hts_measurement_valid(base))
+    test.assert(not hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: true, time: wire.date_time(2026, 0, 27, 13, 5, 9), temperature_type: 0 }))
+    test.assert(not hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: true, time: wire.date_time(2026, 10, 0, 13, 5, 9), temperature_type: 0 }))
+    test.assert(not hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: true, time: wire.date_time(2026, 10, 27, 24, 5, 9), temperature_type: 0 }))
+    // A time that is not sent is not checked.
+    test.assert(hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: false, time: wire.date_time(0, 0, 0, 99, 0, 0), temperature_type: 0 }))
+    for t in 0..10
+        test.assert(hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: false, time: wire.date_time_unknown(), temperature_type: t as u8 }))
+    test.assert(not hts_measurement_valid(HtsMeasurement { temperature: 0, fahrenheit: false, has_time: false, time: wire.date_time_unknown(), temperature_type: 10 }))
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_measurement_is_indicated_only_to_a_subscribed_client()
+    var (s, h) = server(default_hts_config())
+    let m = hts_measurement(wire.float(364, -1), false)
+    // Nothing is sent before the client enables indications, and a value not valid is not stored.
+    test.assert_eq(list.len(hts_indicate(var s.db, var s.link, h, m, 0)), 0)
+    test.assert_eq(list.len(hts_indicate(var s.db, var s.link, h, hts_measurement(wire.FLOAT_RESERVED, false), 0)), 0)
+    subscribe(var s, h.measurement_cccd, 2)
+    let out = hts_indicate(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], [0x1D, 3, 0, 0x00, 0x6C, 0x01, 0x00, 0xFF])
+    // A second measurement waits for the confirmation of the first, and goes out with it.
+    let second = hts_indicate(var s.db, var s.link, h, hts_measurement(wire.float(365, -1), false), 1)
+    test.assert_eq(list.len(second), 0)
+    let confirmed = gatt_server.receive(var s.db, var s.link, [0x1E], 2)
+    test.assert_eq(list.len(confirmed), 1)
+    test.assert_eq(confirmed[0], [0x1D, 3, 0, 0x00, 0x6D, 0x01, 0x00, 0xFF])
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_measurement_cannot_be_read_or_written_and_a_notification_is_not_offered()
+    var (s, h) = server(default_hts_config())
+    test.assert_eq(read(var s, h.measurement)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The descriptor reads back what the client wrote.
+    subscribe(var s, h.measurement_cccd, 2)
+    test.assert_eq(read(var s, h.measurement_cccd), [0x0B, 2, 0])
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_temperature_type_is_read_only_and_leaves_the_field_out_of_the_measurement()
+    var (s, h) = server(full_config())
+    test.assert_eq(read(var s, h.temperature_type), [0x0B, TYPE_MOUTH])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.temperature_type, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    subscribe(var s, h.measurement_cccd, 2)
+    let typed = HtsMeasurement {
+        temperature: wire.float(364, -1), fahrenheit: false, has_time: false,
+        time: wire.date_time_unknown(), temperature_type: TYPE_EAR }
+    // One method only: the characteristic is there, so the field is not sent.
+    let out = hts_indicate(var s.db, var s.link, h, typed, 0)
+    test.assert_eq(out[0], [0x1D, 3, 0, 0x00, 0x6C, 0x01, 0x00, 0xFF])
+    // Without the characteristic the field goes out.
+    var (t, g) = server(default_hts_config())
+    subscribe(var t, g.measurement_cccd, 2)
+    let with_field = hts_indicate(var t.db, var t.link, g, typed, 0)
+    test.assert_eq(with_field[0], [0x1D, 3, 0, 0x04, 0x6C, 0x01, 0x00, 0xFF, 3])
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_intermediate_temperature_is_notified_while_the_measurement_is_indicated()
+    var (s, h) = server(full_config())
+    let m = hts_measurement(wire.float(361, -1), false)
+    test.assert_eq(list.len(hts_intermediate_notify(var s.db, var s.link, h, m, 0)), 0)
+    subscribe(var s, h.intermediate_cccd, 1)
+    let n = hts_intermediate_notify(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0], [0x1B, 8, 0, 0x00, 0x69, 0x01, 0x00, 0xFF])
+    // Notifications do not wait for each other.
+    test.assert_eq(list.len(hts_intermediate_notify(var s.db, var s.link, h, m, 1)), 1)
+    // Then the measurement is indicated.
+    subscribe(var s, h.measurement_cccd, 2)
+    let i = hts_indicate(var s.db, var s.link, h, hts_measurement(wire.float(364, -1), false), 2)
+    test.assert_eq(i[0][0] as Int, 0x1D)
+    // A service without the characteristic sends none.
+    let (t, g) = server(default_hts_config())
+    var u = t
+    test.assert_eq(list.len(hts_intermediate_notify(var u.db, var u.link, g, m, 0)), 0)
+    // The characteristic is not readable.
+    test.assert_eq(read(var s, h.intermediate)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_interval_is_read_and_a_valid_write_is_stored_and_read_back()
+    var (s, h) = server(full_config())
+    test.assert_eq(read(var s, h.interval), [0x0B, 60, 0])
+    test.assert_eq(write_interval(var s, h, 600), [0x13])
+    test.assert_eq(read(var s, h.interval), [0x0B, 0x58, 0x02])
+    test.assert_eq(hts_interval(s.db, h), 600)
+    // The ends of the range and 0, no periodic measurement, are values.
+    test.assert_eq(write_interval(var s, h, 10), [0x13])
+    test.assert_eq(write_interval(var s, h, 3600), [0x13])
+    test.assert_eq(write_interval(var s, h, 0), [0x13])
+    test.assert_eq(hts_interval(s.db, h), 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_an_interval_outside_the_valid_range_is_out_of_range_and_the_value_stays()
+    var (s, h) = server(full_config())
+    test.assert_eq(write_interval(var s, h, 9)[4] as Int, ERR_INTERVAL_OUT_OF_RANGE)
+    test.assert_eq(write_interval(var s, h, 3601)[4] as Int, ERR_INTERVAL_OUT_OF_RANGE)
+    test.assert_eq(write_interval(var s, h, 65535)[4] as Int, ERR_INTERVAL_OUT_OF_RANGE)
+    test.assert_eq(hts_interval(s.db, h), 60)
+    // The error response names the request and the handle.
+    test.assert_eq(write_interval(var s, h, 9), [0x01, 0x12, 11, 0, 0x80])
+    // The first part of a long write is checked the same way, and one that
+    // does not start at offset 0 is the length rule's, at the Execute Write.
+    let prepare = receive_default(var s, h, req(0x16, h.interval, [0, 0, 5, 0]), 0)
+    test.assert_eq(prepare[0], [0x01, 0x16, 11, 0, 0x80])
+    let ok = receive_default(var s, h, req(0x16, h.interval, [0, 0, 20, 0]), 0)
+    test.assert_eq(ok[0][0] as Int, 0x17)
+    test.assert_eq(receive_default(var s, h, [0x18, 0x01], 0)[0][0] as Int, 0x19)
+    test.assert_eq(hts_interval(s.db, h), 20)
+    var (t, g) = server(full_config())
+    let late = receive_default(var t, g, req(0x16, g.interval, [1, 0, 5, 0]), 0)
+    test.assert_eq(late[0][0] as Int, 0x17)
+    let done = receive_default(var t, g, [0x18, 0x01], 0)
+    test.assert_eq(done[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(hts_interval(t.db, g), 60)
+
+// A policy that refuses an interval above a limit and remembers how many times it
+// was asked, the last interval and the slots of the peers (one bit each).
+@value
+struct Slow
+    limit: Int
+    asked: Int
+    last: Int
+    slots: Int
+
+impl HtsPolicy[] for Slow
+    @tier(app)
+    fn interval_change(var self, peer: links.LinkId, seconds: Int) -> Bool
+        self.asked = self.asked + 1
+        self.last = seconds
+        self.slots = self.slots | (1 << peer.slot)
+        seconds <= self.limit
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_policy_is_asked_for_an_interval_inside_the_range_and_a_refusal_is_out_of_range()
+    var (s, h) = server(full_config())
+    var slow = Slow { limit: 100, asked: 0, last: 0, slots: 0 }
+    let ok = hts_receive(var s.db, var s.link, h, var slow, peer(), req(0x12, h.interval, [50, 0]), 0)
+    test.assert_eq(ok[0], [0x13])
+    test.assert_eq(hts_interval(s.db, h), 50)
+    let refused = hts_receive(var s.db, var s.link, h, var slow, peer(), req(0x12, h.interval, [200, 0]), 0)
+    test.assert_eq(refused[0], [0x01, 0x12, 11, 0, 0x80])
+    test.assert_eq(hts_interval(s.db, h), 50)
+    // A value outside the Valid Range is refused before the policy is asked.
+    let outside = hts_receive(var s.db, var s.link, h, var slow, peer(), req(0x12, h.interval, [5, 0]), 0)
+    test.assert_eq(outside[0][4] as Int, ERR_INTERVAL_OUT_OF_RANGE)
+    test.assert_eq(slow.asked, 2)
+    test.assert_eq(slow.last, 200)
+    test.assert_eq(slow.slots, 1)
+    // The default policy takes what the range allows, and `accept: false` takes nothing.
+    var none = DefaultHtsPolicy { accept: false }
+    let no = hts_receive(var s.db, var s.link, h, var none, peer(), req(0x12, h.interval, [60, 0]), 0)
+    test.assert_eq(no[0][4] as Int, ERR_INTERVAL_OUT_OF_RANGE)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_an_interval_of_another_length_is_an_invalid_length()
+    var (s, h) = server(full_config())
+    let one = receive_default(var s, h, req(0x12, h.interval, [30]), 0)
+    test.assert_eq(one[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    let three = receive_default(var s, h, req(0x12, h.interval, [30, 0, 0]), 0)
+    test.assert_eq(three[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    let none = receive_default(var s, h, req(0x12, h.interval, []), 0)
+    test.assert_eq(none[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(hts_interval(s.db, h), 60)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_interval_is_written_with_authentication_and_read_when_encrypted()
+    var (s, h) = server_at(full_config(), 2)
+    // Level 2 reads it and does not write it.
+    test.assert_eq(read(var s, h.interval), [0x0B, 60, 0])
+    test.assert_eq(write_interval(var s, h, 600)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(hts_interval(s.db, h), 60)
+    // An out-of-range value on that link is refused for its security first.
+    test.assert_eq(write_interval(var s, h, 5)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(write_interval(var s, h, 600), [0x13])
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_valid_range_is_read_only_and_exists_for_a_writable_interval_only()
+    var (s, h) = server(full_config())
+    test.assert_eq(read(var s, h.valid_range), [0x0B, 10, 0, 0x10, 0x0E])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.valid_range, [1, 0, 2, 0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    let fixed = HtsConfig {
+        access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated,
+        temperature_type: 0, intermediate: false, interval: 30,
+        interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 65535 }
+    var (t, g) = server(fixed)
+    test.assert_eq(g.valid_range, 0)
+    test.assert_eq(g.interval_cccd, 0)
+    // Read only, the interval refuses a write and holds 30.
+    test.assert_eq(read(var t, g.interval), [0x0B, 30, 0])
+    test.assert_eq(receive_default(var t, g, req(0x12, g.interval, [10, 0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(t.db.attributes[4].value, [0x02, 6, 0, 0x21, 0x2A])
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_local_change_of_the_interval_is_checked_and_indicated_when_enabled()
+    var (s, h) = server(full_config())
+    test.assert(hts_set_interval(var s.db, h, 120))
+    test.assert_eq(hts_interval(s.db, h), 120)
+    test.assert(hts_set_interval(var s.db, h, 0))
+    test.assert(not hts_set_interval(var s.db, h, 9))
+    test.assert(not hts_set_interval(var s.db, h, 70000))
+    test.assert(not hts_set_interval(var s.db, h, -1))
+    test.assert_eq(hts_interval(s.db, h), 0)
+    test.assert(hts_set_interval(var s.db, h, 300))
+    // Nothing is sent until the client enables the indication; then the current value.
+    test.assert_eq(list.len(hts_indicate_interval(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.interval_cccd, 2)
+    let out = hts_indicate_interval(var s.db, var s.link, h, 0)
+    test.assert_eq(out[0], [0x1D, 11, 0, 0x2C, 0x01])
+    // A service without the characteristic has nothing to set or indicate.
+    var (t, g) = server(default_hts_config())
+    test.assert(not hts_set_interval(var t.db, g, 10))
+    test.assert_eq(list.len(hts_indicate_interval(var t.db, var t.link, g, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_write_of_the_interval_is_reported_to_the_product()
+    let (s, h) = server(full_config())
+    test.assert(hts_interval_written(h, [4, 11, 12]))
+    test.assert(not hts_interval_written(h, [4, 12]))
+    test.assert(not hts_interval_written(h, []))
+    let (_, g) = server(default_hts_config())
+    test.assert(not hts_interval_written(g, [11]))
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_every_attribute_needs_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let h = add_hts_service(var s.db, full_config())!
+    // A link without encryption: reads and descriptor writes are refused.
+    test.assert_eq(read(var s, h.temperature_type)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.interval)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.valid_range)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.measurement_cccd)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.intermediate_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // Nothing is indicated to a client that could not subscribe.
+    test.assert_eq(list.len(hts_indicate(var s.db, var s.link, h, hts_measurement(0, false), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_higher_access_is_kept_and_a_lower_one_is_refused()
+    let strong = HtsConfig {
+        access: gatt_server.Access.Authenticated, write_access: gatt_server.Access.SecureConnections,
+        temperature_type: TYPE_BODY, intermediate: false, interval: 5,
+        interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 100 }
+    var (s, h) = server_at(strong, 2)
+    // Authenticated reads need level 3.
+    test.assert_eq(read(var s, h.temperature_type)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read(var s, h.temperature_type), [0x0B, TYPE_BODY])
+    // The write wants Secure Connections.
+    test.assert_eq(write_interval(var s, h, 7)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(write_interval(var s, h, 7), [0x13])
+    for a in [gatt_server.Access.Open, gatt_server.Access.Denied, gatt_server.Access.Authorized]
+        var r = gatt_server.new_server([], 65)
+        match add_hts_service(var r.db, HtsConfig { access: a, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: -1, interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 65535 })
+            Ok(_) => test.fail("an access below security level 2 is refused")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_a_configuration_the_service_cannot_describe_is_refused_before_anything_is_added()
+    // The write of the interval needs authentication, at least.
+    for w in [gatt_server.Access.Open, gatt_server.Access.Encrypted, gatt_server.Access.Authorized, gatt_server.Access.Denied]
+        var r = gatt_server.new_server([], 65)
+        match add_hts_service(var r.db, HtsConfig { access: gatt_server.Access.Encrypted, write_access: w, temperature_type: 0, intermediate: false, interval: 5, interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 10 })
+            Ok(_) => test.fail("a write below authentication is refused")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // Each value out of its range is an invalid value.
+    let bad = [
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 10, intermediate: false, interval: -1, interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: -1, intermediate: false, interval: -1, interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 65536, interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: -2, interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 10 },
+        // A writable or indicating interval needs the characteristic.
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: -1, interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: -1, interval_writable: false, interval_indicate: true, interval_min: 1, interval_max: 10 },
+        // The Valid Range: a lower value of 0, an upper below the lower, an upper above 65535.
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 5, interval_writable: true, interval_indicate: false, interval_min: 0, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 5, interval_writable: true, interval_indicate: false, interval_min: 11, interval_max: 10 },
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 5, interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 65536 },
+        // The first interval is 0 or inside the range.
+        HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 11, interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 10 }]
+    for config in bad
+        var r = gatt_server.new_server([], 65)
+        match add_hts_service(var r.db, config)
+            Ok(_) => test.fail("the configuration is out of range")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+        test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // 0 as the first interval of a writable one is allowed.
+    var ok = gatt_server.new_server([], 65)
+    let h = add_hts_service(var ok.db, HtsConfig { access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated, temperature_type: 0, intermediate: false, interval: 0, interval_writable: true, interval_indicate: false, interval_min: 1, interval_max: 10 })!
+    test.assert_eq(hts_interval(ok.db, h), 0)
+
+@test
+@satisfies("REQ-BLE-HTS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_hts_service(var s.db, full_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

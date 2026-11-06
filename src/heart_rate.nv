@@ -1,0 +1,208 @@
+// src/heart_rate.nv — the Heart Rate Service (0x180D).
+//
+// A heart rate sensor reports the beats per minute of the wearer. The
+// service holds, in the order the builder adds them:
+//
+//   Heart Rate Measurement       0x2A37   Notify, with a Client Characteristic
+//                                         Configuration descriptor
+//   Body Sensor Location         0x2A38   Read; where the sensor is worn
+//   Heart Rate Control Point     0x2A39   Write; 1 resets the energy expended
+//
+// The location is optional: `HeartRateConfig` leaves it out when it is
+// Absent. The control point is present exactly when the sensor reports
+// energy expended, so `heart_rate_notify` leaves the Energy Expended field
+// out of a service that has no control point. A write to the control point
+// of a first octet other than 1 is refused with the Error Code 0x80, and
+// one of more than one octet with Invalid Attribute Value Length. Every
+// attribute a client reads or writes (the descriptor, the location, the
+// control point) needs an access other than Denied; the security level is
+// the application's choice, since the service sets no security permission.
+//
+// `heart_rate_measurement_value` builds the value of a measurement and
+// `heart_rate_notify` stores it and answers the notification.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_HEART_RATE_SERVICE = 0x180D
+const UUID_HEART_RATE_MEASUREMENT = 0x2A37
+const UUID_BODY_SENSOR_LOCATION = 0x2A38
+const UUID_HEART_RATE_CONTROL_POINT = 0x2A39
+
+// The flags octet of a measurement: the format of the heart rate value,
+// the sensor contact status in bits 1 and 2, and which optional fields
+// follow.
+const FLAG_VALUE_16 = 0x01
+const FLAG_ENERGY_EXPENDED = 0x08
+const FLAG_RR_INTERVAL = 0x10
+
+// The control point value that resets the energy expended, and the Error
+// Code of any other value.
+const CONTROL_POINT_RESET_ENERGY = 0x01
+const ERR_CONTROL_POINT_NOT_SUPPORTED = 0x80
+
+// Where the sensor is worn. Absent leaves the characteristic out.
+enum BodySensorLocation
+    Absent
+    Other
+    Chest
+    Wrist
+    Finger
+    Hand
+    EarLobe
+    Foot
+
+// The octet of the Body Sensor Location characteristic, -1 for Absent.
+fn body_sensor_location_value(location: BodySensorLocation) -> Int
+    match location
+        Absent => -1
+        Other => 0
+        Chest => 1
+        Wrist => 2
+        Finger => 3
+        Hand => 4
+        EarLobe => 5
+        Foot => 6
+
+// Whether the sensor detects skin contact, and if it does, whether it
+// has contact.
+enum SensorContact
+    NotSupported
+    NotDetected
+    Detected
+
+// The contact bits of the flags octet.
+fn contact_flags(contact: SensorContact) -> Int
+    match contact
+        NotSupported => 0x00
+        NotDetected => 0x04
+        Detected => 0x06
+
+// One measurement. `heart_rate` is in beats per minute and travels as one
+// octet up to 255 and as two above. `energy_expended` is in kilojoules, -1
+// when the sensor does not report it. `rr_intervals` are the times between
+// beats in units of 1/1024 second, oldest first (`rr_interval` converts
+// milliseconds).
+struct HeartRateMeasurement
+    heart_rate: Int
+    contact: SensorContact
+    energy_expended: Int
+    rr_intervals: [Int]
+
+// An RR-Interval of `ms` milliseconds in units of 1/1024 second.
+fn rr_interval(ms: Int) -> Int
+    ms * 1024 / 1000
+
+// The value of a measurement. The RR-Intervals that do not fit in `room`
+// octets with the other fields are left out, the newest first; a
+// notification has room for ATT_MTU - 3 octets.
+fn heart_rate_measurement_value(m: HeartRateMeasurement, room: Int) -> [u8]
+    let wide = m.heart_rate > 255
+    let has_energy = m.energy_expended >= 0
+    let used = 1 + (if wide then 2 else 1) + (if has_energy then 2 else 0)
+    let fit = if room > used then (room - used) / 2 else 0
+    let count = if list.len(m.rr_intervals) > fit then fit else list.len(m.rr_intervals)
+    var flags = contact_flags(m.contact)
+    if wide
+        flags = flags | FLAG_VALUE_16
+    if has_energy
+        flags = flags | FLAG_ENERGY_EXPENDED
+    if count > 0
+        flags = flags | FLAG_RR_INTERVAL
+    var out: [u8] = [flags as u8]
+    wire.put(var out, wire.clamp(m.heart_rate, 0, 0xFFFF), if wide then 2 else 1)
+    if has_energy
+        wire.put(var out, wire.clamp(m.energy_expended, 0, 0xFFFF), 2)
+    for k in 0..count
+        wire.put(var out, wire.clamp(m.rr_intervals[k], 0, 0xFFFF), 2)
+    out
+
+// The configuration of the service. `read` is the access to the Body Sensor
+// Location, `measurement_cccd` the access to the measurement's descriptor
+// (the measurement is notified only while the link grants its write),
+// `control_point` whether the control point is present and `reset_write`
+// the access a client needs to write it.
+struct HeartRateConfig
+    location: BodySensorLocation
+    control_point: Bool
+    read: gatt_server.Access
+    measurement_cccd: gatt_server.Permissions
+    reset_write: gatt_server.Access
+
+// A sensor worn at `location` with no control point, open to any client.
+fn default_heart_rate_config(location: BodySensorLocation) -> HeartRateConfig
+    HeartRateConfig {
+        location: location, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open }
+
+// The handles of the service. `location` and `control_point` are 0 for a
+// characteristic that is not present.
+struct HeartRateHandles
+    service: Int
+    measurement: Int
+    measurement_cccd: Int
+    location: Int
+    control_point: Int
+
+// Whether `access` lets a client do something at all.
+fn is_granted(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        _ => true
+
+// Whether the accesses of `config` leave a client able to subscribe, to
+// read the location it has and to write the control point it has.
+fn accesses_usable(config: HeartRateConfig) -> Bool
+    if not is_granted(config.measurement_cccd.read) or not is_granted(config.measurement_cccd.write)
+        return false
+    if body_sensor_location_value(config.location) >= 0 and not is_granted(config.read)
+        return false
+    not config.control_point or is_granted(config.reset_write)
+
+// Add the service after the last attribute of `server`. NotPermitted for a
+// configuration that denies a client an access the service requires.
+fn add_heart_rate_service(var db: GattDb, config: HeartRateConfig) -> Result<HeartRateHandles, profile_builder.ProfileError>
+    if not accesses_usable(config)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_HEART_RATE_SERVICE))!
+    let measurement = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(),
+        gatt_server.le16(UUID_HEART_RATE_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, config.measurement_cccd)!
+    var location = 0
+    let v = body_sensor_location_value(config.location)
+    if v >= 0
+        location = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read),
+            gatt_server.le16(UUID_BODY_SENSOR_LOCATION), [v as u8])!
+    var control_point = 0
+    if config.control_point
+        control_point = profile_builder.add_value(var db, gatt_server.PROP_WRITE, profile_builder.write_only(config.reset_write),
+            gatt_server.le16(UUID_HEART_RATE_CONTROL_POINT), [0])!
+        if not gatt_server.restrict_first_octet(var db, control_point, [CONTROL_POINT_RESET_ENERGY], ERR_CONTROL_POINT_NOT_SUPPORTED)
+            return Err(profile_builder.ProfileError.NoRoom)
+    Ok(HeartRateHandles {
+        service: service, measurement: measurement, measurement_cccd: measurement_cccd,
+        location: location, control_point: control_point })
+
+// Store `m` as the measurement and answer the notification PDUs: the
+// notification when the client enabled it, none otherwise. The energy
+// expended is left out when the service has no control point to reset it.
+fn heart_rate_notify(var db: GattDb, var link: AttLink, handles: HeartRateHandles, m: HeartRateMeasurement, now_ms: Int) -> [[u8]]
+    let sent = if handles.control_point == 0
+        HeartRateMeasurement { heart_rate: m.heart_rate, contact: m.contact, energy_expended: -1, rr_intervals: m.rr_intervals }
+    else
+        m
+    let value = heart_rate_measurement_value(sent, gatt_server.mtu_of(link, 0) - 3)
+    let _ = gatt_server.set_value(var db, handles.measurement, value)
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// Whether the client wrote the control point, which asks the sensor to
+// reset the energy expended it reports. `changed` is what
+// `gatt_server.take_changed` answered.
+fn heart_rate_reset_requested(handles: HeartRateHandles, changed: [Int]) -> Bool
+    if handles.control_point == 0
+        return false
+    for h in changed
+        if h == handles.control_point
+            return true
+    false

@@ -1,0 +1,495 @@
+// tests/object_channel_tests.nv — the unit tests of src/object_channel.nv.
+//
+//   novo test tests/object_channel_tests.nv
+
+use std.test
+use gatt_server
+use l2cap
+use l2cap_coc
+use object_store
+use object_transfer
+use wire
+use object_channel.{ ots_poll }
+
+// workaround(a-generic-call-on-a-struct-field-of-a-var-parameter-does-not-close-in-a-small-package): `ots_poll` is generic over the
+// store, and with `var r.repo` as the argument the compiler cannot close the parameter when the package is as small as this one
+// (the same call builds in `orbit/ble`, which holds the audio roles too).  A helper that takes the store as a parameter of its
+// concrete type closes it.
+@tier(app)
+fn poll_channel(config: object_transfer.OtsConfig, var coc: l2cap_coc.CocState, var shared: object_transfer.OtsShared, var repo: object_store.MemoryStore, identity: Int, now_ms: Int) -> [l2cap_coc.CocOut] [mutate]
+    ots_poll(config, var coc, var shared, var repo, identity, now_ms)
+
+// The packets of a client's channel, one peer of the rig: `who` is 0 or 1.
+@tier(app)
+fn poll(var r: object_transfer.Rig, who: Int) -> [l2cap_coc.CocOut] [mutate]
+    if who == 0
+        return poll_channel(r.config, var r.a.coc, var r.shared, var r.repo, 1, r.now)
+    poll_channel(r.config, var r.b.coc, var r.shared, var r.repo, 2, r.now)
+
+// The octets of the SDUs in the K-frames `frames` (the SDU Length fields taken
+// off), for a client that reads them.
+@tier(app)
+fn sdu_octets(frames: [l2cap_coc.CocOut]) -> [u8]
+    var data: [u8] = []
+    var want = 0
+    for f in frames
+        if f.cid != l2cap.CID_LE_SIGNALING
+            if want == 0
+                want = wire.get(f.payload, 0, 2)
+                list.append(data, f.payload[2:list.len(f.payload)])
+                want = want - (list.len(f.payload) - 2)
+            else
+                list.append(data, f.payload)
+                want = want - list.len(f.payload)
+    data
+
+// The signaling packets among `frames`, as the code of each.
+@tier(app)
+fn signaling_codes(frames: [l2cap_coc.CocOut]) -> [Int]
+    var out: [Int] = []
+    for f in frames
+        if f.cid == l2cap.CID_LE_SIGNALING
+            list.push(out, f.payload[0] as Int)
+    out
+
+// The client sends one SDU on the channel `channel` of the peer `who`.
+@tier(app)
+fn client_sends(var r: object_transfer.Rig, who: Int, channel: Int, data: [u8])
+    var payload: [u8] = []
+    wire.put(var payload, list.len(data), 2)
+    list.append(payload, data)
+    if who == 0
+        let cid = l2cap_coc.channel_of(r.a.coc, channel)!.local_cid
+        let _ = l2cap_coc.receive_k_frame(var r.a.coc, cid, payload)
+    else
+        let cid = l2cap_coc.channel_of(r.b.coc, channel)!.local_cid
+        let _ = l2cap_coc.receive_k_frame(var r.b.coc, cid, payload)
+
+// The client gives the server `credits` more on the channel `channel` of the
+// peer `who`: the packets that leave at once.
+@tier(app)
+fn client_credits(var r: object_transfer.Rig, who: Int, channel: Int, credits: Int) -> [l2cap_coc.CocOut]
+    var body: [u8] = []
+    if who == 0
+        wire.put(var body, l2cap_coc.channel_of(r.a.coc, channel)!.remote_cid, 2)
+        wire.put(var body, credits, 2)
+        return l2cap_coc.receive_signaling(var r.a.coc, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 1, body)
+    wire.put(var body, l2cap_coc.channel_of(r.b.coc, channel)!.remote_cid, 2)
+    wire.put(var body, credits, 2)
+    l2cap_coc.receive_signaling(var r.b.coc, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 1, body)
+
+// A hundred octets: 0, 1, 2 ... 99.
+@tier(app)
+fn big_data() -> [u8]
+    var out: [u8] = []
+    for k in 0..100
+        list.push(out, k as u8)
+    out
+
+// Put the object "big" in the store of the rig: its Object ID.
+@tier(app)
+fn add_big(var r: object_transfer.Rig) -> Int
+    object_store.memory_add(var r.repo, wire.text("big"), object_transfer.ots_uuid16(0x2ACA), big_data(), 0x7F)
+
+@tier(app)
+fn read_ok() -> [u8]
+    object_transfer.answer(0x60, object_transfer.OACP_OP_READ, object_transfer.OACP_RESULT_SUCCESS)
+
+@tier(app)
+fn write_ok() -> [u8]
+    object_transfer.answer(0x60, object_transfer.OACP_OP_WRITE, object_transfer.OACP_RESULT_SUCCESS)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_the_service_listens_on_the_psm_of_the_object_transfer_channel_only()
+    var coc = l2cap_coc.new_state()
+    object_transfer.ots_listen(var coc, 247)
+    test.assert_eq(object_transfer.OTS_PSM, 0x25)
+    let id = object_transfer.open_channel(var coc, 0x40, 247, 247, 10)
+    test.assert_eq(id, 0)
+    test.assert_eq(list.len(l2cap_coc.channels_of_psm(coc, 0x25)), 1)
+    // Another PSM is refused.
+    var other: [u8] = []
+    wire.put(var other, 0x27, 2)
+    wire.put(var other, 0x41, 2)
+    wire.put(var other, 247, 2)
+    wire.put(var other, 247, 2)
+    wire.put(var other, 10, 2)
+    let refused = l2cap_coc.receive_signaling(var coc, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 2, other)
+    test.assert_eq(wire.get(refused[0].payload, 12, 2), l2cap_coc.RESULT_SPSM_NOT_SUPPORTED)
+    test.assert_eq(list.len(l2cap_coc.channels_of_psm(coc, 0x25)), 1)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_read_sends_the_octets_of_the_range_through_the_channel()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(2, 6)), read_ok())
+    test.assert_eq(r.shared.transfers[0].state, object_transfer.T_ACTIVE)
+    let frames = poll(var r, 0)
+    test.assert_eq(list.len(frames), 1)
+    test.assert_eq(frames[0].cid, l2cap_coc.channel_of(r.a.coc, channel)!.remote_cid)
+    // The SDU Length field and then the six octets.
+    test.assert_eq(frames[0].payload, [6, 0, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37])
+    // The transfer is over; the channel stays open and the object is free.
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    test.assert(l2cap_coc.is_connected(r.a.coc, channel))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 10)), read_ok())
+    test.assert_eq(sdu_octets(poll(var r, 0)), wire.text("0123456789"))
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_read_is_cut_into_sdus_of_the_clients_mtu_and_waits_for_credits()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let big = add_big(var r)
+    object_transfer.choose(var r, big)
+    // The client receives SDUs of 23 octets in K-frames of 23, and gives 2 credits.
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 23, 23, 2)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    var heard: [l2cap_coc.CocOut] = poll(var r, 0)
+    // The first SDU takes the two credits: 2 + 21 octets, then 2.
+    test.assert_eq(list.len(heard), 2)
+    test.assert_eq(list.len(heard[0].payload), 23)
+    test.assert_eq(list.len(heard[1].payload), 2)
+    // Two more SDUs wait in the channel.
+    test.assert_eq(r.shared.transfers[0].done, 69)
+    test.assert_eq(r.shared.transfers[0].state, object_transfer.T_ACTIVE)
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    // Credits release the queue, and the poll after them fills the window again.
+    list.append(heard, client_credits(var r, 0, channel, 10))
+    list.append(heard, poll(var r, 0))
+    test.assert_eq(sdu_octets(heard), big_data())
+    test.assert_eq(list.len(r.shared.transfers), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_read_a_client_stalls_is_given_up_after_30_seconds_and_the_channel_is_closed()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let big = add_big(var r)
+    object_transfer.choose(var r, big)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 23, 23, 1)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    test.assert_eq(list.len(poll(var r, 0)), 1)
+    // The client gives no credit.
+    r.now = 29999
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(r.shared.transfers[0].state, object_transfer.T_ACTIVE)
+    r.now = 30000
+    let closing = poll(var r, 0)
+    test.assert_eq(signaling_codes(closing), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert(not l2cap_coc.is_connected(r.a.coc, channel))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    // The object is free again, and a new channel carries the next Read.
+    let again = object_transfer.open_channel(var r.a.coc, 0x41, 23, 23, 20)
+    test.assert(again != channel)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    test.assert_eq(sdu_octets(poll(var r, 0)), big_data())
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_read_that_keeps_moving_is_not_given_up_however_long_it_takes()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let big = add_big(var r)
+    object_transfer.choose(var r, big)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 23, 23, 1)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    var heard: [l2cap_coc.CocOut] = poll(var r, 0)
+    // A credit every 20 s keeps it alive for as long as it needs: 9 K-frames in all.
+    for step in 1..12
+        if list.len(r.shared.transfers) > 0
+            r.now = step * 20000
+            list.append(heard, client_credits(var r, 0, channel, 1))
+            list.append(heard, poll(var r, 0))
+    test.assert_eq(sdu_octets(heard), big_data())
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    test.assert(l2cap_coc.is_connected(r.a.coc, channel))
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_abort_stops_new_sdus_and_lets_the_sdu_that_began_to_leave_end()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let big = add_big(var r)
+    object_transfer.choose(var r, big)
+    // SDUs of 23 octets in K-frames of 23: each SDU needs two K-frames.
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 23, 23, 1)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    var heard: [l2cap_coc.CocOut] = poll(var r, 0)
+    test.assert_eq(list.len(heard), 1)
+    test.assert_eq(object_transfer.oacp(var r, [object_transfer.OACP_OP_ABORT]), object_transfer.answer(0x60, object_transfer.OACP_OP_ABORT, object_transfer.OACP_RESULT_SUCCESS))
+    test.assert_eq(r.shared.transfers[0].state, object_transfer.T_ABORTED)
+    // The credits come: the rest of the first SDU leaves, and nothing else.
+    list.append(heard, client_credits(var r, 0, channel, 10))
+    list.append(heard, poll(var r, 0))
+    test.assert_eq(sdu_octets(heard), big_data()[0:23])
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    // The object is free and so is the channel.
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(30, 4)), read_ok())
+    test.assert_eq(sdu_octets(poll(var r, 0)), big_data()[30:34])
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_abort_of_a_read_whose_queue_has_not_begun_to_leave_drops_the_whole_queue()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let big = add_big(var r)
+    object_transfer.choose(var r, big)
+    // SDUs of 23 octets in K-frames of 64: each SDU is one K-frame.
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 23, 64, 1)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 100)), read_ok())
+    var heard: [l2cap_coc.CocOut] = poll(var r, 0)
+    test.assert_eq(list.len(heard), 1)
+    test.assert_eq(object_transfer.oacp(var r, [object_transfer.OACP_OP_ABORT]), object_transfer.answer(0x60, object_transfer.OACP_OP_ABORT, object_transfer.OACP_RESULT_SUCCESS))
+    list.append(heard, client_credits(var r, 0, channel, 10))
+    list.append(heard, poll(var r, 0))
+    test.assert_eq(sdu_octets(heard), big_data()[0:23])
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_read_of_the_directory_listing_object_sends_the_listing_of_the_start()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, object_store.ID_DIRECTORY)
+    let listing = object_transfer.ots_directory(r.config, r.shared, 1, var r.repo).1
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 64, 64, 20)
+    test.assert(channel >= 0)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, list.len(listing))), read_ok())
+    // The store changes while the listing is sent.
+    let _ = object_store.memory_add(var r.repo, wire.text("late"), object_transfer.ots_uuid16(0x2ACA), wire.text("x"), 0x0D)
+    test.assert_eq(sdu_octets(poll(var r, 0)), listing)
+    test.assert_eq(list.len(r.shared.transfers), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_write_puts_the_octets_into_the_object_as_they_arrive()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    var value: [Int] = [object_transfer.OACP_OP_CREATE]
+    list.append(value, object_transfer.le(12, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(object_transfer.oacp(var r, value), object_transfer.answer(0x60, object_transfer.OACP_OP_CREATE, object_transfer.OACP_RESULT_SUCCESS))
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(0, 12, 0)), write_ok())
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [0, 0, 0, 0, 12, 0, 0, 0])
+    // The first part: the current size follows it.
+    client_sends(var r, 0, channel, wire.text("hello "))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [6, 0, 0, 0, 12, 0, 0, 0])
+    test.assert_eq(r.shared.transfers[0].state, object_transfer.T_ACTIVE)
+    test.assert_eq(list.len(object_transfer.ots_take_changes(var r.shared)), 1)
+    // The last part completes the transfer and reports the change.
+    client_sends(var r, 0, channel, wire.text("world!"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [12, 0, 0, 0, 12, 0, 0, 0])
+    test.assert_eq(r.repo.objects[3].data, wire.text("hello world!"))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    let changes = object_transfer.ots_take_changes(var r.shared)
+    test.assert_eq(list.len(changes), 1)
+    test.assert_eq(changes[0].flags, object_transfer.CHANGE_BY_CLIENT | object_transfer.CHANGE_CONTENTS | object_transfer.CHANGE_METADATA)
+    test.assert_eq(changes[0].id, 0x103)
+    // The checksum of the whole object is that of the octets sent.
+    var sum: [u8] = [0x60, object_transfer.OACP_OP_CHECKSUM, object_transfer.OACP_RESULT_SUCCESS]
+    wire.put(var sum, object_store.crc32(wire.text("hello world!")), 4)
+    test.assert_eq(object_transfer.oacp(var r, [object_transfer.OACP_OP_CHECKSUM, 0, 0, 0, 0, 12, 0, 0, 0]), sum)
+
+// A client sets a time of its own on the Current Object.
+@tier(app)
+fn accepted_time(var r: object_transfer.Rig) -> Bool [mutate]
+    object_transfer.accepted(object_transfer.write_to(var r, r.h.modified, [0xE8, 0x07, 1, 2, 3, 4, 5]))
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_write_sets_the_modification_time_from_the_clock_or_to_not_known()
+    var config = object_transfer.default_ots_config()
+    config.rtc = true
+    var r = object_transfer.rig(config)
+    r.repo.clock = [0xE8, 0x07, 6, 1, 12, 30, 0]
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    // Overwrite the first octets (a patch).
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(0, 3, 0)), write_ok())
+    test.assert_eq(object_transfer.peek(var r, r.h.modified), object_store.date_time_zero())
+    client_sends(var r, 0, channel, wire.text("XYZ"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(object_transfer.peek(var r, r.h.modified), [0xE8, 0x07, 6, 1, 12, 30, 0])
+    test.assert_eq(r.repo.objects[0].data, wire.text("XYZ3456789"))
+    // Without a clock the time is not known after a change, whatever it was.
+    var plain = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var plain, 0x100)
+    let pc = object_transfer.open_channel(var plain.a.coc, 0x40, 247, 247, 10)
+    test.assert(accepted_time(var plain))
+    test.assert_eq(object_transfer.peek(var plain, plain.h.modified), [0xE8, 0x07, 1, 2, 3, 4, 5])
+    test.assert_eq(object_transfer.oacp(var plain, object_transfer.write_value(0, 3, 0)), write_ok())
+    client_sends(var plain, 0, pc, wire.text("XYZ"))
+    test.assert_eq(list.len(poll(var plain, 0)), 0)
+    test.assert_eq(object_transfer.peek(var plain, plain.h.modified), object_store.date_time_zero())
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_patch_is_applied_only_when_all_of_it_has_arrived()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(2, 4, 0)), write_ok())
+    client_sends(var r, 0, channel, wire.text("ab"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    // Half of it came: the object is as it was.
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123456789"))
+    client_sends(var r, 0, channel, wire.text("cd"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(r.repo.objects[0].data, wire.text("01abcd6789"))
+    test.assert_eq(r.repo.objects[0].meta.size, 10)
+    // A patch that is given up is not applied at all.
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(0, 4, 0)), write_ok())
+    client_sends(var r, 0, channel, wire.text("zz"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    r.now = 30000
+    test.assert_eq(signaling_codes(poll(var r, 0)), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert_eq(r.repo.objects[0].data, wire.text("01abcd6789"))
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_write_in_truncate_mode_and_a_write_that_appends_change_the_sizes()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(4, 2, 2)), write_ok())
+    client_sends(var r, 0, channel, wire.text("XY"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123XY"))
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [6, 0, 0, 0, 10, 0, 0, 0])
+    // Append past the allocated size.
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(6, 8, 0)), write_ok())
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [6, 0, 0, 0, 14, 0, 0, 0])
+    client_sends(var r, 0, channel, wire.text("12345678"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123XY12345678"))
+    test.assert_eq(object_transfer.peek(var r, r.h.size), [14, 0, 0, 0, 14, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_write_that_stops_is_given_up_and_what_was_written_stays_for_a_resume()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    var value: [Int] = [object_transfer.OACP_OP_CREATE]
+    list.append(value, object_transfer.le(12, 4))
+    list.append(value, [0xCA, 0x2A])
+    test.assert_eq(object_transfer.oacp(var r, value), object_transfer.answer(0x60, object_transfer.OACP_OP_CREATE, object_transfer.OACP_RESULT_SUCCESS))
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(0, 12, 0)), write_ok())
+    client_sends(var r, 0, channel, wire.text("hello"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    // Another client cannot write the object meanwhile.
+    let other = object_transfer.open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    object_transfer.choose_as(var r, 1, 0x103)
+    test.assert_eq(object_transfer.oacp_as(var r, 1, object_transfer.write_value(5, 3, 0)), object_transfer.answer(0x60, object_transfer.OACP_OP_WRITE, object_transfer.OACP_RESULT_LOCKED))
+    // Silence for 30 s: the channel is closed and the lock released.
+    r.now = 30000
+    let closing = poll(var r, 0)
+    test.assert_eq(signaling_codes(closing), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert(not l2cap_coc.is_connected(r.a.coc, channel))
+    test.assert_eq(r.repo.objects[3].data, wire.text("hello"))
+    test.assert_eq(object_transfer.peek_as(var r, 1, r.h.size), [5, 0, 0, 0, 12, 0, 0, 0])
+    // The second client resumes the transfer where it stopped.
+    test.assert_eq(object_transfer.oacp_as(var r, 1, object_transfer.write_value(5, 7, 0)), write_ok())
+    client_sends(var r, 1, other, wire.text(" world!"))
+    test.assert_eq(list.len(poll(var r, 1)), 0)
+    test.assert_eq(r.repo.objects[3].data, wire.text("hello world!"))
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_data_beyond_the_announced_length_closes_the_channel_and_the_rest_is_kept()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    // Replace the last four octets of alpha, then send six.
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(6, 4, 0)), write_ok())
+    client_sends(var r, 0, channel, wire.text("123456"))
+    let closing = poll(var r, 0)
+    test.assert_eq(signaling_codes(closing), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert(not l2cap_coc.is_connected(r.a.coc, channel))
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123451234"))
+    test.assert_eq(r.repo.objects[0].meta.size, 10)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_data_when_no_write_is_under_way_closes_the_channel()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    client_sends(var r, 0, channel, wire.text("unasked"))
+    test.assert_eq(signaling_codes(poll(var r, 0)), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert(not l2cap_coc.is_connected(r.a.coc, channel))
+    // After a Write is over, more data is unasked too.
+    var q = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var q, 0x100)
+    let qc = object_transfer.open_channel(var q.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var q, object_transfer.write_value(0, 2, 0)), write_ok())
+    client_sends(var q, 0, qc, wire.text("ab"))
+    test.assert_eq(list.len(poll(var q, 0)), 0)
+    test.assert(l2cap_coc.is_connected(q.a.coc, qc))
+    client_sends(var q, 0, qc, wire.text("c"))
+    test.assert_eq(signaling_codes(poll(var q, 0)), [l2cap.CODE_DISCONNECTION_REQ])
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_channel_the_client_closes_ends_the_transfer_and_releases_the_lock()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.write_value(10, 8, 0)), write_ok())
+    client_sends(var r, 0, channel, wire.text("abc"))
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    // The client sends L2CAP_DISCONNECTION_REQ: its CID is the Source CID.
+    let c = l2cap_coc.channel_of(r.a.coc, channel)!
+    var body: [u8] = []
+    wire.put(var body, c.local_cid, 2)
+    wire.put(var body, c.remote_cid, 2)
+    let reply = l2cap_coc.receive_signaling(var r.a.coc, l2cap.CODE_DISCONNECTION_REQ, 3, body)
+    test.assert_eq(list.len(reply), 1)
+    test.assert_eq(list.len(poll(var r, 0)), 0)
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    test.assert_eq(r.repo.objects[0].data, wire.text("0123456789abc"))
+    test.assert_eq(r.repo.objects[0].meta.size, 13)
+    // The object is free: another client can write it.
+    let other = object_transfer.open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    test.assert(other >= 0)
+    object_transfer.choose_as(var r, 1, 0x100)
+    test.assert_eq(object_transfer.oacp_as(var r, 1, object_transfer.write_value(0, 1, 0)), write_ok())
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_two_clients_move_two_objects_at_once_through_their_own_channels()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    let a = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    let b = object_transfer.open_channel(var r.b.coc, 0x50, 247, 247, 10)
+    test.assert(a >= 0 and b >= 0)
+    object_transfer.choose(var r, 0x102)
+    object_transfer.choose_as(var r, 1, 0x100)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 20)), read_ok())
+    test.assert_eq(object_transfer.oacp_as(var r, 1, object_transfer.write_value(0, 4, 0)), write_ok())
+    client_sends(var r, 1, b, wire.text("WXYZ"))
+    test.assert_eq(sdu_octets(poll(var r, 0)), wire.text("abcdefghijklmnopqrst"))
+    test.assert_eq(list.len(poll(var r, 1)), 0)
+    test.assert_eq(r.repo.objects[0].data, wire.text("WXYZ456789"))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+
+@test
+@satisfies("REQ-BLE-OTS-002")
+fn test_a_store_that_cannot_write_or_read_fails_the_transfer_and_closes_the_channel()
+    var r = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var r, 0x100)
+    let channel = object_transfer.open_channel(var r.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var r, object_transfer.read_value(0, 10)), read_ok())
+    // The object lost its contents behind the service's back.
+    r.repo.objects[0].data = wire.text("01")
+    let closing = poll(var r, 0)
+    test.assert_eq(signaling_codes(closing), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert(not l2cap_coc.is_connected(r.a.coc, channel))
+    test.assert_eq(list.len(r.shared.transfers), 0)
+    // A write the store refuses.
+    var w = object_transfer.rig(object_transfer.default_ots_config())
+    object_transfer.choose(var w, 0x100)
+    let wc = object_transfer.open_channel(var w.a.coc, 0x40, 247, 247, 10)
+    test.assert_eq(object_transfer.oacp(var w, object_transfer.write_value(10, 4, 0)), write_ok())
+    w.repo.objects[0].meta.allocated = 10
+    client_sends(var w, 0, wc, wire.text("abcd"))
+    test.assert_eq(signaling_codes(poll(var w, 0)), [l2cap.CODE_DISCONNECTION_REQ])
+    test.assert_eq(list.len(w.shared.transfers), 0)

@@ -1,0 +1,569 @@
+// tests/generic_health_sensor_client_tests.nv — the unit tests of src/generic_health_sensor_client.nv.
+//
+//   novo test tests/generic_health_sensor_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use generic_health_sensor
+use sensor_client
+use wire
+use generic_health_sensor_client.{ GHC_ERR_CCCD, GHC_ERR_COMMAND_NOT_SUPPORTED, GHC_ERR_IN_PROGRESS, GHC_ERR_NONE, GHC_ERR_OTHER, GHC_ERR_OUT_OF_RANGE, GHC_RACP_CODE, GHC_RACP_COMBINED, GHC_RACP_NUMBER, GHC_SEG_DONE, GHC_SEG_ERROR, GHC_SEG_MORE, GhcFeatures, GhcObservation, ghc_assembly_new, ghc_client_control, ghc_client_new, ghc_client_racp, ghc_client_start, ghc_decode_body, ghc_decode_control_response, ghc_decode_discrete, ghc_decode_features, ghc_decode_numeric, ghc_decode_racp, ghc_decode_range, ghc_decode_schedule, ghc_decode_stored, ghc_decode_string, ghc_error_kind, ghc_racp_request, ghc_schedule_value, ghc_segment_push, ghc_start_request, ghc_stop_request }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn features_of(v: [Int]) -> GhcFeatures
+    match ghc_decode_features(octets(v))
+        Some(f) => f
+        None =>
+            test.fail("features")
+            GhcFeatures { types: [], spec_codes: [], spec_versions: [], reserved: false }
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_features_examples_of_the_specification()
+    // Table 3.5: a pulse oximeter, two observation types.
+    let f = features_of([0x00, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00])
+    test.assert_eq(f.types, [0x00024BB8, 0x0002481A])
+    test.assert_eq(list.len(f.spec_codes), 0)
+    test.assert(not f.reserved)
+    // Table 3.7: the blood pressure device specialization 0x1007, version 1.
+    let g = features_of([0x01, 0x01, 0xB8, 0x4B, 0x02, 0x00, 0x01, 0x07, 0x10, 0x01])
+    test.assert_eq(g.spec_codes, [0x1007])
+    test.assert_eq(g.spec_versions, [1])
+    // Two specializations and a reserved Flags bit.
+    let h = features_of([0x03, 0x01, 1, 0, 0, 0, 0x02, 0x07, 0x10, 0x01, 0x08, 0x10, 0x02])
+    test.assert(h.reserved)
+    test.assert_eq(h.spec_codes, [0x1007, 0x1008])
+    test.assert_eq(h.spec_versions, [1, 2])
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_a_features_value_that_is_not_whole_is_none()
+    test.assert_eq(ghc_decode_features([]), None)
+    test.assert_eq(ghc_decode_features(octets([0])), None)
+    // A count of 0, a count past the value, octets past the lists.
+    test.assert_eq(ghc_decode_features(octets([0, 0])), None)
+    test.assert_eq(ghc_decode_features(octets([0, 2, 1, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_features(octets([0, 1, 1, 0, 0, 0, 0])), None)
+    // The specialization flag set and the field missing, empty, short or followed by more.
+    test.assert_eq(ghc_decode_features(octets([1, 1, 1, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_features(octets([1, 1, 1, 0, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_features(octets([1, 1, 1, 0, 0, 0, 1, 7, 0x10])), None)
+    test.assert_eq(ghc_decode_features(octets([1, 1, 1, 0, 0, 0, 1, 7, 0x10, 1, 0])), None)
+    // The flag clear and the field present is surplus.
+    test.assert_eq(ghc_decode_features(octets([0, 1, 1, 0, 0, 0, 1, 7, 0x10, 1])), None)
+    // 255 observation types fit.
+    var big: [Int] = [0, 255]
+    for _ in 0..255
+        list.append(big, [1, 0, 0, 0])
+    test.assert_eq(list.len(features_of(big).types), 255)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_segments_join_and_a_bad_segment_ends_the_observation()
+    var a = ghc_assembly_new()
+    test.assert_eq(ghc_segment_push(var a, octets([(62 << 2) | 1, 1, 2])), GHC_SEG_MORE)
+    test.assert_eq(ghc_segment_push(var a, octets([(63 << 2), 3])), GHC_SEG_MORE)
+    test.assert_eq(ghc_segment_push(var a, octets([2, 4])), GHC_SEG_DONE)
+    test.assert_eq(a.data, octets([1, 2, 3, 4]))
+    // One segment, any counter.
+    test.assert_eq(ghc_segment_push(var a, octets([(33 << 2) | 3, 5])), GHC_SEG_DONE)
+    test.assert_eq(a.data, octets([5]))
+    // A segment that is not first with none open, an empty one, one out of sequence, a first inside an observation.
+    test.assert_eq(ghc_segment_push(var a, octets([(34 << 2) | 2, 5])), GHC_SEG_ERROR)
+    test.assert_eq(ghc_segment_push(var a, []), GHC_SEG_ERROR)
+    test.assert_eq(ghc_segment_push(var a, octets([1])), GHC_SEG_ERROR)
+    test.assert_eq(ghc_segment_push(var a, octets([(1 << 2) | 1, 5])), GHC_SEG_MORE)
+    test.assert_eq(ghc_segment_push(var a, octets([(3 << 2) | 2, 5])), GHC_SEG_ERROR)
+    test.assert_eq(ghc_segment_push(var a, octets([(1 << 2) | 1, 5])), GHC_SEG_MORE)
+    test.assert_eq(ghc_segment_push(var a, octets([(2 << 2) | 1, 5])), GHC_SEG_ERROR)
+    // The bound.
+    var seg: [u8] = [1]
+    for _ in 0..GHC_BODY_MAX
+        list.push(seg, 0)
+    test.assert_eq(ghc_segment_push(var a, seg), GHC_SEG_MORE)
+    test.assert_eq(ghc_segment_push(var a, octets([(1 << 2) | 2, 0])), GHC_SEG_ERROR)
+
+// The Elapsed Time of the examples of [GHSS] Annex A.
+@tier(app)
+fn stamp() -> [u8]
+    octets([0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00])
+
+@tier(app)
+fn body_of(b: [u8]) -> GhcObservation
+    match ghc_decode_body(b)
+        Some(o) => o
+        None =>
+            test.fail("a body")
+            GhcObservation {
+                class_type: 0, flags: 0, observation_type: -1, time_stamp: [], duration: -1, status: -1, observation_id: -1,
+                patient: -1, supplemental: [], derived_from: [], member_of: [], tlvs: [], value: [] }
+
+// The first example of [GHSS] A.1 as the server's tests print it: 29 octets.
+@tier(app)
+fn example_1() -> [u8]
+    octets([
+        0x01, 0x1D, 0x00, 0x43, 0x00, 0xB8, 0x4B, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x01, 0x3C, 0x4C, 0x02, 0x00, 0x20, 0x02, 0x62, 0x00, 0x00, 0x00])
+
+@tier(app)
+fn example_2() -> [u8]
+    octets([
+        0x07, 0x38, 0x00, 0x13, 0x00, 0x04, 0x4A, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x40, 0xE2, 0x01, 0x00, 0x03,
+        0x05, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x64, 0x00, 0x00, 0x00,
+        0x06, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x3C, 0x00, 0x00, 0x00,
+        0x07, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x50, 0x00, 0x00, 0x00])
+
+@tier(app)
+fn example_3() -> [u8]
+    octets([
+        0x05, 0x17, 0x00, 0x81, 0x00, 0xF0, 0x55, 0x80, 0x00,
+        0x01, 0x40, 0xE2, 0x01, 0x00,
+        0x02, 0xF0, 0x00, 0x03, 0x00, 0xAE, 0x01, 0x03, 0x00])
+
+@tier(app)
+fn example_4() -> [u8]
+    octets([
+        0x04, 0x2E, 0x00, 0x03, 0x00, 0x01, 0x01, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0xB2, 0x10, 0x4C, 0x06, 0x00, 0xFD, 0x00, 0x08, 0x00, 0x00, 0x0A, 0x00, 0x00, 0xFD,
+        0x01, 0x02, 0x04, 0x00, 0x00, 0x00,
+        0xF9, 0x07, 0xFB, 0x07, 0xF5, 0x07, 0xFF, 0x07])
+
+@tier(app)
+fn example_5() -> [u8]
+    octets([
+        0xFF, 0x32, 0x00, 0x42, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x01, 0x3C, 0x4C, 0x02, 0x00, 0x02,
+        0x01, 0x0F, 0x00, 0x01, 0x00, 0xB8, 0x4B, 0x02, 0x00, 0x20, 0x02, 0x62, 0x00, 0x00, 0x00,
+        0x01, 0x0F, 0x00, 0x01, 0x00, 0x1A, 0x48, 0x02, 0x00, 0xA0, 0x0A, 0x62, 0x00, 0x00, 0x00])
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_five_examples_of_the_specification_decode()
+    let a = body_of(example_1())
+    test.assert_eq(a.class_type, generic_health_sensor.CLASS_NUMERIC)
+    test.assert_eq(a.observation_type, 0x00024BB8)
+    test.assert_eq(a.time_stamp, stamp())
+    test.assert_eq(a.supplemental, [0x00024C3C])
+    test.assert_eq(a.patient, -1)
+    let n = ghc_decode_numeric(a.value)!
+    test.assert_eq(n.0, 0x0220)
+    test.assert_eq(wire.float_scaled(n.1, 0), 98)
+    let b = body_of(example_2())
+    test.assert_eq(b.class_type, generic_health_sensor.CLASS_COMPOUND)
+    test.assert_eq(b.observation_id, 123456)
+    test.assert_eq(b.value[0] as Int, 3)
+    test.assert_eq(list.len(b.value), 34)
+    let c = body_of(example_3())
+    test.assert_eq(c.class_type, generic_health_sensor.CLASS_COMPOUND_DISCRETE)
+    test.assert_eq(c.derived_from, [123456])
+    test.assert_eq(c.observation_type, 0x008055F0)
+    let d = body_of(example_4())
+    test.assert_eq(d.class_type, generic_health_sensor.CLASS_SAMPLE_ARRAY)
+    test.assert_eq(list.len(d.value), 28)
+    let e = body_of(example_5())
+    test.assert_eq(e.class_type, generic_health_sensor.CLASS_BUNDLE)
+    test.assert_eq(e.observation_type, -1)
+    test.assert_eq(e.supplemental, [0x00024C3C])
+    test.assert_eq(e.value[0] as Int, 2)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_every_prefix_and_every_extension_of_a_body_is_none()
+    for body in [example_1(), example_2(), example_3(), example_4(), example_5()]
+        test.assert(ghc_decode_body(body) != None)
+        for k in 0..list.len(body)
+            test.assert_eq(ghc_decode_body(body[:k]), None)
+        var longer = body[:]
+        list.push(longer, 0)
+        test.assert_eq(ghc_decode_body(longer), None)
+    // A class that is not in the table, and a Length that is not the size of the body.
+    var bad = example_1()
+    bad[0] = 9
+    test.assert_eq(ghc_decode_body(bad), None)
+    var short = example_1()
+    short[1] = 0x1C
+    test.assert_eq(ghc_decode_body(short), None)
+
+@tier(app)
+fn field_body(flags: Int, rest: [Int]) -> [u8]
+    // A numeric body needs its Observation Type: it is put first when the flags do not name it.
+    let all = flags | 0x0001
+    var out = octets([0x01, 0, 0, all & 0xFF, all >>> 8])
+    if (flags & 0x0001) == 0
+        list.append(out, octets([0xB8, 0x4B, 0x02, 0x00]))
+    list.append(out, octets(rest))
+    list.append(out, octets([0x20, 0x02, 0x62, 0x00, 0x00, 0x00]))
+    let n = list.len(out)
+    out[1] = (n & 0xFF) as u8
+    out[2] = (n >>> 8) as u8
+    out
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_every_optional_field_alone_and_all_together()
+    let tl = [0xB8, 0x4B, 0x02, 0x00]
+    let st = [0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00]
+    // Type, time stamp, duration, status, id, patient, supplemental, derived from, member of.
+    test.assert_eq(body_of(field_body(0x0001, tl)).observation_type, 0x00024BB8)
+    test.assert_eq(body_of(field_body(0x0002, st)).time_stamp, octets(st))
+    test.assert_eq(body_of(field_body(0x0004, [0x00, 0x0A, 0x00, 0xFF])).duration, 0xFF000A00)
+    test.assert_eq(body_of(field_body(0x0008, [0x05, 0x00])).status, 5)
+    test.assert_eq(body_of(field_body(0x0010, [1, 2, 3, 4])).observation_id, 0x04030201)
+    test.assert_eq(body_of(field_body(0x0020, [7])).patient, 7)
+    test.assert_eq(body_of(field_body(0x0040, [1, 9, 0, 0, 0])).supplemental, [9])
+    test.assert_eq(body_of(field_body(0x0080, [2, 9, 0, 0, 0, 10, 0, 0, 0])).derived_from, [9, 10])
+    test.assert_eq(body_of(field_body(0x0100, [1, 11, 0, 0, 0])).member_of, [11])
+    // A TLV attribute: the code, a 2-octet length, the Format Type and the value.
+    let t = body_of(field_body(0x0200, [1, 0x01, 0x02, 0x03, 0x00, 2, 0x00, 0x06, 0xAA, 0xBB]))
+    test.assert_eq(list.len(t.tlvs), 1)
+    test.assert_eq(t.tlvs[0].observation_type, 0x00030201)
+    test.assert_eq(t.tlvs[0].format, 6)
+    test.assert_eq(t.tlvs[0].value, octets([0xAA, 0xBB]))
+    // All of them in the order of the table.
+    let all = field_body(0x03FF, cat_all())
+    let o = body_of(all)
+    test.assert_eq(o.flags, 0x03FF)
+    test.assert_eq(o.observation_type, 0x00024BB8)
+    test.assert_eq(o.patient, 7)
+    test.assert_eq(o.supplemental, [9])
+    test.assert_eq(o.derived_from, [9])
+    test.assert_eq(o.member_of, [11])
+    test.assert_eq(list.len(o.tlvs), 1)
+    test.assert_eq(o.value, octets([0x20, 0x02, 0x62, 0x00, 0x00, 0x00]))
+
+@tier(app)
+fn cat_all() -> [Int]
+    [0xB8, 0x4B, 0x02, 0x00,
+     0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+     0x00, 0x0A, 0x00, 0xFF,
+     0x05, 0x00,
+     1, 2, 3, 4,
+     7,
+     1, 9, 0, 0, 0,
+     1, 9, 0, 0, 0,
+     1, 11, 0, 0, 0,
+     1, 0x01, 0x02, 0x03, 0x00, 2, 0x00, 0x06, 0xAA, 0xBB]
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_values_of_the_simple_classes()
+    test.assert_eq(ghc_decode_numeric(octets([0x20, 0x02, 0x62, 0x00, 0x00, 0x00]))!.0, 0x0220)
+    test.assert_eq(ghc_decode_numeric(octets([0x20, 0x02, 0x62, 0x00, 0x00])), None)
+    test.assert_eq(ghc_decode_numeric(octets([0x20, 0x02, 0x62, 0x00, 0x00, 0x00, 0x00])), None)
+    // The FLOAT NaN is a value; the one reserved for future use is not.
+    var nan = octets([0x20, 0x02])
+    wire.put(var nan, wire.FLOAT_NAN, 4)
+    test.assert(ghc_decode_numeric(nan) != None)
+    var reserved = octets([0x20, 0x02])
+    wire.put(var reserved, wire.FLOAT_RESERVED, 4)
+    test.assert_eq(ghc_decode_numeric(reserved), None)
+    test.assert_eq(ghc_decode_discrete(octets([0xF0, 0x00, 0x03, 0x00])), Some(0x000300F0))
+    test.assert_eq(ghc_decode_discrete(octets([1, 2, 3])), None)
+    test.assert_eq(ghc_decode_discrete(octets([1, 2, 3, 4, 5])), None)
+    test.assert_eq(ghc_decode_string(octets([3, 0, 0x61, 0x62, 0x63])), Some(octets([0x61, 0x62, 0x63])))
+    let none: [u8] = []
+    test.assert_eq(ghc_decode_string(octets([0, 0])), Some(none))
+    test.assert_eq(ghc_decode_string(octets([3, 0, 0x61, 0x62])), None)
+    test.assert_eq(ghc_decode_string(octets([1, 0, 0x61, 0x62])), None)
+    test.assert_eq(ghc_decode_string(octets([0])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_a_stored_observation_has_a_record_number_before_the_body()
+    var data: [u8] = []
+    wire.put(var data, 0x01020304, 4)
+    list.append(data, example_1())
+    let s = ghc_decode_stored(data)!
+    test.assert_eq(s.number, 0x01020304)
+    test.assert_eq(s.observation.observation_type, 0x00024BB8)
+    test.assert_eq(ghc_decode_stored(data[:8]), None)
+    test.assert_eq(ghc_decode_stored(octets([1, 2, 3])), None)
+    test.assert_eq(ghc_decode_stored(data[:list.len(data) - 1]), None)
+    test.assert_eq(ghc_decode_stored([]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_schedules_and_ranges()
+    let one = wire.float(30, 0)
+    let five = wire.float(5, 0)
+    var s: [u8] = []
+    wire.put(var s, 0x00024BB8, 4)
+    wire.put(var s, one, 4)
+    wire.put(var s, five, 4)
+    let d = ghc_decode_schedule(s)!
+    test.assert_eq(d.observation_type, 0x00024BB8)
+    test.assert_eq(d.period, one)
+    test.assert_eq(d.interval, five)
+    test.assert_eq(ghc_schedule_value(0x00024BB8, one, five), Some(s))
+    test.assert_eq(ghc_decode_schedule(s[:11]), None)
+    // Zero is unspecified; a negative period, NaN and the reserved FLOAT are not periods.
+    test.assert(ghc_schedule_value(1, wire.float(0, 0), wire.float(0, 0)) != None)
+    test.assert_eq(ghc_schedule_value(1, wire.float(-1, 0), five), None)
+    test.assert_eq(ghc_schedule_value(1, wire.FLOAT_NAN, five), None)
+    test.assert_eq(ghc_schedule_value(1, one, wire.FLOAT_RESERVED), None)
+    test.assert_eq(ghc_schedule_value(-1, one, five), None)
+    test.assert_eq(ghc_schedule_value(0x100000000, one, five), None)
+    var neg: [u8] = s[:]
+    var bad: [u8] = []
+    wire.put(var bad, 1, 4)
+    wire.put(var bad, wire.float(-1, 0), 4)
+    wire.put(var bad, five, 4)
+    test.assert_eq(ghc_decode_schedule(bad), None)
+    test.assert_eq(list.len(neg), 12)
+    // Valid Range and Accuracy: 14 octets, 18 with the accuracy.
+    var r: [u8] = []
+    wire.put(var r, 0x00024BB8, 4)
+    wire.put(var r, 0x0220, 2)
+    wire.put(var r, wire.float(0, 0), 4)
+    wire.put(var r, wire.float(100, 0), 4)
+    let a = ghc_decode_range(r)!
+    test.assert(not a.has_accuracy)
+    test.assert_eq(a.unit_code, 0x0220)
+    var ra = r[:]
+    wire.put(var ra, wire.float(2, 0), 4)
+    test.assert(ghc_decode_range(ra)!.has_accuracy)
+    test.assert_eq(ghc_decode_range(r[:13]), None)
+    test.assert_eq(ghc_decode_range(ra[:17]), None)
+    // A lower limit above the upper, and a limit that is not a number.
+    var inv: [u8] = []
+    wire.put(var inv, 1, 4)
+    wire.put(var inv, 1, 2)
+    wire.put(var inv, wire.float(100, 0), 4)
+    wire.put(var inv, wire.float(0, 0), 4)
+    test.assert_eq(ghc_decode_range(inv), None)
+    var nan: [u8] = []
+    wire.put(var nan, 1, 4)
+    wire.put(var nan, 1, 2)
+    wire.put(var nan, wire.FLOAT_NAN, 4)
+    wire.put(var nan, wire.float(0, 0), 4)
+    test.assert_eq(ghc_decode_range(nan), None)
+    var acc: [u8] = r[:]
+    wire.put(var acc, wire.FLOAT_NAN, 4)
+    test.assert_eq(ghc_decode_range(acc), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_control_point_requests_and_response()
+    test.assert_eq(ghc_start_request(), octets([1]))
+    test.assert_eq(ghc_stop_request(), octets([2]))
+    test.assert(ghc_decode_control_response(octets([0x80])))
+    test.assert(not ghc_decode_control_response(octets([0x81])))
+    test.assert(not ghc_decode_control_response(octets([0x80, 0])))
+    test.assert(not ghc_decode_control_response([]))
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_record_access_control_point_requests()
+    test.assert_eq(ghc_racp_request(7, 1, 0, 0), Some(octets([7, 1])))
+    test.assert_eq(ghc_racp_request(4, 5, 0, 0), Some(octets([4, 5])))
+    test.assert_eq(ghc_racp_request(2, 6, 0, 0), Some(octets([2, 6])))
+    test.assert_eq(ghc_racp_request(7, 3, 5, 0), Some(octets([7, 3, 1, 5, 0, 0, 0])))
+    test.assert_eq(ghc_racp_request(7, 2, 0xFFFFFFFF, 0), Some(octets([7, 2, 1, 0xFF, 0xFF, 0xFF, 0xFF])))
+    test.assert_eq(ghc_racp_request(4, 4, 2, 9), Some(octets([4, 4, 1, 2, 0, 0, 0, 9, 0, 0, 0])))
+    test.assert_eq(ghc_racp_request(4, 4, 9, 9), Some(octets([4, 4, 1, 9, 0, 0, 0, 9, 0, 0, 0])))
+    test.assert_eq(ghc_racp_request(3, 0, 0, 0), Some(octets([3, 0])))
+    // Operators the procedure does not take, record numbers outside 32 bits, a range backwards, Op Codes that are not requests.
+    test.assert_eq(ghc_racp_request(3, 1, 0, 0), None)
+    test.assert_eq(ghc_racp_request(7, 0, 0, 0), None)
+    test.assert_eq(ghc_racp_request(7, 7, 0, 0), None)
+    test.assert_eq(ghc_racp_request(7, 3, -1, 0), None)
+    test.assert_eq(ghc_racp_request(7, 3, 0x100000000, 0), None)
+    test.assert_eq(ghc_racp_request(4, 4, 9, 2), None)
+    test.assert_eq(ghc_racp_request(4, 4, 2, 0x100000000), None)
+    test.assert_eq(ghc_racp_request(1, 1, 0, 0), None)
+    test.assert_eq(ghc_racp_request(5, 1, 0, 0), None)
+    test.assert_eq(ghc_racp_request(6, 1, 0, 0), None)
+    test.assert_eq(ghc_racp_request(8, 1, 0, 0), None)
+
+@tier(app)
+fn racp_is(b: [u8], kind: Int, count: Int, request: Int, code: Int) -> Bool
+    match ghc_decode_racp(b)
+        Some(r) => r.kind == kind and r.count == count and r.request == request and r.code == code
+        None => false
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_record_access_control_point_indications()
+    test.assert(racp_is(octets([5, 0, 3, 0, 0, 0]), GHC_RACP_NUMBER, 3, 0, 0))
+    test.assert(racp_is(octets([8, 0, 0xFF, 0xFF, 0xFF, 0xFF]), GHC_RACP_COMBINED, 0xFFFFFFFF, 0, 0))
+    for request in [2, 3, 4, 7]
+        for code in 1..11
+            test.assert(racp_is(octets([6, 0, request, code]), GHC_RACP_CODE, 0, request, code))
+        test.assert_eq(ghc_decode_racp(octets([6, 0, request, 0])), None)
+        test.assert_eq(ghc_decode_racp(octets([6, 0, request, 11])), None)
+    // The operator is 0; the request Op Code of a response is one of the four; lengths.
+    test.assert_eq(ghc_decode_racp(octets([5, 1, 3, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([6, 1, 7, 1])), None)
+    test.assert_eq(ghc_decode_racp(octets([6, 0, 1, 1])), None)
+    test.assert_eq(ghc_decode_racp(octets([6, 0, 5, 1])), None)
+    test.assert_eq(ghc_decode_racp(octets([6, 0, 7])), None)
+    test.assert_eq(ghc_decode_racp(octets([6, 0, 7, 1, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([5, 0, 3, 0, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([8, 0, 3, 0, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([7, 0, 3, 0, 0, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([0x10, 0])), None)
+    test.assert_eq(ghc_decode_racp(octets([5])), None)
+    test.assert_eq(ghc_decode_racp([]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_the_errors_of_a_write_are_named()
+    test.assert_eq(ghc_error_kind(0), GHC_ERR_NONE)
+    test.assert_eq(ghc_error_kind(0x81), GHC_ERR_COMMAND_NOT_SUPPORTED)
+    test.assert_eq(ghc_error_kind(0xFD), GHC_ERR_CCCD)
+    test.assert_eq(ghc_error_kind(0xFE), GHC_ERR_IN_PROGRESS)
+    test.assert_eq(ghc_error_kind(0xFF), GHC_ERR_OUT_OF_RANGE)
+    test.assert_eq(ghc_error_kind(0x03), GHC_ERR_OTHER)
+
+// Run the session against `s`: the PDUs of the session go through `ghs_receive`, the server's own sends
+// (`ghs_pump`) follow every round, and everything the session sees goes back to the server.  The
+// characteristic and the value of each event are appended to `uuids` and `values`.
+@tier(app)
+fn ghc_pump(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var s: gatt_server.GattServer, h: generic_health_sensor.GhsHandles, config: generic_health_sensor.GhsConfig, var state: generic_health_sensor.GhsState, first: sensor_client.ScStep, var uuids: [Int], var values: [[u8]]) -> Int [mutate]
+    var all = first.event
+    var policy = generic_health_sensor.default_ghs_policy()
+    var to_server = first.pdus[:]
+    var again = true
+    for _ in 0..300
+        if not again and list.len(to_server) == 0
+            break
+        var out: [[u8]] = []
+        for item in to_server
+            list.append(out, generic_health_sensor.ghs_receive(var s.db, var s.link, h, config, var state, var policy, sensor_client.test_link(), item[:], 0))
+        let sent = generic_health_sensor.ghs_pump(var s.db, var s.link, h, config, var state, 0)
+        list.append(out, sent[:])
+        again = list.len(out) > 0
+        to_server = []
+        for p in out
+            let step = sensor_client.sc_on_pdu(var t, var c, p[:], 0)
+            list.append(to_server, step.pdus[:])
+            all = all | step.event
+            if (step.event & sensor_client.SE_VALUE) != 0
+                list.push(uuids, sensor_client.sc_uuid(c))
+                list.push(values, sensor_client.sc_value(c))
+    all
+
+@tier(app)
+fn test_server(config: generic_health_sensor.GhsConfig) -> (gatt_server.GattServer, generic_health_sensor.GhsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = generic_health_sensor.add_ghs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    let config = generic_health_sensor.full_config()
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = generic_health_sensor.new_ghs_state()
+    let both = sensor_client.test_open(generic_health_sensor.UUID_GENERIC_HEALTH_SENSOR_SERVICE)
+    var t = both.0
+    var c = ghc_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let all = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_start(var t, var c, true, true, 0), var uuids, var values)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    let f = ghc_decode_features(values[0])!
+    test.assert_eq(f.types, [generic_health_sensor.SPO2, generic_health_sensor.PULSE])
+    test.assert_eq(f.spec_codes, [0x1007])
+    // Start the live observations; a submitted body arrives in segments, each confirmed.
+    var u2: [Int] = []
+    var v2: [[u8]] = []
+    let st = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_control(var t, var c, ghc_start_request(), 0), var u2, var v2)
+    test.assert((st & sensor_client.SE_DONE) != 0)
+    test.assert(ghc_decode_control_response(v2[0]))
+    test.assert_eq(u2[0], generic_health_sensor.UUID_GHS_CONTROL_POINT)
+    let body = example_1()
+    test.assert_eq(generic_health_sensor.ghs_submit(var state, config, body, false), generic_health_sensor.SUBMIT_OK)
+    var u3: [Int] = []
+    var v3: [[u8]] = []
+    let live = ghc_pump(var t, var c, var s, h, config, var state, sensor_client.ScStep { event: 0, pdus: [] }, var u3, var v3)
+    test.assert((live & sensor_client.SE_INDICATION) != 0)
+    var a = ghc_assembly_new()
+    var done = 0
+    for i in 0..list.len(v3)
+        test.assert_eq(u3[i], generic_health_sensor.UUID_LIVE_HEALTH_OBSERVATIONS)
+        if ghc_segment_push(var a, v3[i]) == GHC_SEG_DONE
+            done = done + 1
+    test.assert_eq(done, 1)
+    test.assert_eq(a.data, body)
+    test.assert_eq(body_of(a.data).observation_type, generic_health_sensor.SPO2)
+    // A command the server does not take: Command Not Supported.
+    let bad = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_control(var t, var c, octets([0x07]), 0), var u3, var v3)
+    test.assert((bad & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(ghc_error_kind(sensor_client.sc_status(c)), GHC_ERR_COMMAND_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_session_reads_stored_observations_through_the_record_access_control_point()
+    if not fixtures.client_engine_present()
+        return
+    let config = generic_health_sensor.full_config()
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = generic_health_sensor.new_ghs_state()
+    test.assert_eq(generic_health_sensor.ghs_store(var state, config, example_1()), 0)
+    test.assert_eq(generic_health_sensor.ghs_store(var state, config, example_1()), 1)
+    let both = sensor_client.test_open(generic_health_sensor.UUID_GENERIC_HEALTH_SENSOR_SERVICE)
+    var t = both.0
+    var c = ghc_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let _ = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_start(var t, var c, true, true, 0), var uuids, var values)
+    // Report Number of Stored Records: All.
+    var u2: [Int] = []
+    var v2: [[u8]] = []
+    let _ = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_racp(var t, var c, ghc_racp_request(4, 1, 0, 0)!, 0), var u2, var v2)
+    test.assert(racp_is(v2[0], GHC_RACP_NUMBER, 2, 0, 0))
+    // Combined Report: Greater than or equal to record 1: one record, then the Combined Report Response.
+    var u3: [Int] = []
+    var v3: [[u8]] = []
+    let _ = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_racp(var t, var c, ghc_racp_request(7, 3, 1, 0)!, 0), var u3, var v3)
+    var a = ghc_assembly_new()
+    var records = 0
+    var closing = false
+    for i in 0..list.len(v3)
+        if u3[i] == generic_health_sensor.UUID_STORED_HEALTH_OBSERVATIONS
+            if ghc_segment_push(var a, v3[i]) == GHC_SEG_DONE
+                let r = ghc_decode_stored(a.data)!
+                test.assert_eq(r.number, 1)
+                records = records + 1
+        if u3[i] == generic_health_sensor.UUID_RECORD_ACCESS_CONTROL_POINT
+            test.assert(racp_is(v3[i], GHC_RACP_COMBINED, 1, 0, 0))
+            closing = true
+    test.assert_eq(records, 1)
+    test.assert(closing)
+    // A range with no record: a Response Code, No Records Found.
+    var u4: [Int] = []
+    var v4: [[u8]] = []
+    let _ = ghc_pump(var t, var c, var s, h, config, var state, ghc_client_racp(var t, var c, ghc_racp_request(7, 3, 9, 0)!, 0), var u4, var v4)
+    test.assert(racp_is(v4[0], GHC_RACP_CODE, 0, 7, generic_health_sensor.RESULT_NO_RECORDS_FOUND))
+
+@test
+@satisfies("REQ-BLE-PRFC-021")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(generic_health_sensor.UUID_GENERIC_HEALTH_SENSOR_SERVICE)
+    var t = both.0
+    var c = ghc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, ghc_client_start(var t, var c, true, true, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

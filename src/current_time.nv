@@ -1,0 +1,339 @@
+// src/current_time.nv — the Current Time Service (0x1805).
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+// A device without a screen or a clock source exposes its time so that a
+// phone reads it, follows its changes and, when the product allows, sets it.
+// The service holds, in the order the builder adds them:
+//
+//   Current Time             0x2A2B   Read, Notify, optionally Write; with a
+//                                     Client Characteristic Configuration
+//                                     descriptor; 10 octets
+//   Local Time Information   0x2A0F   Read, optionally Write; 2 octets
+//   Reference Time Info.     0x2A14   Read; 4 octets
+//
+// Current Time is Exact Time 256 (Year u16, Month, Day, Hours, Minutes,
+// Seconds, Day of Week, Fractions256, each one octet) followed by the Adjust
+// Reason octet (bit 0 manual update, bit 1 external reference update, bit 2
+// change of time zone, bit 3 change of DST offset).  Local Time Information
+// is the Time Zone (sint8, 15-minute steps, -128 unknown) and the DST Offset
+// (0, 2, 4, 8 or 255 unknown).  Reference Time Information is the Time Source
+// (0 to 6), the Time Accuracy (1/8 s steps, 254 larger, 255 unknown), and the
+// Days and Hours Since Update (255 and 255 once the update is 255 days old).
+//
+// Writes.  The service holds the time in the attribute values.  A write of a
+// wrong length is answered with the Application Error "Data field ignored"
+// (0x80, [CTS] 1.6).  A write that has the right length but a field outside
+// its range is accepted by the Attribute Protocol, because the rule that
+// answers an error cannot read the fields; `cts_serve_writes` then puts the
+// previous value back and does not tell the policy, so the time is not set
+// from it.  This is the one place the service answers a write with a success
+// where [CTS] 3.1.3 asks for 0x80.
+//
+// Notifications.  `cts_set_time` stores a new time and notifies it.  A change
+// caused only by an external reference update is not notified within 15
+// minutes of the last notification unless it moves the time by more than one
+// minute or a client caused it ([CTS] 3.1.2); every other change is notified
+// at once.
+//
+// Specification checked against: Current Time Service 1.1.0 (2014-10-07) and
+// the GATT Specification Supplement v9 (2023-05-25), Sections 3.62, 3.70 to
+// 3.73, 3.76, 3.90, 3.135, 3.178, 3.220, 3.228 and 3.232.
+//
+// Satisfies: REQ-BLE-CTS-001.
+
+use links
+use gatt_server
+use control_common
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+
+const UUID_CURRENT_TIME_SERVICE = 0x1805
+const UUID_CURRENT_TIME = 0x2A2B
+const UUID_LOCAL_TIME_INFORMATION = 0x2A0F
+const UUID_REFERENCE_TIME_INFORMATION = 0x2A14
+
+// The Application Error Code "Data field ignored" ([CTS] 1.6).
+const ERR_DATA_FIELD_IGNORED = 0x80
+
+// The bits of the Adjust Reason octet.
+const REASON_MANUAL = 0x01
+const REASON_EXTERNAL_REFERENCE = 0x02
+const REASON_TIME_ZONE = 0x04
+const REASON_DST_OFFSET = 0x08
+const REASON_DEFINED_BITS = 0x0F
+
+// The values of the fields that mean "unknown".
+const TIME_ZONE_UNKNOWN = -128
+const DST_UNKNOWN = 255
+const ACCURACY_UNKNOWN = 255
+
+// The value lengths.
+const CURRENT_TIME_OCTETS = 10
+const LOCAL_TIME_OCTETS = 2
+const REFERENCE_TIME_OCTETS = 4
+
+// The spacing of notifications of a reference time update: 15 minutes, and
+// the shift of the time, one minute, that overrides it ([CTS] 3.1.2).
+const REFERENCE_NOTIFY_SPACING_MS = 900000
+const REFERENCE_NOTIFY_SHIFT_S = 60
+
+// The time of the Current Time characteristic.  `day_of_week` is 0 for
+// unknown, 1 Monday to 7 Sunday; `fractions` counts 1/256 s.  `reason` is the
+// Adjust Reason octet.  A year, month or day of 0 is "not known".
+struct CurrentTime
+    time: wire.DateTime
+    day_of_week: Int
+    fractions: Int
+    reason: Int
+
+// The Time Zone and DST Offset of the Local Time Information characteristic.
+struct LocalTime
+    zone: Int
+    dst: Int
+
+// The Reference Time Information characteristic.  `source` is the Time Source
+// value, `accuracy` the Time Accuracy, `days` and `hours` the time since the
+// last update from the source.
+@value
+struct ReferenceTime
+    source: u8
+    accuracy: u8
+    days: u8
+    hours: u8
+
+// The value of the Current Time characteristic.
+@tier(app)
+fn current_time_value(t: CurrentTime) -> [u8]
+    var out: [u8] = []
+    wire.put_date_time(var out, t.time)
+    wire.put(var out, t.day_of_week, 1)
+    wire.put(var out, t.fractions, 1)
+    wire.put(var out, t.reason, 1)
+    out
+
+// The time held in a Current Time value; zeros where `b` is short.
+@tier(app)
+fn parse_current_time(b: [u8]) -> CurrentTime
+    CurrentTime {
+        time: wire.get_date_time(b, 0), day_of_week: wire.get(b, 7, 1), fractions: wire.get(b, 8, 1), reason: wire.get(b, 9, 1) }
+
+// Whether every field of `t` is in its defined range (GSS 3.70, 3.73, 3.90,
+// 3.62): a field outside it is Reserved for Future Use.
+fn current_time_valid(t: CurrentTime) -> Bool
+    wire.date_time_valid(t.time) and t.day_of_week <= 7 and t.fractions <= 255 and (t.reason & (255 ^ REASON_DEFINED_BITS)) == 0
+
+// The value of the Local Time Information characteristic.
+@tier(app)
+fn local_time_value(l: LocalTime) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, l.zone, 1)
+    wire.put(var out, l.dst, 1)
+    out
+
+@tier(app)
+fn parse_local_time(b: [u8]) -> LocalTime
+    LocalTime { zone: wire.get_signed(b, 0, 1), dst: wire.get(b, 1, 1) }
+
+// Whether the zone is -48 to +56 or unknown and the DST Offset is 0, 2, 4, 8
+// or unknown (GSS 3.76, 3.232).
+fn local_time_valid(l: LocalTime) -> Bool
+    let zone_ok = l.zone == TIME_ZONE_UNKNOWN or (l.zone >= -48 and l.zone <= 56)
+    let dst_ok = l.dst == 0 or l.dst == 2 or l.dst == 4 or l.dst == 8 or l.dst == DST_UNKNOWN
+    zone_ok and dst_ok
+
+// The value of the Reference Time Information characteristic.  A time since
+// the update of more than 254 days and 23 hours reads as 255 and 255
+// ([CTS] 3.3); a source above 6 reads as Unknown.
+@tier(app)
+fn reference_time_value(r: ReferenceTime) -> [u8]
+    let old = r.days > 254 or (r.days == 254 and r.hours > 23)
+    let source = if r.source > 6 then 0 else r.source as Int
+    var out: [u8] = []
+    wire.put(var out, source, 1)
+    wire.put(var out, wire.clamp(r.accuracy, 0, 255), 1)
+    wire.put(var out, if old then 255 else wire.clamp(r.days, 0, 254), 1)
+    wire.put(var out, if old then 255 else wire.clamp(r.hours, 0, 23), 1)
+    out
+
+// What the service offers.  `writable_time` and `writable_local` give a
+// client the Write property of the Current Time and Local Time Information
+// characteristics at `write`; `local` and `reference` add the optional
+// characteristics.  `read` is the access to read, `cccd` the access to the
+// descriptor of Current Time.
+struct CtsConfig
+    read: gatt_server.Access
+    cccd: gatt_server.Permissions
+    write: gatt_server.Access
+    writable_time: Bool
+    local: Bool
+    writable_local: Bool
+    reference: Bool
+
+// A time any client reads, follows and sets, with the two optional
+// characteristics.
+@tier(app)
+fn default_cts_config() -> CtsConfig
+    CtsConfig {
+        read: gatt_server.Access.Open, cccd: gatt_server.open_permissions(), write: gatt_server.Access.Open,
+        writable_time: true, local: true, writable_local: true, reference: true }
+
+// The handles of the service; `local` and `reference` are 0 when absent.
+@value
+struct CtsHandles
+    service: u16
+    time: u16
+    cccd: u16
+    local: u16
+    reference: u16
+
+@tier(app)
+fn unknown_time() -> CurrentTime
+    CurrentTime { time: wire.date_time_unknown(), day_of_week: 0, fractions: 0, reason: 0 }
+
+@tier(app)
+fn read_write(config: CtsConfig, writable: Bool) -> gatt_server.Permissions
+    if writable
+        gatt_server.Permissions { read: config.read, write: config.write }
+    else
+        profile_builder.read_only(config.read)
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_cts_service(var db: GattDb, config: CtsConfig) -> Result<CtsHandles, profile_builder.ProfileError>
+    if config.writable_local and not config.local
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_CURRENT_TIME_SERVICE))!
+    let time_props = if config.writable_time then gatt_server.PROP_READ | gatt_server.PROP_NOTIFY | gatt_server.PROP_WRITE else gatt_server.PROP_READ | gatt_server.PROP_NOTIFY
+    let time_handle = profile_builder.add_value(
+        var db, time_props, read_write(config, config.writable_time), gatt_server.le16(UUID_CURRENT_TIME), current_time_value(unknown_time()))!
+    let cccd = profile_builder.add_cccd(var db, config.cccd)!
+    if config.writable_time and not gatt_server.require_value_format(var db, time_handle, CURRENT_TIME_OCTETS, 0, ERR_DATA_FIELD_IGNORED)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    var local = 0
+    if config.local
+        let props = if config.writable_local then gatt_server.PROP_READ | gatt_server.PROP_WRITE else gatt_server.PROP_READ
+        local = profile_builder.add_value(
+            var db, props, read_write(config, config.writable_local), gatt_server.le16(UUID_LOCAL_TIME_INFORMATION),
+            local_time_value(LocalTime { zone: TIME_ZONE_UNKNOWN, dst: DST_UNKNOWN }))!
+        if config.writable_local and not gatt_server.require_value_format(var db, local, LOCAL_TIME_OCTETS, 0, ERR_DATA_FIELD_IGNORED)
+            return Err(profile_builder.ProfileError.InvalidValue)
+    var reference = 0
+    if config.reference
+        reference = profile_builder.add_value(
+            var db, gatt_server.PROP_READ, profile_builder.read_only(config.read), gatt_server.le16(UUID_REFERENCE_TIME_INFORMATION),
+            reference_time_value(ReferenceTime { source: 0, accuracy: ACCURACY_UNKNOWN, days: 255, hours: 255 }))!
+    Ok(CtsHandles { service: service as u16, time: time_handle as u16, cccd: cccd as u16, local: local as u16, reference: reference as u16 })
+
+// What the service remembers between notifications: when the last one went
+// out, in ms, and whether one did.
+struct CtsState
+    var last_notify_ms: Int
+    var notified: Bool
+
+@tier(app)
+fn new_cts_state() -> CtsState
+    CtsState { last_notify_ms: 0, notified: false }
+
+// The seconds of the day of `t`, for the one-minute comparison.
+fn second_of_day(t: CurrentTime) -> Int
+    (t.time.hours as Int) * 3600 + (t.time.minutes as Int) * 60 + (t.time.seconds as Int)
+
+// Whether a change with `reason` that moves the time by `shift_s` seconds
+// is notified at `now_ms`, `caused_by_client` when a client's write caused it.
+fn notify_due(state: CtsState, reason: Int, shift_s: Int, caused_by_client: Bool, now_ms: Int) -> Bool
+    if reason != REASON_EXTERNAL_REFERENCE or caused_by_client or not state.notified
+        return true
+    shift_s > REFERENCE_NOTIFY_SHIFT_S or shift_s < -REFERENCE_NOTIFY_SHIFT_S or now_ms - state.last_notify_ms >= REFERENCE_NOTIFY_SPACING_MS
+
+// Store `t` (its Adjust Reason says why the time changed) and answer the PDUs
+// to send: the notification when the client enabled it and the rule above
+// allows it.
+@tier(app)
+fn cts_set_time(var db: GattDb, var link: AttLink, handles: CtsHandles, var state: CtsState, t: CurrentTime, caused_by_client: Bool, now_ms: Int) -> [[u8]]
+    let before = parse_current_time(control_common.attr(db, handles.time))
+    let shift = second_of_day(t) - second_of_day(before)
+    let _ = gatt_server.set_value(var db, handles.time, current_time_value(t))
+    if not notify_due(state, t.reason, shift, caused_by_client, now_ms)
+        return []
+    let pdus = gatt_server.send_value(var db, var link, handles.time, now_ms)
+    if list.len(pdus) > 0
+        state.last_notify_ms = now_ms
+        state.notified = true
+    pdus
+
+// Store the zone and DST offset the product keeps.
+@tier(app)
+fn cts_set_local_time(var db: GattDb, handles: CtsHandles, l: LocalTime) -> Bool
+    handles.local != 0 and gatt_server.set_value(var db, handles.local, local_time_value(l))
+
+// Store the reference time the product keeps.
+@tier(app)
+fn cts_set_reference_time(var db: GattDb, handles: CtsHandles, r: ReferenceTime) -> Bool
+    handles.reference != 0 and gatt_server.set_value(var db, handles.reference, reference_time_value(r))
+
+trait CtsPolicy[e]
+    // A client of `peer` wrote a valid time; the product sets its clock or
+    // refuses by doing nothing.
+    fn set_time(var self, peer: links.LinkId, t: CurrentTime) [e]
+    // A client of `peer` wrote a valid zone and DST offset.
+    fn set_local_time(var self, peer: links.LinkId, l: LocalTime) [e]
+
+// The policy of a product that keeps no clock a client may set.
+@value
+struct DefaultCtsPolicy
+    placeholder: Int
+
+@tier(embedded)
+fn default_cts_policy() -> DefaultCtsPolicy
+    DefaultCtsPolicy { placeholder: 0 }
+
+impl CtsPolicy[] for DefaultCtsPolicy
+    @tier(embedded)
+    @no_alloc
+    fn set_time(var self, peer: links.LinkId, t: CurrentTime)
+        let _ = t
+    @tier(embedded)
+    @no_alloc
+    fn set_local_time(var self, peer: links.LinkId, l: LocalTime)
+        let _ = l
+
+// Serve the writes `gatt_server.take_changed` reported for `peer`: a valid
+// time or zone reaches the policy, an invalid one is put back as it was
+// (`previous_time`, `previous_local`).  The number of writes the policy was
+// told of.
+@tier(app)
+fn cts_serve_writes<P: CtsPolicy[e]>(var db: GattDb, handles: CtsHandles, var policy: P, peer: links.LinkId, changed: [Int], previous_time: CurrentTime, previous_local: LocalTime) -> Int [e, mutate]
+    var told = 0
+    for handle in changed
+        if handle == handles.time
+            let t = parse_current_time(control_common.attr(db, handles.time))
+            if current_time_valid(t)
+                policy.set_time(peer, t)
+                told = told + 1
+            else
+                let _ = gatt_server.set_value(var db, handles.time, current_time_value(previous_time))
+        else if handles.local != 0 and handle == handles.local
+            let l = parse_local_time(control_common.attr(db, handles.local))
+            if local_time_valid(l)
+                policy.set_local_time(peer, l)
+                told = told + 1
+            else
+                let _ = gatt_server.set_value(var db, handles.local, local_time_value(previous_local))
+    told
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn added(var s: GattServer, config: CtsConfig) -> CtsHandles
+    add_cts_service(var s.db, config)!
+
+// 2026-10-27 (a Tuesday) 13:45:30 and 128/256 s, reason manual.
+@tier(app)
+fn sample() -> CurrentTime
+    CurrentTime { time: wire.date_time(2026, 10, 27, 13, 45, 30), day_of_week: 2, fractions: 128, reason: REASON_MANUAL }

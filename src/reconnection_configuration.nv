@@ -1,0 +1,732 @@
+// src/reconnection_configuration.nv — the Reconnection
+// Configuration Service (0x1829), with which a client reads what a device can
+// change about its reconnection behaviour and asks it to change it.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   RC Feature                 0x2B1D  Read (Indicate when the value can change);
+//                                      an E2E-CRC field, then 3 + n octets of bits
+//   RC Settings                0x2B1E  Read, Notify; Length, a 2-octet Settings
+//                                      field, the E2E-CRC field when supported
+//   Reconnection Configuration
+//   Control Point              0x2B1F  Write, Indicate; an Opcode, an Operand of
+//                                      0 to 17 octets, the E2E-CRC field when
+//                                      supported
+//
+// The RC Feature value says what the device supports.  The service adds only
+// the characteristics Table 3.1 asks for: RC Settings when there is more than
+// one Advertisement Configuration or Ready for Disconnect, Upgrade to LESC
+// Only, Next Pairing OOB or Limited Access is supported; the control point
+// when there is more than one Advertisement Configuration or any procedure is.
+//
+// A write to the control point is evaluated before its Write Response and is
+// answered by one indication:
+//
+//   ATT errors     the link security of the characteristic; 0xFD (Client
+//                  Characteristic Configuration Descriptor Improperly
+//                  Configured) and 0xFE (Procedure Already In Progress), which
+//                  the control point rule of `sensor_control` gives; with E2E-CRC
+//                  0x80 Missing CRC and 0x81 Invalid CRC; Insufficient
+//                  Authorization to a client other than the one that set
+//                  Limited Access, for every procedure that changes a setting
+//   Procedure Response   opcode 0x0E, the request opcode and a result code: an
+//                  opcode the device does not support is Opcode Not Supported,
+//                  an operand of a wrong length or value is Invalid Operand
+//   Responses      0x0F Communication Parameter Response (Get Max, Get Min and
+//                  Get Stored Values), 0x10 Filter Accept List Timer Response,
+//                  0x11 Client Parameter Indication (Get Actual Communication
+//                  Parameters; the product sends it again with
+//                  `rcs_client_parameters` once an accepted proposal is applied)
+//
+// What the device does is the product's: `RcsPolicy` answers the busy state,
+// the connection parameters in use, the limits and stored sets, a proposal, the
+// activation of a stored set, an Advertisement Configuration, and the security
+// switches.  The service keeps the Settings bits, the Filter Accept List timer
+// and the client that holds Limited Access (an identifier of the bonded client,
+// the same across connections).
+//
+// All eight parameters are exchanged in the order of Table 3.8 as a list of
+// eight integers.  A parameter whose Propose feature is not supported travels
+// as 0xFFFF.  The sets of Parameter-Set 0 and the optional ones are the
+// product's; the service accepts the sets 0 to `sets` - 1.
+//
+// Specification checked against: Reconnection Configuration Service 1.0.1 and
+// Reconnection Configuration Profile 1.0.1.  The 30 s timeout of an
+// unconfirmed indication is the ATT transaction timeout.  The Reconnection
+// Timeout, the countdown of the Filter Accept List timer and the fall-back of
+// the LESC Only and OOB bits are NOT IMPLEMENTED in this module.
+//
+// Satisfies: REQ-BLE-RCS-001.
+
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+
+const UUID_RECONNECTION_CONFIGURATION_SERVICE = 0x1829
+const UUID_RC_FEATURE = 0x2B1D
+const UUID_RC_SETTINGS = 0x2B1E
+const UUID_RC_CONTROL_POINT = 0x2B1F
+
+// The bits of the RC Feature field (Table 3.3).
+const F_E2E_CRC = 0x1
+const F_ENABLE_DISCONNECT = 0x2
+const F_READY_FOR_DISCONNECT = 0x4
+const F_PROPOSE_TIMEOUT = 0x8
+const F_PROPOSE_INTERVAL = 0x10
+const F_PROPOSE_LATENCY = 0x20
+const F_PROPOSE_SUPERVISION = 0x40
+const F_PROPOSE_ADV_INTERVAL = 0x80
+const F_PROPOSE_ADV_COUNT = 0x100
+const F_PROPOSE_ADV_REPETITION = 0x200
+const F_ADV_CONFIG_1 = 0x400
+const F_ADV_CONFIG_2 = 0x800
+const F_ADV_CONFIG_3 = 0x1000
+const F_ADV_CONFIG_4 = 0x2000
+const F_LESC_ONLY = 0x4000
+const F_NEXT_PAIRING_OOB = 0x8000
+const F_FILTER_ACCEPT_LIST = 0x10000
+const F_LIMITED_ACCESS = 0x20000
+
+// Any of the seven Propose features.
+const F_PROPOSE_ANY = 0x3F8
+// The bits a feature value may carry; 18 to 22 are reserved and bit 23 is the
+// Feature Extension, which the service sets from `RcsConfig.extension`.
+const F_DEFINED = 0x3FFFF
+const F_EXTENSION = 0x800000
+
+// The bits of the Settings field (Table 3.5), octet 0.
+const S_LESC_ONLY = 0x02
+const S_USE_OOB = 0x04
+const S_READY_FOR_DISCONNECT = 0x10
+const S_LIMITED_ACCESS = 0x20
+const S_ACCESS_PERMITTED = 0x40
+
+// The opcodes (Table 3.7).
+const OP_ENABLE_DISCONNECT = 0x00
+const OP_GET_ACTUAL = 0x01
+const OP_PROPOSE_SETTINGS = 0x02
+const OP_ACTIVATE_STORED = 0x03
+const OP_GET_MAX = 0x04
+const OP_GET_MIN = 0x05
+const OP_GET_STORED = 0x06
+const OP_SET_FILTER_TIMER = 0x07
+const OP_GET_FILTER_TIMER = 0x08
+const OP_SET_ADVERTISEMENT = 0x09
+const OP_LESC_ONLY = 0x0A
+const OP_OOB_PAIRING = 0x0B
+const OP_LIMITED_ACCESS = 0x0C
+const OP_PROCEDURE_RESPONSE = 0x0E
+const OP_PARAMETER_RESPONSE = 0x0F
+const OP_FILTER_TIMER_RESPONSE = 0x10
+const OP_CLIENT_PARAMETERS = 0x11
+
+// The result codes (Table 3.10).
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_OPERAND = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+const RESULT_OUT_OF_RANGE = 0x05
+const RESULT_INVALID_COMBINATION = 0x06
+const RESULT_DEVICE_BUSY = 0x07
+const RESULT_REJECTED = 0x08
+const RESULT_PROPOSAL_ACCEPTED = 0x09
+
+// The Application Error Codes of Table 1.2.
+const ERR_MISSING_CRC = 0x80
+const ERR_INVALID_CRC = 0x81
+
+// The settings `RcsPolicy.apply` is asked to switch.
+const SETTING_LESC_ONLY = 1
+const SETTING_USE_OOB = 2
+
+// The value of a Filter Accept List timer that never runs out.
+const FILTER_TIMER_NONE = 0xFFFFFFFE
+
+// The parameter that is left as it is, and the number of parameters.
+const KEEP = 0xFFFF
+const PARAMETERS = 8
+
+// A client that holds no Limited Access, and the identity of a client the
+// program has not named (`gatt_server.set_identity`).
+const NO_CLIENT = 0
+
+trait RcsPolicy[e]
+    // Whether the device cannot end the connection now (a measurement is
+    // pending).
+    fn busy(var self) -> Bool [e]
+
+    // Ask the product to end the connection when there is nothing left to send;
+    // false when it cannot.
+    fn request_disconnect(var self) -> Bool [e]
+
+    // The parameters of the connection in use, in the order of Table 3.8.
+    fn actual(var self) -> [Int] [e]
+
+    // The parameters of the stored set `set`.
+    fn stored(var self, set: Int) -> [Int] [e]
+
+    // The largest (`maximum`) or the smallest acceptable parameters.
+    fn limit(var self, maximum: Bool) -> [Int] [e]
+
+    // Propose `values` (0xFFFF keeps a parameter): Success when only
+    // advertising changes, Proposal Accepted when the connection parameters are
+    // requested, Communication Parameters rejected, Invalid Parameter
+    // Combination with the bit of each parameter field at fault, or Operation
+    // Failed.  The mask is read for Invalid Parameter Combination only.
+    fn propose(var self, values: [Int]) -> (Int, Int) [e]
+
+    // Request the stored set `set`: Success, Proposal Accepted, rejected or
+    // Operation Failed.
+    fn activate(var self, set: Int) -> Int [e]
+
+    // Use the Advertisement Configuration 0 to 3 (configurations 1 to 4).
+    fn advertise(var self, configuration: Int) -> Bool [e]
+
+    // Switch `SETTING_LESC_ONLY` or `SETTING_USE_OOB`; false when the device
+    // cannot.
+    fn apply(var self, setting: Int, on: Bool) -> Bool [e]
+
+// The policy of a device that changes nothing and is never busy.
+@value
+struct DefaultRcsPolicy
+    placeholder: Int
+
+@tier(embedded)
+fn default_rcs_policy() -> DefaultRcsPolicy
+    DefaultRcsPolicy { placeholder: 0 }
+
+impl RcsPolicy[] for DefaultRcsPolicy
+    fn busy(var self) -> Bool
+        false
+
+    fn request_disconnect(var self) -> Bool
+        false
+
+    @tier(app)
+    fn actual(var self) -> [Int]
+        [KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP]
+
+    @tier(app)
+    fn stored(var self, set: Int) -> [Int]
+        let _ = set
+        [KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP]
+
+    @tier(app)
+    fn limit(var self, maximum: Bool) -> [Int]
+        let _ = maximum
+        [KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP, KEEP]
+
+    @tier(app)
+    fn propose(var self, values: [Int]) -> (Int, Int)
+        let _ = values
+        (RESULT_OPERATION_FAILED, 0)
+
+    fn activate(var self, set: Int) -> Int
+        let _ = set
+        RESULT_OPERATION_FAILED
+
+    fn advertise(var self, configuration: Int) -> Bool
+        let _ = configuration
+        false
+
+    fn apply(var self, setting: Int, on: Bool) -> Bool
+        let _ = setting
+        let _ = on
+        false
+
+// What the device supports and the access to the characteristics.  `features`
+// holds the bits of Table 3.3 (the E2E-CRC bit included); `extension` holds the
+// octets of the Feature Extension, seven bits each, `[]` for none.  `sets` is
+// the number of stored parameter sets (1 to 255; set 0 is mandatory) and
+// `filter_min` to `filter_max` the seconds a Filter Accept List timer may take.
+// `changes` adds the Indicate property to RC Feature, for a value that can
+// change over the life of the device.
+struct RcsConfig
+    var features: Int
+    var extension: [u8]
+    var sets: Int
+    var filter_min: Int
+    var filter_max: Int
+    var changes: Bool
+    var access: gatt_server.Access
+
+// Every feature but E2E-CRC, on an encrypted link.
+@tier(app)
+fn default_rcs_config() -> RcsConfig
+    RcsConfig {
+        features: F_DEFINED ^ F_E2E_CRC, extension: [], sets: 3, filter_min: 20, filter_max: 300,
+        changes: false, access: gatt_server.Access.Encrypted }
+
+@value
+struct RcsHandles
+    service: u16
+    feature: u16
+    feature_cccd: u16
+    settings: u16
+    settings_cccd: u16
+    control_point: u16
+    control_point_cccd: u16
+
+// What the control point changes: the Settings bits, the Advertisement Mode,
+// the client that holds Limited Access and the Filter Accept List timer.
+struct RcsState
+    var settings: Int
+    var mode: Int
+    var owner: Int
+    var filter_timer: Int
+
+@tier(app)
+fn new_rcs_state() -> RcsState
+    RcsState { settings: 0, mode: 0, owner: NO_CLIENT, filter_timer: 0 }
+
+// ── Pure helpers ────────────────────────────────────────────────────
+
+// The E2E-CRC of `b` ([RCS] 3.4): CRC-16 with the generator polynomial
+// D^16 + D^12 + D^5 + 1, the register filled with ones, the octets fed least
+// significant bit first and no final inversion.
+@tier(embedded)
+@no_alloc
+fn crc16(b: [u8]) -> Int
+    var c = 0xFFFF
+    for x in b
+        c = c ^ (x as Int)
+        for _ in 0..8
+            if (c & 1) != 0
+                c = (c >>> 1) ^ 0x8408
+            else
+                c = c >>> 1
+    c
+
+// The number of Advertisement Configurations `features` supports.
+@tier(embedded)
+@no_alloc
+fn rcs_adv_configs(features: Int) -> Int
+    var n = 0
+    for k in 10..14
+        if ((features >>> k) & 1) != 0
+            n = n + 1
+    n
+
+// Whether the service has the RC Settings characteristic ([RCS] Table 3.1, C.1).
+@tier(embedded)
+@no_alloc
+fn rcs_has_settings(features: Int) -> Bool
+    rcs_adv_configs(features) > 1 or (features & (F_READY_FOR_DISCONNECT | F_LESC_ONLY | F_NEXT_PAIRING_OOB | F_LIMITED_ACCESS)) != 0
+
+// Whether the service has the control point (Table 3.1, C.3).
+@tier(embedded)
+@no_alloc
+fn rcs_has_control_point(features: Int) -> Bool
+    rcs_adv_configs(features) > 1 or (features & (F_ENABLE_DISCONNECT | F_PROPOSE_ANY | F_LESC_ONLY | F_NEXT_PAIRING_OOB | F_FILTER_ACCEPT_LIST | F_LIMITED_ACCESS)) != 0
+
+// The octets of the operand of `op`, -1 for an opcode the client cannot write.
+@tier(embedded)
+@no_alloc
+fn rcs_operand_length(op: Int) -> Int
+    if op == OP_ENABLE_DISCONNECT or op == OP_GET_ACTUAL or op == OP_GET_MAX or op == OP_GET_MIN or op == OP_GET_FILTER_TIMER
+        return 0
+    if op == OP_PROPOSE_SETTINGS
+        return 16
+    if op == OP_SET_FILTER_TIMER
+        return 4
+    if op == OP_ACTIVATE_STORED or op == OP_GET_STORED or (op >= OP_SET_ADVERTISEMENT and op <= OP_LIMITED_ACCESS)
+        return 1
+    -1
+
+// Whether a device with `features` supports the procedure `op` (Table 3.7).
+@tier(embedded)
+@no_alloc
+fn rcs_supported(features: Int, op: Int) -> Bool
+    if op == OP_ENABLE_DISCONNECT
+        return (features & F_ENABLE_DISCONNECT) != 0
+    if op == OP_SET_FILTER_TIMER or op == OP_GET_FILTER_TIMER
+        return (features & F_FILTER_ACCEPT_LIST) != 0
+    if op == OP_SET_ADVERTISEMENT
+        return rcs_adv_configs(features) > 1
+    if op == OP_LESC_ONLY
+        return (features & F_LESC_ONLY) != 0
+    if op == OP_OOB_PAIRING
+        return (features & F_NEXT_PAIRING_OOB) != 0
+    if op == OP_LIMITED_ACCESS
+        return (features & F_LIMITED_ACCESS) != 0
+    if op == OP_GET_ACTUAL or op == OP_PROPOSE_SETTINGS or op == OP_ACTIVATE_STORED or op == OP_GET_MAX or op == OP_GET_MIN or op == OP_GET_STORED
+        return (features & F_PROPOSE_ANY) != 0
+    false
+
+// Whether the procedure `op` changes a setting, which a client other than the
+// one holding Limited Access may not do.  Enable Disconnect is open to all.
+@tier(embedded)
+@no_alloc
+fn rcs_modifies(op: Int) -> Bool
+    op == OP_PROPOSE_SETTINGS or op == OP_ACTIVATE_STORED or op == OP_SET_FILTER_TIMER or (op >= OP_SET_ADVERTISEMENT and op <= OP_LIMITED_ACCESS)
+
+// Whether the parameter field `field` (Table 3.8) is one the device supports.
+@tier(embedded)
+@no_alloc
+fn rcs_field_supported(features: Int, field: Int) -> Bool
+    if field == 0
+        return (features & F_PROPOSE_TIMEOUT) != 0
+    if field == 1 or field == 2
+        return (features & F_PROPOSE_INTERVAL) != 0
+    if field == 3
+        return (features & F_PROPOSE_LATENCY) != 0
+    if field == 4
+        return (features & F_PROPOSE_SUPERVISION) != 0
+    if field == 5
+        return (features & F_PROPOSE_ADV_INTERVAL) != 0
+    if field == 6
+        return (features & F_PROPOSE_ADV_COUNT) != 0
+    (features & F_PROPOSE_ADV_REPETITION) != 0
+
+// Whether `v` is in the range of the parameter field `field`; 0xFFFF keeps the
+// parameter, 0xFFFE disables the Reconnection Timeout.
+@tier(embedded)
+@no_alloc
+fn rcs_field_in_range(field: Int, v: Int) -> Bool
+    if v == KEEP
+        return true
+    if field == 0
+        return v <= 20000 or v == 0xFFFE
+    if field == 1 or field == 2
+        return v >= 6 and v <= 0x0C80
+    if field == 3
+        return v <= 499
+    if field == 4
+        return v >= 10 and v <= 3200
+    if field == 5
+        return v >= 0x20 and v <= 0x4000
+    if field == 6
+        return v >= 1 and v <= 1000
+    v <= 10000
+
+// ── Values ──────────────────────────────────────────────────────────
+
+// The RC Feature field: three octets and the extension octets, the extension
+// bit set when there are any, bit 7 of every extension octet but the last set.
+@tier(app)
+fn rcs_feature_field(config: RcsConfig) -> [u8]
+    let n = list.len(config.extension)
+    var f = config.features & F_DEFINED
+    if n > 0
+        f = f | F_EXTENSION
+    var out: [u8] = []
+    wire.put(var out, f, 3)
+    for i in 0..n
+        let b = (config.extension[i] as Int) & 0x7F
+        let more = if i + 1 < n then b | 0x80 else b
+        list.push(out, more as u8)
+    out
+
+// The RC Feature value: the E2E-CRC field (0xFFFF without E2E-CRC) and the field.
+@tier(app)
+fn rcs_feature_value(config: RcsConfig) -> [u8]
+    let field = rcs_feature_field(config)
+    let crc = if (config.features & F_E2E_CRC) != 0 then crc16(field) else 0xFFFF
+    var out: [u8] = []
+    wire.put(var out, crc, 2)
+    list.append(out, field)
+    out
+
+// The RC Settings value read by `client`: the Length, the Settings field with
+// Access Permitted set for the client that holds Limited Access, and the
+// E2E-CRC field.
+@tier(app)
+fn rcs_settings_value(config: RcsConfig, state: RcsState, client: Int) -> [u8]
+    let e2e = (config.features & F_E2E_CRC) != 0
+    var s0 = state.settings & 0x3F
+    if (state.settings & S_LIMITED_ACCESS) != 0 and state.owner == client and client != NO_CLIENT
+        s0 = s0 | S_ACCESS_PERMITTED
+    let length = if e2e then 5 else 3
+    var out: [u8] = [length as u8, s0 as u8, (state.mode & 3) as u8]
+    if e2e
+        wire.put(var out, crc16(out), 2)
+    out
+
+// `value` with the E2E-CRC field appended when the device supports it.
+@tier(app)
+fn rcs_frame(config: RcsConfig, value: [u8]) -> [u8]
+    if (config.features & F_E2E_CRC) == 0
+        return value[:]
+    var out: [u8] = value[:]
+    wire.put(var out, crc16(value), 2)
+    out
+
+// The eight parameters `v` as the 16 octets of Table 3.8; a parameter the
+// device does not support, or one that `v` lacks, is 0xFFFF.
+@tier(app)
+fn rcs_parameter_octets(features: Int, v: [Int]) -> [u8]
+    var out: [u8] = []
+    for f in 0..PARAMETERS
+        let x = if f < list.len(v) and rcs_field_supported(features, f) then v[f] else KEEP
+        wire.put(var out, x, 2)
+    out
+
+// A Procedure Response: the request opcode, the result code and, for Out of
+// Range and Invalid Combination, the octet that names the fields at fault.
+@tier(app)
+fn rcs_result(op: Int, code: Int, fields: Int) -> [u8]
+    var out: [u8] = [OP_PROCEDURE_RESPONSE as u8, op as u8, code as u8]
+    if fields >= 0
+        list.push(out, fields as u8)
+    out
+
+// A response of the opcode `op` and the 16 octets of parameters.
+@tier(app)
+fn rcs_parameter_response(features: Int, code: Int, request: Int, v: [Int]) -> [u8]
+    var out: [u8] = [code as u8]
+    if code == OP_PARAMETER_RESPONSE
+        list.push(out, request as u8)
+    list.append(out, rcs_parameter_octets(features, v))
+    out
+
+// The Client Parameter Indication for the connection `v`: the minimum and the
+// maximum connection interval are both the interval in use.
+@tier(app)
+fn rcs_client_value(features: Int, v: [Int]) -> [u8]
+    var same: [Int] = v[:]
+    if list.len(same) > 2
+        same[2] = same[1]
+    rcs_parameter_response(features, OP_CLIENT_PARAMETERS, 0, same)
+
+// Whether the CRC of the control point value `value` is wrong: 0, or the
+// Application Error Code.  A value too short to hold an opcode and a CRC, or
+// exactly as long as an opcode and its operand, has no CRC.
+@tier(app)
+fn rcs_crc_error(value: [u8]) -> Int
+    let n = list.len(value)
+    if n < 3
+        return ERR_MISSING_CRC
+    let want = rcs_operand_length(value[0] as Int)
+    if want >= 0 and n == 1 + want
+        return ERR_MISSING_CRC
+    if wire.get(value, n - 2, 2) != crc16(value[0:n - 2])
+        return ERR_INVALID_CRC
+    0
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_rcs_service(var db: GattDb, config: RcsConfig) -> Result<RcsHandles, profile_builder.ProfileError>
+    if config.sets < 1 or config.sets > 255 or list.len(config.extension) > 8 or config.filter_min > config.filter_max
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_RECONNECTION_CONFIGURATION_SERVICE))!
+    let props = if config.changes then gatt_server.PROP_READ | gatt_server.PROP_INDICATE else gatt_server.PROP_READ
+    let feature = profile_builder.add_value(
+        var db, props, profile_builder.read_only(config.access), gatt_server.le16(UUID_RC_FEATURE), rcs_feature_value(config))!
+    let cccd_permissions = gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access }
+    var feature_cccd = 0
+    if config.changes
+        feature_cccd = profile_builder.add_cccd(var db, cccd_permissions)!
+    var settings = 0
+    var settings_cccd = 0
+    if rcs_has_settings(config.features)
+        settings = profile_builder.add_value(
+            var db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, profile_builder.read_only(config.access),
+            gatt_server.le16(UUID_RC_SETTINGS), rcs_settings_value(config, new_rcs_state(), NO_CLIENT))!
+        settings_cccd = profile_builder.add_cccd(var db, cccd_permissions)!
+    var control_point = 0
+    var control_point_cccd = 0
+    if rcs_has_control_point(config.features)
+        let cp = sensor_control.add_control_point_with_errors(
+            var db, UUID_RC_CONTROL_POINT, config.access, cccd_permissions,
+            att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        control_point = cp.0
+        control_point_cccd = cp.1
+    Ok(RcsHandles {
+        service: service as u16, feature: feature as u16, feature_cccd: feature_cccd as u16, settings: settings as u16, settings_cccd: settings_cccd as u16,
+        control_point: control_point as u16, control_point_cccd: control_point_cccd as u16 })
+
+// Set or clear the Settings bit `bit`.
+@tier(embedded)
+@no_alloc
+fn rcs_set_bit(var state: RcsState, bit: Int, on: Bool)
+    if on
+        state.settings = state.settings | bit
+    else
+        state.settings = state.settings & (0xFF ^ bit)
+
+// The set the operand `operand` names, -1 when the device has no such set.
+@tier(embedded)
+@no_alloc
+fn rcs_set_of(config: RcsConfig, operand: [u8]) -> Int
+    let set = operand[0] as Int
+    if set < config.sets then set else -1
+
+// The result code a policy may answer to a proposal or an activation, else Operation Failed.
+@tier(embedded)
+@no_alloc
+fn rcs_allowed(code: Int) -> Int
+    if code == RESULT_SUCCESS or code == RESULT_REJECTED or code == RESULT_PROPOSAL_ACCEPTED or code == RESULT_INVALID_COMBINATION
+        return code
+    RESULT_OPERATION_FAILED
+
+// Run the procedure `request` (opcode and operand, the CRC already taken off)
+// of `client` and answer the value to indicate.
+@tier(app)
+fn rcs_procedure<P: RcsPolicy[e]>(config: RcsConfig, var state: RcsState, var policy: P, client: Int, request: [u8]) -> [u8] [e, mutate]
+    let op = request[0] as Int
+    let operand = if list.len(request) > 1 then request[1:list.len(request)] else []
+    let features = config.features
+    if not rcs_supported(features, op)
+        return rcs_result(op, RESULT_OP_CODE_NOT_SUPPORTED, -1)
+    if list.len(operand) != rcs_operand_length(op)
+        return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+    if op == OP_ENABLE_DISCONNECT
+        if policy.busy()
+            return rcs_result(op, RESULT_DEVICE_BUSY, -1)
+        let done = policy.request_disconnect()
+        return rcs_result(op, if done then RESULT_SUCCESS else RESULT_OPERATION_FAILED, -1)
+    if op == OP_GET_ACTUAL
+        return rcs_client_value(features, policy.actual())
+    if op == OP_PROPOSE_SETTINGS
+        var values: [Int] = []
+        var fields = 0
+        for f in 0..PARAMETERS
+            let v = if rcs_field_supported(features, f) then wire.get(operand, 2 * f, 2) else KEEP
+            if not rcs_field_in_range(f, v)
+                fields = fields | (1 << f)
+            list.push(values, v)
+        if values[1] != KEEP and values[2] != KEEP and values[1] > values[2]
+            fields = fields | 0x06
+        if fields != 0
+            return rcs_result(op, RESULT_OUT_OF_RANGE, fields)
+        let r = policy.propose(values)
+        let code = rcs_allowed(r.0)
+        let at_fault = if code == RESULT_INVALID_COMBINATION then r.1 & 0xFF else -1
+        return rcs_result(op, code, at_fault)
+    if op == OP_ACTIVATE_STORED
+        let set = rcs_set_of(config, operand)
+        if set < 0
+            return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+        let code = rcs_allowed(policy.activate(set))
+        if code == RESULT_INVALID_COMBINATION
+            return rcs_result(op, RESULT_OPERATION_FAILED, -1)
+        return rcs_result(op, code, -1)
+    if op == OP_GET_MAX or op == OP_GET_MIN
+        return rcs_parameter_response(features, OP_PARAMETER_RESPONSE, op, policy.limit(op == OP_GET_MAX))
+    if op == OP_GET_STORED
+        let set = rcs_set_of(config, operand)
+        if set < 0
+            return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+        return rcs_parameter_response(features, OP_PARAMETER_RESPONSE, op, policy.stored(set))
+    if op == OP_SET_FILTER_TIMER
+        let v = wire.get(operand, 0, 4)
+        if v != 0 and v != FILTER_TIMER_NONE and (v < config.filter_min or v > config.filter_max)
+            return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+        state.filter_timer = v
+        return rcs_result(op, RESULT_SUCCESS, -1)
+    if op == OP_GET_FILTER_TIMER
+        var out: [u8] = [OP_FILTER_TIMER_RESPONSE]
+        wire.put(var out, state.filter_timer, 4)
+        wire.put(var out, config.filter_min, 4)
+        wire.put(var out, config.filter_max, 4)
+        return out
+    if op == OP_SET_ADVERTISEMENT
+        let configuration = operand[0] as Int
+        if configuration > 3 or (features & (F_ADV_CONFIG_1 << configuration)) == 0
+            return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+        if not policy.advertise(configuration)
+            return rcs_result(op, RESULT_OPERATION_FAILED, -1)
+        state.mode = configuration
+        return rcs_result(op, RESULT_SUCCESS, -1)
+    // The three switches take 0xFF for true and 0x00 for false.
+    let flag = operand[0] as Int
+    if flag != 0xFF and flag != 0x00
+        return rcs_result(op, RESULT_INVALID_OPERAND, -1)
+    let on = flag == 0xFF
+    if op == OP_LIMITED_ACCESS
+        rcs_set_bit(var state, S_LIMITED_ACCESS, on)
+        state.owner = if on then client else NO_CLIENT
+        return rcs_result(op, RESULT_SUCCESS, -1)
+    let setting = if op == OP_LESC_ONLY then SETTING_LESC_ONLY else SETTING_USE_OOB
+    if not policy.apply(setting, on)
+        return rcs_result(op, RESULT_OPERATION_FAILED, -1)
+    rcs_set_bit(var state, if op == OP_LESC_ONLY then S_LESC_ONLY else S_USE_OOB, on)
+    rcs_result(op, RESULT_SUCCESS, -1)
+
+// Store `value` (CRC appended when supported) as the control point value and
+// answer its indication, none when the client has not enabled them.
+@tier(app)
+fn rcs_indicate(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, value: [u8], now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handles.control_point, rcs_frame(config, value))
+    gatt_server.send_value(var db, var link, handles.control_point, now_ms)
+
+// Answer one ATT PDU of the client of `link`, whom `link.identity` names: a write
+// to the control point is evaluated before its Write Response, and its response
+// follows the Write Response as an indication.  A read of RC Settings shows the
+// Access Permitted bit for this client.
+@tier(app)
+fn rcs_receive<P: RcsPolicy[e]>(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, var state: RcsState, var policy: P, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let client = link.identity
+    if handles.settings != 0
+        let _ = gatt_server.set_value(var db, handles.settings, rcs_settings_value(config, state, client))
+    let is_write = handles.control_point != 0 and list.len(pdu) >= 3 and pdu[0] as Int == att.ATT_OP_WRITE_REQ and gatt_server.read_le16(pdu, 1) == handles.control_point
+    if not is_write
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.control_point), true)
+    if access != 0
+        return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, access)
+    let value = pdu[3:list.len(pdu)]
+    var request = value[:]
+    if (config.features & F_E2E_CRC) != 0
+        let crc = rcs_crc_error(value)
+        if crc != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, crc)
+        request = value[0:list.len(value) - 2]
+    if list.len(request) == 0
+        return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    if (state.settings & S_LIMITED_ACCESS) != 0 and state.owner != client and rcs_modifies(request[0] as Int)
+        return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if list.len(out) > 0 and out[0][0] as Int == att.ATT_OP_WRITE_RSP
+        let response = rcs_procedure(config, var state, var policy, client, request)
+        list.append(out, rcs_indicate(var db, var link, handles, config, response, now_ms))
+    out
+
+// The Client Parameter Indication for the parameters `v` of the connection in
+// use, sent once the connection parameters of an accepted proposal are applied
+// ([RCS] 3.3.2.3), whatever the client asked.
+@tier(app)
+fn rcs_client_parameters(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, v: [Int], now_ms: Int) -> [[u8]]
+    if handles.control_point == 0
+        return []
+    rcs_indicate(var db, var link, handles, config, rcs_client_value(config.features, v), now_ms)
+
+// Notify RC Settings to the client `client`: after a setting changed.
+@tier(app)
+fn rcs_notify_settings(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, state: RcsState, client: Int, now_ms: Int) -> [[u8]]
+    if handles.settings == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.settings, rcs_settings_value(config, state, client))
+    gatt_server.send_value(var db, var link, handles.settings, now_ms)
+
+// The device is ready for disconnect (or no longer is): the bit of RC Settings,
+// notified; nothing when the feature is not supported.
+@tier(app)
+fn rcs_set_ready_for_disconnect(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, var state: RcsState, ready: Bool, client: Int, now_ms: Int) -> [[u8]]
+    if (config.features & F_READY_FOR_DISCONNECT) == 0
+        return []
+    rcs_set_bit(var state, S_READY_FOR_DISCONNECT, ready)
+    rcs_notify_settings(var db, var link, handles, config, state, client, now_ms)
+
+// Indicate RC Feature after a reconnection when the features changed, for a
+// service built with `changes`.
+@tier(app)
+fn rcs_features_changed(var db: GattDb, var link: AttLink, handles: RcsHandles, config: RcsConfig, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.feature, rcs_feature_value(config))
+    gatt_server.send_value(var db, var link, handles.feature, now_ms)
+
+// The bond of `client` is gone and the device disconnected: Limited Access
+// held by it ends ([RCS] 3.3.2.13).
+@tier(embedded)
+@no_alloc
+fn rcs_client_forgotten(var state: RcsState, client: Int)
+    if state.owner == client and (state.settings & S_LIMITED_ACCESS) != 0
+        rcs_set_bit(var state, S_LIMITED_ACCESS, false)
+        state.owner = NO_CLIENT

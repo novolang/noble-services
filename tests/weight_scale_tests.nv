@@ -1,0 +1,449 @@
+// tests/weight_scale_tests.nv — the unit tests of src/weight_scale.nv.
+//
+//   novo test tests/weight_scale_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use fixtures.{ req }
+use wire
+use weight_scale.{ USER_UNKNOWN, WEIGHT_UNSUCCESSFUL, WSS_BAD_FIELD, WSS_BMI_NOT_SUPPORTED, WSS_BMI_REQUIRED, WSS_OK, WSS_STORE_PER_USER, WSS_TIME_STAMP_INVALID, WSS_TIME_STAMP_MISMATCH, WSS_UNSUCCESSFUL_WITH_FIELDS, WSS_USER_MISMATCH, WssConfig, WssFeatures, add_wss_service, basic, default_wss_config, everything, full_measurement, new_wss_store, server, wss_feature_value, wss_features_valid, wss_indicate, wss_indicate_feature, wss_measurement, wss_measurement_error, wss_measurement_value, wss_send_next, wss_service_data, wss_set_features, wss_store_confirmed, wss_store_count, wss_store_link_lost, wss_store_push, wss_time_valid }
+
+@tier(app)
+fn read_of(var s: GattServer, handle: Int) -> [u8]
+    gatt_server.receive(var s.db, var s.link, req(0x0A, handle, []), 0)[0]
+
+@tier(app)
+fn subscribe(var s: GattServer, handle: Int, value: Int)
+    let r = gatt_server.receive(var s.db, var s.link, req(0x12, handle, [value, 0]), 0)
+    test.assert_eq(r[0], [0x13])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_service_has_a_readable_feature_and_an_indicated_measurement()
+    var (s, h) = server(default_wss_config(basic()))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.included, 0)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.feature_cccd, 0)
+    test.assert_eq(h.measurement, 5)
+    test.assert_eq(h.measurement_cccd, 6)
+    test.assert_eq(gatt_server.last_handle(s.db), 6)
+    test.assert_eq(s.db.attributes[0].value, [0x1D, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 0x03, 0x00, 0x9E, 0x2A])
+    test.assert_eq(s.db.attributes[3].value, [0x20, 0x05, 0x00, 0x9D, 0x2A])
+    test.assert_eq(read_of(var s, h.feature), [0x0B, 0, 0, 0, 0])
+    // The measurement is indicated only: it cannot be read, and neither can be written.
+    test.assert_eq(read_of(var s, h.measurement)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.feature, [1, 0, 0, 0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The descriptor is read and written to configure indications.
+    test.assert_eq(read_of(var s, h.measurement_cccd), [0x0B, 0, 0])
+    subscribe(var s, h.measurement_cccd, 2)
+    test.assert_eq(read_of(var s, h.measurement_cccd), [0x0B, 2, 0])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_feature_value_carries_the_support_and_resolution_bits()
+    test.assert_eq(wss_feature_value(basic()), [0, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: true, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 0 }), [0x01, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: true, bmi: false, weight_resolution: 0, height_resolution: 0 }), [0x02, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 0, height_resolution: 0 }), [0x04, 0, 0, 0])
+    // Bits 3 to 6 and 7 to 9.
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: false, bmi: false, weight_resolution: 1, height_resolution: 0 }), [0x08, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: false, bmi: false, weight_resolution: 7, height_resolution: 0 }), [0x38, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 0, height_resolution: 1 }), [0x84, 0, 0, 0])
+    test.assert_eq(wss_feature_value(WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 0, height_resolution: 3 }), [0x84, 0x01, 0, 0])
+    test.assert_eq(wss_feature_value(everything()), [0xBF, 0x01, 0, 0])
+    var (s, h) = server(default_wss_config(everything()))
+    test.assert_eq(read_of(var s, h.feature), [0x0B, 0xBF, 0x01, 0, 0])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_feature_with_a_reserved_value_is_refused_when_added_and_when_changed()
+    for f in [
+        WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 8, height_resolution: 0 },
+        WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 0, height_resolution: 4 },
+        WssFeatures { time_stamp: false, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 1 }]
+        test.assert(not wss_features_valid(f))
+        var s = gatt_server.new_server([], 65)
+        match add_wss_service(var s.db, default_wss_config(f))
+            Ok(_) => test.fail("the feature value sets a Reserved bit")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+        test.assert_eq(gatt_server.last_handle(s.db), 0)
+    var (t, h) = server(default_wss_config(basic()))
+    test.assert(wss_set_features(var t.db, h, everything()))
+    test.assert_eq(read_of(var t, h.feature), [0x0B, 0xBF, 0x01, 0, 0])
+    test.assert(not wss_set_features(var t.db, h, WssFeatures { time_stamp: false, multiple_users: false, bmi: false, weight_resolution: 8, height_resolution: 0 }))
+    test.assert_eq(read_of(var t, h.feature), [0x0B, 0xBF, 0x01, 0, 0])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_feature_indicates_only_when_the_product_says_it_can_change()
+    let config = WssConfig { features: everything(), access: gatt_server.Access.Encrypted, feature_indicate: true, included_service: 0 }
+    var (s, h) = server(config)
+    test.assert_eq(h.feature_cccd, 4)
+    test.assert_eq(h.measurement, 6)
+    test.assert_eq(h.measurement_cccd, 7)
+    test.assert_eq(s.db.attributes[1].value, [0x22, 0x03, 0x00, 0x9E, 0x2A])
+    // Not subscribed: nothing; subscribed: the value.
+    test.assert_eq(list.len(wss_indicate_feature(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.feature_cccd, 2)
+    test.assert_eq(wss_indicate_feature(var s.db, var s.link, h, 0)[0], wire.octets([0x1D, h.feature, 0, 0xBF, 0x01, 0, 0]))
+    // A scale whose feature is static has nothing to indicate.
+    var (t, th) = server(default_wss_config(everything()))
+    test.assert_eq(list.len(wss_indicate_feature(var t.db, var t.link, th, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_characteristics_need_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let h = add_wss_service(var s.db, default_wss_config(basic()))!
+    // No encryption, no key: authentication is what a client lacks.
+    test.assert_eq(read_of(var s, h.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // A key the link has not encrypted with yet: encryption is.
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 16, true))
+    test.assert_eq(read_of(var s, h.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    // Level 2 is enough; the access can be raised to authenticated.
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(read_of(var s, h.feature), [0x0B, 0, 0, 0, 0])
+    var t = gatt_server.new_server([], 65)
+    let config = WssConfig { features: basic(), access: gatt_server.Access.Authenticated, feature_indicate: false, included_service: 0 }
+    let th = add_wss_service(var t.db, config)!
+    gatt_server.set_security(var t.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(read_of(var t, th.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var t.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read_of(var t, th.feature), [0x0B, 0, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_measurement_value_orders_the_fields_after_the_flags_and_the_weight()
+    // 70.000 kg alone: Flags 0, weight 14000 = 0x36B0.
+    test.assert_eq(wss_measurement_value(wss_measurement(14000)), [0x00, 0xB0, 0x36])
+    // Imperial: 154.32 lb = 15432 = 0x3C48.
+    var lb = wss_measurement(15432)
+    lb.imperial = true
+    test.assert_eq(wss_measurement_value(lb), [0x01, 0x48, 0x3C])
+    // The time stamp: 2026 = 0x07EA, 10, 27, 14, 30, 5.
+    var t = wss_measurement(14000)
+    t.has_time_stamp = true
+    t.time = wire.date_time(2026, 10, 27, 14, 30, 5)
+    test.assert_eq(wss_measurement_value(t), [0x02, 0xB0, 0x36, 0xEA, 0x07, 10, 27, 14, 30, 5])
+    var u = wss_measurement(14000)
+    u.has_user = true
+    u.user_id = USER_UNKNOWN
+    test.assert_eq(wss_measurement_value(u), [0x04, 0xB0, 0x36, 0xFF])
+    // BMI 22.9 = 229 and height 1.75 m = 1750 = 0x06D6, as a pair.
+    var b = wss_measurement(14000)
+    b.has_bmi = true
+    b.bmi = 229
+    b.height = 1750
+    test.assert_eq(wss_measurement_value(b), [0x08, 0xB0, 0x36, 0xE5, 0x00, 0xD6, 0x06])
+    // All of them, in the order of the table.
+    test.assert_eq(wss_measurement_value(full_measurement()), [0x0E, 0xB0, 0x36, 0xEA, 0x07, 10, 27, 14, 30, 5, 2, 0xE5, 0x00, 0xD6, 0x06])
+    // Measurement Unsuccessful is the weight 0xFFFF.
+    var bad = wss_measurement(WEIGHT_UNSUCCESSFUL)
+    bad.has_user = true
+    bad.user_id = 1
+    test.assert_eq(wss_measurement_value(bad), [0x04, 0xFF, 0xFF, 0x01])
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_field_is_present_exactly_when_its_feature_bit_is_set()
+    let f = everything()
+    test.assert_eq(wss_measurement_error(f, false, full_measurement()), WSS_OK)
+    // The time stamp and the user ID follow the feature bits both ways.
+    var no_time = full_measurement()
+    no_time.has_time_stamp = false
+    test.assert_eq(wss_measurement_error(f, false, no_time), WSS_TIME_STAMP_MISMATCH)
+    var no_user = full_measurement()
+    no_user.has_user = false
+    test.assert_eq(wss_measurement_error(f, false, no_user), WSS_USER_MISMATCH)
+    test.assert_eq(wss_measurement_error(basic(), false, full_measurement()), WSS_TIME_STAMP_MISMATCH)
+    var time_only = wss_measurement(1000)
+    time_only.has_time_stamp = true
+    time_only.time = wire.date_time(2026, 1, 1, 0, 0, 0)
+    test.assert_eq(wss_measurement_error(basic(), false, time_only), WSS_TIME_STAMP_MISMATCH)
+    var user_only = wss_measurement(1000)
+    user_only.has_user = true
+    test.assert_eq(wss_measurement_error(basic(), false, user_only), WSS_USER_MISMATCH)
+    // BMI and Height only with the BMI feature.
+    var b = wss_measurement(1000)
+    b.has_bmi = true
+    test.assert_eq(wss_measurement_error(basic(), false, b), WSS_BMI_NOT_SUPPORTED)
+    let bmi_only = WssFeatures { time_stamp: false, multiple_users: false, bmi: true, weight_resolution: 0, height_resolution: 1 }
+    test.assert_eq(wss_measurement_error(bmi_only, false, b), WSS_OK)
+    // The pair is optional, until a Body Composition Service is included.
+    test.assert_eq(wss_measurement_error(bmi_only, false, wss_measurement(1000)), WSS_OK)
+    test.assert_eq(wss_measurement_error(bmi_only, true, wss_measurement(1000)), WSS_BMI_REQUIRED)
+    test.assert_eq(wss_measurement_error(bmi_only, true, b), WSS_OK)
+    // A measurement that did not succeed carries no BMI, and needs none.
+    var failed = wss_measurement(WEIGHT_UNSUCCESSFUL)
+    test.assert_eq(wss_measurement_error(bmi_only, true, failed), WSS_OK)
+    failed.has_bmi = true
+    test.assert_eq(wss_measurement_error(bmi_only, true, failed), WSS_UNSUCCESSFUL_WITH_FIELDS)
+    // The time stamp and user ID stay with an unsuccessful measurement.
+    var failed_full = full_measurement()
+    failed_full.weight = WEIGHT_UNSUCCESSFUL
+    failed_full.has_bmi = false
+    test.assert_eq(wss_measurement_error(everything(), true, failed_full), WSS_OK)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_time_stamp_is_a_date_time_without_unknown_parts()
+    let f = everything()
+    var m = full_measurement()
+    test.assert(wss_time_valid(m))
+    // The ends of every field.
+    for (year, month, day, hours, minutes, seconds) in [(1582, 1, 1, 0, 0, 0), (9999, 12, 31, 23, 59, 59)]
+        m.time = wire.date_time(year, month, day, hours, minutes, seconds)
+        test.assert_eq(wss_measurement_error(f, false, m), WSS_OK)
+    // Unknown (zero) year, month or day is not allowed here, nor is anything outside the Date Time.
+    for (year, month, day, hours, minutes, seconds) in [
+        (0, 10, 27, 14, 30, 5), (1581, 10, 27, 14, 30, 5), (10000, 10, 27, 14, 30, 5), (2026, 0, 27, 14, 30, 5), (2026, 13, 27, 14, 30, 5),
+        (2026, 10, 0, 14, 30, 5), (2026, 10, 32, 14, 30, 5), (2026, 10, 27, 24, 30, 5), (2026, 10, 27, -1, 30, 5), (2026, 10, 27, 14, 60, 5),
+        (2026, 10, 27, 14, 30, 60), (2026, 10, 27, 14, 30, -1)]
+        m.time = wire.date_time(year, month, day, hours, minutes, seconds)
+        test.assert_eq(wss_measurement_error(f, false, m), WSS_TIME_STAMP_INVALID)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_field_outside_its_width_is_refused()
+    let f = everything()
+    var m = full_measurement()
+    m.weight = 0x10000
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_BAD_FIELD)
+    m = full_measurement()
+    m.weight = -1
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_BAD_FIELD)
+    m = full_measurement()
+    m.user_id = 256
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_BAD_FIELD)
+    m = full_measurement()
+    m.bmi = 0x10000
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_BAD_FIELD)
+    m = full_measurement()
+    m.height = -5
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_BAD_FIELD)
+    // The largest weight of a successful measurement, and the ends of the others.
+    m = full_measurement()
+    m.weight = 0xFFFE
+    m.bmi = 0xFFFF
+    m.height = 0
+    m.user_id = 0
+    test.assert_eq(wss_measurement_error(f, false, m), WSS_OK)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_measurement_is_indicated_to_a_subscribed_client_and_the_next_waits_for_the_confirmation()
+    let f = everything()
+    var (s, h) = server(default_wss_config(f))
+    // Not subscribed: nothing, and the value stays empty.
+    test.assert_eq(list.len(wss_indicate(var s.db, var s.link, h, f, false, full_measurement(), 0)), 0)
+    subscribe(var s, h.measurement_cccd, 2)
+    let first = wss_indicate(var s.db, var s.link, h, f, false, full_measurement(), 0)
+    test.assert_eq(first[0], wire.octets([0x1D, h.measurement, 0, 0x0E, 0xB0, 0x36, 0xEA, 0x07, 10, 27, 14, 30, 5, 2, 0xE5, 0x00, 0xD6, 0x06]))
+    // A second indication is held until the first is confirmed.
+    var second = full_measurement()
+    second.weight = 14100
+    test.assert_eq(list.len(wss_indicate(var s.db, var s.link, h, f, false, second, 1)), 0)
+    let confirmed = gatt_server.receive(var s.db, var s.link, [0x1E], 2)
+    test.assert_eq(list.len(confirmed), 1)
+    test.assert_eq(confirmed[0][3] as Int, 0x0E)
+    test.assert_eq(confirmed[0][4] as Int, 0x14)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_measurement_that_breaks_a_rule_is_not_indicated_and_the_value_stays()
+    let f = basic()
+    var (s, h) = server(default_wss_config(f))
+    subscribe(var s, h.measurement_cccd, 2)
+    test.assert_eq(list.len(wss_indicate(var s.db, var s.link, h, f, false, full_measurement(), 0)), 0)
+    var no_time_wanted = wss_measurement(14000)
+    no_time_wanted.has_time_stamp = true
+    test.assert_eq(list.len(wss_indicate(var s.db, var s.link, h, f, false, no_time_wanted, 0)), 0)
+    test.assert_eq(list.len(s.db.attributes[gatt_server.index_of(s.db, h.measurement)].value), 0)
+    // A right one goes out.
+    test.assert_eq(list.len(wss_indicate(var s.db, var s.link, h, f, false, wss_measurement(14000), 0)), 1)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_an_included_body_composition_service_needs_bmi_and_a_service_handle()
+    var s = gatt_server.new_server([], 65)
+    // The secondary Body Composition Service is added first.
+    let bcs = gatt_server.add_service(var s.db, true, gatt_server.le16(0x181B))
+    test.assert_eq(bcs, 1)
+    let bmi = WssFeatures { time_stamp: true, multiple_users: false, bmi: true, weight_resolution: 3, height_resolution: 3 }
+    let config = WssConfig { features: bmi, access: gatt_server.Access.Encrypted, feature_indicate: false, included_service: bcs }
+    let h = add_wss_service(var s.db, config)!
+    test.assert_eq(h.service, 2)
+    test.assert_eq(h.included, 3)
+    test.assert_eq(h.feature, 5)
+    test.assert_eq(s.db.attributes[2].type_uuid, [0x02, 0x28])
+    test.assert_eq(s.db.attributes[2].included, bcs)
+    // Without the BMI feature the Weight Measurement could not carry what the profile requires.
+    var t = gatt_server.new_server([], 65)
+    let tb = gatt_server.add_service(var t.db, true, gatt_server.le16(0x181B))
+    match add_wss_service(var t.db, WssConfig { features: basic(), access: gatt_server.Access.Encrypted, feature_indicate: false, included_service: tb })
+        Ok(_) => test.fail("the Height and BMI fields are required with a Body Composition Service")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    // A handle that is not a service declaration cannot be included.
+    var u = gatt_server.new_server([], 65)
+    let ub = gatt_server.add_service(var u.db, true, gatt_server.le16(0x181B))
+    let c = gatt_server.add_characteristic(var u.db, gatt_server.PROP_READ, gatt_server.PERM_READ, gatt_server.le16(0x2A9B))
+    test.assert(c > ub)
+    match add_wss_service(var u.db, WssConfig { features: bmi, access: gatt_server.Access.Encrypted, feature_indicate: false, included_service: c })
+        Ok(_) => test.fail("a characteristic is not a service")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_wss_service(var s.db, default_wss_config(basic()))
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_scale_without_the_time_stamp_feature_stores_nothing()
+    var backlog = new_wss_store(WSS_STORE_PER_USER)
+    test.assert(not wss_store_push(var backlog, basic(), false, wss_measurement(14000)))
+    test.assert_eq(wss_store_count(backlog), 0)
+    // With the feature a valid measurement is kept and an invalid one is not.
+    let f = WssFeatures { time_stamp: true, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 0 }
+    var timed = wss_measurement(14000)
+    timed.has_time_stamp = true
+    timed.time = wire.date_time(2026, 10, 27, 0, 0, 0)
+    test.assert(wss_store_push(var backlog, f, false, timed))
+    test.assert(not wss_store_push(var backlog, f, false, wss_measurement(14000)))
+    test.assert_eq(wss_store_count(backlog), 1)
+    var none = new_wss_store(0)
+    test.assert(not wss_store_push(var none, f, false, timed))
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_stored_measurements_go_oldest_first_and_leave_only_when_confirmed()
+    let f = WssFeatures { time_stamp: true, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 0 }
+    var (s, h) = server(default_wss_config(f))
+    var backlog = new_wss_store(WSS_STORE_PER_USER)
+    for w in [14000, 14100, 14200]
+        var m = wss_measurement(w)
+        m.has_time_stamp = true
+        m.time = wire.date_time(2026, 10, 27, 0, 0, 0)
+        test.assert(wss_store_push(var backlog, f, false, m))
+    // Not subscribed: nothing is sent and nothing is lost.
+    test.assert_eq(list.len(wss_send_next(var s.db, var s.link, h, var backlog, f, false, 0)), 0)
+    test.assert_eq(wss_store_count(backlog), 3)
+    subscribe(var s, h.measurement_cccd, 2)
+    let first = wss_send_next(var s.db, var s.link, h, var backlog, f, false, 0)
+    test.assert_eq(first[0][4] as Int, 0xB0)
+    // While the first waits for its confirmation the next is not sent.
+    test.assert_eq(list.len(wss_send_next(var s.db, var s.link, h, var backlog, f, false, 1)), 0)
+    test.assert_eq(wss_store_count(backlog), 3)
+
+// A fresh connection to the server of the test above, subscribed to indications.
+@tier(app)
+fn full_link_for(s: GattServer) -> AttLink
+    var link = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var link, gatt_server.link_security(true, 2, 16, true))
+    link
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_a_confirmed_measurement_is_not_sent_again_and_a_lost_one_is()
+    let f = WssFeatures { time_stamp: true, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 0 }
+    var (s, h) = server(default_wss_config(f))
+    var backlog = new_wss_store(WSS_STORE_PER_USER)
+    for w in [14000, 14100]
+        var m = wss_measurement(w)
+        m.has_time_stamp = true
+        m.time = wire.date_time(2026, 10, 27, 0, 0, 0)
+        test.assert(wss_store_push(var backlog, f, false, m))
+    subscribe(var s, h.measurement_cccd, 2)
+    test.assert_eq(wss_send_next(var s.db, var s.link, h, var backlog, f, false, 0)[0][4] as Int, 0xB0)
+    // The confirmation removes the first; the second goes out next.
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 1)
+    wss_store_confirmed(var backlog)
+    test.assert_eq(wss_store_count(backlog), 1)
+    test.assert_eq(wss_send_next(var s.db, var s.link, h, var backlog, f, false, 2)[0][4] as Int, 0x14)
+    // The link ends before the second is confirmed: it stays, and a new connection sends it.
+    wss_store_link_lost(var backlog)
+    test.assert_eq(wss_store_count(backlog), 1)
+    var next = full_link_for(s)
+    let _ = gatt_server.receive(var s.db, var next, req(0x12, h.measurement_cccd, [2, 0]), 3)
+    test.assert_eq(wss_send_next(var s.db, var next, h, var backlog, f, false, 4)[0][4] as Int, 0x14)
+    wss_store_confirmed(var backlog)
+    test.assert_eq(wss_store_count(backlog), 0)
+    // A confirmation with nothing in flight changes nothing.
+    wss_store_confirmed(var backlog)
+    test.assert_eq(wss_store_count(backlog), 0)
+    test.assert_eq(list.len(wss_send_next(var s.db, var next, h, var backlog, f, false, 5)), 0)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_store_keeps_a_number_of_measurements_for_each_user_and_purges_the_oldest_of_that_user()
+    let f = WssFeatures { time_stamp: true, multiple_users: true, bmi: false, weight_resolution: 0, height_resolution: 0 }
+    var backlog = new_wss_store(3)
+    // Users 1 and 2 alternate; user 1 is the first to fill up.
+    for w in [100, 200, 101, 201, 102, 202, 103]
+        var m = wss_measurement(w)
+        m.has_time_stamp = true
+        m.time = wire.date_time(2026, 10, 27, 0, 0, 0)
+        m.has_user = true
+        m.user_id = if w >= 200 then 2 else 1
+        test.assert(wss_store_push(var backlog, f, false, m))
+    // 103 purged 100, the oldest of user 1; user 2 kept all three.
+    test.assert_eq(wss_store_count(backlog), 6)
+    var weights: [Int] = []
+    for m in backlog.items
+        list.push(weights, m.weight)
+    test.assert_eq(weights, [200, 101, 201, 102, 202, 103])
+    // The oldest measurement, if it is waiting for its confirmation, is not the one purged.
+    var held = new_wss_store(2)
+    for w in [1, 2]
+        var m = wss_measurement(w)
+        m.has_time_stamp = true
+        m.time = wire.date_time(2026, 1, 1, 0, 0, 0)
+        m.has_user = true
+        m.user_id = 1
+        test.assert(wss_store_push(var held, f, false, m))
+    held.in_flight = true
+    var m3 = wss_measurement(3)
+    m3.has_time_stamp = true
+    m3.time = wire.date_time(2026, 1, 1, 0, 0, 0)
+    m3.has_user = true
+    m3.user_id = 1
+    test.assert(wss_store_push(var held, f, false, m3))
+    test.assert_eq(held.items[0].weight, 1)
+    test.assert_eq(held.items[1].weight, 3)
+    // With a single slot and that one in flight nothing can be purged.
+    var one = new_wss_store(1)
+    var m4 = wss_measurement(4)
+    m4.has_time_stamp = true
+    m4.time = wire.date_time(2026, 1, 1, 0, 0, 0)
+    m4.has_user = true
+    m4.user_id = 1
+    test.assert(wss_store_push(var one, f, false, m4))
+    one.in_flight = true
+    test.assert(not wss_store_push(var one, f, false, m4))
+    test.assert_eq(wss_store_count(one), 1)
+
+@test
+@satisfies("REQ-BLE-WSS-001")
+fn test_the_service_data_lists_the_users_with_measurements_waiting()
+    test.assert_eq(wss_service_data([]), [0x03, 0x16, 0x1D, 0x18])
+    test.assert_eq(wss_service_data([1, 3]), [0x05, 0x16, 0x1D, 0x18, 1, 3])
+    var many: [Int] = []
+    for k in 0..27
+        list.push(many, k + 1)
+    test.assert_eq(list.len(wss_service_data(many)), 31)
+    test.assert_eq(wss_service_data(many)[0] as Int, 30)
+    list.push(many, 28)
+    test.assert_eq(list.len(wss_service_data(many)), 0)

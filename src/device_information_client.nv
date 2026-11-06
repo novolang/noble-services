@@ -1,0 +1,113 @@
+// src/device_information_client.nv — the Collector side of the Device
+// Information Service (0x180A): the decoders of its characteristics and the client
+// session that reads the ones the peer has.
+//
+// The string characteristics (Manufacturer Name 0x2A29, Model Number 0x2A24, Serial
+// Number 0x2A25, Hardware Revision 0x2A27, Firmware Revision 0x2A26, Software Revision
+// 0x2A28) are UTF-8 text with no terminator; a value may be longer than the ATT_MTU, so the
+// session reads each with Read Long.  `dis_text_length` answers the number of octets of a
+// well-formed UTF-8 string with trailing NUL octets dropped, and -1 for a value that is not
+// UTF-8 (a surrogate, an overlong form, a code point past U+10FFFF or a cut sequence).
+// The System ID (0x2A23) is 8 octets: the 40-bit manufacturer-defined identifier, then the
+// 24-bit organizationally unique identifier.  The PnP ID (0x2A50) is 7 octets: the Vendor ID
+// Source, then the Vendor ID, Product ID and Product Version of 16 bits each.  A value of
+// the wrong length is `None`.
+//
+// The session reads the characteristics it is given, each optional: the service lists
+// only what the peer chooses to expose, and every value arrives as an `SE_VALUE` event
+// naming its characteristic.  The decoders allocate nothing.
+
+use gatt_client
+use links
+use device_information
+use sensor_client
+use wire
+
+// The number of leading octets of `b` that are well-formed UTF-8, once the trailing NUL octets are
+// dropped; -1 when `b` is not UTF-8.
+@tier(embedded)
+@no_alloc
+fn dis_text_length(b: [u8]) -> Int
+    var end = list.len(b)
+    for _ in 0..list.len(b)
+        if end > 0 and b[end - 1] as Int == 0
+            end = end - 1
+    var i = 0
+    for _ in 0..end
+        if i >= end
+            break
+        let c = b[i] as Int
+        var extra = -1
+        var least = 0
+        if c < 0x80
+            extra = 0
+        else if c >= 0xC2 and c <= 0xDF
+            extra = 1
+            least = 0x80
+        else if c >= 0xE0 and c <= 0xEF
+            extra = 2
+            least = 0x800
+        else if c >= 0xF0 and c <= 0xF4
+            extra = 3
+            least = 0x10000
+        if extra < 0 or i + extra >= end
+            return -1
+        var cp = if extra == 0 then c else if extra == 1 then c & 0x1F else if extra == 2 then c & 0x0F else c & 0x07
+        for k in 1..(extra + 1)
+            let cc = b[i + k] as Int
+            if (cc & 0xC0) != 0x80
+                return -1
+            cp = (cp << 6) | (cc & 0x3F)
+        if cp < least or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)
+            return -1
+        i = i + extra + 1
+    end
+
+// A decoded System ID.
+@value
+struct SystemId
+    manufacturer: Int
+    oui: Int
+
+// The System ID in `b`, `None` unless 8 octets.
+@tier(embedded)
+@no_alloc
+fn dis_decode_system_id(b: [u8]) -> ?SystemId
+    if list.len(b) != 8
+        return None
+    Some(SystemId { manufacturer: wire.get(b, 0, 5), oui: wire.get(b, 5, 3) })
+
+// A decoded PnP ID.
+@value
+struct PnpId
+    source: Int
+    vendor: Int
+    product: Int
+    version: Int
+
+// The PnP ID in `b`, `None` unless 7 octets.
+@tier(embedded)
+@no_alloc
+fn dis_decode_pnp_id(b: [u8]) -> ?PnpId
+    if list.len(b) != 7
+        return None
+    Some(PnpId { source: b[0] as Int, vendor: wire.get(b, 1, 2), product: wire.get(b, 3, 2), version: wire.get(b, 5, 2) })
+
+@tier(app)
+fn dis_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, device_information.UUID_DEVICE_INFORMATION_SERVICE)
+
+// Discover the service and read the characteristics in `uuids`, each when the peer has it (Read Long).
+@tier(app)
+fn dis_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, uuids: [Int], now_ms: Int) -> sensor_client.ScStep
+    for u in uuids
+        sensor_client.sc_queue_read_long(var c, u, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// The six strings, the System ID and the PnP ID.
+@tier(app)
+fn dis_all_characteristics() -> [Int]
+    [device_information.UUID_MANUFACTURER_NAME_STRING, device_information.UUID_MODEL_NUMBER_STRING,
+        device_information.UUID_SERIAL_NUMBER_STRING, device_information.UUID_HARDWARE_REVISION_STRING,
+        device_information.UUID_FIRMWARE_REVISION_STRING, device_information.UUID_SOFTWARE_REVISION_STRING,
+        device_information.UUID_SYSTEM_ID, device_information.UUID_PNP_ID]

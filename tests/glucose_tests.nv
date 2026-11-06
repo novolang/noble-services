@@ -1,0 +1,369 @@
+// tests/glucose_tests.nv — the unit tests of src/glucose.nv.
+//
+//   novo test tests/glucose_tests.nv
+
+use std.test
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use racp
+use wire
+use glucose.{ ERR_CCC_IMPROPERLY_CONFIGURED, ERR_PROCEDURE_ALREADY_IN_PROGRESS, GlsConfig, GlsHandles, GlsSession, GlsStore, add_gls_service, default_gls_config, full_config, gls_abandon, gls_context_carbohydrate, gls_context_empty, gls_context_exercise, gls_context_hba1c, gls_context_meal, gls_context_medication, gls_context_tester_health, gls_context_valid, gls_context_value, gls_indicate_feature, gls_measurement, gls_measurement_valid, gls_measurement_value, gls_pump, gls_receive, gls_set_features, gls_store_add, gls_store_count, gls_store_delete, gls_store_keys, gls_with_offset, gls_with_status, gls_without_concentration, new_gls_session, new_gls_store, reading, server }
+
+// A server with the three descriptors subscribed.
+@tier(app)
+fn ready(config: GlsConfig) -> (GattServer, GlsHandles)
+    var built = server(config)
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.measurement_cccd as Int, 1)
+    if h.context != 0
+        subscribe(var s, h.context_cccd as Int, 1)
+    subscribe(var s, h.racp_cccd as Int, 2)
+    (s, h)
+
+// A write to the control point; the PDUs of the answer.
+@tier(app)
+fn write_racp(var s: GattServer, h: GlsHandles, var ledger: GlsStore, var session: GlsSession, value: [Int], config: GlsConfig) -> [[u8]]
+    gls_receive(var s.db, var s.link, h, config.support, var ledger, var session, req(0x12, h.racp as Int, value), 0)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_service_lists_its_characteristics_in_the_table_order()
+    let (s, h) = server(full_config())
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.context, 6)
+    test.assert_eq(h.context_cccd, 7)
+    test.assert_eq(h.feature, 9)
+    test.assert_eq(h.feature_cccd, 10)
+    test.assert_eq(h.racp, 12)
+    test.assert_eq(h.racp_cccd, 13)
+    test.assert_eq(s.db.attributes[1].value, [0x10, 3, 0, 0x18, 0x2A])
+    test.assert_eq(s.db.attributes[7].value, [0x22, 9, 0, 0x51, 0x2A])
+    // Indicate and Write: 0x20 | 0x08.
+    test.assert_eq(s.db.attributes[10].value, [0x28, 12, 0, 0x52, 0x2A])
+    let (min, g) = server(default_gls_config())
+    test.assert_eq(g.context, 0)
+    test.assert_eq(g.racp, 8)
+    test.assert_eq(gatt_server.last_handle(min.db), 9)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_measurement_has_its_fields_in_the_order_of_the_flags()
+    let plain = gls_measurement(wire.date_time(2026, 11, 1, 8, 30, 0), wire.sfloat(95, -5), false, 1, 1)
+    let stored = GlsStore { items: [], next_sequence: 7, capacity: 4, features: 0x07FF, context_supported: true }
+    var st = stored
+    test.assert_eq(gls_store_add(var st, plain, false, gls_context_empty()), 7)
+    let m = st.items[0].measurement
+    // Flags: concentration only.
+    test.assert_eq(gls_measurement_value(m, false), [0x02, 7, 0, 0xEA, 0x07, 11, 1, 8, 30, 0, 0x5F, 0xB0, 0x11])
+    // With the offset (-60 minutes) and mol/L and the status.
+    let full = gls_with_status(gls_with_offset(gls_measurement(wire.date_time(2026, 11, 1, 8, 30, 0), wire.sfloat(55, -4), true, 9, 15), -60), 0x0801)
+    test.assert_eq(gls_measurement_value(full, false), [0x0F, 0, 0, 0xEA, 0x07, 11, 1, 8, 30, 0, 0xC4, 0xFF, 0x37, 0xC0, 0xF9, 0x01, 0x08])
+    // A forced offset is 0 when the measurement has none.
+    test.assert_eq(gls_measurement_value(m, true)[0] as Int, 0x03)
+    // No concentration: the Type-Sample Location goes too.
+    test.assert_eq(list.len(gls_measurement_value(gls_without_concentration(m), false)), 10)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_context_has_its_fields_in_the_order_of_the_flags()
+    let all = gls_context_hba1c(gls_context_medication(gls_context_exercise(gls_context_tester_health(
+        gls_context_meal(gls_context_carbohydrate(gls_context_empty(), 3, wire.sfloat(5, -2)), 2), 1, 5), 3600, 40), 2, wire.sfloat(8, -6), true), wire.sfloat(65, -1))
+    test.assert(gls_context_valid(all))
+    test.assert_eq(gls_context_value(0x0102, all), [
+        0x7F, 0x02, 0x01, 3, 0x05, 0xE0, 2, 0x51, 0x10, 0x0E, 40, 2, 0x08, 0xA0, 0x41, 0xF0])
+    let meal = gls_context_meal(gls_context_empty(), 3)
+    test.assert_eq(gls_context_value(1, meal), [0x02, 1, 0, 3])
+    test.assert_eq(gls_context_value(1, gls_context_medication(gls_context_empty(), 1, 0, false))[0] as Int, 0x10)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_measurement_or_context_that_breaks_a_rule_is_refused()
+    let t = wire.date_time(2026, 11, 1, 8, 30, 0)
+    let ok = gls_measurement(t, wire.sfloat(95, -5), false, 1, 1)
+    test.assert(gls_measurement_valid(0, ok))
+    test.assert(not gls_measurement_valid(0, gls_measurement(wire.date_time(0, 11, 1, 0, 0, 0), 0, false, 1, 1)))
+    test.assert(not gls_measurement_valid(0, gls_measurement(wire.date_time(2026, 0, 1, 0, 0, 0), 0, false, 1, 1)))
+    test.assert(not gls_measurement_valid(0, gls_measurement(t, wire.SFLOAT_RESERVED, false, 1, 1)))
+    test.assert(not gls_measurement_valid(0, gls_measurement(t, 0, false, 0, 1)))
+    test.assert(not gls_measurement_valid(0, gls_measurement(t, 0, false, 11, 1)))
+    test.assert(not gls_measurement_valid(0, gls_measurement(t, 0, false, 1, 5)))
+    test.assert(gls_measurement_valid(0, gls_measurement(t, wire.SFLOAT_NAN, false, 1, 15)))
+    test.assert(not gls_measurement_valid(0, gls_with_offset(ok, 40000)))
+    // The status bits need the Feature bits: battery low (bit 0), result too high (bit 5 needs Feature bit 5).
+    test.assert(not gls_measurement_valid(0, gls_with_status(ok, 0x0001)))
+    test.assert(gls_measurement_valid(0x0001, gls_with_status(ok, 0x0001)))
+    test.assert(not gls_measurement_valid(0x0001, gls_with_status(ok, 0x0020)))
+    test.assert(gls_measurement_valid(0x0020, gls_with_status(ok, 0x0060)))
+    test.assert(gls_measurement_valid(0x0040, gls_with_status(ok, 0x0180)))
+    test.assert(gls_measurement_valid(0x0200, gls_with_status(ok, 0x0800)))
+    test.assert(not gls_measurement_valid(0x07FF, gls_with_status(ok, 0x1000)))
+    // A context needs a field and each field its table.
+    test.assert(not gls_context_valid(gls_context_empty()))
+    test.assert(not gls_context_valid(gls_context_meal(gls_context_empty(), 0)))
+    test.assert(not gls_context_valid(gls_context_meal(gls_context_empty(), 6)))
+    test.assert(not gls_context_valid(gls_context_carbohydrate(gls_context_empty(), 8, 0)))
+    test.assert(not gls_context_valid(gls_context_tester_health(gls_context_empty(), 4, 1)))
+    test.assert(gls_context_valid(gls_context_tester_health(gls_context_empty(), 15, 15)))
+    test.assert(not gls_context_valid(gls_context_exercise(gls_context_empty(), 70000, 10)))
+    test.assert(not gls_context_valid(gls_context_exercise(gls_context_empty(), 10, 101)))
+    test.assert(not gls_context_valid(gls_context_medication(gls_context_empty(), 6, 0, false)))
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_store_numbers_the_records_and_never_reuses_a_number_and_drops_the_oldest_at_capacity()
+    var st = new_gls_store(3, 0, true)
+    let bad = gls_measurement(wire.date_time(0, 0, 0, 0, 0, 0), 0, false, 1, 1)
+    test.assert_eq(gls_store_add(var st, bad, false, gls_context_empty()), -1)
+    test.assert_eq(gls_store_add(var st, reading(1), false, gls_context_empty()), 0)
+    test.assert_eq(gls_store_add(var st, reading(2), true, gls_context_meal(gls_context_empty(), 1)), 1)
+    test.assert_eq(gls_store_add(var st, reading(3), false, gls_context_empty()), 2)
+    test.assert_eq(gls_store_add(var st, reading(4), false, gls_context_empty()), 3)
+    test.assert_eq(gls_store_keys(st), [1, 2, 3])
+    gls_store_delete(var st, [1, 2, 3])
+    test.assert_eq(gls_store_count(st), 0)
+    // A delete does not reset the Sequence Number.
+    test.assert_eq(gls_store_add(var st, reading(5), false, gls_context_empty()), 4)
+    // A context with no field, or on a store without the characteristic, is refused.
+    test.assert_eq(gls_store_add(var st, reading(6), true, gls_context_empty()), -1)
+    var plain = new_gls_store(3, 0, false)
+    test.assert_eq(gls_store_add(var plain, reading(6), true, gls_context_meal(gls_context_empty(), 1)), -1)
+    test.assert_eq(gls_store_count(plain), 0)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_report_stored_records_sends_each_measurement_with_its_context_oldest_first_and_then_success()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    let _ = gls_store_add(var st, reading(1), false, gls_context_empty())
+    let _ = gls_store_add(var st, reading(2), true, gls_context_meal(gls_context_empty(), 3))
+    let _ = gls_store_add(var st, reading(3), false, gls_context_empty())
+    let answer = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    test.assert_eq(answer, [[0x13]])
+    test.assert_eq(session.run.active, true)
+    let sent = gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)
+    // Three measurements, one context, the response.
+    test.assert_eq(list.len(sent), 5)
+    test.assert_eq(sent[0][1] as Int, 3)
+    test.assert_eq(sent[0][3] as Int, 0x02 | 0x01)
+    test.assert_eq(sent[0][4] as Int, 0)
+    test.assert_eq(sent[1][3] as Int, 0x02 | 0x10)
+    test.assert_eq(sent[1][4] as Int, 1)
+    test.assert_eq(sent[2][1] as Int, 6)
+    test.assert_eq(sent[2][4] as Int, 1)
+    // The third measurement has the same offset as the second and leaves it out.
+    test.assert_eq(sent[3][3] as Int, 0x02)
+    test.assert_eq(sent[4][0] as Int, 0x1D)
+    test.assert_eq(sent[4][1] as Int, 12)
+    test.assert_eq(wire.get(sent[4], 3, 4), 0x01010006)
+    test.assert_eq(session.run.active, false)
+    // The records stay: a transfer is a copy ([GLS] 3.4.3.4).
+    test.assert_eq(gls_store_count(st), 3)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_transfer_carries_the_offset_again_when_it_changes()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    let _ = gls_store_add(var st, reading(1), false, gls_context_empty())
+    let _ = gls_store_add(var st, reading(2), false, gls_context_empty())
+    let _ = gls_store_add(var st, gls_with_offset(reading(3), 60), false, gls_context_empty())
+    let _ = gls_store_add(var st, reading(4), false, gls_context_empty())
+    let _ = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    let sent = gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)
+    // The first measurement of the transfer, one whose offset is new, and one that
+    // goes back to 0, carry the Time Offset; the second does not.
+    test.assert_eq((sent[0][3] as Int) & 0x01, 1)
+    test.assert_eq((sent[1][3] as Int) & 0x01, 0)
+    test.assert_eq((sent[2][3] as Int) & 0x01, 1)
+    test.assert_eq((sent[3][3] as Int) & 0x01, 1)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_filter_selects_by_sequence_number_and_a_count_is_a_response_at_once()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    for m in 1..6
+        let _ = gls_store_add(var st, reading(m), false, gls_context_empty())
+    let counted = write_racp(var s, h, var st, var session, [0x04, 0x03, 1, 2, 0], config)
+    test.assert_eq(counted[0], [0x13])
+    test.assert_eq(counted[1][0] as Int, 0x1D)
+    test.assert_eq(counted[1][3], 0x05)
+    test.assert_eq(counted[1][5] as Int, 3)
+    test.assert_eq(session.run.active, false)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let _ = write_racp(var s, h, var st, var session, [0x01, 0x04, 1, 1, 0, 2, 0], config)
+    let sent = gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)
+    test.assert_eq(list.len(sent), 3)
+    test.assert_eq(sent[0][4] as Int, 1)
+    test.assert_eq(sent[1][4] as Int, 2)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_delete_removes_the_selected_records_and_no_match_is_no_records_found()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    for m in 1..4
+        let _ = gls_store_add(var st, reading(m), false, gls_context_empty())
+    let deleted = write_racp(var s, h, var st, var session, [0x02, 0x02, 1, 0, 0], config)
+    test.assert_eq(gls_store_keys(st), [1, 2])
+    test.assert_eq(deleted[1][3], 0x06)
+    test.assert_eq(deleted[1][6] as Int, 1)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let none = write_racp(var s, h, var st, var session, [0x01, 0x03, 1, 9, 0], config)
+    test.assert_eq(none[1][6] as Int, 6)
+    test.assert_eq(gls_store_count(st), 2)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_request_with_an_error_is_answered_with_its_response_code()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    let _ = gls_store_add(var st, reading(1), false, gls_context_empty())
+    let unsupported = write_racp(var s, h, var st, var session, [0x09, 0x01], config)
+    test.assert_eq(unsupported[1][6] as Int, 2)
+    test.assert_eq(unsupported[1][5] as Int, 9)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let invalid = write_racp(var s, h, var st, var session, [0x01, 0x00], config)
+    test.assert_eq(invalid[1][6] as Int, 3)
+    test.assert_eq(session.run.active, false)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_second_procedure_is_refused_while_one_runs_and_abort_stops_it()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    for m in 1..6
+        let _ = gls_store_add(var st, reading(m), false, gls_context_empty())
+    let _ = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    let part = gls_pump(var s.db, var s.link, h, var st, var session, 2, 0)
+    test.assert_eq(list.len(part), 2)
+    test.assert_eq(session.run.active, true)
+    // [GLS] SPE/BI-07: Procedure Already In Progress, the Write Request refused.
+    let again = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    test.assert_eq(again[0][0] as Int, 0x01)
+    test.assert_eq(again[0][4] as Int, ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    // Abort is accepted, stops the run and is answered Success.
+    let abort = write_racp(var s, h, var st, var session, [0x03, 0x00], config)
+    test.assert_eq(abort[0], [0x13])
+    test.assert_eq(abort[1][6] as Int, 1)
+    test.assert_eq(session.run.active, false)
+    test.assert_eq(list.len(gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_descriptor_not_configured_refuses_the_report_with_0x81()
+    let config = full_config()
+    var built = server(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    let _ = gls_store_add(var st, reading(1), false, gls_context_empty())
+    // Nothing subscribed.
+    test.assert_eq(write_racp(var s, h, var st, var session, [0x01, 0x01], config)[0][4] as Int, ERR_CCC_IMPROPERLY_CONFIGURED)
+    subscribe(var s, h.racp_cccd as Int, 2)
+    subscribe(var s, h.measurement_cccd as Int, 1)
+    // The context descriptor is still off.
+    test.assert_eq(write_racp(var s, h, var st, var session, [0x01, 0x01], config)[0][4] as Int, ERR_CCC_IMPROPERLY_CONFIGURED)
+    subscribe(var s, h.context_cccd as Int, 1)
+    test.assert_eq(write_racp(var s, h, var st, var session, [0x01, 0x01], config)[0], [0x13])
+    test.assert_eq(session.run.active, true)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_control_point_needs_an_authenticated_link()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    let r = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    test.assert_eq(r[0][0] as Int, 0x01)
+    test.assert_eq(r[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(session.run.active, false)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_an_abandoned_run_sends_nothing_more()
+    let config = full_config()
+    var built = ready(config)
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(10, config.features, true)
+    var session = new_gls_session()
+    for m in 1..4
+        let _ = gls_store_add(var st, reading(m), false, gls_context_empty())
+    let _ = write_racp(var s, h, var st, var session, [0x01, 0x01], config)
+    gls_abandon(var session)
+    test.assert_eq(list.len(gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_the_feature_is_read_changed_and_indicated()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    var st = new_gls_store(5, 0x07FF, true)
+    test.assert_eq(read(var s, h.feature as Int), [0x0B, 0xFF, 0x07])
+    test.assert(not gls_set_features(var s.db, var st, h, 0x0800))
+    test.assert(gls_set_features(var s.db, var st, h, 0x0001))
+    test.assert_eq(read(var s, h.feature as Int), [0x0B, 0x01, 0x00])
+    test.assert_eq(st.features, 1)
+    test.assert_eq(list.len(gls_indicate_feature(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.feature_cccd as Int, 2)
+    test.assert_eq(list.len(gls_indicate_feature(var s.db, var s.link, h, 0)), 1)
+
+@tier(app)
+fn add_error(config: GlsConfig) -> ?profile_builder.ProfileError
+    var s = gatt_server.new_server([], 65)
+    match add_gls_service(var s.db, config)
+        Ok(_) => None
+        Err(e) => Some(e)
+
+@test
+@satisfies("REQ-BLE-GLS-001")
+fn test_a_configuration_below_the_profile_or_out_of_range_is_refused()
+    let all = racp.racp_support_all()
+    let open = GlsConfig {
+        access: gatt_server.Access.Open, racp_write: gatt_server.Access.Authenticated, features: 0,
+        feature_indicate: false, context: false, support: all }
+    test.assert_eq(add_error(open), Some(profile_builder.ProfileError.NotPermitted))
+    let low = GlsConfig {
+        access: gatt_server.Access.Encrypted, racp_write: gatt_server.Access.Encrypted, features: 0,
+        feature_indicate: false, context: false, support: all }
+    test.assert_eq(add_error(low), Some(profile_builder.ProfileError.NotPermitted))
+    let reserved = GlsConfig {
+        access: gatt_server.Access.Encrypted, racp_write: gatt_server.Access.Authenticated, features: 0x0800,
+        feature_indicate: false, context: false, support: all }
+    test.assert_eq(add_error(reserved), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(full_config()), None)

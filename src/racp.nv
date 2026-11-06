@@ -1,0 +1,282 @@
+// src/racp.nv — the Record Access Control Point, the control point
+// the Glucose Service ([GLS] 3.4) and the Continuous Glucose Monitoring Service
+// ([CGMS] 3.6) share, in the form of [GSS] 3.177.
+//
+// A write has an Op Code, an Operator and an Operand.  `racp_decode` turns the
+// octets into a `RacpRequest`, or into the Response Code Value the service
+// answers with ([GLS] 3.4.4), and `racp_execute` carries the request out
+// against the keys of the stored records:
+//
+//   Report Stored Records (0x01)         the matching keys wait in `RacpRun.pending`;
+//                                        the service sends the records oldest first
+//                                        and then the response
+//   Delete Stored Records (0x02)         the matching keys come back in `deleted`
+//   Abort Operation (0x03)               stops the run
+//   Report Number of Stored Records      the Number of Stored Records Response
+//     (0x04)                             (0x05), a uint16
+//
+// A key is the value the filter compares: the Sequence Number of the Glucose
+// Service or the Time Offset of the CGM Service ([CGMS] 3.6.3.1: the Time Offset
+// "is handled like the sequence number").  The keys of the store come oldest
+// first, which is the order the records are sent in ([GLS] 3.5: FIFO).  Both
+// services use the one Filter Type 0x01, with a uint16 value, so the Operand of
+// a filter is the Filter Type and one value or a pair.  The Filter Type 0x02
+// (User Facing Time) is optional in the Glucose Service ([GLS] Table 3.22) and not
+// allowed in the CGM Service ([CGMS] 3.6.3.1); both answer Operand not supported.
+//
+// What the service decides: which of the optional operators it supports
+// (`RacpSupport`) and whether Delete Stored Records is offered, which a sensor
+// may leave to the user ([GLS] 3.4.3.3).
+//
+// Satisfies: REQ-BLE-RACP-001.
+
+// The Op Code field ([GSS] Table 3.277).
+const OP_REPORT_STORED_RECORDS = 0x01
+const OP_DELETE_STORED_RECORDS = 0x02
+const OP_ABORT_OPERATION = 0x03
+const OP_REPORT_NUMBER_OF_STORED_RECORDS = 0x04
+const OP_NUMBER_OF_STORED_RECORDS_RESPONSE = 0x05
+const OP_RESPONSE_CODE = 0x06
+
+// The Operator field ([GSS] Table 3.278).
+const OPERATOR_NULL = 0x00
+const OPERATOR_ALL_RECORDS = 0x01
+const OPERATOR_LESS_THAN_OR_EQUAL_TO = 0x02
+const OPERATOR_GREATER_THAN_OR_EQUAL_TO = 0x03
+const OPERATOR_WITHIN_RANGE_OF = 0x04
+const OPERATOR_FIRST_RECORD = 0x05
+const OPERATOR_LAST_RECORD = 0x06
+
+// The Response Code Values ([GSS] Table 3.280).
+const RESPONSE_SUCCESS = 0x01
+const RESPONSE_OP_CODE_NOT_SUPPORTED = 0x02
+const RESPONSE_INVALID_OPERATOR = 0x03
+const RESPONSE_OPERATOR_NOT_SUPPORTED = 0x04
+const RESPONSE_INVALID_OPERAND = 0x05
+const RESPONSE_NO_RECORDS_FOUND = 0x06
+const RESPONSE_ABORT_UNSUCCESSFUL = 0x07
+const RESPONSE_PROCEDURE_NOT_COMPLETED = 0x08
+const RESPONSE_OPERAND_NOT_SUPPORTED = 0x09
+
+// The Filter Type that selects by the key of a record ([GLS] Table 3.44, [CGMS]
+// Table 3.5).
+const FILTER_KEY = 0x01
+
+// What the service offers beyond the mandatory part.  Report Stored Records and
+// Report Number of Stored Records with All records and Greater than or equal to,
+// and Abort Operation, are mandatory ([GLS] Table 3.22).
+@value
+struct RacpSupport
+    delete: Bool
+    less_or_equal: Bool
+    within_range: Bool
+    first_last: Bool
+
+// A service that offers every optional part.
+@tier(embedded)
+@no_alloc
+fn racp_support_all() -> RacpSupport
+    RacpSupport { delete: true, less_or_equal: true, within_range: true, first_last: true }
+
+// A service with the mandatory part only.
+@tier(embedded)
+@no_alloc
+fn racp_support_minimal() -> RacpSupport
+    RacpSupport { delete: false, less_or_equal: false, within_range: false, first_last: false }
+
+// A decoded write.  `error` is 0 for a request the service can carry out and
+// otherwise the Response Code Value to answer with; `lo` and `hi` are the filter
+// values, `hi` equal to `lo` when the Operator names one.
+@value
+struct RacpRequest
+    op: Int
+    operator: Int
+    lo: Int
+    hi: Int
+    error: Int
+
+@tier(embedded)
+@no_alloc
+fn rejected(op: Int, operator: Int, code: Int) -> RacpRequest
+    RacpRequest { op: op, operator: operator, lo: 0, hi: 0, error: code }
+
+// Whether `operator` is one the service offers.
+@tier(embedded)
+@no_alloc
+fn operator_offered(s: RacpSupport, operator: Int) -> Bool
+    if operator == OPERATOR_ALL_RECORDS or operator == OPERATOR_GREATER_THAN_OR_EQUAL_TO
+        return true
+    if operator == OPERATOR_LESS_THAN_OR_EQUAL_TO
+        return s.less_or_equal
+    if operator == OPERATOR_WITHIN_RANGE_OF
+        return s.within_range
+    if operator == OPERATOR_FIRST_RECORD or operator == OPERATOR_LAST_RECORD
+        return s.first_last
+    false
+
+// Decode the value written to the control point.  The order of the checks is
+// that of [GLS] 3.4.4: the Op Code, then the Operator, then the Operand.  An
+// Operator of Null is invalid for the procedures that take an Operator ([GLS]
+// SPE/BI-02), one of the reserved range or one the service does not offer is not
+// supported (SPE/BI-03), an Operand where none is used, a short or long one, or
+// a range whose minimum is above its maximum is invalid (SPE/BI-04, BI-05), and a
+// Filter Type other than 0x01 is not supported (SPE/BI-06).
+@tier(embedded)
+@no_alloc
+fn racp_decode(b: [u8], s: RacpSupport) -> RacpRequest
+    if list.len(b) < 1
+        return rejected(0, 0, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    let op = b[0] as Int
+    let operator = if list.len(b) > 1 then b[1] as Int else 0
+    let operand = list.len(b) - 2
+    if op != OP_REPORT_STORED_RECORDS and op != OP_DELETE_STORED_RECORDS and op != OP_ABORT_OPERATION and op != OP_REPORT_NUMBER_OF_STORED_RECORDS
+        return rejected(op, operator, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    if op == OP_DELETE_STORED_RECORDS and not s.delete
+        return rejected(op, operator, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    if list.len(b) < 2
+        return rejected(op, 0, RESPONSE_INVALID_OPERATOR)
+    if op == OP_ABORT_OPERATION
+        if operator != OPERATOR_NULL
+            return rejected(op, operator, RESPONSE_INVALID_OPERATOR)
+        if operand != 0
+            return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+        return RacpRequest { op: op, operator: operator, lo: 0, hi: 0, error: 0 }
+    if operator == OPERATOR_NULL
+        return rejected(op, operator, RESPONSE_INVALID_OPERATOR)
+    if not operator_offered(s, operator)
+        return rejected(op, operator, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    if operator == OPERATOR_ALL_RECORDS or operator == OPERATOR_FIRST_RECORD or operator == OPERATOR_LAST_RECORD
+        if operand != 0
+            return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+        return RacpRequest { op: op, operator: operator, lo: 0, hi: 0, error: 0 }
+    if operand < 1
+        return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+    if b[2] as Int != FILTER_KEY
+        return rejected(op, operator, RESPONSE_OPERAND_NOT_SUPPORTED)
+    if operator == OPERATOR_WITHIN_RANGE_OF
+        if operand != 5
+            return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+        let lo = (b[3] as Int) | ((b[4] as Int) << 8)
+        let hi = (b[5] as Int) | ((b[6] as Int) << 8)
+        if lo > hi
+            return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+        return RacpRequest { op: op, operator: operator, lo: lo, hi: hi, error: 0 }
+    if operand != 3
+        return rejected(op, operator, RESPONSE_INVALID_OPERAND)
+    let v = (b[3] as Int) | ((b[4] as Int) << 8)
+    RacpRequest { op: op, operator: operator, lo: v, hi: v, error: 0 }
+
+// Whether the request reports records, the only one that needs the record
+// characteristics subscribed ([GLS] 3.4.4).
+@tier(embedded)
+@no_alloc
+fn racp_reports(r: RacpRequest) -> Bool
+    r.error == 0 and r.op == OP_REPORT_STORED_RECORDS
+
+// The keys of `keys` the request selects, oldest first.  The keys come in the
+// order of the store.
+@tier(app)
+fn racp_select(r: RacpRequest, keys: [Int]) -> [Int]
+    var out: [Int] = []
+    let n = list.len(keys)
+    for i in 0..n
+        let k = keys[i]
+        var hit = false
+        if r.operator == OPERATOR_ALL_RECORDS
+            hit = true
+        else if r.operator == OPERATOR_LESS_THAN_OR_EQUAL_TO
+            hit = k <= r.hi
+        else if r.operator == OPERATOR_GREATER_THAN_OR_EQUAL_TO
+            hit = k >= r.lo
+        else if r.operator == OPERATOR_WITHIN_RANGE_OF
+            hit = k >= r.lo and k <= r.hi
+        else if r.operator == OPERATOR_FIRST_RECORD
+            hit = i == 0
+        else if r.operator == OPERATOR_LAST_RECORD
+            hit = i == n - 1
+        if hit
+            list.push(out, k)
+    out
+
+// The Response Code value: Op Code 0x06, Operator Null, the Request Op Code and
+// the Response Code Value.
+@tier(app)
+fn racp_response(request_op: Int, code: Int) -> [u8]
+    [OP_RESPONSE_CODE as u8, OPERATOR_NULL as u8, request_op as u8, code as u8]
+
+// The Number of Stored Records Response value, a uint16 count ([GLS] 3.4.3.2).
+@tier(app)
+fn racp_count_response(count: Int) -> [u8]
+    [OP_NUMBER_OF_STORED_RECORDS_RESPONSE as u8, OPERATOR_NULL as u8, (count & 0xFF) as u8, ((count >>> 8) & 0xFF) as u8]
+
+// The procedure in progress.  `pending` holds the keys of the records still to be
+// sent, oldest first.  `fresh` says nothing of the transfer has been sent yet,
+// which the services use for the fields a transfer's first record must carry.
+struct RacpRun
+    var active: Bool
+    var pending: [Int]
+    var fresh: Bool
+
+@tier(app)
+fn racp_run_new() -> RacpRun
+    RacpRun { active: false, pending: [], fresh: true }
+
+// What a request leads to.  `reply` is the value to indicate now, empty when the
+// records go first.  `deleted` holds the keys a Delete Stored Records removes.
+struct RacpOutcome
+    reply: [u8]
+    deleted: [Int]
+
+// Carry out `r` against the store whose keys are `keys`.  A request with an
+// error answers it.  Abort Operation stops the run and answers Success; with no
+// run it answers Success too, because there is nothing left to stop ([GLS]
+// 3.4.3.5).  Report Stored Records starts a run when a record matches and answers
+// No records found when none does; Delete Stored Records and Report Number of
+// Stored Records answer at once.
+@tier(app)
+fn racp_execute(var run: RacpRun, r: RacpRequest, keys: [Int]) -> RacpOutcome
+    if r.error != 0
+        return RacpOutcome { reply: racp_response(r.op, r.error), deleted: [] }
+    if r.op == OP_ABORT_OPERATION
+        run.active = false
+        run.pending = []
+        run.fresh = true
+        return RacpOutcome { reply: racp_response(r.op, RESPONSE_SUCCESS), deleted: [] }
+    let found = racp_select(r, keys)
+    if r.op == OP_REPORT_NUMBER_OF_STORED_RECORDS
+        return RacpOutcome { reply: racp_count_response(list.len(found)), deleted: [] }
+    if list.len(found) == 0
+        return RacpOutcome { reply: racp_response(r.op, RESPONSE_NO_RECORDS_FOUND), deleted: [] }
+    if r.op == OP_DELETE_STORED_RECORDS
+        return RacpOutcome { reply: racp_response(r.op, RESPONSE_SUCCESS), deleted: found }
+    run.active = true
+    run.pending = found[:]
+    run.fresh = true
+    RacpOutcome { reply: [], deleted: [] }
+
+// The key of the next record to send, -1 when the run has none left.  The key
+// leaves the run.
+@tier(app)
+fn racp_next(var run: RacpRun) -> Int
+    if not run.active or list.len(run.pending) == 0
+        return -1
+    let k = run.pending[0]
+    run.pending = run.pending[1:]
+    run.fresh = false
+    k
+
+// The run is over: the response of Report Stored Records, Success.
+@tier(app)
+fn racp_finish(var run: RacpRun) -> [u8]
+    run.active = false
+    run.pending = []
+    run.fresh = true
+    racp_response(OP_REPORT_STORED_RECORDS, RESPONSE_SUCCESS)
+
+// The run cannot be completed, the link ended or the response was not confirmed
+// within the ATT transaction timeout ([GLS] 3.4.5): the service stops sending.
+@tier(app)
+fn racp_abandon(var run: RacpRun)
+    run.active = false
+    run.pending = []
+    run.fresh = true

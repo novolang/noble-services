@@ -1,0 +1,482 @@
+// src/pulse_oximeter.nv — the Pulse Oximeter Service (0x1822),
+// with which a pulse oximeter sends the oxygen saturation (SpO2) and the pulse
+// rate (PR) of a user to a collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   PLX Spot-Check Measurement   0x2A5E  Indicate; once per measurement session
+//   PLX Continuous Measurement   0x2A5F  Notify; periodic, not stored
+//   PLX Features                 0x2A60  Read, optionally Indicate; what the
+//                                        two measurements carry
+//
+// At least one of the two measurements is present ([PLXS] Table 3.1, C.1); each
+// has a Client Characteristic Configuration descriptor.  The fields that are
+// not always there (the time stamp of a spot-check measurement, the Fast and
+// Slow values, the Measurement Status, the Device and Sensor Status and the
+// Pulse Amplitude Index) are there for every measurement or for none, as the
+// Supported Features of PLX Features say ([PLXS] 3.3.1.1): the flags of a value
+// follow `PlxsConfig`, never the caller.  A value the oximeter cannot give is
+// the SFLOAT NaN (`wire.SFLOAT_NAN`).  A status bit that PLX Features does not
+// list as supported is sent as 0, and the RFU bits are always 0 ([PLXS]
+// 3.1.1.4, 3.1.1.5).
+//
+// Security.  The service imposes none ([PLXS] Table 3.1); the Pulse Oximeter
+// Profile 1.0 asks for security mode 1 and level 2 or higher on every
+// characteristic ([PLXP] 7).  `add_plxs_service` takes the access as Encrypted,
+// Authenticated or SecureConnections, refuses the others with `NotPermitted`,
+// and puts it on the Features value and on every Client Characteristic
+// Configuration descriptor, which is where a measurement that is only indicated
+// or notified gets its protection: it goes to a client whose link grants the
+// write of the descriptor.
+//
+// NOT IMPLEMENTED: the storage of spot-check measurements and the Record Access
+// Control Point.  The service says so in PLX Features (the storage bit is 0),
+// as [PLXS] 3.3.1.1.3 and Table 3.1 (C.2) allow: it has no Record Access Control
+// Point, it sends a measurement once and keeps none, and the Data from
+// Measurement Storage bit of the status is refused in the support field.  A
+// product that wants storage needs the procedures of [PLXS] 3.4 first.
+//
+// Specification checked against: Pulse Oximeter Service 1.0.1 (PLXS), Pulse
+// Oximeter Profile 1.0.1 (PLXP) and the GATT Specification Supplement v9,
+// Sections 3.70 and 2.1.1.
+//
+// Satisfies: REQ-BLE-PLXS-001.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_PULSE_OXIMETER_SERVICE = 0x1822
+const UUID_PLX_SPOT_CHECK_MEASUREMENT = 0x2A5E
+const UUID_PLX_CONTINUOUS_MEASUREMENT = 0x2A5F
+const UUID_PLX_FEATURES = 0x2A60
+const UUID_RECORD_ACCESS_CONTROL_POINT = 0x2A52
+
+// The Supported Features field ([PLXS] Table 3.9).  FEATURE_STORAGE is never
+// set: see NOT IMPLEMENTED above.
+const FEATURE_MEASUREMENT_STATUS = 0x0001
+const FEATURE_DEVICE_STATUS = 0x0002
+const FEATURE_STORAGE = 0x0004
+const FEATURE_TIMESTAMP = 0x0008
+const FEATURE_FAST = 0x0010
+const FEATURE_SLOW = 0x0020
+const FEATURE_PULSE_AMPLITUDE_INDEX = 0x0040
+const FEATURE_MULTIPLE_BONDS = 0x0080
+
+// The Flags of the Spot-Check Measurement ([PLXS] Table 3.3).
+const SPOT_TIMESTAMP = 0x01
+const SPOT_MEASUREMENT_STATUS = 0x02
+const SPOT_DEVICE_STATUS = 0x04
+const SPOT_PULSE_AMPLITUDE_INDEX = 0x08
+const SPOT_CLOCK_NOT_SET = 0x10
+
+// The Flags of the Continuous Measurement ([PLXS] Table 3.7).
+const CONTINUOUS_FAST = 0x01
+const CONTINUOUS_SLOW = 0x02
+const CONTINUOUS_MEASUREMENT_STATUS = 0x04
+const CONTINUOUS_DEVICE_STATUS = 0x08
+const CONTINUOUS_PULSE_AMPLITUDE_INDEX = 0x10
+
+// The Measurement Status bits ([PLXS] Table 3.4, and Table 3.10 for the support
+// field).  Bits 0 to 4 are RFU.
+const STATUS_MEASUREMENT_ONGOING = 0x0020
+const STATUS_EARLY_ESTIMATED_DATA = 0x0040
+const STATUS_VALIDATED_DATA = 0x0080
+const STATUS_FULLY_QUALIFIED_DATA = 0x0100
+const STATUS_DATA_FROM_STORAGE = 0x0200
+const STATUS_DATA_FOR_DEMONSTRATION = 0x0400
+const STATUS_DATA_FOR_TESTING = 0x0800
+const STATUS_CALIBRATION_ONGOING = 0x1000
+const STATUS_MEASUREMENT_UNAVAILABLE = 0x2000
+const STATUS_QUESTIONABLE_MEASUREMENT = 0x4000
+const STATUS_INVALID_MEASUREMENT = 0x8000
+const STATUS_DEFINED = 0xFFE0
+
+// The bits a Measurement Status Support field may hold here: the defined ones
+// but the Data from Measurement Storage bit, which belongs to the storage the
+// service does not have.
+const STATUS_SUPPORTABLE = 0xFDE0
+
+// The Device and Sensor Status bits ([PLXS] Table 3.5 and Table 3.11).  Bits
+// 16 to 23 are RFU.
+const DEVICE_EXTENDED_DISPLAY_UPDATE_ONGOING = 0x0001
+const DEVICE_EQUIPMENT_MALFUNCTION = 0x0002
+const DEVICE_SIGNAL_PROCESSING_IRREGULARITY = 0x0004
+const DEVICE_INADEQUATE_SIGNAL = 0x0008
+const DEVICE_POOR_SIGNAL = 0x0010
+const DEVICE_LOW_PERFUSION = 0x0020
+const DEVICE_ERRATIC_SIGNAL = 0x0040
+const DEVICE_NONPULSATILE_SIGNAL = 0x0080
+const DEVICE_QUESTIONABLE_PULSE = 0x0100
+const DEVICE_SIGNAL_ANALYSIS_ONGOING = 0x0200
+const DEVICE_SENSOR_INTERFERENCE = 0x0400
+const DEVICE_SENSOR_UNCONNECTED_TO_USER = 0x0800
+const DEVICE_UNKNOWN_SENSOR_CONNECTED = 0x1000
+const DEVICE_SENSOR_DISPLACED = 0x2000
+const DEVICE_SENSOR_MALFUNCTIONING = 0x4000
+const DEVICE_SENSOR_DISCONNECTED = 0x8000
+const DEVICE_DEFINED = 0xFFFF
+
+// What the oximeter has.  `access` is the access of the Features value and of
+// every Client Characteristic Configuration descriptor (Encrypted,
+// Authenticated or SecureConnections).  `spot_check` and `continuous` add the
+// two measurements, at least one of them.  `measurement_status_support` and
+// `device_status_support` are the bits the oximeter can report, -1 when it
+// reports no such status (the field is then not in any value).  `timestamp`
+// puts the Date Time in every spot-check value, `fast` and `slow` the SpO2PR
+// values of those metrics in every continuous value, `pulse_amplitude_index`
+// the index in every value of either measurement.  `multiple_bonds` is the
+// Multiple Bonds Supported feature bit, and `features_indicate` adds the
+// Indicate property and its descriptor to PLX Features, for an oximeter whose
+// features changed over its life ([PLXS] Table 3.1, C.3).
+struct PlxsConfig
+    access: gatt_server.Access
+    spot_check: Bool
+    continuous: Bool
+    measurement_status_support: Int
+    device_status_support: Int
+    timestamp: Bool
+    fast: Bool
+    slow: Bool
+    pulse_amplitude_index: Bool
+    multiple_bonds: Bool
+    features_indicate: Bool
+
+// An oximeter with both measurements and no optional field, on an encrypted link.
+@tier(app)
+fn default_plxs_config() -> PlxsConfig
+    PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: -1, device_status_support: -1, timestamp: false,
+        fast: false, slow: false, pulse_amplitude_index: false, multiple_bonds: false, features_indicate: false }
+
+// The handles of the service; 0 for what it does not have.
+@value
+struct PlxsHandles
+    service: u16
+    spot_check: u16
+    spot_check_cccd: u16
+    continuous: u16
+    continuous_cccd: u16
+    features: u16
+    features_cccd: u16
+
+// One spot-check measurement.  `spo2` and `pulse_rate` are the raw SFLOATs
+// (`wire.sfloat(98, 0)` for 98 %, `wire.SFLOAT_NAN` for a value the oximeter
+// cannot give); the fields below them are sent only where `PlxsConfig` has the
+// feature.  The time stamp is a Date Time of [GSS] 3.70, whose year, month and
+// day may be 0 for unknown; `clock_not_set` raises the flag that says the
+// clock of the oximeter was not set for this measurement.
+@value
+struct PlxSpotCheck
+    spo2: Int
+    pulse_rate: Int
+    time: wire.DateTime
+    clock_not_set: Bool
+    measurement_status: Int
+    device_status: Int
+    pulse_amplitude_index: Int
+
+// A spot-check measurement of SpO2 and pulse rate with the optional fields
+// at their neutral values.
+@tier(embedded)
+@no_alloc
+fn plx_spot_check(spo2: Int, pulse_rate: Int) -> PlxSpotCheck
+    PlxSpotCheck {
+        spo2: spo2, pulse_rate: pulse_rate, time: wire.date_time_unknown(),
+        clock_not_set: false, measurement_status: 0, device_status: 0, pulse_amplitude_index: wire.SFLOAT_NAN }
+
+// One continuous measurement: the normal SpO2 and pulse rate, and the fast and
+// the slow ones where `PlxsConfig` has those metrics.
+@value
+struct PlxContinuous
+    spo2: Int
+    pulse_rate: Int
+    fast_spo2: Int
+    fast_pulse_rate: Int
+    slow_spo2: Int
+    slow_pulse_rate: Int
+    measurement_status: Int
+    device_status: Int
+    pulse_amplitude_index: Int
+
+@tier(embedded)
+@no_alloc
+fn plx_continuous(spo2: Int, pulse_rate: Int) -> PlxContinuous
+    PlxContinuous {
+        spo2: spo2, pulse_rate: pulse_rate, fast_spo2: wire.SFLOAT_NAN, fast_pulse_rate: wire.SFLOAT_NAN,
+        slow_spo2: wire.SFLOAT_NAN, slow_pulse_rate: wire.SFLOAT_NAN, measurement_status: 0, device_status: 0,
+        pulse_amplitude_index: wire.SFLOAT_NAN }
+
+// Whether `raw` is an SFLOAT the service can send: 16 bits and not the value
+// reserved for future use.
+@tier(embedded)
+@no_alloc
+fn plx_sfloat_valid(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) != wire.KIND_RESERVED
+
+// Whether `access` is a security level the Pulse Oximeter Profile allows.
+@tier(embedded)
+@no_alloc
+fn plxs_access_secure(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// What is wrong with `config`, the first thing: CONFIG_OK, CONFIG_NOT_PERMITTED
+// for an access below the profile's, CONFIG_INVALID for no measurement at all,
+// a feature of a measurement the service does not have, or a support field with
+// a bit it cannot have.
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+@tier(embedded)
+@no_alloc
+fn plxs_config_error(config: PlxsConfig) -> Int
+    if not plxs_access_secure(config.access)
+        return CONFIG_NOT_PERMITTED
+    if not config.spot_check and not config.continuous
+        return CONFIG_INVALID
+    if config.timestamp and not config.spot_check
+        return CONFIG_INVALID
+    if (config.fast or config.slow) and not config.continuous
+        return CONFIG_INVALID
+    let ms = config.measurement_status_support
+    if ms < -1 or (ms >= 0 and (ms | STATUS_SUPPORTABLE) != STATUS_SUPPORTABLE)
+        return CONFIG_INVALID
+    let ds = config.device_status_support
+    if ds < -1 or ds > DEVICE_DEFINED
+        return CONFIG_INVALID
+    CONFIG_OK
+
+// The Supported Features field of `config`: the bits of the features it has.
+@tier(embedded)
+@no_alloc
+fn plxs_supported_features(config: PlxsConfig) -> Int
+    var f = 0
+    if config.measurement_status_support >= 0
+        f = f | FEATURE_MEASUREMENT_STATUS
+    if config.device_status_support >= 0
+        f = f | FEATURE_DEVICE_STATUS
+    if config.timestamp
+        f = f | FEATURE_TIMESTAMP
+    if config.fast
+        f = f | FEATURE_FAST
+    if config.slow
+        f = f | FEATURE_SLOW
+    if config.pulse_amplitude_index
+        f = f | FEATURE_PULSE_AMPLITUDE_INDEX
+    if config.multiple_bonds
+        f = f | FEATURE_MULTIPLE_BONDS
+    f
+
+// The value of PLX Features: the Supported Features (2 octets), then the
+// Measurement Status Support (2) and the Device and Sensor Status Support (3)
+// when the oximeter reports them, in that order ([PLXS] Table 3.8).
+@tier(app)
+fn plxs_features_value(config: PlxsConfig) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, plxs_supported_features(config), 2)
+    if config.measurement_status_support >= 0
+        wire.put(var out, config.measurement_status_support, 2)
+    if config.device_status_support >= 0
+        wire.put(var out, config.device_status_support, 3)
+    out
+
+// Whether the service can send the spot-check measurement `m` under `config`:
+// the SFLOATs it sends, and the Date Time when the service has the time stamp.
+// The fields of a feature the service does not have are not looked at.
+@tier(embedded)
+@no_alloc
+fn plxs_spot_check_valid(config: PlxsConfig, m: PlxSpotCheck) -> Bool
+    if not plx_sfloat_valid(m.spo2) or not plx_sfloat_valid(m.pulse_rate)
+        return false
+    if config.pulse_amplitude_index and not plx_sfloat_valid(m.pulse_amplitude_index)
+        return false
+    if config.timestamp and not wire.date_time_valid(m.time)
+        return false
+    if config.measurement_status_support >= 0 and (m.measurement_status < 0 or m.measurement_status > 0xFFFF)
+        return false
+    config.device_status_support < 0 or (m.device_status >= 0 and m.device_status <= 0xFFFFFF)
+
+// Whether the service can send the continuous measurement `m` under `config`.
+@tier(embedded)
+@no_alloc
+fn plxs_continuous_valid(config: PlxsConfig, m: PlxContinuous) -> Bool
+    if not plx_sfloat_valid(m.spo2) or not plx_sfloat_valid(m.pulse_rate)
+        return false
+    if config.fast and (not plx_sfloat_valid(m.fast_spo2) or not plx_sfloat_valid(m.fast_pulse_rate))
+        return false
+    if config.slow and (not plx_sfloat_valid(m.slow_spo2) or not plx_sfloat_valid(m.slow_pulse_rate))
+        return false
+    if config.pulse_amplitude_index and not plx_sfloat_valid(m.pulse_amplitude_index)
+        return false
+    if config.measurement_status_support >= 0 and (m.measurement_status < 0 or m.measurement_status > 0xFFFF)
+        return false
+    config.device_status_support < 0 or (m.device_status >= 0 and m.device_status <= 0xFFFFFF)
+
+// The value of the Spot-Check Measurement: the Flags, SpO2 and PR, then the
+// Timestamp, the Measurement Status, the Device and Sensor Status and the
+// Pulse Amplitude Index in that order, each where `config` has it ([PLXS]
+// Table 3.2).  The status fields keep the bits the support fields list.  The
+// clock flag is raised only where the service has a time stamp.
+@tier(app)
+fn plxs_spot_check_value(config: PlxsConfig, m: PlxSpotCheck) -> [u8]
+    var flags = 0
+    if config.timestamp
+        flags = flags | SPOT_TIMESTAMP
+        if m.clock_not_set
+            flags = flags | SPOT_CLOCK_NOT_SET
+    if config.measurement_status_support >= 0
+        flags = flags | SPOT_MEASUREMENT_STATUS
+    if config.device_status_support >= 0
+        flags = flags | SPOT_DEVICE_STATUS
+    if config.pulse_amplitude_index
+        flags = flags | SPOT_PULSE_AMPLITUDE_INDEX
+    var out: [u8] = [flags as u8]
+    wire.put(var out, m.spo2, 2)
+    wire.put(var out, m.pulse_rate, 2)
+    if config.timestamp
+        wire.put_date_time(var out, m.time)
+    if config.measurement_status_support >= 0
+        wire.put(var out, m.measurement_status & config.measurement_status_support, 2)
+    if config.device_status_support >= 0
+        wire.put(var out, m.device_status & config.device_status_support, 3)
+    if config.pulse_amplitude_index
+        wire.put(var out, m.pulse_amplitude_index, 2)
+    out
+
+// The value of the Continuous Measurement: the Flags and the normal SpO2 and
+// PR, then the fast pair, the slow pair, the Measurement Status, the Device
+// and Sensor Status and the Pulse Amplitude Index, each where `config` has it
+// ([PLXS] Table 3.6).
+@tier(app)
+fn plxs_continuous_value(config: PlxsConfig, m: PlxContinuous) -> [u8]
+    var flags = 0
+    if config.fast
+        flags = flags | CONTINUOUS_FAST
+    if config.slow
+        flags = flags | CONTINUOUS_SLOW
+    if config.measurement_status_support >= 0
+        flags = flags | CONTINUOUS_MEASUREMENT_STATUS
+    if config.device_status_support >= 0
+        flags = flags | CONTINUOUS_DEVICE_STATUS
+    if config.pulse_amplitude_index
+        flags = flags | CONTINUOUS_PULSE_AMPLITUDE_INDEX
+    var out: [u8] = [flags as u8]
+    wire.put(var out, m.spo2, 2)
+    wire.put(var out, m.pulse_rate, 2)
+    if config.fast
+        wire.put(var out, m.fast_spo2, 2)
+        wire.put(var out, m.fast_pulse_rate, 2)
+    if config.slow
+        wire.put(var out, m.slow_spo2, 2)
+        wire.put(var out, m.slow_pulse_rate, 2)
+    if config.measurement_status_support >= 0
+        wire.put(var out, m.measurement_status & config.measurement_status_support, 2)
+    if config.device_status_support >= 0
+        wire.put(var out, m.device_status & config.device_status_support, 3)
+    if config.pulse_amplitude_index
+        wire.put(var out, m.pulse_amplitude_index, 2)
+    out
+
+// Add the service to `db` after its last attribute: the Spot-Check Measurement
+// and the Continuous Measurement with their descriptors, then PLX Features.
+@tier(app)
+fn add_plxs_service(var db: GattDb, config: PlxsConfig) -> Result<PlxsHandles, profile_builder.ProfileError>
+    let problem = plxs_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_PULSE_OXIMETER_SERVICE))!
+    var spot_check = 0
+    var spot_check_cccd = 0
+    if config.spot_check
+        spot_check = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_PLX_SPOT_CHECK_MEASUREMENT), [])!
+        spot_check_cccd = profile_builder.add_cccd(var db, both)!
+    var continuous = 0
+    var continuous_cccd = 0
+    if config.continuous
+        continuous = profile_builder.add_value(
+            var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_PLX_CONTINUOUS_MEASUREMENT), [])!
+        continuous_cccd = profile_builder.add_cccd(var db, both)!
+    let properties = if config.features_indicate then gatt_server.PROP_READ | gatt_server.PROP_INDICATE else gatt_server.PROP_READ
+    let features = profile_builder.add_value(
+        var db, properties, profile_builder.read_only(config.access), gatt_server.le16(UUID_PLX_FEATURES), plxs_features_value(config))!
+    var features_cccd = 0
+    if config.features_indicate
+        features_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(PlxsHandles {
+        service: service as u16, spot_check: spot_check as u16, spot_check_cccd: spot_check_cccd as u16,
+        continuous: continuous as u16, continuous_cccd: continuous_cccd as u16, features: features as u16, features_cccd: features_cccd as u16 })
+
+// Store `m` as the Spot-Check Measurement and answer the indication PDU: the
+// indication when the client enabled it, none otherwise (and none, with the
+// old value kept, for a measurement the service cannot send or a service
+// without the characteristic).  The measurement is indicated once, and a
+// second one waits for the confirmation of the first.
+@tier(app)
+fn plxs_indicate_spot_check(var db: GattDb, var link: AttLink, handles: PlxsHandles, config: PlxsConfig, m: PlxSpotCheck, now_ms: Int) -> [[u8]]
+    if handles.spot_check == 0 or not plxs_spot_check_valid(config, m)
+        return []
+    if not gatt_server.set_value(var db, handles.spot_check, plxs_spot_check_value(config, m))
+        return []
+    gatt_server.send_value(var db, var link, handles.spot_check, now_ms)
+
+// Store `m` as the Continuous Measurement and answer the notification PDU,
+// none when the client did not enable it, when the measurement cannot be
+// sent, or when the service has no such characteristic.
+@tier(app)
+fn plxs_notify_continuous(var db: GattDb, var link: AttLink, handles: PlxsHandles, config: PlxsConfig, m: PlxContinuous, now_ms: Int) -> [[u8]]
+    if handles.continuous == 0 or not plxs_continuous_valid(config, m)
+        return []
+    if not gatt_server.set_value(var db, handles.continuous, plxs_continuous_value(config, m))
+        return []
+    gatt_server.send_value(var db, var link, handles.continuous, now_ms)
+
+// Indicate PLX Features to a bonded client that enabled it, which the service
+// does after a reconnection when the features changed ([PLXS] 3.3.1); none for
+// a service whose PLX Features has no Indicate property.
+@tier(app)
+fn plxs_indicate_features(var db: GattDb, var link: AttLink, handles: PlxsHandles, now_ms: Int) -> [[u8]]
+    if handles.features_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.features, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// A server whose link is encrypted at `level`.
+@tier(app)
+fn server_at(config: PlxsConfig, level: Int) -> (GattServer, PlxsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_plxs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, level, 16, true))
+    (s, h)
+
+@tier(app)
+fn server(config: PlxsConfig) -> (GattServer, PlxsHandles)
+    server_at(config, 2)
+
+// Every feature the service has, with a few status bits supported.
+@tier(app)
+fn full_config() -> PlxsConfig
+    PlxsConfig {
+        access: gatt_server.Access.Encrypted, spot_check: true, continuous: true,
+        measurement_status_support: STATUS_VALIDATED_DATA | STATUS_FULLY_QUALIFIED_DATA | STATUS_QUESTIONABLE_MEASUREMENT | STATUS_INVALID_MEASUREMENT,
+        device_status_support: DEVICE_POOR_SIGNAL | DEVICE_LOW_PERFUSION | DEVICE_SENSOR_DISCONNECTED,
+        timestamp: true, fast: true, slow: true, pulse_amplitude_index: true, multiple_bonds: true, features_indicate: true }
+
+// SpO2 98 %, pulse rate 72 beats per minute.
+@tier(app)
+fn usual_spot_check() -> PlxSpotCheck
+    plx_spot_check(wire.sfloat(98, 0), wire.sfloat(72, 0))

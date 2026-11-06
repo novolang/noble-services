@@ -1,0 +1,314 @@
+// tests/object_list_tests.nv — the unit tests of src/object_list.nv.
+//
+//   novo test tests/object_list_tests.nv
+
+use std.test
+use gatt_server
+use object_store
+use wire
+use object_list.{ ERR_INVALID_LENGTH, ERR_WRITE_REQUEST_REJECTED, directory_contents, directory_record, filter_matches, filter_write_error, filters_match, meta_before, order_valid, sort_metas }
+
+@tier(app)
+fn flt(t: Int, p: [u8]) -> [u8]
+    var v: [u8] = [t as u8]
+    list.append(v, p)
+    v
+
+@tier(app)
+fn dt(year: Int, month: Int, day: Int, h: Int, m: Int, s: Int) -> [u8]
+    var out: [u8] = []
+    wire.put_date_time(var out, wire.date_time(year, month, day, h, m, s))
+    out
+
+@tier(app)
+fn span(a: [u8], b: [u8]) -> [u8]
+    var out: [u8] = a[:]
+    list.append(out, b)
+    out
+
+@tier(app)
+fn sizes(a: Int, b: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, a, 4)
+    wire.put(var out, b, 4)
+    out
+
+@tier(app)
+fn object(id: Int, name: Str, kind: [u8], size: Int, allocated: Int) -> ObjectMeta
+    var m = object_store.new_meta(id, kind, size, allocated, object_store.PROP_READ)
+    m.name = wire.text(name)
+    m
+
+@tier(app)
+fn type16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_a_filter_value_is_checked_for_its_length_and_its_content()
+    // No Filter and Marked Objects take no parameter.
+    test.assert_eq(filter_write_error([0x00]), 0)
+    test.assert_eq(filter_write_error([0x0A]), 0)
+    test.assert_eq(filter_write_error([0x00, 1]), ERR_INVALID_LENGTH)
+    test.assert_eq(filter_write_error([0x0A, 1]), ERR_INVALID_LENGTH)
+    test.assert_eq(filter_write_error([]), ERR_INVALID_LENGTH)
+    // A name filter takes 1 to 120 octets of UTF-8.
+    for t in [0x01, 0x02, 0x03, 0x04]
+        test.assert_eq(filter_write_error(flt(t, wire.text("ab"))), 0)
+        test.assert_eq(filter_write_error(flt(t, [])), ERR_INVALID_LENGTH)
+        test.assert_eq(filter_write_error(flt(t, [0xC3])), ERR_WRITE_REQUEST_REJECTED)
+    var long: [u8] = []
+    for _ in 0..120
+        list.push(long, 0x61)
+    test.assert_eq(filter_write_error(flt(0x01, long)), 0)
+    list.push(long, 0x61)
+    test.assert_eq(filter_write_error(flt(0x01, long)), ERR_INVALID_LENGTH)
+    // A type is a UUID of 2 or 16 octets.
+    test.assert_eq(filter_write_error(flt(0x05, type16(0x2ACA))), 0)
+    test.assert_eq(filter_write_error(flt(0x05, object_store.uuid_expand(type16(0x2ACA)))), 0)
+    test.assert_eq(filter_write_error(flt(0x05, [1, 2, 3])), ERR_INVALID_LENGTH)
+    // Two Date Time values, the first not after the second.
+    let early = dt(2024, 1, 2, 3, 4, 5)
+    let late = dt(2025, 6, 7, 8, 9, 10)
+    for t in [0x06, 0x07]
+        test.assert_eq(filter_write_error(flt(t, span(early, late))), 0)
+        test.assert_eq(filter_write_error(flt(t, span(early, early))), 0)
+        test.assert_eq(filter_write_error(flt(t, span(late, early))), ERR_WRITE_REQUEST_REJECTED)
+        test.assert_eq(filter_write_error(flt(t, span(early, dt(2025, 13, 7, 8, 9, 10)))), ERR_WRITE_REQUEST_REJECTED)
+        test.assert_eq(filter_write_error(flt(t, early)), ERR_INVALID_LENGTH)
+    // Two sizes, the first not above the second.
+    for t in [0x08, 0x09]
+        test.assert_eq(filter_write_error(flt(t, sizes(10, 20))), 0)
+        test.assert_eq(filter_write_error(flt(t, sizes(10, 10))), 0)
+        test.assert_eq(filter_write_error(flt(t, sizes(21, 20))), ERR_WRITE_REQUEST_REJECTED)
+        test.assert_eq(filter_write_error(flt(t, [1, 2, 3, 4])), ERR_INVALID_LENGTH)
+    // The values from 0x0B are reserved.
+    test.assert_eq(filter_write_error([0x0B]), ERR_WRITE_REQUEST_REJECTED)
+    test.assert_eq(filter_write_error([0xFF, 1]), ERR_WRITE_REQUEST_REJECTED)
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_name_filters_compare_the_octets_of_the_name()
+    let m = object(0x100, "Firmware.bin", type16(0x2ACA), 10, 20)
+    test.assert(filter_matches(flt(0x00, []), m, false))
+    test.assert(filter_matches([], m, false))
+    test.assert(filter_matches(flt(0x01, wire.text("Firm")), m, false))
+    test.assert(not filter_matches(flt(0x01, wire.text("firm")), m, false))
+    test.assert(filter_matches(flt(0x02, wire.text(".bin")), m, false))
+    test.assert(not filter_matches(flt(0x02, wire.text("Firm")), m, false))
+    test.assert(filter_matches(flt(0x03, wire.text("mwa")), m, false))
+    test.assert(not filter_matches(flt(0x03, wire.text("MWA")), m, false))
+    test.assert(filter_matches(flt(0x04, wire.text("Firmware.bin")), m, false))
+    test.assert(not filter_matches(flt(0x04, wire.text("Firmware.bi")), m, false))
+    test.assert(not filter_matches(flt(0x04, wire.text("Firmware.bin ")), m, false))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_type_filter_matches_a_uuid_in_either_width()
+    let m = object(0x100, "a", type16(0x2ACA), 10, 20)
+    test.assert(filter_matches(flt(0x05, type16(0x2ACA)), m, false))
+    test.assert(filter_matches(flt(0x05, object_store.uuid_expand(type16(0x2ACA))), m, false))
+    test.assert(not filter_matches(flt(0x05, type16(0x2ACB)), m, false))
+    let wide = object(0x101, "b", object_store.uuid_expand(type16(0x2ACA)), 10, 20)
+    test.assert(filter_matches(flt(0x05, type16(0x2ACA)), wide, false))
+    var proprietary = object_store.uuid_expand(type16(0x2ACA))
+    proprietary[0] = 0x01
+    test.assert(not filter_matches(flt(0x05, proprietary), m, false))
+    test.assert(filter_matches(flt(0x05, proprietary), object(0x102, "c", proprietary, 0, 0), false))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_timestamp_filters_are_inclusive_and_pass_an_unknown_timestamp()
+    var m = object(0x100, "a", type16(0x2ACA), 10, 20)
+    let low = dt(2024, 1, 1, 0, 0, 0)
+    let high = dt(2024, 12, 31, 23, 59, 59)
+    let both = span(low, high)
+    // Not known: not excluded by either filter.
+    test.assert(filter_matches(flt(0x06, both), m, false))
+    test.assert(filter_matches(flt(0x07, both), m, false))
+    // Created inside, on both ends, outside.
+    m.created = dt(2024, 6, 1, 12, 0, 0)
+    test.assert(filter_matches(flt(0x06, both), m, false))
+    m.created = low[:]
+    test.assert(filter_matches(flt(0x06, both), m, false))
+    m.created = high[:]
+    test.assert(filter_matches(flt(0x06, both), m, false))
+    m.created = dt(2023, 12, 31, 23, 59, 59)
+    test.assert(not filter_matches(flt(0x06, both), m, false))
+    m.created = dt(2025, 1, 1, 0, 0, 0)
+    test.assert(not filter_matches(flt(0x06, both), m, false))
+    // The modified filter looks at the modification time, not the creation time.
+    test.assert(filter_matches(flt(0x07, both), m, false))
+    m.modified = dt(2030, 1, 1, 0, 0, 0)
+    test.assert(not filter_matches(flt(0x07, both), m, false))
+    // A timestamp with an unknown day is not known.
+    m.modified = [0xE8, 0x07, 6, 0, 1, 2, 3]
+    test.assert(filter_matches(flt(0x07, both), m, false))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_size_filters_are_inclusive_and_the_marked_filter_asks_the_client()
+    let m = object(0x100, "a", type16(0x2ACA), 10, 20)
+    test.assert(filter_matches(flt(0x08, sizes(10, 10)), m, false))
+    test.assert(filter_matches(flt(0x08, sizes(0, 10)), m, false))
+    test.assert(filter_matches(flt(0x08, sizes(10, 99)), m, false))
+    test.assert(not filter_matches(flt(0x08, sizes(11, 99)), m, false))
+    test.assert(not filter_matches(flt(0x08, sizes(0, 9)), m, false))
+    // The allocated size is the second field.
+    test.assert(filter_matches(flt(0x09, sizes(20, 20)), m, false))
+    test.assert(not filter_matches(flt(0x09, sizes(0, 19)), m, false))
+    test.assert(not filter_matches(flt(0x09, sizes(21, 30)), m, false))
+    test.assert(filter_matches(flt(0x0A, []), m, true))
+    test.assert(not filter_matches(flt(0x0A, []), m, false))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_three_filters_are_combined_by_and()
+    let m = object(0x100, "Firmware.bin", type16(0x2ACA), 10, 20)
+    let starts = flt(0x01, wire.text("Firm"))
+    let kind = flt(0x05, type16(0x2ACA))
+    let size = flt(0x08, sizes(5, 15))
+    test.assert(filters_match([starts, kind, size], m, false))
+    test.assert(filters_match([flt(0x00, []), flt(0x00, []), flt(0x00, [])], m, false))
+    test.assert(not filters_match([starts, kind, flt(0x08, sizes(11, 15))], m, false))
+    test.assert(not filters_match([flt(0x01, wire.text("x")), kind, size], m, false))
+    test.assert(not filters_match([starts, flt(0x05, type16(1)), size], m, false))
+    test.assert(filters_match([], m, false))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_sort_orders_of_table_3_23()
+    test.assert(not order_valid(0x00))
+    test.assert(order_valid(0x01))
+    test.assert(order_valid(0x05))
+    test.assert(not order_valid(0x06))
+    test.assert(not order_valid(0x10))
+    test.assert(order_valid(0x11))
+    test.assert(order_valid(0x15))
+    test.assert(not order_valid(0x16))
+    test.assert(not order_valid(0xFF))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_a_list_is_sorted_by_name_type_size_and_timestamps_both_ways()
+    var a = object(0x102, "b", type16(0x2ACB), 5, 9)
+    var b = object(0x100, "c", type16(0x2ACA), 30, 40)
+    var c = object(0x101, "a", object_store.uuid_expand(type16(0x2ACC)), 1, 2)
+    a.created = dt(2024, 1, 1, 0, 0, 0)
+    b.created = dt(2023, 1, 1, 0, 0, 0)
+    c.created = dt(2025, 1, 1, 0, 0, 0)
+    a.modified = dt(2022, 1, 1, 0, 0, 0)
+    b.modified = dt(2026, 1, 1, 0, 0, 0)
+    c.modified = dt(2024, 1, 1, 0, 0, 0)
+    var all = [a, b, c]
+    sort_metas(var all, 0x01)
+    test.assert_eq(ids_of(all), [0x101, 0x102, 0x100])
+    sort_metas(var all, 0x11)
+    test.assert_eq(ids_of(all), [0x100, 0x102, 0x101])
+    sort_metas(var all, 0x02)
+    test.assert_eq(ids_of(all), [0x100, 0x102, 0x101])
+    sort_metas(var all, 0x12)
+    test.assert_eq(ids_of(all), [0x101, 0x102, 0x100])
+    sort_metas(var all, 0x03)
+    test.assert_eq(ids_of(all), [0x101, 0x102, 0x100])
+    sort_metas(var all, 0x13)
+    test.assert_eq(ids_of(all), [0x100, 0x102, 0x101])
+    sort_metas(var all, 0x04)
+    test.assert_eq(ids_of(all), [0x100, 0x102, 0x101])
+    sort_metas(var all, 0x14)
+    test.assert_eq(ids_of(all), [0x101, 0x102, 0x100])
+    sort_metas(var all, 0x05)
+    test.assert_eq(ids_of(all), [0x102, 0x101, 0x100])
+    sort_metas(var all, 0x15)
+    test.assert_eq(ids_of(all), [0x100, 0x101, 0x102])
+    // The order of the store leaves a list alone.
+    sort_metas(var all, 0x00)
+    test.assert_eq(ids_of(all), [0x100, 0x101, 0x102])
+
+@tier(app)
+fn ids_of(metas: [ObjectMeta]) -> [Int]
+    var out: [Int] = []
+    for m in metas
+        list.push(out, m.id)
+    out
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_objects_that_tie_come_in_the_order_of_their_ids_whichever_way_the_order_runs()
+    let a = object(0x102, "same", type16(1), 7, 7)
+    let b = object(0x100, "same", type16(1), 7, 7)
+    let c = object(0x101, "same", type16(1), 7, 7)
+    for order in [0x01, 0x11, 0x02, 0x12, 0x03, 0x13, 0x04, 0x14, 0x05, 0x15]
+        var all = [a, b, c]
+        sort_metas(var all, order)
+        test.assert_eq(ids_of(all), [0x100, 0x101, 0x102])
+    // The shorter name comes first and a prefix is before its extension.
+    let shorter = object(0x103, "ab", type16(1), 0, 0)
+    let longer = object(0x104, "abc", type16(1), 0, 0)
+    var pair = [longer, shorter]
+    sort_metas(var pair, 0x01)
+    test.assert_eq(ids_of(pair), [0x103, 0x104])
+    sort_metas(var pair, 0x11)
+    test.assert_eq(ids_of(pair), [0x104, 0x103])
+    test.assert(not meta_before(shorter, longer, 0x00))
+    test.assert(meta_before(shorter, longer, 0x01))
+    test.assert(not meta_before(shorter, shorter, 0x01))
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_an_object_record_holds_its_fields_in_the_order_of_table_4_1()
+    var m = object(0x102, "ab", type16(0x2ACA), 3, 8)
+    m.properties = 0x0D
+    m.created = dt(2024, 1, 2, 3, 4, 5)
+    m.modified = dt(2025, 6, 7, 8, 9, 10)
+    // All the optional fields: 2 + 6 + 1 + 2 + 1 + 2 + 4 + 4 + 7 + 7 + 4 = 40 octets.
+    let full = directory_record(m, true, true)
+    test.assert_eq(list.len(full), 40)
+    test.assert_eq(full[0] as Int, 40)
+    test.assert_eq(full[1] as Int, 0)
+    test.assert_eq(full[2:8], [0x02, 0x01, 0, 0, 0, 0])
+    test.assert_eq(full[8] as Int, 2)
+    test.assert_eq(full[9:11], wire.text("ab"))
+    // Flags: current size, allocated size, created, modified and properties.
+    test.assert_eq(full[11] as Int, 0x3E)
+    test.assert_eq(full[12:14], [0xCA, 0x2A])
+    test.assert_eq(full[14:18], [3, 0, 0, 0])
+    test.assert_eq(full[18:22], [8, 0, 0, 0])
+    test.assert_eq(full[22:29], dt(2024, 1, 2, 3, 4, 5))
+    test.assert_eq(full[29:36], dt(2025, 6, 7, 8, 9, 10))
+    test.assert_eq(full[36:40], [0x0D, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_a_record_leaves_out_the_timestamps_the_service_lacks_and_widens_a_128_bit_type()
+    var m = object(0x100, "x", object_store.uuid_expand(type16(0x2ACA)), 1, 1)
+    m.properties = 4
+    let plain = directory_record(m, false, false)
+    // 2 + 6 + 1 + 1 + 1 + 16 + 4 + 4 + 4 = 39 octets, the Type 128 bit set.
+    test.assert_eq(list.len(plain), 39)
+    test.assert_eq(plain[0] as Int, 39)
+    test.assert_eq(plain[10] as Int, 0x27)
+    test.assert_eq(list.len(directory_record(m, true, false)), 46)
+    test.assert_eq(list.len(directory_record(m, false, true)), 46)
+    test.assert_eq(directory_record(m, true, false)[10] as Int, 0x2F)
+    test.assert_eq(directory_record(m, false, true)[10] as Int, 0x37)
+    // The name length is the number of octets, not of characters.
+    m.name = [0xE2, 0x82, 0xAC]
+    test.assert_eq(directory_record(m, false, false)[8] as Int, 3)
+
+@test
+@satisfies("REQ-BLE-OTS-004")
+fn test_the_directory_listing_is_the_records_one_after_the_other()
+    let a = object(0x100, "a", type16(1), 1, 1)
+    let b = object(0x101, "bb", type16(2), 2, 2)
+    let ra = directory_record(a, true, true)
+    let rb = directory_record(b, true, true)
+    var want: [u8] = ra[:]
+    list.append(want, rb)
+    test.assert_eq(directory_contents([a, b], true, true), want)
+    test.assert_eq(list.len(directory_contents([], true, true)), 0)
+    // A reader finds the next record by the first two octets of each.
+    let all = directory_contents([a, b], true, true)
+    test.assert_eq(wire.get(all, 0, 2), list.len(ra))
+    test.assert_eq(wire.get(all, list.len(ra), 2), list.len(rb))
+    test.assert_eq(list.len(all), list.len(ra) + list.len(rb))

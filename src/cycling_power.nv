@@ -1,0 +1,266 @@
+// src/cycling_power.nv — the Cycling Power Service (0x1818).
+//
+// A power meter on a bicycle reports the power the rider produces, and
+// optionally the pedal balance, the torque, the wheel and crank revolutions
+// and the energy. The service holds, in the order the builder adds them:
+//
+//   Cycling Power Measurement   0x2A63   Notify, with a Client Characteristic
+//                                        Configuration descriptor
+//   Cycling Power Feature       0x2A65   Read; 32 bits of what the meter does
+//   Sensor Location             0x2A5D   Read
+//   Cycling Power Control Point 0x2A66   Write, Indicate, with a descriptor;
+//                                        optional, required with the wheel
+//                                        revolution data
+//
+// The measurement covers instantaneous power, pedal power balance,
+// accumulated torque, wheel and crank revolution data, accumulated energy
+// and the offset compensation indicator, each field only when the Feature
+// value names it. The extreme force, extreme torque, extreme angle and dead
+// spot angle fields, the Cycling Power Vector and the broadcast of the
+// measurement are not built. The control point has three procedures, each
+// answered with an indication, and every other opcode is answered Op Code
+// Not Supported:
+//
+//   0x01  Set Cumulative Value          4 octets, the wheel revolutions
+//   0x02  Update Sensor Location        1 octet, a location in the list
+//   0x03  Request Supported Sensor Locations
+//   0x20  Response Code                 opcode, result, parameter
+//
+// A client that has not enabled indications on the control point is refused
+// with the Error Code 0xFD, and one that writes while an indication is
+// unconfirmed with 0xFE.
+//
+// The Cycling Power Service Specification 1.1.1 and its test specification
+// give the flags of the measurement, the Feature bits 0 to 8, 16 and 17, the
+// opcodes and response values below, the 4-octet Feature and the 1-octet
+// Sensor Location. They leave the widths of the measurement fields, the
+// Sensor Location values and the other Feature bits to the characteristic
+// definitions, which this module was not compared with.
+
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+
+const UUID_CYCLING_POWER_SERVICE = 0x1818
+const UUID_CYCLING_POWER_MEASUREMENT = 0x2A63
+const UUID_CYCLING_POWER_FEATURE = 0x2A65
+const UUID_CYCLING_POWER_CONTROL_POINT = 0x2A66
+
+// The bits of the Cycling Power Feature value that name the fields of the
+// measurement this module builds.
+const FEATURE_PEDAL_POWER_BALANCE = 0x00000001
+const FEATURE_ACCUMULATED_TORQUE = 0x00000002
+const FEATURE_WHEEL_REVOLUTION_DATA = 0x00000004
+const FEATURE_CRANK_REVOLUTION_DATA = 0x00000008
+const FEATURE_ACCUMULATED_ENERGY = 0x00000080
+const FEATURE_OFFSET_COMPENSATION_INDICATOR = 0x00000100
+
+// Bit 16 is 0 for a force-based sensor and 1 for a torque-based one; bit 17
+// says the Vector characteristic reports the direction of its magnitudes.
+const FEATURE_TORQUE_BASED_CONTEXT = 0x00010000
+const FEATURE_INSTANTANEOUS_MEASUREMENT_DIRECTION = 0x00020000
+
+// The bits of the Feature value the service defines, 0 to 21; the rest are
+// reserved and read as 0.
+const FEATURE_DEFINED_BITS = 0x003FFFFF
+
+// The bits of the flags field of a measurement.
+const FLAG_PEDAL_POWER_BALANCE = 0x0001
+const FLAG_PEDAL_POWER_BALANCE_LEFT = 0x0002
+const FLAG_ACCUMULATED_TORQUE = 0x0004
+const FLAG_TORQUE_CRANK_BASED = 0x0008
+const FLAG_WHEEL_REVOLUTION_DATA = 0x0010
+const FLAG_CRANK_REVOLUTION_DATA = 0x0020
+const FLAG_ACCUMULATED_ENERGY = 0x0800
+const FLAG_OFFSET_COMPENSATION = 0x1000
+
+// The opcodes of the Cycling Power Control Point and the code of a
+// response.
+const OP_SET_CUMULATIVE_VALUE = 0x01
+const OP_UPDATE_SENSOR_LOCATION = 0x02
+const OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS = 0x03
+const OP_RESPONSE_CODE = 0x20
+
+// One measurement. `power` is in watts and may be negative. A field whose
+// `has_` flag is false, or whose value is -1 where noted, is not in the
+// value. `pedal_balance` is the share of the power on one pedal in units of
+// 1/2 percent, -1 for none; `balance_left` says the balance is of the left
+// pedal, otherwise its reference is unknown. `accumulated_torque` is in
+// units of 1/32 newton metre, -1 for none; `torque_crank_based` says it is
+// measured at the crank, otherwise at the wheel. Wheel revolutions are a
+// 32-bit count with the time of the last event in units of 1/2048 second,
+// crank revolutions a 16-bit count with the time in units of 1/1024 second.
+// `accumulated_energy` is in kilojoules, -1 for none. `offset_compensated`
+// sets the offset compensation indicator.
+struct CyclingPowerMeasurement
+    power: Int
+    pedal_balance: Int
+    balance_left: Bool
+    accumulated_torque: Int
+    torque_crank_based: Bool
+    has_wheel: Bool
+    wheel_revolutions: Int
+    last_wheel_event: Int
+    has_crank: Bool
+    crank_revolutions: Int
+    last_crank_event: Int
+    accumulated_energy: Int
+    offset_compensated: Bool
+
+// A measurement of `power` watts and nothing else.
+fn power_only(power: Int) -> CyclingPowerMeasurement
+    CyclingPowerMeasurement {
+        power: power, pedal_balance: -1, balance_left: false, accumulated_torque: -1, torque_crank_based: false,
+        has_wheel: false, wheel_revolutions: 0, last_wheel_event: 0, has_crank: false, crank_revolutions: 0,
+        last_crank_event: 0, accumulated_energy: -1, offset_compensated: false }
+
+// The value of a measurement: the flags, the power and the fields the
+// flags name, in the order of the flags.
+fn cycling_power_measurement_value(m: CyclingPowerMeasurement) -> [u8]
+    var flags = 0
+    if m.pedal_balance >= 0
+        flags = flags | FLAG_PEDAL_POWER_BALANCE
+        if m.balance_left
+            flags = flags | FLAG_PEDAL_POWER_BALANCE_LEFT
+    if m.accumulated_torque >= 0
+        flags = flags | FLAG_ACCUMULATED_TORQUE
+        if m.torque_crank_based
+            flags = flags | FLAG_TORQUE_CRANK_BASED
+    if m.has_wheel
+        flags = flags | FLAG_WHEEL_REVOLUTION_DATA
+    if m.has_crank
+        flags = flags | FLAG_CRANK_REVOLUTION_DATA
+    if m.accumulated_energy >= 0
+        flags = flags | FLAG_ACCUMULATED_ENERGY
+    if m.offset_compensated
+        flags = flags | FLAG_OFFSET_COMPENSATION
+    var out: [u8] = []
+    wire.put(var out, flags, 2)
+    wire.put(var out, wire.clamp(m.power, -32768, 32767), 2)
+    if m.pedal_balance >= 0
+        wire.put(var out, wire.clamp(m.pedal_balance, 0, 200), 1)
+    if m.accumulated_torque >= 0
+        wire.put(var out, wire.clamp(m.accumulated_torque, 0, 0xFFFF), 2)
+    if m.has_wheel
+        wire.put(var out, wire.clamp(m.wheel_revolutions, 0, 0xFFFFFFFF), 4)
+        wire.put(var out, m.last_wheel_event, 2)
+    if m.has_crank
+        wire.put(var out, m.crank_revolutions, 2)
+        wire.put(var out, m.last_crank_event, 2)
+    if m.accumulated_energy >= 0
+        wire.put(var out, wire.clamp(m.accumulated_energy, 0, 0xFFFF), 2)
+    out
+
+// `m` with every field the Feature value `feature` does not name left out:
+// the flags of a field the meter does not support are 0.
+fn limited_to_feature(m: CyclingPowerMeasurement, feature: Int) -> CyclingPowerMeasurement
+    CyclingPowerMeasurement {
+        power: m.power,
+        pedal_balance: if (feature & FEATURE_PEDAL_POWER_BALANCE) != 0 then m.pedal_balance else -1,
+        balance_left: m.balance_left,
+        accumulated_torque: if (feature & FEATURE_ACCUMULATED_TORQUE) != 0 then m.accumulated_torque else -1,
+        torque_crank_based: m.torque_crank_based,
+        has_wheel: m.has_wheel and (feature & FEATURE_WHEEL_REVOLUTION_DATA) != 0,
+        wheel_revolutions: m.wheel_revolutions, last_wheel_event: m.last_wheel_event,
+        has_crank: m.has_crank and (feature & FEATURE_CRANK_REVOLUTION_DATA) != 0,
+        crank_revolutions: m.crank_revolutions, last_crank_event: m.last_crank_event,
+        accumulated_energy: if (feature & FEATURE_ACCUMULATED_ENERGY) != 0 then m.accumulated_energy else -1,
+        offset_compensated: m.offset_compensated and (feature & FEATURE_OFFSET_COMPENSATION_INDICATOR) != 0 }
+
+// The configuration of the service. `feature` is the 32-bit Cycling Power
+// Feature value, of which the reserved bits are dropped; `location` is
+// required, and `control_point` is required when `feature` has the wheel
+// revolution data. The accesses are at security level 3 or below and none
+// is `Denied`; `add_cycling_power_service` answers `NotPermitted` otherwise.
+struct CyclingPowerConfig
+    feature: Int
+    location: sensor_control.SensorLocation
+    control_point: Bool
+    read: gatt_server.Access
+    measurement_cccd: gatt_server.Permissions
+    control_point_write: gatt_server.Access
+    control_point_cccd: gatt_server.Permissions
+
+// A meter open to any client, with the control point.
+fn default_cycling_power_config(feature: Int, location: sensor_control.SensorLocation) -> CyclingPowerConfig
+    CyclingPowerConfig {
+        feature: feature, location: location, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+
+// The handles of the service. `control_point` and `control_point_cccd` are 0
+// when the service has no control point. `feature_bits` is the Feature value
+// the service holds.
+struct CyclingPowerHandles
+    feature_bits: Int
+    service: Int
+    measurement: Int
+    measurement_cccd: Int
+    feature: Int
+    location: Int
+    control_point: Int
+    control_point_cccd: Int
+
+// Add the service after the last attribute of `server`.
+fn add_cycling_power_service(var db: GattDb, config: CyclingPowerConfig) -> Result<CyclingPowerHandles, profile_builder.ProfileError>
+    let feature_bits = config.feature & FEATURE_DEFINED_BITS
+    if config.location == sensor_control.SensorLocation.Absent
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if (feature_bits & FEATURE_WHEEL_REVOLUTION_DATA) != 0 and not config.control_point
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if not sensor_control.accesses_conform(config.read, config.measurement_cccd, config.control_point, config.control_point_write, config.control_point_cccd)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_CYCLING_POWER_SERVICE))!
+    let measurement = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(),
+        gatt_server.le16(UUID_CYCLING_POWER_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, config.measurement_cccd)!
+    var feature_value: [u8] = []
+    wire.put(var feature_value, feature_bits, 4)
+    let feature = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read),
+        gatt_server.le16(UUID_CYCLING_POWER_FEATURE), feature_value)!
+    let location = sensor_control.add_location(var db, config.location, config.read)!
+    var control_point = 0
+    var control_point_cccd = 0
+    if config.control_point
+        let added = sensor_control.add_control_point_with_errors(var db, UUID_CYCLING_POWER_CONTROL_POINT, config.control_point_write,
+            config.control_point_cccd, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        control_point = added.0
+        control_point_cccd = added.1
+    Ok(CyclingPowerHandles {
+        feature_bits: feature_bits, service: service, measurement: measurement, measurement_cccd: measurement_cccd, feature: feature,
+        location: location, control_point: control_point, control_point_cccd: control_point_cccd })
+
+// Store `m`, limited to the fields the Feature value names, as the
+// measurement and answer the notification PDUs: the notification when the
+// client enabled it, none otherwise.
+fn cycling_power_notify(var db: GattDb, var link: AttLink, handles: CyclingPowerHandles, m: CyclingPowerMeasurement, now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handles.measurement, cycling_power_measurement_value(limited_to_feature(m, handles.feature_bits)))
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// The response value to the request written to the control point.
+fn cycling_power_control_point_response(var state: sensor_control.ScState, request: [u8]) -> [u8]
+    if list.len(request) == 0
+        return sensor_control.response(OP_RESPONSE_CODE, 0, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+    let op = request[0] as Int
+    let parameter = request[1:]
+    match op
+        OP_SET_CUMULATIVE_VALUE => sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.set_cumulative(var state, parameter), [])
+        OP_UPDATE_SENSOR_LOCATION =>
+            let r = sensor_control.update_location(var state, parameter)
+            sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+        OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS =>
+            let r = sensor_control.list_locations(state)
+            sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+        _ => sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+
+// Answer the request the client wrote to the control point: apply it to
+// `state`, keep the Sensor Location in step and answer the indication PDUs.
+// Call it once for each write, when `gatt_server.take_changed` names the
+// control point.
+fn cycling_power_handle_control_point(var db: GattDb, var link: AttLink, handles: CyclingPowerHandles, var state: sensor_control.ScState, now_ms: Int) -> [[u8]]
+    if handles.control_point == 0
+        return []
+    let reply = cycling_power_control_point_response(var state, sensor_control.written(db, handles.control_point))
+    sensor_control.respond(var db, var link, handles.control_point, handles.location, state, reply, now_ms)

@@ -1,0 +1,2148 @@
+// tests/generic_health_sensor_tests.nv — the unit tests of src/generic_health_sensor.nv.
+//
+//   novo test tests/generic_health_sensor_tests.nv
+
+use std.test
+use att
+use gatt_server
+use links
+use dis_policy
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer, subscribe }
+use wire
+use generic_health_sensor.{ BODY_BUNDLE_ID, BODY_CLASS, BODY_FIELD, BODY_FLAGS, BODY_LENGTH, BODY_NESTED_BUNDLE, BODY_NO_TYPE, BODY_OK, BODY_STATUS, BODY_STRING, BODY_TOO_SHORT, BODY_TRAILING, BODY_VALUE, CLASS_BUNDLE, CLASS_COMPOUND, CLASS_COMPOUND_DISCRETE, CLASS_COMPOUND_STATE_EVENT, CLASS_DISCRETE, CLASS_NUMERIC, CLASS_SAMPLE_ARRAY, CLASS_STRING, CLASS_TLV, CONFIG_INVALID, CONFIG_NOT_PERMITTED, CONFIG_OK, ERR_COMMAND_NOT_SUPPORTED, FILTER_RECORD_NUMBER, FILTER_TIME, FLAGS_DEFINED, FLAG_DERIVED_FROM, FLAG_DURATION, FLAG_ID, FLAG_MEMBER_OF, FLAG_PATIENT, FLAG_STATUS, FLAG_SUPPLEMENTAL, FLAG_TIME_STAMP, FLAG_TLVS, FLAG_TYPE, GhsConfig, GhsHandles, GhsObservation, GhsPolicy, GhsRange, GhsState, GhsTlv, MASK_ALL, MASK_ALL_OPERATORS, MASK_FIRST, MASK_GREATER_OR_EQUAL, MASK_LAST, OPERATOR_ALL, OPERATOR_FIRST, OPERATOR_GREATER_OR_EQUAL, OPERATOR_LAST, OPERATOR_LESS_OR_EQUAL, OPERATOR_NULL, OPERATOR_WITHIN, OP_START, OP_STOP, PULSE, RACP_ABORT, RACP_COMBINED_REPORT, RACP_COMBINED_RESPONSE, RACP_DELETE, RACP_NUMBER_RESPONSE, RACP_REPORT_NUMBER, RACP_RESPONSE_CODE, RESULT_ABORT_UNSUCCESSFUL, RESULT_CONTROL_POINT_SUCCESS, RESULT_INVALID_OPERAND, RESULT_INVALID_OPERATOR, RESULT_NO_RECORDS_FOUND, RESULT_OPERAND_NOT_SUPPORTED, RESULT_OPERATOR_NOT_SUPPORTED, RESULT_OP_CODE_NOT_SUPPORTED, RESULT_PROCEDURE_NOT_COMPLETED, RESULT_SERVER_BUSY, RESULT_SUCCESS, SPO2, STATUS_MANUALLY_ENTERED, STATUS_TEST_DATA, STORE_DISABLED, STORE_FULL, STORE_INVALID, STORE_NO_TIME_STAMP, SUBMIT_DISABLED, SUBMIT_FULL, SUBMIT_INVALID, SUBMIT_NO_TIME_STAMP, SUBMIT_OK, UNIT_PERCENT, add_ghs_service, both_config, default_ghs_config, default_ghs_policy, full_config, ghs_body, ghs_body_error, ghs_body_patient, ghs_bundle_value, ghs_component, ghs_compound_discrete_value, ghs_compound_value, ghs_config_error, ghs_delete_records, ghs_discrete_value, ghs_features_length, ghs_features_value, ghs_format_octets, ghs_has_time_stamp, ghs_indicate_features, ghs_indicate_schedule_changed, ghs_live_count, ghs_numeric_value, ghs_observation, ghs_observation_flags, ghs_pump, ghs_range_value, ghs_receive, ghs_reset_connection, ghs_sample_array_value, ghs_segment_count, ghs_segment_header, ghs_segments, ghs_service_data, ghs_set_features, ghs_set_schedule, ghs_set_users, ghs_state_event_value, ghs_store, ghs_store_count, ghs_store_drop_oldest, ghs_string_value, ghs_submit, ghs_tlv_value, ghs_written_schedule, new_ghs_state, stored_config }
+
+const MODALITY_SPOT = 0x00024C3C
+const UNIT_BPM = 0x0AA0
+const UNIT_MMHG = 0x0F20
+
+// A server with the service of `config`, on an encrypted link of security
+// level `level` whose ATT_MTU is `mtu` (23 is the default).
+@tier(app)
+fn rig_at(config: GhsConfig, level: Int, mtu: Int) -> (GattServer, GhsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_ghs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, level, 16, true))
+    if mtu > 23
+        gatt_server.set_mtu(var s.link, 0, mtu)
+    (s, h)
+
+@tier(app)
+fn rig(config: GhsConfig) -> (GattServer, GhsHandles)
+    rig_at(config, 2, 23)
+
+// Live observations over notifications and/or indications, no stored ones.
+@tier(app)
+fn live_config(notify: Bool, indicate: Bool) -> GhsConfig
+    var c = default_ghs_config([SPO2, PULSE])
+    c.live_notify = notify
+    c.live_indicate = indicate
+    c
+
+@tier(app)
+fn confirm(var s: GattServer) -> [[u8]]
+    gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+
+@tier(app)
+fn read_of(var s: GattServer, handle: Int) -> [u8]
+    gatt_server.receive(var s.db, var s.link, req(0x0A, handle, []), 0)[0]
+
+// `ghs_receive` with the default policy, for the tests that do not look at it.
+@tier(app)
+fn receive_default(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState, pdu: [u8], now_ms: Int) -> [[u8]]
+    var policy = default_ghs_policy()
+    ghs_receive(var s.db, var s.link, h, config, var st, var policy, peer(), pdu, now_ms)
+
+@tier(app)
+fn write(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState, handle: Int, value: [Int]) -> [[u8]]
+    receive_default(var s, h, config, var st, req(0x12, handle, value), 0)
+
+@tier(app)
+fn pump(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState) -> [[u8]]
+    ghs_pump(var s.db, var s.link, h, config, var st, 0)
+
+// The error response to the request `op` for `handle` with `code`.
+@tier(app)
+fn error_pdu(op: Int, handle: Int, code: Int) -> [u8]
+    wire.octets([0x01, op, handle & 0xFF, handle >>> 8, code])
+
+// The values of the segments in the PDUs: the Segmentation Header and the data.
+@tier(app)
+fn segment_values(pdus: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for p in pdus
+        list.append(out, p[3:])
+    out
+
+// The data of the segments in the PDUs, without the Segmentation Headers.
+@tier(app)
+fn segment_data(pdus: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for p in pdus
+        list.append(out, p[4:])
+    out
+
+// The Elapsed Time of the examples of [GHSS] Appendix A: flags 0x22, the time
+// value 0x00002 9 2B9D72, and two more octets.
+@tier(app)
+fn stamp() -> [u8]
+    [0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00]
+
+// A numeric SpO2 observation of `value` percent.
+@tier(app)
+fn numeric(value: Int) -> GhsObservation
+    ghs_observation(CLASS_NUMERIC, SPO2, ghs_numeric_value(UNIT_PERCENT, wire.float(value, 0)))
+
+// 15 octets: it fits one segment of the default ATT_MTU.
+@tier(app)
+fn live_body(value: Int) -> [u8]
+    ghs_body(numeric(value))
+
+// 24 octets with a time stamp, 25 with a patient: a record of 28 octets, which
+// takes two segments of the default ATT_MTU.
+@tier(app)
+fn stamped_body(value: Int, patient: Int) -> [u8]
+    var o = numeric(value)
+    o.time_stamp = stamp()
+    o.patient = patient
+    ghs_body(o)
+
+// The first observation of [GHSS] A.1: a spot-check SpO2 of 98 percent, 29
+// octets, which takes two segments of the default ATT_MTU.
+@tier(app)
+fn spot_check() -> [u8]
+    var o = numeric(98)
+    o.time_stamp = stamp()
+    o.supplemental = [MODALITY_SPOT]
+    ghs_body(o)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_live_sensor_lists_the_features_the_live_characteristic_and_the_control_point()
+    let (s, h) = rig(default_ghs_config([SPO2, PULSE]))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.features, 3)
+    test.assert_eq(h.features_cccd, 0)
+    test.assert_eq(h.live, 5)
+    test.assert_eq(h.live_cccd, 6)
+    test.assert_eq(h.control_point, 8)
+    test.assert_eq(h.control_point_cccd, 9)
+    test.assert_eq(h.stored, 0)
+    test.assert_eq(h.stored_cccd, 0)
+    test.assert_eq(h.racp, 0)
+    test.assert_eq(h.schedule_changed, 0)
+    test.assert_eq(list.len(h.schedules), 0)
+    test.assert_eq(list.len(h.ranges), 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 9)
+    // A primary service, then the declarations of Table 3.1 with their properties:
+    // Read, Indicate, and Write with Indicate for the control point (the rows of the test specification).
+    test.assert_eq(s.db.attributes[0].value, [0x40, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 0x03, 0x00, 0xF3, 0x2B])
+    test.assert_eq(s.db.attributes[3].value, [0x20, 0x05, 0x00, 0x8B, 0x2B])
+    test.assert_eq(s.db.attributes[6].value, [0x28, 0x08, 0x00, 0xF4, 0x2B])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_full_sensor_lists_every_characteristic_and_descriptor_in_the_order_of_the_table()
+    let (s, h) = rig(full_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.features, 3)
+    test.assert_eq(h.features_cccd, 4)
+    test.assert_eq(h.schedules[0], 5)
+    test.assert_eq(h.schedules[1], 6)
+    test.assert_eq(h.ranges[0], 7)
+    test.assert_eq(h.live, 9)
+    test.assert_eq(h.live_cccd, 10)
+    test.assert_eq(h.stored, 12)
+    test.assert_eq(h.stored_cccd, 13)
+    test.assert_eq(h.racp, 15)
+    test.assert_eq(h.racp_cccd, 16)
+    test.assert_eq(h.control_point, 18)
+    test.assert_eq(h.control_point_cccd, 19)
+    test.assert_eq(h.schedule_changed, 21)
+    test.assert_eq(h.schedule_changed_cccd, 22)
+    test.assert_eq(gatt_server.last_handle(s.db), 22)
+    test.assert_eq(s.db.attributes[1].value, [0x22, 0x03, 0x00, 0xF3, 0x2B])
+    test.assert_eq(s.db.attributes[7].value, [0x30, 0x09, 0x00, 0x8B, 0x2B])
+    test.assert_eq(s.db.attributes[10].value, [0x30, 0x0C, 0x00, 0xDD, 0x2B])
+    test.assert_eq(s.db.attributes[13].value, [0x28, 0x0F, 0x00, 0x52, 0x2A])
+    test.assert_eq(s.db.attributes[16].value, [0x28, 0x12, 0x00, 0xF4, 0x2B])
+    test.assert_eq(s.db.attributes[19].value, [0x20, 0x15, 0x00, 0xF1, 0x2B])
+    // The descriptors of the features: two Observation Schedule (0x2910), one Valid Range and Accuracy (0x2911).
+    test.assert_eq(s.db.attributes[4].type_uuid, [0x10, 0x29])
+    test.assert_eq(s.db.attributes[5].type_uuid, [0x10, 0x29])
+    test.assert_eq(s.db.attributes[6].type_uuid, [0x11, 0x29])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_stored_sensor_has_the_stored_characteristic_and_the_point_but_no_live_characteristic()
+    var c = stored_config(false, true)
+    c.features = false
+    c.observation_types = []
+    let (s, h) = rig(c)
+    test.assert_eq(h.features, 0)
+    test.assert_eq(h.live, 0)
+    test.assert_eq(h.control_point, 0)
+    test.assert_eq(h.stored, 3)
+    test.assert_eq(h.stored_cccd, 4)
+    test.assert_eq(h.racp, 6)
+    test.assert_eq(h.racp_cccd, 7)
+    test.assert_eq(gatt_server.last_handle(s.db), 7)
+    test.assert_eq(s.db.attributes[1].value, [0x20, 0x03, 0x00, 0xDD, 0x2B])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_features_value_lists_the_observation_types_and_the_device_specializations()
+    // [GHSS] Table 3.5: a pulse oximeter with the oxygen saturation and the pulse rate.
+    var c = default_ghs_config([SPO2, PULSE])
+    test.assert_eq(ghs_features_value(c), [0x00, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00])
+    // Table 3.7: the blood pressure monitor specialization 0x1007 in version 1 sets bit 0 of the Flags.
+    c.specialization_codes = [0x1007]
+    c.specialization_versions = [1]
+    test.assert_eq(ghs_features_value(c), [0x01, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00, 0x01, 0x07, 0x10, 0x01])
+    c.specialization_codes = [0x1007, 0x1004]
+    c.specialization_versions = [1, 2]
+    test.assert_eq(ghs_features_value(c), [0x01, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00, 0x02, 0x07, 0x10, 0x01, 0x04, 0x10, 0x02])
+    test.assert_eq(ghs_features_length(c), 17)
+    var (s, h) = rig(c)
+    test.assert_eq(read_of(var s, h.features), [0x0B, 0x01, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00, 0x02, 0x07, 0x10, 0x01, 0x04, 0x10, 0x02])
+    // The value is read, not written.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.features, [0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_features_value_longer_than_the_mtu_is_read_long()
+    var types: [Int] = []
+    for i in 0..40
+        list.push(types, 0x00024000 + i)
+    var (s, h) = rig(default_ghs_config(types))
+    // 2 + 160 octets: the Read Response holds 22 of them at the default ATT_MTU of 23.
+    let value = s.db.attributes[gatt_server.index_of(s.db, h.features)].value
+    test.assert_eq(list.len(value), 162)
+    let first = read_of(var s, h.features)
+    test.assert_eq(list.len(first), 23)
+    test.assert_eq(first[1:], value[0:22])
+    let blob = gatt_server.receive(var s.db, var s.link, req(0x0C, h.features, [22, 0]), 0)[0]
+    test.assert_eq(blob[0] as Int, 0x0D)
+    test.assert_eq(blob[1:], value[22:44])
+    let last = gatt_server.receive(var s.db, var s.link, req(0x0C, h.features, [154, 0]), 0)[0]
+    test.assert_eq(last[1:], value[154:162])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_sensor_whose_features_change_indicates_them_to_a_subscribed_client()
+    var c = full_config()
+    var (s, h) = rig(c)
+    test.assert_eq(list.len(ghs_indicate_features(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.features_cccd, 2)
+    let first = ghs_indicate_features(var s.db, var s.link, h, 0)
+    test.assert_eq(first[0], [0x1D, 0x03, 0x00, 0x01, 0x02, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00, 0x01, 0x07, 0x10, 0x01])
+    let _ = confirm(var s)
+    // The features changed: a third observation type and no specialization.
+    c.observation_types = [SPO2, PULSE, 0x00024A04]
+    c.specialization_codes = []
+    c.specialization_versions = []
+    test.assert(ghs_set_features(var s.db, h, c))
+    let second = ghs_indicate_features(var s.db, var s.link, h, 1)
+    test.assert_eq(second[0], [0x1D, 0x03, 0x00, 0x00, 0x03, 0xB8, 0x4B, 0x02, 0x00, 0x1A, 0x48, 0x02, 0x00, 0x04, 0x4A, 0x02, 0x00])
+    // A value that breaks a rule leaves the old one.
+    c.observation_types = []
+    test.assert(not ghs_set_features(var s.db, h, c))
+    // A sensor whose features cannot change has no Indicate property.
+    var (u, uh) = rig(default_ghs_config([SPO2]))
+    test.assert_eq(list.len(ghs_indicate_features(var u.db, var u.link, uh, 0)), 0)
+    // A sensor without the Health Sensor Features characteristic has none to set.
+    var plain = default_ghs_config([SPO2])
+    plain.features = false
+    plain.observation_types = []
+    var (v, vh) = rig(plain)
+    test.assert(not ghs_set_features(var v.db, vh, plain))
+    test.assert_eq(list.len(ghs_indicate_features(var v.db, var v.link, vh, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_schedule_and_range_descriptors_are_read_with_the_twelve_and_the_fourteen_or_eighteen_octets_of_the_tables()
+    var c = full_config()
+    var r2 = GhsRange { observation_type: PULSE, unit_code: UNIT_BPM, lower: wire.float(30, 0), upper: wire.float(250, 0), has_accuracy: false, accuracy: 0 }
+    list.push(c.ranges, r2)
+    var (s, h) = rig(c)
+    // Type, period and update interval: 12 octets.
+    test.assert_eq(read_of(var s, h.schedules[0]), [0x0B, 0xB8, 0x4B, 0x02, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00])
+    test.assert_eq(read_of(var s, h.schedules[1]), [0x0B, 0x1A, 0x48, 0x02, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00])
+    // Type, unit, lower and upper limit, and the accuracy when there is one: 18 and 14 octets.
+    test.assert_eq(read_of(var s, h.ranges[0]), [0x0B, 0xB8, 0x4B, 0x02, 0x00, 0x20, 0x02, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])
+    test.assert_eq(list.len(ghs_range_value(c.ranges[0])), 18)
+    test.assert_eq(read_of(var s, h.ranges[1]), [0x0B, 0x1A, 0x48, 0x02, 0x00, 0xA0, 0x0A, 0x1E, 0x00, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x00])
+    test.assert_eq(list.len(ghs_range_value(r2)), 14)
+    // The range is static: no client writes it.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.ranges[0], [0, 0]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // A negative limit is a FLOAT: -40.
+    r2.lower = wire.float(-40, 0)
+    test.assert_eq(ghs_range_value(r2)[6:10], [0xD8, 0xFF, 0xFF, 0x00])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_every_configuration_that_breaks_a_rule_is_refused_with_its_error()
+    test.assert_eq(ghs_config_error(default_ghs_config([SPO2])), CONFIG_OK)
+    test.assert_eq(ghs_config_error(full_config()), CONFIG_OK)
+    // The profile asks for security level 2 or higher: an open access is refused, the others pass.
+    var c = default_ghs_config([SPO2])
+    c.access = gatt_server.Access.Open
+    test.assert_eq(ghs_config_error(c), CONFIG_NOT_PERMITTED)
+    c.access = gatt_server.Access.Denied
+    test.assert_eq(ghs_config_error(c), CONFIG_NOT_PERMITTED)
+    c.access = gatt_server.Access.Authenticated
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    c.access = gatt_server.Access.SecureConnections
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    // At least one of the live and the stored characteristic, each with a way to send (Table 3.1, C.2 and C.3).
+    var none = default_ghs_config([SPO2])
+    none.live = false
+    none.live_indicate = false
+    test.assert_eq(ghs_config_error(none), CONFIG_INVALID)
+    var silent = default_ghs_config([SPO2])
+    silent.live_indicate = false
+    test.assert_eq(ghs_config_error(silent), CONFIG_INVALID)
+    var orphan = stored_config(true, false)
+    orphan.live_notify = true
+    test.assert_eq(ghs_config_error(orphan), CONFIG_INVALID)
+    var mute = stored_config(false, false)
+    test.assert_eq(ghs_config_error(mute), CONFIG_INVALID)
+    var stray = default_ghs_config([SPO2])
+    stray.stored_indicate = true
+    test.assert_eq(ghs_config_error(stray), CONFIG_INVALID)
+    var no_queue = default_ghs_config([SPO2])
+    no_queue.live_capacity = 0
+    test.assert_eq(ghs_config_error(no_queue), CONFIG_INVALID)
+    var no_store = stored_config(true, false)
+    no_store.store_capacity = 0
+    test.assert_eq(ghs_config_error(no_store), CONFIG_INVALID)
+    // The operators of the Combined Report hold All records and Greater than or equal to; the rest are optional.
+    var ops = stored_config(true, false)
+    ops.report_operators = MASK_ALL | MASK_GREATER_OR_EQUAL
+    test.assert_eq(ghs_config_error(ops), CONFIG_OK)
+    ops.report_operators = MASK_ALL
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    ops.report_operators = MASK_GREATER_OR_EQUAL | MASK_FIRST
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    ops.report_operators = MASK_ALL_OPERATORS | 0x01
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    ops.report_operators = MASK_ALL_OPERATORS | 0x80
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    ops.report_operators = MASK_ALL_OPERATORS
+    ops.delete_operators = MASK_ALL
+    test.assert_eq(ghs_config_error(ops), CONFIG_OK)
+    ops.delete_operators = MASK_LAST
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    ops.delete_operators = MASK_ALL | 0x80
+    test.assert_eq(ghs_config_error(ops), CONFIG_INVALID)
+    // Without stored observations there is neither a delete nor an abort procedure.
+    var live_delete = default_ghs_config([SPO2])
+    live_delete.delete_operators = MASK_ALL
+    test.assert_eq(ghs_config_error(live_delete), CONFIG_INVALID)
+    var live_abort = default_ghs_config([SPO2])
+    live_abort.abort = true
+    test.assert_eq(ghs_config_error(live_abort), CONFIG_INVALID)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_features_characteristic_needs_one_to_255_codes_of_the_right_width_and_fits_an_attribute()
+    var c = default_ghs_config([SPO2])
+    c.observation_types = []
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    var many: [Int] = []
+    for i in 0..256
+        list.push(many, i)
+    c.observation_types = many
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.observation_types = [-1]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.observation_types = [4294967296]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.observation_types = [4294967295]
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    // The specializations: as many versions as codes, 16-bit codes, 8-bit versions.
+    c.observation_types = [SPO2]
+    c.specialization_codes = [0x1007]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_versions = [1]
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    c.specialization_codes = [0x10000]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_codes = [-1]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_codes = [0xFFFF]
+    c.specialization_versions = [256]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_versions = [-1]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_versions = [255]
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    // A value longer than an attribute: 100 codes and 100 specializations are 703 octets.
+    var wide: [Int] = []
+    var spec: [Int] = []
+    var version: [Int] = []
+    for i in 0..100
+        list.push(wide, 0x00024000 + i)
+        list.push(spec, i)
+        list.push(version, 1)
+    var big = default_ghs_config(wide)
+    big.specialization_codes = spec
+    big.specialization_versions = version
+    test.assert_eq(ghs_features_length(big), 703)
+    test.assert_eq(ghs_config_error(big), CONFIG_INVALID)
+    big.specialization_codes = []
+    big.specialization_versions = []
+    test.assert_eq(ghs_config_error(big), CONFIG_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_sensor_without_features_has_no_descriptors_and_no_lists()
+    var c = default_ghs_config([SPO2])
+    c.features = false
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.observation_types = []
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    c.features_indicate = true
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.features_indicate = false
+    c.specialization_codes = [1]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_codes = []
+    c.specialization_versions = [1]
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+    c.specialization_versions = []
+    c.schedule_changed = true
+    test.assert_eq(ghs_config_error(c), CONFIG_INVALID)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_schedule_and_range_descriptors_obey_the_rules_of_their_tables()
+    var c = full_config()
+    test.assert_eq(ghs_config_error(c), CONFIG_OK)
+    // A schedule is for an observation type the sensor supports, one for each type.
+    var stray = full_config()
+    stray.schedules[1].observation_type = 0x00024A04
+    test.assert_eq(ghs_config_error(stray), CONFIG_INVALID)
+    var twice = full_config()
+    twice.schedules[1].observation_type = SPO2
+    test.assert_eq(ghs_config_error(twice), CONFIG_INVALID)
+    // The period and the interval are numbers of seconds that are not negative.
+    var nan = full_config()
+    nan.schedules[1].period = wire.FLOAT_NAN
+    test.assert_eq(ghs_config_error(nan), CONFIG_INVALID)
+    var negative = full_config()
+    negative.schedules[1].interval = wire.float(-1, 0)
+    test.assert_eq(ghs_config_error(negative), CONFIG_INVALID)
+    // A writable schedule has limits that hold its own value, and needs the characteristic that tells of changes.
+    var inverted = full_config()
+    inverted.schedules[0].period_min = 5000000
+    test.assert_eq(ghs_config_error(inverted), CONFIG_INVALID)
+    var outside = full_config()
+    outside.schedules[0].interval_max = 1000
+    test.assert_eq(ghs_config_error(outside), CONFIG_INVALID)
+    var silent = full_config()
+    silent.schedule_changed = false
+    test.assert_eq(ghs_config_error(silent), CONFIG_INVALID)
+    // The characteristic with no schedule, and with only a schedule the user changes, are both there.
+    var empty = full_config()
+    empty.schedules = []
+    test.assert_eq(ghs_config_error(empty), CONFIG_INVALID)
+    var by_user = full_config()
+    by_user.schedules[0].writable = false
+    test.assert_eq(ghs_config_error(by_user), CONFIG_OK)
+    // The ranges: one for each type, a unit of 16 bits, numbers for the limits, the lower not above the upper.
+    var again = full_config()
+    list.push(again.ranges, again.ranges[0])
+    test.assert_eq(ghs_config_error(again), CONFIG_INVALID)
+    var unit = full_config()
+    unit.ranges[0].unit_code = 0x10000
+    test.assert_eq(ghs_config_error(unit), CONFIG_INVALID)
+    var lower = full_config()
+    lower.ranges[0].lower = wire.FLOAT_NAN
+    test.assert_eq(ghs_config_error(lower), CONFIG_INVALID)
+    var order = full_config()
+    order.ranges[0].lower = wire.float(101, 0)
+    test.assert_eq(ghs_config_error(order), CONFIG_INVALID)
+    var same = full_config()
+    same.ranges[0].lower = wire.float(100, 0)
+    test.assert_eq(ghs_config_error(same), CONFIG_OK)
+    var accuracy = full_config()
+    accuracy.ranges[0].accuracy = wire.FLOAT_POSITIVE_INFINITY
+    test.assert_eq(ghs_config_error(accuracy), CONFIG_INVALID)
+    accuracy.ranges[0].has_accuracy = false
+    test.assert_eq(ghs_config_error(accuracy), CONFIG_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_builder_answers_the_error_of_a_refused_configuration_and_a_full_table()
+    var s = gatt_server.new_server([], 65)
+    var open = default_ghs_config([SPO2])
+    open.access = gatt_server.Access.Open
+    match add_ghs_service(var s.db, open)
+        Ok(_) => test.fail("an open access is below the profile")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+    var bad = default_ghs_config([SPO2])
+    bad.live = false
+    bad.live_indicate = false
+    match add_ghs_service(var s.db, bad)
+        Ok(_) => test.fail("a sensor with no observations")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    test.assert_eq(gatt_server.last_handle(s.db), 0)
+    // A table with no handle left.
+    var t = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var t.db, false, gatt_server.le16(0xAA00)), 1)
+    t.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_ghs_service(var t.db, default_ghs_config([SPO2]))
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)
+
+// ── Tests: observations ─────────────────────────────────────────────
+
+@tier(app)
+fn cat(a: [Int], b: [Int]) -> [Int]
+    var out: [Int] = []
+    list.append(out, a)
+    list.append(out, b)
+    out
+
+@tier(app)
+fn ints(b: [u8]) -> [Int]
+    var out: [Int] = []
+    for x in b
+        list.push(out, x as Int)
+    out
+
+// The octets of the Observation Type 0x00024BB8 and of the Numeric value of 98 percent.
+@tier(app)
+fn type_bytes() -> [Int]
+    [0xB8, 0x4B, 0x02, 0x00]
+
+@tier(app)
+fn num_bytes() -> [Int]
+    [0x20, 0x02, 0x62, 0x00, 0x00, 0x00]
+
+// A body of the class and Flags with `rest` after the Flags and the Length it
+// has: for the bodies a test breaks on purpose.
+@tier(app)
+fn raw_body(class_type: Int, flags: Int, rest: [Int]) -> [u8]
+    var out = wire.octets([class_type, 0, 0, flags & 0xFF, flags >>> 8])
+    list.append(out, wire.octets(rest))
+    let n = list.len(out)
+    out[1] = (n & 0xFF) as u8
+    out[2] = (n >>> 8) as u8
+    out
+
+// A typed body of the class with the Observation Value `value`.
+@tier(app)
+fn typed(class_type: Int, value: [Int]) -> [u8]
+    raw_body(class_type, FLAG_TYPE, cat(type_bytes(), value))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_numeric_observation_of_the_first_example_has_its_29_octets()
+    // [GHSS] A.1.  The example prints the Flags as 0x0023 but lists the Supplemental Information bit (6)
+    // and not the Patient bit (5); Table 3.12 puts the Supplemental Information at bit 6, so 0x0043.
+    let body = spot_check()
+    test.assert_eq(list.len(body), 29)
+    test.assert(body == [
+        0x01, 0x1D, 0x00, 0x43, 0x00, 0xB8, 0x4B, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x01, 0x3C, 0x4C, 0x02, 0x00, 0x20, 0x02, 0x62, 0x00, 0x00, 0x00])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_compound_observation_of_the_second_example_carries_three_numeric_components_and_an_id()
+    // [GHSS] A.2: a blood pressure of 100, 60 and 80 mmHg.  The example gives the Length as 53 and a
+    // component 13 octets; the fields it lists add up to 11 octets for a component and 56 for the body.
+    var o = ghs_observation(CLASS_COMPOUND, 0x00024A04, ghs_compound_value([
+        ghs_component(0x00024A05, 1, ghs_numeric_value(UNIT_MMHG, wire.float(100, 0))),
+        ghs_component(0x00024A06, 1, ghs_numeric_value(UNIT_MMHG, wire.float(60, 0))),
+        ghs_component(0x00024A07, 1, ghs_numeric_value(UNIT_MMHG, wire.float(80, 0)))]))
+    o.time_stamp = stamp()
+    o.observation_id = 123456
+    let body = ghs_body(o)
+    test.assert_eq(ghs_observation_flags(o), 0x0013)
+    test.assert(body == [
+        0x07, 0x38, 0x00, 0x13, 0x00, 0x04, 0x4A, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x40, 0xE2, 0x01, 0x00, 0x03,
+        0x05, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x64, 0x00, 0x00, 0x00,
+        0x06, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x3C, 0x00, 0x00, 0x00,
+        0x07, 0x4A, 0x02, 0x00, 0x01, 0x20, 0x0F, 0x50, 0x00, 0x00, 0x00])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_compound_discrete_observation_of_the_third_example_derives_from_the_blood_pressure()
+    // [GHSS] A.3: cuff loose and cuff improperly placed, derived from the observation 123456.
+    var o = ghs_observation(CLASS_COMPOUND_DISCRETE, 0x008055F0, ghs_compound_discrete_value([0x000300F0, 0x000301AE]))
+    o.derived_from = [123456]
+    let body = ghs_body(o)
+    test.assert_eq(list.len(body), 23)
+    test.assert(body == [
+        0x05, 0x17, 0x00, 0x81, 0x00, 0xF0, 0x55, 0x80, 0x00,
+        0x01, 0x40, 0xE2, 0x01, 0x00,
+        0x02, 0xF0, 0x00, 0x03, 0x00, 0xAE, 0x01, 0x03, 0x00])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_sample_array_observation_of_the_fourth_example_scales_two_octet_samples()
+    // [GHSS] A.4: an ECG lead with the first four samples.  The scale factor 1.612 is the FLOAT with the
+    // exponent -3 (0xFD); the example prints the exponent octet as 0x00.
+    var o = ghs_observation(CLASS_SAMPLE_ARRAY, 0x00020101, ghs_sample_array_value(
+        0x10B2, wire.float(1612, -3), wire.float(2048, 0), wire.float(10, -3), 1, 2, [2041, 2043, 2037, 2047]))
+    o.time_stamp = stamp()
+    let body = ghs_body(o)
+    test.assert_eq(list.len(body), 46)
+    test.assert(body == [
+        0x04, 0x2E, 0x00, 0x03, 0x00, 0x01, 0x01, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0xB2, 0x10, 0x4C, 0x06, 0x00, 0xFD, 0x00, 0x08, 0x00, 0x00, 0x0A, 0x00, 0x00, 0xFD,
+        0x01, 0x02, 0x04, 0x00, 0x00, 0x00,
+        0xF9, 0x07, 0xFB, 0x07, 0xF5, 0x07, 0xFF, 0x07])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+    // Four octets a sample, and three; a sample size the integers cannot hold is no value.
+    test.assert_eq(list.len(ghs_sample_array_value(1, 0, 0, 0, 1, 4, [1, 2])), 28)
+    test.assert_eq(list.len(ghs_sample_array_value(1, 0, 0, 0, 1, 3, [1, 2])), 26)
+    test.assert_eq(list.len(ghs_sample_array_value(1, 0, 0, 0, 1, 9, [1, 2])), 0)
+    test.assert_eq(list.len(ghs_sample_array_value(1, 0, 0, 0, 1, 0, [1, 2])), 0)
+    // A negative sample is its two's complement.
+    test.assert_eq(ghs_sample_array_value(1, 0, 0, 0, 1, 2, [-2])[20:22], [0xFE, 0xFF])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_bundle_of_the_fifth_example_factors_out_the_time_stamp_and_the_supplemental_information()
+    // [GHSS] A.5: oxygen saturation and pulse rate of one spot check.  The example gives the Length as 53;
+    // the fields it lists add up to 50.
+    let one = ghs_observation(CLASS_NUMERIC, SPO2, ghs_numeric_value(UNIT_PERCENT, wire.float(98, 0)))
+    let two = ghs_observation(CLASS_NUMERIC, PULSE, ghs_numeric_value(UNIT_BPM, wire.float(98, 0)))
+    var bundle = ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([ghs_body(one), ghs_body(two)]))
+    bundle.time_stamp = stamp()
+    bundle.supplemental = [MODALITY_SPOT]
+    let body = ghs_body(bundle)
+    test.assert_eq(ghs_observation_flags(bundle), 0x0042)
+    test.assert(body == [
+        0xFF, 0x32, 0x00, 0x42, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x01, 0x3C, 0x4C, 0x02, 0x00, 0x02,
+        0x01, 0x0F, 0x00, 0x01, 0x00, 0xB8, 0x4B, 0x02, 0x00, 0x20, 0x02, 0x62, 0x00, 0x00, 0x00,
+        0x01, 0x0F, 0x00, 0x01, 0x00, 0x1A, 0x48, 0x02, 0x00, 0xA0, 0x0A, 0x62, 0x00, 0x00, 0x00])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+    test.assert(ghs_has_time_stamp(body))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_body_with_every_optional_field_lists_them_in_the_order_of_the_table()
+    var o = numeric(98)
+    o.time_stamp = stamp()
+    o.duration = wire.float(30, 0)
+    o.status = STATUS_TEST_DATA | STATUS_MANUALLY_ENTERED
+    o.observation_id = 7
+    o.patient = 3
+    o.supplemental = [MODALITY_SPOT]
+    o.derived_from = [123456]
+    o.member_of = [123457]
+    o.tlvs = [GhsTlv { observation_type: 0x00020001, format: 0x04, value: [5] }]
+    test.assert_eq(ghs_observation_flags(o), FLAGS_DEFINED)
+    let body = ghs_body(o)
+    test.assert_eq(list.len(body), 59)
+    test.assert(body == [
+        0x01, 0x3B, 0x00, 0xFF, 0x03, 0xB8, 0x4B, 0x02, 0x00,
+        0x22, 0x72, 0x9D, 0x2B, 0x29, 0x00, 0x00, 0x06, 0x00,
+        0x1E, 0x00, 0x00, 0x00, 0x50, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03,
+        0x01, 0x3C, 0x4C, 0x02, 0x00, 0x01, 0x40, 0xE2, 0x01, 0x00, 0x01, 0x41, 0xE2, 0x01, 0x00,
+        0x01, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x05,
+        0x20, 0x02, 0x62, 0x00, 0x00, 0x00])
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+    test.assert_eq(ghs_body_patient(body), 3)
+    // Each field has its own bit: the Flags of one field at a time.
+    var one = numeric(98)
+    test.assert_eq(ghs_observation_flags(one), FLAG_TYPE)
+    one.observation_type = -1
+    test.assert_eq(ghs_observation_flags(one), 0)
+    one.time_stamp = stamp()
+    test.assert_eq(ghs_observation_flags(one), FLAG_TIME_STAMP)
+    one.time_stamp = []
+    one.duration = 0
+    test.assert_eq(ghs_observation_flags(one), FLAG_DURATION)
+    one.duration = -1
+    one.status = 0
+    test.assert_eq(ghs_observation_flags(one), FLAG_STATUS)
+    one.status = -1
+    one.observation_id = 0
+    test.assert_eq(ghs_observation_flags(one), FLAG_ID)
+    one.observation_id = -1
+    one.patient = 0
+    test.assert_eq(ghs_observation_flags(one), FLAG_PATIENT)
+    one.patient = -1
+    one.supplemental = [1]
+    test.assert_eq(ghs_observation_flags(one), FLAG_SUPPLEMENTAL)
+    one.supplemental = []
+    one.derived_from = [1]
+    test.assert_eq(ghs_observation_flags(one), FLAG_DERIVED_FROM)
+    one.derived_from = []
+    one.member_of = [1]
+    test.assert_eq(ghs_observation_flags(one), FLAG_MEMBER_OF)
+    one.member_of = []
+    one.tlvs = [GhsTlv { observation_type: 1, format: 4, value: [1] }]
+    test.assert_eq(ghs_observation_flags(one), FLAG_TLVS)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_each_class_of_observation_has_the_value_of_its_table()
+    // Simple discrete: the MDC code.  String: the length and the text.  State/event: the size and three masks.
+    test.assert_eq(ghs_discrete_value(0x00030001), [0x01, 0x00, 0x03, 0x00])
+    test.assert_eq(ghs_string_value(wire.text("Man")), [0x03, 0x00, 0x4D, 0x61, 0x6E])
+    test.assert_eq(ghs_string_value([]), [0x00, 0x00])
+    test.assert_eq(ghs_state_event_value([0xFF], [0x0F], [0x05]), [0x01, 0xFF, 0x0F, 0x05])
+    test.assert_eq(ghs_state_event_value([0xFF, 0x01], [0x0F, 0x00], [0x05, 0x01]), [0x02, 0xFF, 0x01, 0x0F, 0x00, 0x05, 0x01])
+    // The three masks are of one size.
+    test.assert_eq(list.len(ghs_state_event_value([0xFF], [0x0F, 0x00], [0x05])), 0)
+    test.assert_eq(list.len(ghs_state_event_value([0xFF], [0x0F], [])), 0)
+    // The TLV value: the count and each attribute with its length and Format Type.
+    test.assert_eq(ghs_tlv_value([GhsTlv { observation_type: 0x00020001, format: 0x19, value: wire.text("ab") }]), [0x01, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x19, 0x61, 0x62])
+    test.assert_eq(ghs_tlv_value([]), [0x00])
+    // Every class makes a body that passes the check.
+    let words = ghs_observation(CLASS_STRING, SPO2, ghs_string_value(wire.text("Man")))
+    test.assert_eq(ghs_body_error(ghs_body(words)), BODY_OK)
+    let discrete = ghs_observation(CLASS_DISCRETE, SPO2, ghs_discrete_value(0x00030001))
+    test.assert_eq(ghs_body_error(ghs_body(discrete)), BODY_OK)
+    let masks = ghs_observation(CLASS_COMPOUND_STATE_EVENT, SPO2, ghs_state_event_value([0xFF], [0x0F], [0x05]))
+    test.assert_eq(ghs_body_error(ghs_body(masks)), BODY_OK)
+    let events = ghs_observation(CLASS_COMPOUND_DISCRETE, SPO2, ghs_compound_discrete_value([1, 2, 3]))
+    test.assert_eq(ghs_body_error(ghs_body(events)), BODY_OK)
+    let attributes = ghs_observation(CLASS_TLV, SPO2, ghs_tlv_value([GhsTlv { observation_type: 1, format: 0x08, value: [1, 0, 0, 0] }]))
+    test.assert_eq(ghs_body_error(ghs_body(attributes)), BODY_OK)
+    // A compound observation of one component of each value type.
+    let components = [
+        ghs_component(1, 1, ghs_numeric_value(UNIT_PERCENT, wire.float(1, 0))),
+        ghs_component(2, 2, ghs_discrete_value(5)),
+        ghs_component(3, 3, ghs_string_value(wire.text("ok"))),
+        ghs_component(4, 4, ghs_sample_array_value(1, 0, 0, 0, 1, 1, [1, 2])),
+        ghs_component(5, 5, ghs_compound_discrete_value([9])),
+        ghs_component(6, 6, ghs_state_event_value([1], [1], [1]))]
+    let compound = ghs_observation(CLASS_COMPOUND, SPO2, ghs_compound_value(components))
+    test.assert_eq(ghs_body_error(ghs_body(compound)), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_body_that_breaks_the_fixed_part_is_refused_with_its_error()
+    let good = typed(CLASS_NUMERIC, num_bytes())
+    test.assert_eq(ghs_body_error(good), BODY_OK)
+    // Fewer than the five octets of the class, the Length and the Flags.
+    test.assert_eq(ghs_body_error([]), BODY_TOO_SHORT)
+    test.assert_eq(ghs_body_error([1, 4, 0, 0]), BODY_TOO_SHORT)
+    // The Observation Class Type: 0 and 9 to 254 are RFU.
+    for c in [0, 9, 10, 100, 254]
+        test.assert_eq(ghs_body_error(typed(c, num_bytes())), BODY_CLASS)
+    for c in [1, 2, 3, 4, 5, 6, 7, 8, 255]
+        test.assert(ghs_body_error(typed(c, num_bytes())) != BODY_CLASS)
+    // The Length is the octets of the body.
+    var longer = typed(CLASS_NUMERIC, num_bytes())
+    longer[1] = 0x20
+    test.assert_eq(ghs_body_error(longer), BODY_LENGTH)
+    var shorter = typed(CLASS_NUMERIC, num_bytes())
+    shorter[1] = 0x05
+    test.assert_eq(ghs_body_error(shorter), BODY_LENGTH)
+    var high = typed(CLASS_NUMERIC, num_bytes())
+    high[2] = 0x01
+    test.assert_eq(ghs_body_error(high), BODY_LENGTH)
+    // Flags 10 to 15 are RFU.
+    for f in [0x0401, 0x0801, 0x1001, 0x2001, 0x4001, 0x8001]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, f, cat(type_bytes(), num_bytes()))), BODY_FLAGS)
+    // A single observation has its Observation Type.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0, num_bytes())), BODY_NO_TYPE)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_DISCRETE, 0, [1, 2, 3, 4])), BODY_NO_TYPE)
+    // Octets after the value.
+    test.assert_eq(ghs_body_error(typed(CLASS_NUMERIC, cat(num_bytes(), [0]))), BODY_TRAILING)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_optional_fields_are_checked_for_their_size_and_their_rules()
+    // The Time Stamp is nine octets.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0003, cat(type_bytes(), [1, 2, 3]))), BODY_FIELD)
+    // The Measurement Duration is a FLOAT that is not the reserved value; NaN is allowed.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0005, cat(cat(type_bytes(), [0x01, 0x00, 0x80, 0x00]), num_bytes()))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0005, cat(cat(type_bytes(), [0xFF, 0xFF, 0x7F, 0x00]), num_bytes()))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0005, cat(type_bytes(), [0x01, 0x00]))), BODY_FIELD)
+    // The Measurement Status: the bits 8 to 13 are RFU and the two threshold bits are not both set.
+    for s in [[0x00, 0x01], [0x00, 0x02], [0x00, 0x04], [0x00, 0x08], [0x00, 0x10], [0x00, 0x20], [0x00, 0xC0], [0x00, 0xFF]]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0009, cat(cat(type_bytes(), s), num_bytes()))), BODY_STATUS)
+    for s in [[0x00, 0x00], [0xFF, 0x00], [0x00, 0x40], [0x00, 0x80], [0xFF, 0x40], [0xFF, 0x80]]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0009, cat(cat(type_bytes(), s), num_bytes()))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0009, cat(type_bytes(), [0x00]))), BODY_FIELD)
+    // The Observation Id is four octets, the Patient one.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0011, cat(type_bytes(), [1, 2]))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0021, type_bytes())), BODY_FIELD)
+    // The lists hold the number of codes their count says.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0041, cat(type_bytes(), [5, 1, 2, 3, 4]))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0081, cat(type_bytes(), []))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0101, cat(type_bytes(), [2, 1, 2, 3, 4]))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0041, cat(cat(type_bytes(), [1, 1, 2, 3, 4]), num_bytes()))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, 0x0041, cat(cat(type_bytes(), [0]), num_bytes()))), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_tlv_attributes_are_checked_for_their_format_and_size()
+    let flags = 0x0201
+    // A uint8 of one octet, a UTF-8 string of three, an ASN.1 structure of two, and two attributes at once.
+    for tlv in [[1, 1, 0, 2, 0, 1, 0, 0x04, 5], [1, 1, 0, 2, 0, 3, 0, 0x19, 0x61, 0x62, 0x63], [1, 1, 0, 2, 0, 2, 0, 0x1C, 0xAA, 0xBB],
+        [2, 1, 0, 2, 0, 1, 0, 0x04, 5, 2, 0, 2, 0, 2, 0, 0x06, 7, 0], [0]]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, cat(cat(type_bytes(), tlv), num_bytes()))), BODY_OK)
+    // The Format Type 0 and the values above 0x1C are not in the table of the Assigned Numbers.
+    for tlv in [[1, 1, 0, 2, 0, 1, 0, 0x00, 5], [1, 1, 0, 2, 0, 1, 0, 0x1D, 5], [1, 1, 0, 2, 0, 1, 0, 0xFF, 5]]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, cat(cat(type_bytes(), tlv), num_bytes()))), BODY_FIELD)
+    // A fixed-size format has a value of its size: uint8 of two octets, uint16 of one, uint32 of three.
+    for tlv in [[1, 1, 0, 2, 0, 2, 0, 0x04, 5, 6], [1, 1, 0, 2, 0, 1, 0, 0x06, 5], [1, 1, 0, 2, 0, 3, 0, 0x08, 1, 2, 3]]
+        test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, cat(cat(type_bytes(), tlv), num_bytes()))), BODY_FIELD)
+    // A value that runs past the body, and a header that does.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, cat(type_bytes(), [1, 1, 0, 2, 0, 9, 0, 0x19, 1, 2]))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, cat(type_bytes(), [1, 1, 0, 2]))), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_NUMERIC, flags, type_bytes())), BODY_FIELD)
+    // The sizes of the fixed formats.
+    for (kind, size) in [(0x01, 1), (0x04, 1), (0x05, 2), (0x07, 3), (0x08, 4), (0x09, 6), (0x0A, 8), (0x0B, 16), (0x14, 4), (0x15, 8), (0x16, 2), (0x17, 4), (0x18, 4), (0x19, 0), (0x1A, 0), (0x1B, 0), (0x1C, 0), (0x00, -1), (0x1D, -1)]
+        test.assert_eq(ghs_format_octets(kind), size)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_values_of_the_classes_are_checked_for_their_size_and_their_rules()
+    // Numeric: six octets with a FLOAT that is not the reserved value.
+    test.assert_eq(ghs_body_error(typed(CLASS_NUMERIC, [0x20, 0x02, 0x62, 0x00, 0x00])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_NUMERIC, [0x20, 0x02, 0x01, 0x00, 0x80, 0x00])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_NUMERIC, [0x20, 0x02, 0xFF, 0xFF, 0x7F, 0x00])), BODY_OK)
+    // Simple discrete: four octets.
+    test.assert_eq(ghs_body_error(typed(CLASS_DISCRETE, [1, 2, 3])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_DISCRETE, [1, 2, 3, 4])), BODY_OK)
+    // String: the length, the text, UTF-8.
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [3, 0, 0x61, 0x62])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [1])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [0, 0])), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [2, 0, 0xC3, 0xA9])), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [4, 0, 0xF0, 0x9F, 0x98, 0x80])), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [2, 0, 0xC0, 0x80])), BODY_STRING)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [3, 0, 0xED, 0xA0, 0x80])), BODY_STRING)
+    test.assert_eq(ghs_body_error(typed(CLASS_STRING, [2, 0, 0xC3, 0x28])), BODY_STRING)
+    // Sample array: a header of 20 octets, one or more samples per period and octets per sample, the samples.
+    let head = [0xB2, 0x10, 0x4C, 0x06, 0x00, 0xFD, 0x00, 0x08, 0x00, 0x00, 0x0A, 0x00, 0x00, 0xFD]
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 2, 3, 0, 0, 0, 1, 2, 3, 4, 5, 6]))), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [0, 2, 3, 0, 0, 0, 1, 2, 3, 4, 5, 6]))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 0, 3, 0, 0, 0, 1, 2, 3, 4, 5, 6]))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 2, 4, 0, 0, 0, 1, 2, 3, 4, 5, 6]))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 2, 3, 0, 0, 0, 1, 2, 3, 4, 5]))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 2]))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 2, 0, 0, 0, 0]))), BODY_OK)
+    // A reserved FLOAT in the scale factor, the offset or the period.
+    for at in [2, 6, 10]
+        var reserved = cat(head, [1, 2, 3, 0, 0, 0, 1, 2, 3, 4, 5, 6])
+        reserved[at] = 0x01
+        reserved[at + 1] = 0x00
+        reserved[at + 2] = 0x80
+        reserved[at + 3] = 0x00
+        test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, reserved)), BODY_VALUE)
+    // A count of samples that the octets cannot hold, however large.
+    test.assert_eq(ghs_body_error(typed(CLASS_SAMPLE_ARRAY, cat(head, [1, 255, 0xFF, 0xFF, 0xFF, 0xFF, 1, 2]))), BODY_VALUE)
+    // Compound discrete event: the count of four-octet codes.
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND_DISCRETE, [2, 1, 2, 3, 4])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND_DISCRETE, [1, 1, 2, 3, 4])), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND_DISCRETE, [])), BODY_VALUE)
+    // Compound state/event: the size and three masks of it.
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND_STATE_EVENT, [2, 1, 2, 3, 4, 5])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND_STATE_EVENT, [2, 1, 2, 3, 4, 5, 6])), BODY_OK)
+    // TLV-encoded: the list of attributes.
+    test.assert_eq(ghs_body_error(typed(CLASS_TLV, [1, 1, 0, 2, 0, 5, 0, 0x04, 5])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_TLV, [1, 1, 0, 2, 0, 1, 0, 0x04, 5])), BODY_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_components_of_a_compound_observation_have_the_types_of_the_table()
+    let good = ghs_component(1, 1, ghs_numeric_value(UNIT_PERCENT, wire.float(1, 0)))
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, ghs_compound_value([good]))), BODY_OK)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, ghs_compound_value([]))), BODY_OK)
+    // The Component Value Type 0 and 7 to 255 are RFU.
+    for t in [0, 7, 8, 255]
+        test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, ghs_compound_value([ghs_component(1, t, ghs_discrete_value(1))]))), BODY_VALUE)
+    // A component cut short, a count that promises more, and a bad value inside a component.
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, [1, 1, 2, 3, 4])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, [2, 1, 0, 0, 0, 1, 0x20, 0x02, 0x62, 0, 0, 0])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, [1, 1, 0, 0, 0, 1, 0x20, 0x02, 0x62, 0, 0])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, ghs_compound_value([ghs_component(1, 3, ghs_string_value([0xC0, 0x80]))]))), BODY_STRING)
+    // Octets after the last component.
+    test.assert_eq(ghs_body_error(typed(CLASS_COMPOUND, cat(ghs_compound_value([good]), [0]))), BODY_TRAILING)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_bundle_holds_bodies_that_are_not_bundles_and_names_the_type_once_or_each_time()
+    let one = typed(CLASS_NUMERIC, num_bytes())
+    let untyped = raw_body(CLASS_NUMERIC, 0, num_bytes())
+    // A bundle with no observation is allowed; a bundle has no Observation Id.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, [0])), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, FLAG_ID, [1, 0, 0, 0, 0])), BODY_BUNDLE_ID)
+    // Each observation names its type, or the bundle does for all.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([1], ints(one)))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([1], ints(untyped)))), BODY_NO_TYPE)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, FLAG_TYPE, cat(type_bytes(), cat([1], ints(untyped))))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, FLAG_TYPE, cat(type_bytes(), cat([1], ints(one))))), BODY_OK)
+    // A bundle in a bundle.
+    let inner = raw_body(CLASS_BUNDLE, 0, [0])
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([1], ints(inner)))), BODY_NESTED_BUNDLE)
+    // A count that promises more bodies, a body whose Length runs past the bundle, a body shorter than its header,
+    // a bad observation inside, and octets after the last.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([2], ints(one)))), BODY_VALUE)
+    var past = one[:]
+    past[1] = 0x40
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([1], ints(past)))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, [1, 1, 3, 0, 0, 0])), BODY_VALUE)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat([1], ints(typed(CLASS_NUMERIC, [1, 2]))))), BODY_VALUE)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, cat(cat([1], ints(one)), [0]))), BODY_TRAILING)
+    // The bundle takes the same optional fields: here a time stamp.
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, FLAG_TIME_STAMP, cat(ints(stamp()), cat([1], ints(one))))), BODY_OK)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, FLAG_TIME_STAMP, [1, 2, 3])), BODY_FIELD)
+    test.assert_eq(ghs_body_error(raw_body(CLASS_BUNDLE, 0, [])), BODY_VALUE)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_patient_and_the_time_stamp_are_found_in_a_body_and_in_a_bundle()
+    test.assert_eq(ghs_body_patient(live_body(98)), -1)
+    test.assert_eq(ghs_body_patient(stamped_body(98, 5)), 5)
+    test.assert_eq(ghs_body_patient(stamped_body(98, 0)), 0)
+    test.assert_eq(ghs_body_patient(stamped_body(98, 255)), 255)
+    test.assert_eq(ghs_body_patient([]), -1)
+    test.assert_eq(ghs_body_patient([1, 5, 0, 0x20, 0x00]), -1)
+    test.assert(ghs_has_time_stamp(spot_check()))
+    test.assert(not ghs_has_time_stamp(live_body(98)))
+    test.assert(not ghs_has_time_stamp([]))
+    // A bundle has a time stamp of its own or one in each bundled observation.
+    var stamped = numeric(98)
+    stamped.time_stamp = stamp()
+    let with_stamp = ghs_body(stamped)
+    let without = live_body(98)
+    var own = ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([without]))
+    own.time_stamp = stamp()
+    test.assert(ghs_has_time_stamp(ghs_body(own)))
+    test.assert(ghs_has_time_stamp(ghs_body(ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([with_stamp, with_stamp])))))
+    test.assert(not ghs_has_time_stamp(ghs_body(ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([with_stamp, without])))))
+    test.assert(not ghs_has_time_stamp(ghs_body(ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([])))))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_body_is_cut_into_segments_of_the_mtu_less_four_with_a_header_and_a_rolling_counter()
+    test.assert_eq(ghs_segment_count(0, 19), 0)
+    test.assert_eq(ghs_segment_count(1, 19), 1)
+    test.assert_eq(ghs_segment_count(19, 19), 1)
+    test.assert_eq(ghs_segment_count(20, 19), 2)
+    test.assert_eq(ghs_segment_count(38, 19), 2)
+    test.assert_eq(ghs_segment_count(39, 19), 3)
+    test.assert_eq(ghs_segment_count(5, 0), 0)
+    // One segment is first and last; the counter is in bits 2 to 7.
+    test.assert_eq(ghs_segment_header(0, 1, 0), 0x03)
+    test.assert_eq(ghs_segment_header(0, 1, 5), 0x17)
+    // Several: the first has bit 0, the last bit 1, the ones between neither, the counter goes up by one.
+    test.assert_eq(ghs_segment_header(0, 3, 10), 0x29)
+    test.assert_eq(ghs_segment_header(1, 3, 10), 0x2C)
+    test.assert_eq(ghs_segment_header(2, 3, 10), 0x32)
+    // From 63 to 0.
+    test.assert_eq(ghs_segment_header(0, 3, 62), 0xF9)
+    test.assert_eq(ghs_segment_header(1, 3, 62), 0xFC)
+    test.assert_eq(ghs_segment_header(2, 3, 62), 0x02)
+    test.assert_eq(ghs_segment_header(0, 2, 63), 0xFD)
+    test.assert_eq(ghs_segment_header(1, 2, 63), 0x02)
+    // 45 octets in segments of 19: three, the last one short.
+    var data: [u8] = []
+    for i in 0..45
+        list.push(data, i as u8)
+    let segments = ghs_segments(data, 19, 62)
+    test.assert_eq(list.len(segments), 3)
+    test.assert_eq(list.len(segments[0]), 20)
+    test.assert_eq(list.len(segments[1]), 20)
+    test.assert_eq(list.len(segments[2]), 8)
+    test.assert_eq(segments[0][0] as Int, 0xF9)
+    test.assert_eq(segments[1][0] as Int, 0xFC)
+    test.assert_eq(segments[2][0] as Int, 0x02)
+    var joined: [u8] = []
+    for segment in segments
+        list.append(joined, segment[1:])
+    test.assert_eq(joined, data)
+    test.assert_eq(list.len(ghs_segments(data, 0, 0)), 0)
+    test.assert_eq(list.len(ghs_segments([], 19, 0)), 0)
+
+// ── Tests: live observations ────────────────────────────────────────
+
+// A notification (0x1B) or indication (0x1D) of `handle` with the Segmentation
+// Header `header` and the data.
+@tier(app)
+fn segment_pdu(op: Int, handle: Int, header: Int, data: [u8]) -> [u8]
+    var out = wire.octets([op, handle & 0xFF, handle >>> 8, header])
+    list.append(out, data)
+    out
+
+// The collector enables the control point, writes Start sending live
+// observations and gets the success indication, which it confirms.
+@tier(app)
+fn start_live(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState)
+    subscribe(var s, h.control_point_cccd, 2)
+    let out = write(var s, h, config, var st, h.control_point, [OP_START])
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1], wire.octets([0x1D, h.control_point & 0xFF, h.control_point >>> 8, RESULT_CONTROL_POINT_SUCCESS]))
+    test.assert(st.live_started)
+    let _ = confirm(var s)
+
+// A numeric SpO2 observation of `value` percent for the user `patient`, with no time stamp.
+@tier(app)
+fn patient_body(value: Int, patient: Int) -> [u8]
+    var o = numeric(value)
+    o.patient = patient
+    ghs_body(o)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_live_observations_go_out_as_notifications_only_after_the_start_command()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    let body = spot_check()
+    test.assert_eq(ghs_submit(var st, c, body, false), SUBMIT_OK)
+    // The collector has not started the observations: none goes out, and the queue keeps it.
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 1)
+    start_live(var s, h, c, var st)
+    // 29 octets in segments of ATT_MTU - 4 = 19 octets: the first, then the last, the counter 0 and 1.
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], segment_pdu(0x1B, h.live, 0x01, body[0:19]))
+    test.assert_eq(out[1], segment_pdu(0x1B, h.live, 0x06, body[19:29]))
+    test.assert_eq(segment_data(out), body)
+    // Nothing else goes out; the observation leaves the queue at the next call.
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 0)
+    // The Rolling Segment Counter goes on from 2: a body of one segment is first and last.
+    test.assert_eq(ghs_submit(var st, c, live_body(97), false), SUBMIT_OK)
+    let next = pump(var s, h, c, var st)
+    test.assert_eq(list.len(next), 1)
+    test.assert_eq(next[0], segment_pdu(0x1B, h.live, 0x0B, live_body(97)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_stop_command_ends_the_live_observations_until_the_next_start()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    start_live(var s, h, c, var st)
+    let stop = write(var s, h, c, var st, h.control_point, [OP_STOP])
+    test.assert_eq(stop[0], [0x13])
+    test.assert_eq(stop[1], wire.octets([0x1D, h.control_point, 0, RESULT_CONTROL_POINT_SUCCESS]))
+    test.assert(not st.live_started)
+    let _ = confirm(var s)
+    // An observation generated now stays in the queue.
+    test.assert_eq(ghs_submit(var st, c, live_body(96), false), SUBMIT_OK)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 1)
+    // Start again: it goes out.
+    let again = write(var s, h, c, var st, h.control_point, [OP_START])
+    test.assert_eq(again[1], wire.octets([0x1D, h.control_point, 0, RESULT_CONTROL_POINT_SUCCESS]))
+    let _ = confirm(var s)
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], segment_pdu(0x1B, h.live, 0x03, live_body(96)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_live_observations_over_indications_wait_for_each_confirmation_and_leave_the_queue_after_the_last()
+    let c = live_config(false, true)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 2)
+    start_live(var s, h, c, var st)
+    let body = spot_check()
+    test.assert_eq(ghs_submit(var st, c, body, false), SUBMIT_OK)
+    test.assert_eq(ghs_submit(var st, c, live_body(95), false), SUBMIT_OK)
+    // The first segment is indicated, the second waits behind it for the confirmation.
+    let first = pump(var s, h, c, var st)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0], segment_pdu(0x1D, h.live, 0x01, body[0:19]))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    let second = confirm(var s)
+    test.assert_eq(list.len(second), 1)
+    test.assert_eq(second[0], segment_pdu(0x1D, h.live, 0x06, body[19:29]))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 2)
+    test.assert_eq(list.len(confirm(var s)), 0)
+    // The last segment is confirmed: the observation is gone and the next one goes out.
+    let next = pump(var s, h, c, var st)
+    test.assert_eq(list.len(next), 1)
+    test.assert_eq(next[0], segment_pdu(0x1D, h.live, 0x0B, live_body(95)))
+    test.assert_eq(ghs_live_count(st), 1)
+    test.assert_eq(list.len(confirm(var s)), 0)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_when_the_collector_enabled_both_the_observation_goes_out_as_notifications_only()
+    let c = live_config(true, true)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 3)
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, spot_check(), false), SUBMIT_OK)
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0][0] as Int, 0x1B)
+    test.assert_eq(out[1][0] as Int, 0x1B)
+    test.assert(not gatt_server.indication_pending(s.link, h.live))
+    // With indications alone it is indications only.
+    var (t, th) = rig(c)
+    var tt = new_ghs_state()
+    subscribe(var t, th.live_cccd, 2)
+    start_live(var t, th, c, var tt)
+    test.assert_eq(ghs_submit(var tt, c, spot_check(), false), SUBMIT_OK)
+    let ind = pump(var t, th, c, var tt)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(ind[0][0] as Int, 0x1D)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_start_is_answered_with_success_even_when_the_live_characteristic_is_not_enabled()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, live_body(98), false), SUBMIT_OK)
+    // The collector did not enable the characteristic: nothing goes out and the observation stays.
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 1)
+    test.assert_eq(st.live_counter, 0)
+    subscribe(var s, h.live_cccd, 1)
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], segment_pdu(0x1B, h.live, 0x03, live_body(98)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_control_point_answers_the_errors_of_the_service()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    // Not enabled for indications: Client Characteristic Configuration Descriptor Improperly Configured.
+    let none = write(var s, h, c, var st, h.control_point, [OP_START])
+    test.assert_eq(list.len(none), 1)
+    test.assert_eq(none[0], error_pdu(0x12, h.control_point, 0xFD))
+    test.assert(not st.live_started)
+    subscribe(var s, h.control_point_cccd, 2)
+    // A value that is not Start or Stop: Command Not Supported (0x81).
+    let empty: [Int] = []
+    for value in [[0x00], [0x03], [0x7F], [0x80], [0xFF], empty, [OP_START, 0x00], [OP_START, OP_STOP]]
+        let r = write(var s, h, c, var st, h.control_point, value)
+        test.assert_eq(list.len(r), 1)
+        test.assert_eq(r[0], error_pdu(0x12, h.control_point, ERR_COMMAND_NOT_SUPPORTED))
+    test.assert(not st.live_started)
+    // A write command and a signed write are dropped; a long write is refused.
+    test.assert_eq(list.len(receive_default(var s, h, c, var st, req(0x52, h.control_point, [OP_START]), 0)), 0)
+    test.assert_eq(list.len(receive_default(var s, h, c, var st, req(0xD2, h.control_point, [OP_START]), 0)), 0)
+    test.assert(not st.live_started)
+    let long_write = receive_default(var s, h, c, var st, req(0x16, h.control_point, [0, 0, OP_START]), 0)
+    test.assert_eq(long_write[0], error_pdu(0x16, h.control_point, 0x0B))
+    // A command while the last indication is not confirmed: Procedure Already In Progress.
+    let ok = write(var s, h, c, var st, h.control_point, [OP_START])
+    test.assert_eq(list.len(ok), 2)
+    test.assert(st.live_started)
+    let busy = write(var s, h, c, var st, h.control_point, [OP_STOP])
+    test.assert_eq(busy[0], error_pdu(0x12, h.control_point, 0xFE))
+    test.assert(st.live_started)
+    let _ = confirm(var s)
+    let stop = write(var s, h, c, var st, h.control_point, [OP_STOP])
+    test.assert_eq(list.len(stop), 2)
+    test.assert(not st.live_started)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_sensor_queues_only_what_the_format_allows_and_holds_the_most_it_was_told_to()
+    var c = live_config(true, false)
+    c.live_capacity = 2
+    var st = new_ghs_state()
+    test.assert_eq(ghs_submit(var st, c, live_body(98), false), SUBMIT_OK)
+    // A body that breaks a rule, and a stored-only service.
+    test.assert_eq(ghs_submit(var st, c, [1, 2, 3], false), SUBMIT_INVALID)
+    test.assert_eq(ghs_submit(var st, c, raw_body(CLASS_NUMERIC, 0, num_bytes()), false), SUBMIT_INVALID)
+    test.assert_eq(ghs_submit(var st, stored_config(true, false), live_body(98), false), SUBMIT_DISABLED)
+    // An observation made while no collector was connected has a time stamp.
+    test.assert_eq(ghs_submit(var st, c, live_body(97), true), SUBMIT_NO_TIME_STAMP)
+    test.assert_eq(ghs_submit(var st, c, stamped_body(97, -1), true), SUBMIT_OK)
+    // The queue holds two.
+    test.assert_eq(ghs_submit(var st, c, live_body(96), false), SUBMIT_FULL)
+    test.assert_eq(ghs_live_count(st), 2)
+    // A bundle of stamped observations is stamped.
+    var stamped = numeric(98)
+    stamped.time_stamp = stamp()
+    var big = c
+    big.live_capacity = 5
+    test.assert_eq(ghs_submit(var st, big, ghs_body(ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([ghs_body(stamped)]))), true), SUBMIT_OK)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_oldest_observation_goes_first()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    start_live(var s, h, c, var st)
+    for v in [11, 22, 33]
+        test.assert_eq(ghs_submit(var st, c, live_body(v), false), SUBMIT_OK)
+    var seen: [Int] = []
+    for _ in 0..8
+        for p in pump(var s, h, c, var st)
+            list.push(seen, p[15] as Int)
+    test.assert_eq(seen, [11, 22, 33])
+    test.assert_eq(ghs_live_count(st), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_an_observation_of_a_user_the_collector_has_not_consented_to_is_held_back()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    start_live(var s, h, c, var st)
+    ghs_set_users(var st, [3], [])
+    test.assert_eq(ghs_submit(var st, c, patient_body(91, 3), false), SUBMIT_OK)
+    test.assert_eq(ghs_submit(var st, c, live_body(92), false), SUBMIT_OK)
+    test.assert_eq(ghs_submit(var st, c, patient_body(93, 4), false), SUBMIT_OK)
+    // User 3 is registered and the collector has not consented: the others go out.
+    let first = pump(var s, h, c, var st)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0], segment_pdu(0x1B, h.live, 0x03, live_body(92)))
+    let second = pump(var s, h, c, var st)
+    test.assert_eq(list.len(second), 1)
+    test.assert_eq(second[0], segment_pdu(0x1B, h.live, 0x07, patient_body(93, 4)))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 1)
+    // The collector consents: the observation goes out.
+    ghs_set_users(var st, [3], [3])
+    let held = pump(var s, h, c, var st)
+    test.assert_eq(list.len(held), 1)
+    test.assert_eq(held[0], segment_pdu(0x1B, h.live, 0x0B, patient_body(91, 3)))
+    // A new connection takes the consent back.
+    ghs_reset_connection(var st)
+    test.assert_eq(list.len(st.consented), 0)
+    test.assert_eq(list.len(st.registered), 1)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_new_connection_stops_the_observations_and_starts_the_segments_again()
+    let c = live_config(false, true)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 2)
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, spot_check(), false), SUBMIT_OK)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 1)
+    test.assert_eq(st.live_counter, 2)
+    test.assert(st.live_at >= 0)
+    ghs_reset_connection(var st)
+    test.assert(not st.live_started)
+    test.assert_eq(st.live_at, -1)
+    test.assert_eq(st.live_counter, 0)
+    test.assert_eq(st.stored_counter, 0)
+    test.assert_eq(st.procedure, 0)
+    // The observation stays and goes out whole at the next start.
+    test.assert_eq(ghs_live_count(st), 1)
+    var (t, th) = rig(c)
+    subscribe(var t, th.live_cccd, 2)
+    start_live(var t, th, c, var st)
+    let again = pump(var t, th, c, var st)
+    test.assert_eq(list.len(again), 1)
+    test.assert_eq(again[0], segment_pdu(0x1D, th.live, 0x01, spot_check()[0:19]))
+
+// ── Tests: stored observations and the Record Access Control Point ──
+
+@tier(app)
+fn le4(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]
+
+// The request `op` with the operator and a Record Number filter of one value.
+@tier(app)
+fn racp_filter(op: Int, operator: Int, low: Int) -> [Int]
+    cat([op, operator, FILTER_RECORD_NUMBER], le4(low))
+
+// The request `op` with the Within range of operator and a minimum and a maximum.
+@tier(app)
+fn racp_range(op: Int, low: Int, high: Int) -> [Int]
+    cat(racp_filter(op, OPERATOR_WITHIN, low), le4(high))
+
+// The RACP indication with the value.
+@tier(app)
+fn racp_pdu(h: GhsHandles, value: [Int]) -> [u8]
+    wire.octets(cat([0x1D, h.racp & 0xFF, h.racp >>> 8], value))
+
+// The Response Code indication for the request Op Code `op`.
+@tier(app)
+fn racp_code_pdu(h: GhsHandles, op: Int, code: Int) -> [u8]
+    racp_pdu(h, [RACP_RESPONSE_CODE, 0x00, op, code])
+
+// The Number of Stored Records Response or the Combined Report Response.
+@tier(app)
+fn racp_count_pdu(h: GhsHandles, response: Int, count: Int) -> [u8]
+    racp_pdu(h, cat([response, 0x00], le4(count)))
+
+// What a record is on the air: its number and its body.
+@tier(app)
+fn record_data(number: Int, body: [u8]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, number, 4)
+    list.append(out, body)
+    out
+
+// A server whose service has `config` and whose store holds `count` records of
+// 28 octets (numbers from 0), with the collector subscribed to the Record Access
+// Control Point and, when `stored_bits` is not 0, to the Stored Health
+// Observations.
+@tier(app)
+fn stored_rig(config: GhsConfig, count: Int, stored_bits: Int) -> (GattServer, GhsHandles, GhsState)
+    var (s, h) = rig(config)
+    var st = new_ghs_state()
+    for i in 0..count
+        test.assert_eq(ghs_store(var st, config, stamped_body(90 + i, -1)), i)
+    if stored_bits != 0
+        subscribe(var s, h.stored_cccd, stored_bits)
+    subscribe(var s, h.racp_cccd, 2)
+    (s, h, st)
+
+// Write the request, check the Write Response, confirm the answer and return its indication.
+@tier(app)
+fn racp_answer(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState, value: [Int]) -> [u8]
+    let out = write(var s, h, config, var st, h.racp, value)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    let _ = confirm(var s)
+    out[1]
+
+@tier(app)
+fn check_code(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState, value: [Int], op: Int, code: Int)
+    test.assert_eq(racp_answer(var s, h, config, var st, value), racp_code_pdu(h, op, code))
+
+// Pump until the report ends, confirming the last indication: the record numbers
+// of the first segments and the closing indication of the Record Access Control Point.
+@tier(app)
+fn run_report(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState) -> ([Int], [u8])
+    var numbers: [Int] = []
+    var closing: [u8] = []
+    for _ in 0..20
+        for p in pump(var s, h, config, var st)
+            if (p[0] as Int) == 0x1B and ((p[3] as Int) & 1) == 1
+                list.push(numbers, wire.get(p, 4, 4))
+            if (p[0] as Int) == 0x1D
+                closing = p[:]
+    if list.len(closing) > 0
+        let _ = confirm(var s)
+    (numbers, closing)
+
+// Write a Combined Report and check that it sends the records `want` and a response with their number.
+@tier(app)
+fn check_report(var s: GattServer, h: GhsHandles, config: GhsConfig, var st: GhsState, value: [Int], want: [Int])
+    let out = write(var s, h, config, var st, h.racp, value)
+    test.assert_eq(list.len(out), 1)
+    let (numbers, closing) = run_report(var s, h, config, var st)
+    test.assert_eq(numbers, want)
+    test.assert_eq(closing, racp_count_pdu(h, RACP_COMBINED_RESPONSE, list.len(want)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_stored_observations_get_numbers_from_zero_and_only_valid_stamped_ones_are_kept()
+    let c = stored_config(true, false)
+    var st = new_ghs_state()
+    for i in 0..3
+        test.assert_eq(ghs_store(var st, c, stamped_body(90 + i, -1)), i)
+    test.assert_eq(ghs_store_count(st), 3)
+    // A stored observation has a time stamp ([GHSS] 3.3.2); a body that breaks a rule is refused; a live-only service stores none.
+    test.assert_eq(ghs_store(var st, c, live_body(90)), STORE_NO_TIME_STAMP)
+    test.assert_eq(ghs_store(var st, c, [1, 2, 3]), STORE_INVALID)
+    test.assert_eq(ghs_store(var st, default_ghs_config([SPO2]), stamped_body(90, -1)), STORE_DISABLED)
+    // A bundle of stamped observations is stored.
+    var stamped = numeric(98)
+    stamped.time_stamp = stamp()
+    var bundle = ghs_observation(CLASS_BUNDLE, -1, ghs_bundle_value([ghs_body(stamped)]))
+    test.assert_eq(ghs_store(var st, c, ghs_body(bundle)), 3)
+    // The store holds the most it was told to; the oldest can be dropped; the numbers go on.
+    var small = stored_config(true, false)
+    small.store_capacity = 4
+    test.assert_eq(ghs_store(var st, small, stamped_body(94, -1)), STORE_FULL)
+    ghs_store_drop_oldest(var st)
+    test.assert_eq(ghs_store_count(st), 3)
+    test.assert_eq(st.records[0].number, 1)
+    test.assert_eq(ghs_store(var st, small, stamped_body(94, -1)), 4)
+    // The number wraps after 2^32 records.
+    var w = new_ghs_state()
+    w.next_record = 4294967295
+    test.assert_eq(ghs_store(var w, c, stamped_body(90, -1)), 4294967295)
+    test.assert_eq(ghs_store(var w, c, stamped_body(91, -1)), 0)
+    test.assert_eq(w.next_record, 1)
+    // Dropping from an empty store changes nothing.
+    var empty = new_ghs_state()
+    ghs_store_drop_oldest(var empty)
+    test.assert_eq(ghs_store_count(empty), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_report_number_of_stored_records_counts_what_each_operator_selects()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    let n = RACP_REPORT_NUMBER
+    test.assert_eq(racp_answer(var s, h, c, var st, [n, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 3))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_filter(n, OPERATOR_GREATER_OR_EQUAL, 1)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 2))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_filter(n, OPERATOR_GREATER_OR_EQUAL, 3)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 0))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_filter(n, OPERATOR_LESS_OR_EQUAL, 1)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 2))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_filter(n, OPERATOR_LESS_OR_EQUAL, 0)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_range(n, 1, 2)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 2))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_range(n, 1, 1)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_range(n, 5, 9)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 0))
+    test.assert_eq(racp_answer(var s, h, c, var st, [n, OPERATOR_FIRST]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+    test.assert_eq(racp_answer(var s, h, c, var st, [n, OPERATOR_LAST]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+    // The encodings of [GHSS] Appendix B: a number above all records answers 0, in 6 octets.
+    test.assert_eq(racp_answer(var s, h, c, var st, [0x04, 0x03, 0x01, 0xDD, 0xCC, 0xBB, 0xAA]), racp_pdu(h, [0x05, 0x00, 0x00, 0x00, 0x00, 0x00]))
+    test.assert_eq(st.procedure, 0)
+    // An empty store counts 0 for All records.
+    var (t, th, tt) = stored_rig(c, 0, 1)
+    test.assert_eq(racp_answer(var t, th, c, var tt, [n, OPERATOR_ALL]), racp_count_pdu(th, RACP_NUMBER_RESPONSE, 0))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_combined_report_sends_each_record_in_segments_and_then_the_response_with_the_count()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    let out = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(st.procedure, RACP_COMBINED_REPORT)
+    // Each record is its number and its 24 octets in two segments of the default ATT_MTU; the Rolling
+    // Segment Counter goes on across the records.
+    for k in 0..3
+        let part = pump(var s, h, c, var st)
+        test.assert_eq(list.len(part), 2)
+        test.assert_eq(segment_data(part), record_data(k, stamped_body(90 + k, -1)))
+        test.assert_eq(part[0][0] as Int, 0x1B)
+        test.assert_eq(wire.get(part[0], 1, 2), h.stored)
+        test.assert_eq(part[0][3] as Int, ((2 * k) << 2) | 0x01)
+        test.assert_eq(part[1][3] as Int, ((2 * k + 1) << 2) | 0x02)
+    let closing = pump(var s, h, c, var st)
+    test.assert_eq(list.len(closing), 1)
+    test.assert_eq(closing[0], racp_count_pdu(h, RACP_COMBINED_RESPONSE, 3))
+    test.assert_eq(st.procedure, 0)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_combined_report_over_indications_waits_for_each_confirmation()
+    let c = stored_config(false, true)
+    var (s, h, st) = stored_rig(c, 2, 2)
+    let first = record_data(0, stamped_body(90, -1))
+    let second = record_data(1, stamped_body(91, -1))
+    let out = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(out), 1)
+    let a = pump(var s, h, c, var st)
+    test.assert_eq(list.len(a), 1)
+    test.assert_eq(a[0], segment_pdu(0x1D, h.stored, 0x01, first[0:19]))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    let b = confirm(var s)
+    test.assert_eq(list.len(b), 1)
+    test.assert_eq(b[0], segment_pdu(0x1D, h.stored, 0x06, first[19:28]))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(list.len(confirm(var s)), 0)
+    // The next record goes after the last confirmation.
+    let d = pump(var s, h, c, var st)
+    test.assert_eq(list.len(d), 1)
+    test.assert_eq(d[0], segment_pdu(0x1D, h.stored, 0x09, second[0:19]))
+    let e = confirm(var s)
+    test.assert_eq(e[0], segment_pdu(0x1D, h.stored, 0x0E, second[19:28]))
+    test.assert_eq(list.len(confirm(var s)), 0)
+    let closing = pump(var s, h, c, var st)
+    test.assert_eq(list.len(closing), 1)
+    test.assert_eq(closing[0], racp_count_pdu(h, RACP_COMBINED_RESPONSE, 2))
+    test.assert_eq(st.procedure, 0)
+    // With both enabled the records go as notifications.
+    var (t, th, tt) = stored_rig(stored_config(true, true), 1, 3)
+    let w = write(var t, th, stored_config(true, true), var tt, th.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(w), 1)
+    let part = pump(var t, th, stored_config(true, true), var tt)
+    test.assert_eq(part[0][0] as Int, 0x1B)
+    test.assert_eq(part[1][0] as Int, 0x1B)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_combined_report_selects_the_records_by_the_operator_and_counts_those_it_sent()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 5, 1)
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_ALL], [0, 1, 2, 3, 4])
+    check_report(var s, h, c, var st, racp_filter(RACP_COMBINED_REPORT, OPERATOR_LESS_OR_EQUAL, 2), [0, 1, 2])
+    check_report(var s, h, c, var st, racp_filter(RACP_COMBINED_REPORT, OPERATOR_GREATER_OR_EQUAL, 3), [3, 4])
+    check_report(var s, h, c, var st, racp_range(RACP_COMBINED_REPORT, 1, 3), [1, 2, 3])
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_FIRST], [0])
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_LAST], [4])
+    // The encoding of [GHSS] Appendix B for a number: Greater than or equal to the record 3.
+    check_report(var s, h, c, var st, [0x07, 0x03, 0x01, 0x03, 0x00, 0x00, 0x00], [3, 4])
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_combined_report_that_selects_no_record_answers_no_records_found()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    check_code(var s, h, c, var st, racp_filter(RACP_COMBINED_REPORT, OPERATOR_GREATER_OR_EQUAL, 9), RACP_COMBINED_REPORT, RESULT_NO_RECORDS_FOUND)
+    test.assert_eq(st.procedure, 0)
+    check_code(var s, h, c, var st, racp_range(RACP_COMBINED_REPORT, 7, 9), RACP_COMBINED_REPORT, RESULT_NO_RECORDS_FOUND)
+    var (t, th, tt) = stored_rig(c, 0, 1)
+    check_code(var t, th, c, var tt, [RACP_COMBINED_REPORT, OPERATOR_ALL], RACP_COMBINED_REPORT, RESULT_NO_RECORDS_FOUND)
+    // The encoding of Appendix B: {0x06, 0x00, 0x07, 0x06}.
+    test.assert_eq(racp_answer(var t, th, c, var tt, [0x07, 0x01]), racp_pdu(th, [0x06, 0x00, 0x07, 0x06]))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_delete_stored_records_removes_what_the_operator_selects_and_keeps_the_numbers()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 5, 1)
+    let d = RACP_DELETE
+    check_code(var s, h, c, var st, racp_filter(d, OPERATOR_GREATER_OR_EQUAL, 3), d, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(st), 3)
+    check_code(var s, h, c, var st, [d, OPERATOR_LAST], d, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(st), 2)
+    check_code(var s, h, c, var st, [d, OPERATOR_FIRST], d, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(st), 1)
+    test.assert_eq(st.records[0].number, 1)
+    check_code(var s, h, c, var st, racp_filter(d, OPERATOR_LESS_OR_EQUAL, 0), d, RESULT_NO_RECORDS_FOUND)
+    check_code(var s, h, c, var st, racp_range(d, 1, 1), d, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(st), 0)
+    check_code(var s, h, c, var st, [d, OPERATOR_ALL], d, RESULT_NO_RECORDS_FOUND)
+    // The records are not renumbered: the next one goes on from 5.
+    test.assert_eq(ghs_store(var st, c, stamped_body(90, -1)), 5)
+    // The encoding of Appendix B for All records: {0x06, 0x00, 0x02, 0x01}.
+    test.assert_eq(racp_answer(var s, h, c, var st, [0x02, 0x01]), racp_pdu(h, [0x06, 0x00, 0x02, 0x01]))
+    test.assert_eq(ghs_store_count(st), 0)
+    // A deleted record is not reported.
+    test.assert_eq(ghs_store(var st, c, stamped_body(91, -1)), 6)
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_ALL], [6])
+
+// A policy that keeps every record and remembers how many it was asked to delete.
+@value
+struct Keeper
+    asked: Int
+    last: Int
+
+impl GhsPolicy[] for Keeper
+    @tier(app)
+    fn delete_records(var self, _peer: links.LinkId, count: Int) -> Bool
+        self.asked = self.asked + 1
+        self.last = count
+        false
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_policy_that_keeps_the_records_makes_delete_procedure_not_completed()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    var keeper = Keeper { asked: 0, last: 0 }
+    let out = ghs_receive(var s.db, var s.link, h, c, var st, var keeper, peer(), req(0x12, h.racp, [RACP_DELETE, OPERATOR_ALL]), 0)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1], racp_code_pdu(h, RACP_DELETE, RESULT_PROCEDURE_NOT_COMPLETED))
+    test.assert_eq(ghs_store_count(st), 3)
+    test.assert_eq(keeper.asked, 1)
+    test.assert_eq(keeper.last, 3)
+    let _ = confirm(var s)
+    // A request that selects no record is No Records Found and the policy is not asked.
+    let none = ghs_receive(var s.db, var s.link, h, c, var st, var keeper, peer(), req(0x12, h.racp, racp_filter(RACP_DELETE, OPERATOR_GREATER_OR_EQUAL, 9)), 0)
+    test.assert_eq(none[1], racp_code_pdu(h, RACP_DELETE, RESULT_NO_RECORDS_FOUND))
+    test.assert_eq(keeper.asked, 1)
+    test.assert_eq(keeper.last, 3)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_sensor_without_the_delete_procedure_or_with_fewer_operators_refuses_them()
+    var none = stored_config(true, false)
+    none.delete_operators = 0
+    var (s, h, st) = stored_rig(none, 3, 1)
+    check_code(var s, h, none, var st, [RACP_DELETE, OPERATOR_ALL], RACP_DELETE, RESULT_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ghs_store_count(st), 3)
+    var few = stored_config(true, false)
+    few.delete_operators = MASK_ALL
+    var (t, th, tt) = stored_rig(few, 3, 1)
+    check_code(var t, th, few, var tt, racp_filter(RACP_DELETE, OPERATOR_GREATER_OR_EQUAL, 1), RACP_DELETE, RESULT_OPERATOR_NOT_SUPPORTED)
+    check_code(var t, th, few, var tt, [RACP_DELETE, OPERATOR_LAST], RACP_DELETE, RESULT_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(ghs_store_count(tt), 3)
+    check_code(var t, th, few, var tt, [RACP_DELETE, OPERATOR_ALL], RACP_DELETE, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(tt), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_abort_operation_stops_the_report_and_answers_success_or_abort_unsuccessful()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 5, 1)
+    let started = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(started), 1)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 2)
+    // The collector aborts: success, no response for the report, nothing more is sent.
+    let out = write(var s, h, c, var st, h.racp, [RACP_ABORT, OPERATOR_NULL])
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1], racp_code_pdu(h, RACP_ABORT, RESULT_SUCCESS))
+    test.assert_eq(st.procedure, 0)
+    let _ = confirm(var s)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    // With no report to stop it is unsuccessful ({0x06, 0x00, 0x03, 0x07}).
+    test.assert_eq(racp_answer(var s, h, c, var st, [0x03, 0x00]), racp_pdu(h, [0x06, 0x00, 0x03, 0x07]))
+    // The operator is Null and there is no operand.
+    check_code(var s, h, c, var st, [RACP_ABORT, OPERATOR_ALL], RACP_ABORT, RESULT_INVALID_OPERATOR)
+    check_code(var s, h, c, var st, [RACP_ABORT], RACP_ABORT, RESULT_INVALID_OPERATOR)
+    check_code(var s, h, c, var st, [RACP_ABORT, OPERATOR_NULL, 0x05], RACP_ABORT, RESULT_INVALID_OPERAND)
+    // A sensor without the procedure does not take the Op Code.
+    var none = stored_config(true, false)
+    none.abort = false
+    var (t, th, tt) = stored_rig(none, 1, 1)
+    check_code(var t, th, none, var tt, [RACP_ABORT, OPERATOR_NULL], RACP_ABORT, RESULT_OP_CODE_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_request_with_an_op_code_the_sensor_does_not_take_is_answered_op_code_not_supported()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    // A reserved Op Code (the test specification writes one with All records), the Report stored records
+    // Op Code that [GHSS] Table 3.31 leaves out, and the response Op Codes: the answer names the Op Code written.
+    for op in [0x01, 0x05, 0x06, 0x08, 0x09, 0x20, 0xFF]
+        check_code(var s, h, c, var st, [op, OPERATOR_ALL], op, RESULT_OP_CODE_NOT_SUPPORTED)
+    check_code(var s, h, c, var st, [0x00, OPERATOR_ALL], 0x00, RESULT_OP_CODE_NOT_SUPPORTED)
+    // A write of no octet.
+    check_code(var s, h, c, var st, [], 0x00, RESULT_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(st.procedure, 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_request_with_a_bad_operator_is_answered_invalid_operator_or_operator_not_supported()
+    var c = stored_config(true, false)
+    c.report_operators = MASK_ALL | MASK_GREATER_OR_EQUAL
+    var (s, h, st) = stored_rig(c, 3, 1)
+    for op in [RACP_COMBINED_REPORT, RACP_REPORT_NUMBER, RACP_DELETE]
+        // Null, with an operand (the test specification) and without, and no operator at all.
+        check_code(var s, h, c, var st, cat([op, OPERATOR_NULL, FILTER_RECORD_NUMBER], le4(1)), op, RESULT_INVALID_OPERATOR)
+        check_code(var s, h, c, var st, [op, OPERATOR_NULL], op, RESULT_INVALID_OPERATOR)
+        check_code(var s, h, c, var st, [op], op, RESULT_INVALID_OPERATOR)
+        // A Reserved operator (the test specification), whatever follows it.
+        for operator in [0x07, 0x08, 0x10, 0x80, 0xFF]
+            check_code(var s, h, c, var st, cat([op, operator, FILTER_RECORD_NUMBER], le4(1)), op, RESULT_OPERATOR_NOT_SUPPORTED)
+            check_code(var s, h, c, var st, [op, operator], op, RESULT_OPERATOR_NOT_SUPPORTED)
+    // The operators the sensor does not list for the Combined Report and the Report Number.
+    for op in [RACP_COMBINED_REPORT, RACP_REPORT_NUMBER]
+        check_code(var s, h, c, var st, racp_filter(op, OPERATOR_LESS_OR_EQUAL, 1), op, RESULT_OPERATOR_NOT_SUPPORTED)
+        check_code(var s, h, c, var st, racp_range(op, 0, 1), op, RESULT_OPERATOR_NOT_SUPPORTED)
+        check_code(var s, h, c, var st, [op, OPERATOR_FIRST], op, RESULT_OPERATOR_NOT_SUPPORTED)
+        check_code(var s, h, c, var st, [op, OPERATOR_LAST], op, RESULT_OPERATOR_NOT_SUPPORTED)
+    // The operators it lists are taken.
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 3))
+    test.assert_eq(racp_answer(var s, h, c, var st, racp_filter(RACP_REPORT_NUMBER, OPERATOR_GREATER_OR_EQUAL, 2)), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_request_with_a_bad_operand_is_answered_operand_not_supported_or_invalid_operand()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    for op in [RACP_COMBINED_REPORT, RACP_REPORT_NUMBER, RACP_DELETE]
+        // A Filter Type that is not the Record Number: the Time filter is not supported, the others are RFU.
+        for filter in [0x00, 0x02, 0x03, 0x80, 0xFF]
+            check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL, filter, 1, 0, 0, 0], op, RESULT_OPERAND_NOT_SUPPORTED)
+            check_code(var s, h, c, var st, [op, OPERATOR_LESS_OR_EQUAL, filter, 1, 0, 0, 0], op, RESULT_OPERAND_NOT_SUPPORTED)
+            check_code(var s, h, c, var st, cat([op, OPERATOR_WITHIN, filter], cat(le4(0), le4(1))), op, RESULT_OPERAND_NOT_SUPPORTED)
+        // The Time filter with the six octets of a time value.
+        check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL, FILTER_TIME, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA], op, RESULT_OPERAND_NOT_SUPPORTED)
+        // A filter with too few or too many octets.
+        check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL, FILTER_RECORD_NUMBER], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL, FILTER_RECORD_NUMBER, 1, 0, 0], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_GREATER_OR_EQUAL, FILTER_RECORD_NUMBER, 1, 0, 0, 0, 0], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_LESS_OR_EQUAL, FILTER_RECORD_NUMBER, 1, 0, 0], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, cat(racp_filter(op, OPERATOR_WITHIN, 1), [2, 0, 0]), op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, cat(racp_range(op, 1, 2), [0]), op, RESULT_INVALID_OPERAND)
+        // A range whose minimum is above its maximum.
+        check_code(var s, h, c, var st, racp_range(op, 2, 1), op, RESULT_INVALID_OPERAND)
+        // Operators with no operand.
+        check_code(var s, h, c, var st, [op, OPERATOR_ALL, 0], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_FIRST, FILTER_RECORD_NUMBER], op, RESULT_INVALID_OPERAND)
+        check_code(var s, h, c, var st, [op, OPERATOR_LAST, 1, 0, 0, 0, 0], op, RESULT_INVALID_OPERAND)
+    test.assert_eq(ghs_store_count(st), 3)
+    // A value longer than the 20 octets the point holds is an ATT error.
+    let long_write = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(long_write[0], error_pdu(0x12, h.racp, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_second_command_while_a_report_runs_is_procedure_already_in_progress_except_abort()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 5, 1)
+    let first = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(first), 1)
+    let empty: [Int] = []
+    for value in [[RACP_COMBINED_REPORT, OPERATOR_ALL], [RACP_REPORT_NUMBER, OPERATOR_ALL], [RACP_DELETE, OPERATOR_ALL], [0x20, 0x01], empty, [RACP_COMBINED_REPORT, OPERATOR_NULL]]
+        let again = write(var s, h, c, var st, h.racp, value)
+        test.assert_eq(list.len(again), 1)
+        test.assert_eq(again[0], error_pdu(0x12, h.racp, 0xFE))
+    test.assert_eq(st.procedure, RACP_COMBINED_REPORT)
+    test.assert_eq(ghs_store_count(st), 5)
+    // The report goes on after the refused commands.
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 2)
+    // Abort is taken.
+    check_code(var s, h, c, var st, [RACP_ABORT, OPERATOR_NULL], RACP_ABORT, RESULT_SUCCESS)
+    // A response the collector has not confirmed also blocks the next command.
+    let one = write(var s, h, c, var st, h.racp, [RACP_REPORT_NUMBER, OPERATOR_ALL])
+    test.assert_eq(list.len(one), 2)
+    let two = write(var s, h, c, var st, h.racp, [RACP_REPORT_NUMBER, OPERATOR_ALL])
+    test.assert_eq(two[0], error_pdu(0x12, h.racp, 0xFE))
+    let _ = confirm(var s)
+    test.assert_eq(list.len(write(var s, h, c, var st, h.racp, [RACP_REPORT_NUMBER, OPERATOR_ALL])), 2)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_command_needs_the_point_enabled_and_a_report_needs_the_stored_characteristic_enabled()
+    let c = stored_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    for i in 0..3
+        test.assert_eq(ghs_store(var st, c, stamped_body(90 + i, -1)), i)
+    // The point is not enabled for indications: Client Characteristic Configuration Descriptor Improperly Configured.
+    for value in [[RACP_COMBINED_REPORT, OPERATOR_ALL], [RACP_REPORT_NUMBER, OPERATOR_ALL], [RACP_ABORT, OPERATOR_NULL]]
+        let r = write(var s, h, c, var st, h.racp, value)
+        test.assert_eq(list.len(r), 1)
+        test.assert_eq(r[0], error_pdu(0x12, h.racp, 0xFD))
+    subscribe(var s, h.racp_cccd, 2)
+    // A count sends no record, so the Stored Health Observations need not be enabled.
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 3))
+    check_code(var s, h, c, var st, [RACP_DELETE, OPERATOR_FIRST], RACP_DELETE, RESULT_SUCCESS)
+    // A report sends records: the same error, and no procedure starts.
+    let report = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(report), 1)
+    test.assert_eq(report[0], error_pdu(0x12, h.racp, 0xFD))
+    test.assert_eq(st.procedure, 0)
+    subscribe(var s, h.stored_cccd, 1)
+    let ok = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(ok[0], [0x13])
+    test.assert_eq(st.procedure, RACP_COMBINED_REPORT)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_procedure_while_live_observations_are_sent_is_server_busy_unless_the_sensor_does_both()
+    let c = both_config(false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    for i in 0..3
+        test.assert_eq(ghs_store(var st, c, stamped_body(90 + i, -1)), i)
+    subscribe(var s, h.live_cccd, 1)
+    subscribe(var s, h.stored_cccd, 1)
+    subscribe(var s, h.racp_cccd, 2)
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, live_body(98), false), SUBMIT_OK)
+    // Live observations are waiting for the collector who started them: Server Busy (0x0A), the
+    // encoding of [GHSS] Appendix B for the Combined Report, the count and the delete.
+    test.assert_eq(racp_answer(var s, h, c, var st, [0x07, 0x01]), racp_pdu(h, [0x06, 0x00, 0x07, 0x0A]))
+    check_code(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL], RACP_REPORT_NUMBER, RESULT_SERVER_BUSY)
+    check_code(var s, h, c, var st, [RACP_DELETE, OPERATOR_ALL], RACP_DELETE, RESULT_SERVER_BUSY)
+    test.assert_eq(ghs_store_count(st), 3)
+    test.assert_eq(st.procedure, 0)
+    // Abort has nothing to stop and is not busy.
+    check_code(var s, h, c, var st, [RACP_ABORT, OPERATOR_NULL], RACP_ABORT, RESULT_ABORT_UNSUCCESSFUL)
+    // The live observation goes out; with none left the procedure runs.
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 1)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 0)
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 3))
+    // A collector that has not started the live observations does not make the sensor busy.
+    ghs_reset_connection(var st)
+    test.assert_eq(ghs_submit(var st, c, live_body(97), false), SUBMIT_OK)
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 3))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_sensor_that_can_do_both_sends_live_observations_beside_the_report_and_one_that_cannot_waits()
+    let c = both_config(true)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    for i in 0..2
+        test.assert_eq(ghs_store(var st, c, stamped_body(90 + i, -1)), i)
+    subscribe(var s, h.live_cccd, 1)
+    subscribe(var s, h.stored_cccd, 1)
+    subscribe(var s, h.racp_cccd, 2)
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, live_body(98), false), SUBMIT_OK)
+    let started = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(started), 1)
+    // The record's two segments and the live observation in one call.
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 3)
+    test.assert_eq(wire.get(out[0], 1, 2), h.stored)
+    test.assert_eq(out[2], segment_pdu(0x1B, h.live, 0x03, live_body(98)))
+    // Without the ability the live observation waits until the report ends.
+    let d = both_config(false)
+    var (t, th) = rig(d)
+    var tt = new_ghs_state()
+    for i in 0..1
+        test.assert_eq(ghs_store(var tt, d, stamped_body(90 + i, -1)), i)
+    subscribe(var t, th.live_cccd, 1)
+    subscribe(var t, th.stored_cccd, 1)
+    subscribe(var t, th.racp_cccd, 2)
+    start_live(var t, th, d, var tt)
+    let w = write(var t, th, d, var tt, th.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(w), 1)
+    test.assert_eq(ghs_submit(var tt, d, live_body(98), false), SUBMIT_OK)
+    let record = pump(var t, th, d, var tt)
+    test.assert_eq(list.len(record), 2)
+    test.assert_eq(wire.get(record[0], 1, 2), th.stored)
+    let end = pump(var t, th, d, var tt)
+    test.assert_eq(list.len(end), 2)
+    test.assert_eq(end[0], racp_count_pdu(th, RACP_COMBINED_RESPONSE, 1))
+    test.assert_eq(end[1], segment_pdu(0x1B, th.live, 0x03, live_body(98)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_report_ends_when_the_collector_does_not_confirm_in_30_seconds_or_the_link_is_lost()
+    let c = stored_config(false, true)
+    var (s, h, st) = stored_rig(c, 3, 2)
+    let started = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(started), 1)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 1)
+    // 29 seconds: the indication is still awaited.
+    gatt_server.tick(var s.link, 29999)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(st.procedure, RACP_COMBINED_REPORT)
+    // 30 seconds: the transaction timed out, the report is over and sends nothing more.
+    gatt_server.tick(var s.link, 30000)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(st.procedure, 0)
+    test.assert_eq(list.len(st.todo), 0)
+    // A report is not resumed after the link is lost either.
+    var (t, th, tt) = stored_rig(c, 3, 2)
+    let w = write(var t, th, c, var tt, th.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(w), 1)
+    ghs_reset_connection(var tt)
+    test.assert_eq(tt.procedure, 0)
+    test.assert_eq(list.len(pump(var t, th, c, var tt)), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_report_whose_characteristic_the_collector_disabled_ends_procedure_not_completed()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    let started = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(started), 1)
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 2)
+    subscribe(var s, h.stored_cccd, 0)
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], racp_code_pdu(h, RACP_COMBINED_REPORT, RESULT_PROCEDURE_NOT_COMPLETED))
+    test.assert_eq(st.procedure, 0)
+    test.assert_eq(list.len(st.todo), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_record_deleted_during_the_report_is_skipped_and_the_response_counts_what_was_sent()
+    let c = stored_config(true, false)
+    var (s, h, st) = stored_rig(c, 3, 1)
+    let started = write(var s, h, c, var st, h.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(started), 1)
+    ghs_delete_records(var st, [1])
+    let (numbers, closing) = run_report(var s, h, c, var st)
+    test.assert_eq(numbers, [0, 2])
+    test.assert_eq(closing, racp_count_pdu(h, RACP_COMBINED_RESPONSE, 2))
+    // Every record gone: no records found.
+    var (t, th, tt) = stored_rig(c, 1, 1)
+    let w = write(var t, th, c, var tt, th.racp, [RACP_COMBINED_REPORT, OPERATOR_ALL])
+    test.assert_eq(list.len(w), 1)
+    ghs_delete_records(var tt, [0])
+    let out = pump(var t, th, c, var tt)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], racp_code_pdu(th, RACP_COMBINED_REPORT, RESULT_NO_RECORDS_FOUND))
+    test.assert_eq(tt.procedure, 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_records_of_a_user_the_collector_has_not_consented_to_are_neither_counted_nor_reported_nor_deleted()
+    let c = stored_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    // Record 0 of user 3, record 1 of no user, record 2 of user 4.
+    test.assert_eq(ghs_store(var st, c, stamped_body(90, 3)), 0)
+    test.assert_eq(ghs_store(var st, c, stamped_body(91, -1)), 1)
+    test.assert_eq(ghs_store(var st, c, stamped_body(92, 4)), 2)
+    subscribe(var s, h.stored_cccd, 1)
+    subscribe(var s, h.racp_cccd, 2)
+    ghs_set_users(var st, [3, 4], [3])
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 2))
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_LAST]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_ALL], [0, 1])
+    check_report(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_LAST], [1])
+    check_code(var s, h, c, var st, [RACP_DELETE, OPERATOR_ALL], RACP_DELETE, RESULT_SUCCESS)
+    test.assert_eq(ghs_store_count(st), 1)
+    test.assert_eq(st.records[0].number, 2)
+    check_code(var s, h, c, var st, [RACP_COMBINED_REPORT, OPERATOR_ALL], RACP_COMBINED_REPORT, RESULT_NO_RECORDS_FOUND)
+    // With the consent to user 4 the record is there.
+    ghs_set_users(var st, [3, 4], [4])
+    test.assert_eq(racp_answer(var s, h, c, var st, [RACP_REPORT_NUMBER, OPERATOR_ALL]), racp_count_pdu(h, RACP_NUMBER_RESPONSE, 1))
+
+// ── Tests: schedules, security and the advertising payload ──────────
+
+// The value of an Observation Schedule write: the type, the period and the interval as FLOATs.
+@tier(app)
+fn schedule_write(observation_type: Int, period: Int, interval: Int) -> [Int]
+    cat(cat(le4(observation_type), le4(period)), le4(interval))
+
+// A server whose link has no security.
+@tier(app)
+fn bare(config: GhsConfig) -> (GattServer, GhsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_ghs_service(var s.db, config)!
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_writable_schedule_takes_a_period_and_an_interval_inside_its_limits()
+    let c = full_config()
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    let value = schedule_write(SPO2, wire.float(60, 0), wire.float(10, 0))
+    let r = write(var s, h, c, var st, h.schedules[0], value)
+    test.assert_eq(list.len(r), 1)
+    test.assert_eq(r[0], [0x13])
+    test.assert_eq(read_of(var s, h.schedules[0]), wire.octets(cat([0x0B], value)))
+    // The ends of the limits are inside them: 1 second and 3600 seconds, 1 second and 60 seconds.
+    for (period, interval) in [(wire.float(1, 0), wire.float(1, 0)), (wire.float(3600, 0), wire.float(60, 0)), (wire.float(1000, -3), wire.float(1000, -3))]
+        let ends = schedule_write(SPO2, period, interval)
+        test.assert_eq(write(var s, h, c, var st, h.schedules[0], ends)[0], [0x13])
+        test.assert_eq(read_of(var s, h.schedules[0]), wire.octets(cat([0x0B], ends)))
+    // The product learns which descriptor a request wrote, to tell the other clients.
+    test.assert_eq(ghs_written_schedule(h, req(0x12, h.schedules[0], value)), 0)
+    test.assert_eq(ghs_written_schedule(h, req(0x12, h.schedules[1], value)), 1)
+    test.assert_eq(ghs_written_schedule(h, req(0x12, h.live_cccd, [1, 0])), -1)
+    test.assert_eq(ghs_written_schedule(h, req(0x0A, h.schedules[0], [])), -1)
+    test.assert_eq(ghs_written_schedule(h, [0x12]), -1)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_schedule_the_sensor_cannot_support_or_for_another_type_is_out_of_range()
+    let c = full_config()
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    let before = read_of(var s, h.schedules[0])
+    let good_period = wire.float(60, 0)
+    let good_interval = wire.float(10, 0)
+    // A period or an interval below or above the limits (0.5 s, 7200 s, 61 s), a number that is not one, or negative.
+    for (period, interval) in [
+        (wire.float(5, -1), good_interval), (wire.float(7200, 0), good_interval), (good_period, wire.float(5, -1)), (good_period, wire.float(61, 0)),
+        (wire.FLOAT_NAN, good_interval), (good_period, wire.FLOAT_NAN), (wire.FLOAT_POSITIVE_INFINITY, good_interval), (good_period, wire.FLOAT_NEGATIVE_INFINITY),
+        (wire.FLOAT_NRES, good_interval), (wire.float(-60, 0), good_interval), (good_period, wire.float(-10, 0)), (0, 0), (wire.FLOAT_RESERVED, good_interval)]
+        let r = write(var s, h, c, var st, h.schedules[0], schedule_write(SPO2, period, interval))
+        test.assert_eq(list.len(r), 1)
+        test.assert_eq(r[0], error_pdu(0x12, h.schedules[0], att.ATT_ERR_OUT_OF_RANGE))
+    // Another Observation Type than the descriptor's, even with a schedule that would do.
+    for other in [PULSE, 0, 0x00024BB9, 0xFFFFFFFF]
+        let r = write(var s, h, c, var st, h.schedules[0], schedule_write(other, good_period, good_interval))
+        test.assert_eq(r[0], error_pdu(0x12, h.schedules[0], att.ATT_ERR_OUT_OF_RANGE))
+    // The value of a refused write is not taken.
+    test.assert_eq(read_of(var s, h.schedules[0]), before)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_schedule_write_of_the_wrong_length_or_to_a_read_only_schedule_or_by_another_pdu_is_refused()
+    let c = full_config()
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    let before = read_of(var s, h.schedules[0])
+    let good = schedule_write(SPO2, wire.float(60, 0), wire.float(10, 0))
+    // 12 octets: 11 and 13, and none.
+    let empty: [Int] = []
+    for value in [good[0:11], cat(good, [0]), empty]
+        let r = write(var s, h, c, var st, h.schedules[0], value)
+        test.assert_eq(list.len(r), 1)
+        test.assert_eq(r[0], error_pdu(0x12, h.schedules[0], att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN))
+    // The second schedule is read-only.
+    let ro = write(var s, h, c, var st, h.schedules[1], schedule_write(PULSE, wire.float(30, 0), wire.float(5, 0)))
+    test.assert_eq(ro[0], error_pdu(0x12, h.schedules[1], att.ATT_ERR_WRITE_NOT_PERMITTED))
+    // A write command and a signed write are dropped; a long write is refused.
+    test.assert_eq(list.len(receive_default(var s, h, c, var st, req(0x52, h.schedules[0], good), 0)), 0)
+    test.assert_eq(list.len(receive_default(var s, h, c, var st, req(0xD2, h.schedules[0], good), 0)), 0)
+    let long_write = receive_default(var s, h, c, var st, req(0x16, h.schedules[0], cat([0, 0], good)), 0)
+    test.assert_eq(long_write[0], error_pdu(0x16, h.schedules[0], 0x0B))
+    test.assert_eq(read_of(var s, h.schedules[0]), before)
+    // A PDU of another kind is the GATT server's: here a read of the descriptor.
+    test.assert_eq(receive_default(var s, h, c, var st, req(0x0A, h.schedules[0], []), 0)[0], before)
+    // A PDU shorter than a handle is the server's too.
+    test.assert_eq(receive_default(var s, h, c, var st, [0x12, 0x01], 0)[0][0] as Int, 0x01)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_schedule_changed_by_the_user_or_a_client_is_indicated_to_the_other_clients()
+    let c = full_config()
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    // A second client connected to the same sensor.
+    var other = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var other, gatt_server.link_security(true, 2, 16, true))
+    let enabled = gatt_server.receive(var s.db, var other, req(0x12, h.schedule_changed_cccd, [2, 0]), 0)
+    test.assert_eq(enabled[0], [0x13])
+    // The first client writes a schedule; the product indicates the change to the other client.
+    let value = schedule_write(SPO2, wire.float(120, 0), wire.float(20, 0))
+    let pdu = req(0x12, h.schedules[0], value)
+    test.assert_eq(receive_default(var s, h, c, var st, pdu, 0)[0], [0x13])
+    let at = ghs_written_schedule(h, pdu)
+    test.assert_eq(at, 0)
+    let told = ghs_indicate_schedule_changed(var s.db, var other, h, at, 0)
+    test.assert_eq(list.len(told), 1)
+    test.assert_eq(told[0], wire.octets(cat([0x1D, h.schedule_changed & 0xFF, h.schedule_changed >>> 8], value)))
+    // The writer did not enable it and hears nothing.
+    test.assert_eq(list.len(ghs_indicate_schedule_changed(var s.db, var s.link, h, at, 0)), 0)
+    // The user changes the schedule on the device: the descriptor and the indication follow, without the client limits.
+    test.assert(ghs_set_schedule(var s.db, h, 1, wire.float(0, 0), wire.float(1, 0)))
+    test.assert_eq(read_of(var s, h.schedules[1]), wire.octets(cat([0x0B], schedule_write(PULSE, 0, wire.float(1, 0)))))
+    let _ = gatt_server.receive(var s.db, var other, [0x1E], 1)
+    let user = ghs_indicate_schedule_changed(var s.db, var other, h, 1, 2)
+    test.assert_eq(user[0], wire.octets(cat([0x1D, h.schedule_changed & 0xFF, h.schedule_changed >>> 8], schedule_write(PULSE, 0, wire.float(1, 0)))))
+    // Values that are not seconds are refused, and so is a descriptor that is not there.
+    test.assert(not ghs_set_schedule(var s.db, h, 0, wire.FLOAT_NAN, wire.float(1, 0)))
+    test.assert(not ghs_set_schedule(var s.db, h, 0, wire.float(1, 0), wire.float(-1, 0)))
+    test.assert(not ghs_set_schedule(var s.db, h, 7, wire.float(1, 0), wire.float(1, 0)))
+    test.assert(not ghs_set_schedule(var s.db, h, -1, wire.float(1, 0), wire.float(1, 0)))
+    test.assert_eq(read_of(var s, h.schedules[0]), wire.octets(cat([0x0B], value)))
+    test.assert_eq(list.len(ghs_indicate_schedule_changed(var s.db, var other, h, 7, 3)), 0)
+    // A sensor without the characteristic tells nothing.
+    var (t, th) = rig(default_ghs_config([SPO2]))
+    test.assert_eq(list.len(ghs_indicate_schedule_changed(var t.db, var t.link, th, 0, 0)), 0)
+    test.assert(not ghs_set_schedule(var t.db, th, 0, wire.float(1, 0), wire.float(1, 0)))
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_values_that_are_only_indicated_or_written_cannot_be_read_or_written_the_other_way()
+    let c = full_config()
+    var (s, h) = rig(c)
+    for handle in [h.live, h.stored, h.racp, h.control_point, h.schedule_changed]
+        test.assert_eq(read_of(var s, handle)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    for handle in [h.live, h.stored, h.schedule_changed, h.features]
+        test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, handle, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // Each Client Characteristic Configuration descriptor reads 0 and is written to enable.
+    for cccd in [h.features_cccd, h.live_cccd, h.stored_cccd, h.racp_cccd, h.control_point_cccd, h.schedule_changed_cccd]
+        test.assert_eq(read_of(var s, cccd), [0x0B, 0, 0])
+        subscribe(var s, cccd, 2)
+        test.assert_eq(read_of(var s, cccd), [0x0B, 2, 0])
+        subscribe(var s, cccd, 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_a_link_without_the_security_of_the_profile_reaches_nothing_of_the_service()
+    let c = full_config()
+    var (s, h) = bare(c)
+    var st = new_ghs_state()
+    // An unencrypted link with no key: Insufficient Authentication on every value, descriptor and point.
+    for handle in [h.features, h.schedules[0], h.schedules[1], h.ranges[0]]
+        test.assert_eq(read_of(var s, handle)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    for cccd in [h.features_cccd, h.live_cccd, h.stored_cccd, h.racp_cccd, h.control_point_cccd, h.schedule_changed_cccd]
+        test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    let cp = write(var s, h, c, var st, h.control_point, [OP_START])
+    test.assert_eq(cp[0], error_pdu(0x12, h.control_point, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
+    let racp = write(var s, h, c, var st, h.racp, [RACP_REPORT_NUMBER, OPERATOR_ALL])
+    test.assert_eq(racp[0], error_pdu(0x12, h.racp, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
+    let schedule = write(var s, h, c, var st, h.schedules[0], schedule_write(SPO2, wire.float(60, 0), wire.float(10, 0)))
+    test.assert_eq(schedule[0], error_pdu(0x12, h.schedules[0], att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
+    test.assert(not st.live_started)
+    // A link that has a key but is not encrypted is told to encrypt.
+    var (t, th) = bare(c)
+    gatt_server.set_security(var t.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(read_of(var t, th.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_access_of_the_configuration_is_the_level_the_link_needs()
+    var authenticated = full_config()
+    authenticated.access = gatt_server.Access.Authenticated
+    // Level 2 is encrypted, not authenticated.
+    var (a, ah) = rig_at(authenticated, 2, 23)
+    test.assert_eq(read_of(var a, ah.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, req(0x12, ah.live_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    var (b, bh) = rig_at(authenticated, 3, 23)
+    test.assert_eq(read_of(var b, bh.features)[0] as Int, 0x0B)
+    subscribe(var b, bh.live_cccd, 1)
+    var secure = full_config()
+    secure.access = gatt_server.Access.SecureConnections
+    var (c3, ch3) = rig_at(secure, 3, 23)
+    test.assert_eq(read_of(var c3, ch3.features)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    var (c4, ch4) = rig_at(secure, 4, 23)
+    test.assert_eq(read_of(var c4, ch4.features)[0] as Int, 0x0B)
+    subscribe(var c4, ch4.live_cccd, 1)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_nothing_is_sent_to_a_collector_whose_link_lost_the_security_of_its_subscription()
+    let c = live_config(true, false)
+    var (s, h) = rig(c)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    start_live(var s, h, c, var st)
+    test.assert_eq(ghs_submit(var st, c, live_body(98), false), SUBMIT_OK)
+    gatt_server.set_security(var s.link, gatt_server.no_security())
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 0)
+    test.assert_eq(ghs_live_count(st), 1)
+    test.assert_eq(st.live_counter, 0)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(list.len(pump(var s, h, c, var st)), 1)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_service_data_of_the_profile_lists_the_specializations_and_the_users_with_new_observations()
+    // [GHSP] Table 3.3: the blood pressure monitor 0x1007 and the user 5.
+    test.assert_eq(ghs_service_data([0x1007], true, [5]), [0x08, 0x16, 0x40, 0x18, 0x01, 0x07, 0x10, 0x01, 0x05])
+    // Without the User Data Service the user fields are absent.
+    test.assert_eq(ghs_service_data([0x1007], false, []), [0x06, 0x16, 0x40, 0x18, 0x01, 0x07, 0x10])
+    // No specialization: a count of 0 and no code; users with the service and none with new observations.
+    test.assert_eq(ghs_service_data([], false, []), [0x04, 0x16, 0x40, 0x18, 0x00])
+    test.assert_eq(ghs_service_data([], true, []), [0x05, 0x16, 0x40, 0x18, 0x00, 0x00])
+    test.assert_eq(ghs_service_data([0x1007, 0x1004], true, [1, 2, 3]), [0x0C, 0x16, 0x40, 0x18, 0x02, 0x07, 0x10, 0x04, 0x10, 0x03, 0x01, 0x02, 0x03])
+    // A field outside its width, and a structure that does not fit the 31 octets of a legacy advertisement.
+    test.assert_eq(list.len(ghs_service_data([0x10000], false, [])), 0)
+    test.assert_eq(list.len(ghs_service_data([-1], false, [])), 0)
+    test.assert_eq(list.len(ghs_service_data([], true, [256])), 0)
+    test.assert_eq(list.len(ghs_service_data([], true, [-1])), 0)
+    var most: [Int] = []
+    for i in 0..13
+        list.push(most, 0x1000 + i)
+    test.assert_eq(list.len(ghs_service_data(most, false, [])), 31)
+    var over: [Int] = []
+    for i in 0..14
+        list.push(over, 0x1000 + i)
+    test.assert_eq(list.len(ghs_service_data(over, false, [])), 0)
+
+@test
+@satisfies("REQ-BLE-GHS-001")
+fn test_the_largest_mtu_gives_segments_of_the_largest_attribute_value_and_a_body_that_fits_is_one_segment()
+    let c = live_config(true, false)
+    var (s, h) = rig_at(c, 2, 517)
+    var st = new_ghs_state()
+    subscribe(var s, h.live_cccd, 1)
+    start_live(var s, h, c, var st)
+    var samples: [Int] = []
+    for i in 0..300
+        list.push(samples, i)
+    let o = ghs_observation(CLASS_SAMPLE_ARRAY, 0x00020101, ghs_sample_array_value(0x10B2, wire.float(1, 0), wire.float(0, 0), wire.float(10, -3), 1, 2, samples))
+    let body = ghs_body(o)
+    test.assert_eq(list.len(body), 629)
+    test.assert_eq(ghs_body_error(body), BODY_OK)
+    test.assert_eq(ghs_submit(var st, c, body, false), SUBMIT_OK)
+    // ATT_MTU - 4 is 513 octets but an attribute holds 512, header included: 511 octets of data and 118.
+    let out = pump(var s, h, c, var st)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(list.len(out[0]), 3 + 512)
+    test.assert_eq(list.len(out[1]), 3 + 1 + 118)
+    test.assert_eq(out[0][3] as Int, 0x01)
+    test.assert_eq(out[1][3] as Int, 0x06)
+    test.assert_eq(segment_data(out), body)
+    // A body of 29 octets is one segment, first and last, with the counter at 2.
+    test.assert_eq(ghs_submit(var st, c, spot_check(), false), SUBMIT_OK)
+    let next = pump(var s, h, c, var st)
+    test.assert_eq(list.len(next), 1)
+    test.assert_eq(next[0], segment_pdu(0x1B, h.live, 0x0B, spot_check()))

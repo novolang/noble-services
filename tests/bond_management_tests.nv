@@ -1,0 +1,148 @@
+// tests/bond_management_tests.nv — the unit tests of src/bond_management.nv.
+//
+//   novo test tests/bond_management_tests.nv
+
+use std.test
+use att
+use links
+use gatt_server
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+use bond_management.{ BmsConfig, BmsHandles, BmsPolicy, ERR_OPERATION_FAILED, ERR_OP_CODE_NOT_SUPPORTED, OP_DELETE_ALL_BUT_ACTIVE_LE, OP_DELETE_ALL_LE, OP_DELETE_REQUESTING_LE, add_bms_service, bms_feature_value, bms_receive, default_bms_config, default_bms_policy }
+
+struct Tag
+    var scopes: [Int]
+    var accept: Bool
+
+impl BmsPolicy[] for Tag
+    @tier(app)
+    fn delete_bonds(var self, peer: links.LinkId, scope: Int) -> Bool
+        list.push(self.scopes, scope)
+        self.accept
+
+// A server on an authenticated link.
+@tier(app)
+fn server(config: BmsConfig) -> (GattServer, BmsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_bms_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@tier(app)
+fn write_cp(var s: GattServer, h: BmsHandles, config: BmsConfig, var tag: Tag, value: [Int]) -> [[u8]] [mutate]
+    bms_receive(var s.db, var s.link, h, config, var tag, peer(), req(0x12, h.control_point, value), 0)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_the_service_has_a_write_only_control_point_and_a_readable_feature()
+    let config = default_bms_config()
+    let (s, h) = server(config)
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.control_point, 3)
+    test.assert_eq(h.feature, 5)
+    test.assert_eq(s.db.attributes[0].value, [0x1E, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x08, 3, 0, 0xA4, 0x2A])
+    test.assert_eq(s.db.attributes[3].value, [0x02, 5, 0, 0xA5, 0x2A])
+    // The control point cannot be read, the feature cannot be written.
+    var t = s
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x0A, h.control_point, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.feature, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_the_feature_names_the_operations_and_the_authorization_code()
+    test.assert_eq(bms_feature_value(default_bms_config()), [0x10, 0x04, 0x01])
+    let only = BmsConfig { delete_all: false, delete_all_but_active: false, authorization_code: [], access: gatt_server.Access.Authenticated }
+    test.assert_eq(bms_feature_value(only), [0x10])
+    let all = BmsConfig { delete_all: true, delete_all_but_active: false, authorization_code: wire.text("1234"), access: gatt_server.Access.Authenticated }
+    test.assert_eq(bms_feature_value(all), [0x20, 0x08])
+    let but = BmsConfig { delete_all: false, delete_all_but_active: true, authorization_code: wire.text("1234"), access: gatt_server.Access.Authenticated }
+    test.assert_eq(bms_feature_value(but), [0x20, 0x00, 0x02])
+    var (s, h) = server(default_bms_config())
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.feature, []), 0)[0], [0x0B, 0x10, 0x04, 0x01])
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_a_supported_op_code_asks_the_policy_with_its_scope_and_is_answered()
+    let config = default_bms_config()
+    var (s, h) = server(config)
+    var tag = Tag { scopes: [], accept: true }
+    test.assert_eq(write_cp(var s, h, config, var tag, [OP_DELETE_REQUESTING_LE])[0], [0x13])
+    test.assert_eq(write_cp(var s, h, config, var tag, [OP_DELETE_ALL_LE])[0], [0x13])
+    test.assert_eq(write_cp(var s, h, config, var tag, [OP_DELETE_ALL_BUT_ACTIVE_LE])[0], [0x13])
+    test.assert_eq(tag.scopes, [1, 2, 3])
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_an_op_code_the_service_does_not_support_is_0x80_and_the_policy_is_not_asked()
+    let config = BmsConfig { delete_all: false, delete_all_but_active: false, authorization_code: [], access: gatt_server.Access.Authenticated }
+    var (s, h) = server(config)
+    var tag = Tag { scopes: [], accept: true }
+    // Reserved 0x00 and 0x0A, the BR/EDR codes, and the optional LE codes left out.
+    for op in [0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0xFF]
+        let r = write_cp(var s, h, config, var tag, [op])
+        test.assert_eq(r[0][4] as Int, ERR_OP_CODE_NOT_SUPPORTED)
+    // An empty write has no Op Code.
+    test.assert_eq(write_cp(var s, h, config, var tag, [])[0][4] as Int, ERR_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(list.len(tag.scopes), 0)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_the_authorization_code_must_match_and_a_failure_of_the_policy_is_0x81()
+    let config = BmsConfig { delete_all: true, delete_all_but_active: true, authorization_code: wire.text("1234"), access: gatt_server.Access.Authenticated }
+    var (s, h) = server(config)
+    var tag = Tag { scopes: [], accept: true }
+    let wrong = write_cp(var s, h, config, var tag, [OP_DELETE_ALL_LE, 0x31, 0x32, 0x33, 0x35])
+    test.assert_eq(wrong[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    let none = write_cp(var s, h, config, var tag, [OP_DELETE_ALL_LE])
+    test.assert_eq(none[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(list.len(tag.scopes), 0)
+    test.assert_eq(write_cp(var s, h, config, var tag, [OP_DELETE_ALL_LE, 0x31, 0x32, 0x33, 0x34])[0], [0x13])
+    // The Op Code is checked before the code: an unsupported one is 0x80 whatever the code is.
+    test.assert_eq(write_cp(var s, h, config, var tag, [0x01, 0x30])[0][4] as Int, ERR_OP_CODE_NOT_SUPPORTED)
+    // The policy refuses.
+    var no = Tag { scopes: [], accept: false }
+    test.assert_eq(write_cp(var s, h, config, var no, [OP_DELETE_REQUESTING_LE, 0x31, 0x32, 0x33, 0x34])[0][4] as Int, ERR_OPERATION_FAILED)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_the_characteristics_need_an_authenticated_link()
+    var s = gatt_server.new_server([], 65)
+    let config = default_bms_config()
+    let h = add_bms_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    var tag = Tag { scopes: [], accept: true }
+    let r = write_cp(var s, h, config, var tag, [OP_DELETE_REQUESTING_LE])
+    test.assert_eq(r[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(list.len(tag.scopes), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_a_code_up_to_511_octets_is_written_and_a_longer_one_is_refused_when_added()
+    var long: [u8] = []
+    for _ in 0..511
+        list.push(long, 0x31)
+    let config = BmsConfig { delete_all: false, delete_all_but_active: false, authorization_code: long, access: gatt_server.Access.Authenticated }
+    var (s, h) = server(config)
+    var tag = Tag { scopes: [], accept: true }
+    var value: [Int] = [OP_DELETE_REQUESTING_LE]
+    for _ in 0..511
+        list.push(value, 0x31)
+    test.assert_eq(write_cp(var s, h, config, var tag, value)[0], [0x13])
+    var longer: [u8] = long[:]
+    list.push(longer, 0x31)
+    var t = gatt_server.new_server([], 65)
+    match add_bms_service(var t.db, BmsConfig { delete_all: false, delete_all_but_active: false, authorization_code: longer, access: gatt_server.Access.Authenticated })
+        Ok(_) => test.fail("a code of 512 octets is too long")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-BMS-001")
+fn test_the_default_policy_deletes_nothing()
+    let config = default_bms_config()
+    var (s, h) = server(config)
+    var p = default_bms_policy()
+    let r = bms_receive(var s.db, var s.link, h, config, var p, peer(), req(0x12, h.control_point, [OP_DELETE_REQUESTING_LE]), 0)
+    test.assert_eq(r[0][4] as Int, ERR_OPERATION_FAILED)

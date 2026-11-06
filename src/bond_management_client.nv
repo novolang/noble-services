@@ -1,0 +1,162 @@
+// src/bond_management_client.nv — the client of the Bond Management
+// Service (0x181E): the decoder of the Bond Management Feature, the Control Point
+// requests, the classification of the errors a request can get, and the client
+// session.
+//
+//   Bond Management Feature         0x2AA5   decoded by `bm_decode_feature`
+//   Bond Management Control Point   0x2AA4   written with `bm_request`
+//
+// The Feature is a bit field of one or more octets ([BMS] 3.2): the server sends the
+// octets up to its highest set bit and a client ignores the bits it does not know.  The
+// operations 0x01 to 0x09 of Table 3.3 take two bits each, in the order of the Op Codes: the
+// bit 2(n-1) of the value says the Op Code n is supported, the next bit says it is supported
+// with an Authorization Code.  A Feature of no octet is `None`.
+//
+// A request is the Op Code and, when the server asks for one, the Authorization Code: a
+// UTF-8 string of at most 511 octets ([BMS] 3.1.2).  `bm_request` builds it for the Op Codes
+// 0x01 to 0x09, `bm_request_for` also checks the Feature of the peer: the Op Code is
+// supported, and a code is given when the Feature says the operation needs one.
+//
+// A request the server refuses ends the write with an ATT error ([BMS] 1.7 and 3.1.2.1):
+// 0x80 Op Code not supported, 0x08 Insufficient Authorization for a code that does not
+// match, 0x81 Operation failed.  `bm_error_kind` names them.  A decoder allocates nothing
+// and keeps no state.
+//
+// The session (`bm_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Feature (required) and enable its indication where the service has the property (optional);
+// `bm_client_delete` writes a request.
+//
+// Satisfies: REQ-BLE-PRFC-018.
+
+use att
+use gatt_client
+use gatt_server
+use links
+use bond_management
+use device_information_client
+use sensor_client
+use wire
+
+// The Op Codes of Table 3.3 that a client may send; 0x00 and 0x0A to 0xFF are reserved.
+const BM_OP_FIRST = 0x01
+const BM_OP_LAST = 0x09
+
+// The longest Authorization Code, in octets.
+const BM_CODE_MAX = 511
+
+// The Feature octets this client knows, and so the number of bits it reads.
+const BM_FEATURE_KNOWN_OCTETS = 3
+
+// What an ATT error of a request means.
+const BM_ERR_NONE = 0
+const BM_ERR_OP_CODE_NOT_SUPPORTED = 1
+const BM_ERR_AUTHORIZATION = 2
+const BM_ERR_OPERATION_FAILED = 3
+const BM_ERR_OTHER = 4
+
+// The Feature of a peer: the bits of the first three octets, bit 0 of octet 0 as bit 0.  `octets`
+// is the length of the value.
+@value
+struct BmFeature
+    bits: Int
+    octets: Int
+
+// The Feature in `b`, `None` for an empty value.  Octets after the third and the reserved bits
+// are ignored ([BMS] 3.2.1).
+@tier(embedded)
+@no_alloc
+fn bm_decode_feature(b: [u8]) -> ?BmFeature
+    if list.len(b) == 0
+        return None
+    var bits = 0
+    for k in 0..BM_FEATURE_KNOWN_OCTETS
+        if k < list.len(b)
+            bits = bits | ((b[k] as Int) << (8 * k))
+    Some(BmFeature { bits: bits, octets: list.len(b) })
+
+// Whether `op` is an Op Code a client may send.
+@tier(embedded)
+@no_alloc
+fn bm_op_valid(op: Int) -> Bool
+    op >= BM_OP_FIRST and op <= BM_OP_LAST
+
+// Whether the Feature says `op` is supported, with a code or without.
+@tier(embedded)
+@no_alloc
+fn bm_feature_supports(f: BmFeature, op: Int) -> Bool
+    if not bm_op_valid(op)
+        return false
+    ((f.bits >> (2 * (op - 1))) & 3) != 0
+
+// Whether the Feature says `op` is supported with an Authorization Code.
+@tier(embedded)
+@no_alloc
+fn bm_feature_needs_code(f: BmFeature, op: Int) -> Bool
+    if not bm_op_valid(op)
+        return false
+    ((f.bits >> (2 * (op - 1) + 1)) & 1) != 0
+
+// Whether the Feature has a bit in the octets it names that this client does not know.
+@tier(embedded)
+@no_alloc
+fn bm_feature_reserved(f: BmFeature) -> Bool
+    (f.bits >> 18) != 0
+
+// The Control Point value for `op` and the Authorization Code `code`: the Op Code and the code.
+// `None` for a reserved Op Code, a code over 511 octets and a code that is not UTF-8.
+@tier(app)
+fn bm_request(op: Int, code: [u8]) -> ?[u8]
+    if not bm_op_valid(op) or list.len(code) > BM_CODE_MAX
+        return None
+    if device_information_client.dis_text_length(code) != list.len(code)
+        return None
+    var out: [u8] = [op as u8]
+    for x in code
+        list.push(out, x)
+    Some(out)
+
+// The request as `bm_request` builds it, once the Feature of the peer allows it: `op` is supported,
+// and a code is given when the Feature says the operation needs one.
+@tier(app)
+fn bm_request_for(f: BmFeature, op: Int, code: [u8]) -> ?[u8]
+    if not bm_feature_supports(f, op)
+        return None
+    if bm_feature_needs_code(f, op) and list.len(code) == 0
+        return None
+    bm_request(op, code)
+
+// What the ATT error `status` of a request means: one of the `BM_ERR_` values.
+@tier(embedded)
+@no_alloc
+fn bm_error_kind(status: Int) -> Int
+    if status == 0
+        return BM_ERR_NONE
+    if status == bond_management.ERR_OP_CODE_NOT_SUPPORTED
+        return BM_ERR_OP_CODE_NOT_SUPPORTED
+    if status == att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+        return BM_ERR_AUTHORIZATION
+    if status == bond_management.ERR_OPERATION_FAILED
+        return BM_ERR_OPERATION_FAILED
+    BM_ERR_OTHER
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn bm_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, bond_management.UUID_BOND_MANAGEMENT_SERVICE)
+
+// Discover the service, read the Feature (required) and enable its indication (optional).
+@tier(app)
+fn bm_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, bond_management.UUID_BOND_MANAGEMENT_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, bond_management.UUID_BOND_MANAGEMENT_FEATURE, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write a request.  The session must have finished its plan.  A request `bm_request` refuses is not
+// written: the step answers `SE_FAILED` with no PDU.
+@tier(app)
+fn bm_client_delete(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, op: Int, code: [u8], now_ms: Int) -> sensor_client.ScStep
+    match bm_request(op, code)
+        None => sensor_client.ScStep { event: sensor_client.SE_FAILED, pdus: [] }
+        Some(v) =>
+            sensor_client.sc_queue_write(var c, bond_management.UUID_BOND_MANAGEMENT_CONTROL_POINT, v)
+            sensor_client.sc_kick(var t, var c, now_ms)

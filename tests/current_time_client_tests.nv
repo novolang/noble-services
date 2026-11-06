@@ -1,0 +1,229 @@
+// tests/current_time_client_tests.nv — the unit tests of src/current_time_client.nv.
+//
+//   novo test tests/current_time_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use current_time
+use sensor_client
+use wire
+use current_time_client.{ CT_REASON_DST, CT_REASON_EXTERNAL, CT_REASON_MANUAL, CT_REASON_MASK, CT_REASON_TIME_ZONE, CtLocal, CtTime, ct_accuracy_ms, ct_client_new, ct_client_set_local, ct_client_set_time, ct_client_start, ct_decode_local, ct_decode_reference, ct_decode_time, ct_dst_minutes, ct_fractions_ms, ct_local_value, ct_reference_stale, ct_time_value, ct_zone_minutes }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn time_of(b: [u8]) -> CtTime
+    match ct_decode_time(b)
+        Some(t) => t
+        None =>
+            test.fail("a current time")
+            CtTime { time: wire.date_time_unknown(), day_of_week: 0, fractions: 0, reason: 0 }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_the_current_time_fields_in_the_order_of_the_supplement()
+    let t = time_of(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128, 0x01]))
+    test.assert_eq(t.time.year as Int, 2026)
+    test.assert_eq(t.time.month as Int, 10)
+    test.assert_eq(t.time.day as Int, 27)
+    test.assert_eq(t.time.hours as Int, 13)
+    test.assert_eq(t.time.minutes as Int, 45)
+    test.assert_eq(t.time.seconds as Int, 30)
+    test.assert_eq(t.day_of_week, 2)
+    test.assert_eq(t.fractions, 128)
+    test.assert_eq(ct_fractions_ms(t.fractions), 500)
+    test.assert_eq(t.reason, CT_REASON_MANUAL)
+    test.assert_eq(ct_fractions_ms(0), 0)
+    test.assert_eq(ct_fractions_ms(255), 996)
+    // Each reason bit, and the reserved bits cleared.
+    test.assert_eq(time_of(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 0, 0x02])).reason, CT_REASON_EXTERNAL)
+    test.assert_eq(time_of(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 0, 0x04])).reason, CT_REASON_TIME_ZONE)
+    test.assert_eq(time_of(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 0, 0x08])).reason, CT_REASON_DST)
+    test.assert_eq(time_of(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 0, 0xFF])).reason, CT_REASON_MASK)
+    // The unknown date and the unknown day of the week decode.
+    let u = time_of(octets([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+    test.assert_eq(u.time.year as Int, 0)
+    test.assert_eq(u.day_of_week, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_a_current_time_out_of_range_or_of_the_wrong_length_is_none()
+    test.assert_eq(ct_decode_time([]), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128, 1, 0])), None)
+    // A year below 1582 or above 9999, a month of 13, a day of 32, an hour of 24, a minute of 60, a second of 60, a weekday of 8.
+    test.assert_eq(ct_decode_time(octets([0x2D, 0x06, 10, 27, 13, 45, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0x10, 0x27, 10, 27, 13, 45, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 13, 27, 13, 45, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 32, 13, 45, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 24, 45, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 13, 60, 30, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 13, 45, 60, 2, 0, 0])), None)
+    test.assert_eq(ct_decode_time(octets([0xEA, 0x07, 10, 27, 13, 45, 30, 8, 0, 0])), None)
+    // The ends that are in range.
+    test.assert(ct_decode_time(octets([0x2E, 0x06, 1, 1, 0, 0, 0, 1, 0, 0])) != None)
+    test.assert(ct_decode_time(octets([0x0F, 0x27, 12, 31, 23, 59, 59, 7, 255, 0])) != None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_the_value_a_client_builds_is_the_value_the_decoder_reads()
+    let t = CtTime { time: wire.date_time(2026, 10, 27, 13, 45, 30), day_of_week: 2, fractions: 128, reason: CT_REASON_MANUAL }
+    test.assert_eq(ct_time_value(t), octets([0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128, 1]))
+    test.assert_eq(time_of(ct_time_value(t)).fractions, 128)
+    let wild = CtTime { time: wire.date_time(2026, 10, 27, 13, 45, 30), day_of_week: 9, fractions: 300, reason: 0xFF }
+    test.assert_eq(ct_time_value(wild), octets([0xEA, 0x07, 10, 27, 13, 45, 30, 7, 255, 0x0F]))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_local_time_information_zone_and_dst()
+    match ct_decode_local(octets([4, 4]))
+        None => test.fail("local time")
+        Some(l) =>
+            test.assert_eq(ct_zone_minutes(l), 60)
+            test.assert_eq(ct_dst_minutes(l), 60)
+    match ct_decode_local(octets([0xD0, 0x00]))
+        None => test.fail("local time")
+        Some(l) =>
+            test.assert_eq(ct_zone_minutes(l), -720)
+            test.assert_eq(ct_dst_minutes(l), 0)
+    match ct_decode_local(octets([56, 8]))
+        None => test.fail("local time")
+        Some(l) =>
+            test.assert_eq(ct_zone_minutes(l), 840)
+            test.assert_eq(ct_dst_minutes(l), 120)
+    match ct_decode_local(octets([0x80, 0xFF]))
+        None => test.fail("local time")
+        Some(l) =>
+            test.assert_eq(ct_zone_minutes(l), 0)
+            test.assert_eq(ct_dst_minutes(l), -1)
+    match ct_decode_local(octets([0, 2]))
+        None => test.fail("local time")
+        Some(l) => test.assert_eq(ct_dst_minutes(l), 30)
+    // A zone beyond -48 and +56, a DST Offset the table does not define, the wrong lengths.
+    test.assert_eq(ct_decode_local(octets([0xCF, 0])), None)
+    test.assert_eq(ct_decode_local(octets([57, 0])), None)
+    test.assert_eq(ct_decode_local(octets([0, 1])), None)
+    test.assert_eq(ct_decode_local(octets([0, 3])), None)
+    test.assert_eq(ct_decode_local(octets([0, 254])), None)
+    test.assert_eq(ct_decode_local(octets([0])), None)
+    test.assert_eq(ct_decode_local(octets([0, 0, 0])), None)
+    test.assert_eq(ct_local_value(CtLocal { zone: -4, dst: 4 }), octets([0xFC, 4]))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_reference_time_information()
+    match ct_decode_reference(octets([2, 8, 3, 12]))
+        None => test.fail("reference time")
+        Some(r) =>
+            test.assert_eq(r.source, 2)
+            test.assert_eq(ct_accuracy_ms(r), 1000)
+            test.assert_eq(r.days, 3)
+            test.assert_eq(r.hours, 12)
+            test.assert_eq(ct_reference_stale(r), false)
+    match ct_decode_reference(octets([0, 255, 255, 255]))
+        None => test.fail("reference time")
+        Some(r) =>
+            test.assert_eq(ct_accuracy_ms(r), -1)
+            test.assert_eq(ct_reference_stale(r), true)
+    match ct_decode_reference(octets([6, 254, 254, 23]))
+        None => test.fail("reference time")
+        Some(r) =>
+            test.assert_eq(ct_accuracy_ms(r), -2)
+            test.assert_eq(r.days, 254)
+            test.assert_eq(r.hours, 23)
+    test.assert_eq(ct_decode_reference(octets([7, 0, 0, 0])), None)
+    test.assert_eq(ct_decode_reference(octets([1, 0, 0, 24])), None)
+    test.assert_eq(ct_decode_reference(octets([1, 0, 255, 23])), None)
+    test.assert_eq(ct_decode_reference(octets([1, 0, 0])), None)
+    test.assert_eq(ct_decode_reference(octets([1, 0, 0, 0, 0])), None)
+
+// The value of the attribute at `handle`.
+@tier(app)
+fn attribute(db: GattDb, handle: Int) -> [u8]
+    db.attributes[gatt_server.index_of(db, handle)].value[:]
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_session_against_the_server_reads_follows_and_sets_the_time()
+    if not fixtures.client_engine_present()
+        return
+    var s = gatt_server.new_server([], 65)
+    let config = current_time.default_cts_config()
+    let h = current_time.added(var s, config)
+    var state = current_time.new_cts_state()
+    let both = sensor_client.test_open(current_time.UUID_CURRENT_TIME_SERVICE)
+    var t = both.0
+    var c = ct_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ct_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The reads arrived in the order of the plan: the time, the zone, the reference.
+    var order: [Int] = []
+    for i in 0..(list.len(seen) / 2)
+        if (seen[2 * i] & sensor_client.SE_VALUE) != 0
+            list.push(order, seen[2 * i + 1])
+    test.assert_eq(order, [current_time.UUID_CURRENT_TIME, current_time.UUID_LOCAL_TIME_INFORMATION, current_time.UUID_REFERENCE_TIME_INFORMATION])
+    test.assert(ct_decode_reference(sensor_client.sc_value(c)) != None)
+    // The server sets a new time and notifies it.
+    let ntf = current_time.cts_set_time(var s.db, var s.link, h, var state, current_time.sample(), false, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), current_time.UUID_CURRENT_TIME)
+    let n = time_of(sensor_client.sc_value(c))
+    test.assert_eq(n.time.day as Int, 27)
+    test.assert_eq(n.day_of_week, 2)
+    // The client sets the time and the zone; the server reads them as a write.
+    let want = CtTime { time: wire.date_time(2027, 1, 2, 3, 4, 5), day_of_week: 6, fractions: 64, reason: CT_REASON_MANUAL }
+    let w = sensor_client.test_pump(var t, var c, var s, ct_client_set_time(var t, var c, want, 0), var seen)
+    test.assert((w & sensor_client.SE_DONE) != 0)
+    test.assert_eq(current_time.parse_current_time(attribute(s.db, h.time)).time.year as Int, 2027)
+    let z = sensor_client.test_pump(var t, var c, var s, ct_client_set_local(var t, var c, CtLocal { zone: 8, dst: 4 }, 0), var seen)
+    test.assert((z & sensor_client.SE_DONE) != 0)
+    test.assert_eq(current_time.parse_local_time(attribute(s.db, h.local)).zone, 8)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_session_with_a_read_only_time_and_no_optional_characteristics()
+    if not fixtures.client_engine_present()
+        return
+    var s = gatt_server.new_server([], 65)
+    let config = current_time.CtsConfig {
+        read: gatt_server.Access.Open, cccd: gatt_server.open_permissions(), write: gatt_server.Access.Open,
+        writable_time: false, local: false, writable_local: false, reference: false }
+    let h = current_time.added(var s, config)
+    let both = sensor_client.test_open(current_time.UUID_CURRENT_TIME_SERVICE)
+    var t = both.0
+    var c = ct_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ct_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The service has no Local Time Information: setting the zone ends with Not Found.
+    let z = ct_client_set_local(var t, var c, CtLocal { zone: 8, dst: 4 }, 0)
+    test.assert((z.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+    test.assert_eq(h.local as Int, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-014")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(current_time.UUID_CURRENT_TIME_SERVICE)
+    var t = both.0
+    var c = ct_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, ct_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

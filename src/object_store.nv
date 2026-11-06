@@ -1,0 +1,576 @@
+// src/object_store.nv — the object database behind the Object
+// Transfer Service (0x1825): what the service asks a product to keep, an
+// in-memory store that keeps it, and the pure helpers the service and the
+// store share.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+// Mechanism and policy.  The Object Transfer Service fixes how a client lists,
+// selects, reads, writes, creates and deletes objects, the metadata every
+// object has and the order in which a procedure answers.  Where the bytes and
+// the metadata live is the product's: a file system, a flash log, a firmware
+// slot.  `ObjectStore` is the product's side of that line.  The service never
+// holds an object itself; it asks the store for the list of Object IDs, the
+// metadata of one, a range of its contents, and tells it to create, change or
+// delete one.
+//
+//   ids          the Object IDs in the order the store keeps them
+//   meta         the metadata of one object, a copy the caller may change
+//   set_meta     take the name, the two timestamps and the properties of a copy
+//   accepts      whether the store takes an object of a type (a UUID)
+//   available    the octets the store can still allocate
+//   create       a new, empty object of a type with `size` octets reserved
+//   delete       remove one
+//   read, write  a range of the contents; a write inside the allocated size
+//   resize       set the current size and the allocated size
+//   execute      run an object (OACP Execute), the product's meaning
+//   now          the date and time in UTC, all zero without a clock
+//
+// An Object ID is a 48-bit integer from 0x000000000100: 0 is the Directory
+// Listing Object and 1 to 0xFF are reserved (OTS 3.2.7), so `create` answers an
+// id from `ID_FIRST` on or a negative result.  The metadata a store holds is
+// `ObjectMeta`.  The name is 0 to `NAME_MAX` octets of UTF-8, the type a
+// 16-bit or 128-bit UUID (2 or 16 octets), the two timestamps the 7 octets of
+// a Date Time with zeros for "not known", and the properties the bits of
+// OTS Table 3.7 without the Mark bit, which the service keeps for each client.
+//
+// `MemoryStore` is the store of a program that has no storage of its own and of
+// the tests: objects in lists, a capacity in octets, a limit on the number of
+// objects, a list of the types it accepts, a settable clock, and a record of the
+// objects it was asked to execute.
+//
+// The helpers are `crc32` (the CRC-32 of ISO/IEC 3309 that OACP Calculate
+// Checksum answers, the polynomial 0x04C11DB7 reflected, the register filled
+// with ones and inverted at the end), the Date Time key and comparison, UUID
+// expansion and the checks of a name (well-formed UTF-8, no ASCII control
+// character).
+//
+// Specification checked against: Object Transfer Service 1.0 (Sections 1.7 to
+// 1.9, 3.2 and 4.1), the GATT Specification Supplement v9 (Sections 3.70,
+// 3.158 to 3.162) and ISO/IEC 3309 as the CRC of the Ethernet frame.
+//
+// Satisfies: REQ-BLE-OTS-003.
+
+use gatt_server
+use wire
+
+// The Object Properties bits of OTS Table 3.7.  `PROP_MARK` is the client's
+// mark, which the service adds to the value a client reads.
+const PROP_DELETE = 0x01
+const PROP_EXECUTE = 0x02
+const PROP_READ = 0x04
+const PROP_WRITE = 0x08
+const PROP_APPEND = 0x10
+const PROP_TRUNCATE = 0x20
+const PROP_PATCH = 0x40
+const PROP_MARK = 0x80
+// The bits a store keeps, the Mark bit excepted.
+const PROP_STORED = 0x7F
+
+// The longest Object Name, in octets (GSS 3.161).
+const NAME_MAX = 120
+
+// The Object ID of the Directory Listing Object, the first ID a store gives an
+// object and the last (OTS 3.2.7).
+const ID_DIRECTORY = 0
+const ID_FIRST = 0x100
+const ID_LAST = 0xFFFFFFFFFFFF
+
+// "No object": the Current Object before one is selected.
+const NO_OBJECT = -1
+
+// The results `create` answers instead of an Object ID: the store has no room
+// for the object, or failed for another reason.
+const CREATE_NO_ROOM = -2
+const CREATE_FAILED = -3
+
+// The Object Type UUIDs of the Assigned Numbers (Section 3.9).
+const TYPE_UNSPECIFIED = 0x2ACA
+const TYPE_DIRECTORY_LISTING = 0x2ACB
+
+// The result codes of OACP Execute a store may answer (OTS Table 3.11).
+const EXECUTE_SUCCESS = 0x01
+const EXECUTE_INVALID_PARAMETER = 0x03
+const EXECUTE_PROCEDURE_NOT_PERMITTED = 0x08
+const EXECUTE_OBJECT_LOCKED = 0x09
+const EXECUTE_FAILED = 0x0A
+
+// The metadata of one object (OTS 3.2).  `size` and `allocated` are the two
+// fields of the Object Size characteristic: the current size is at most the
+// allocated size.  `created` and `modified` are Date Time values of 7 octets.
+struct ObjectMeta
+    var id: Int
+    var name: [u8]
+    var kind: [u8]
+    var size: Int
+    var allocated: Int
+    var created: [u8]
+    var modified: [u8]
+    var properties: Int
+
+// The questions and the changes the service puts to a product's storage.  An
+// `Int` result that is not an Object ID is negative; a `Bool` result is false
+// when the store could not do what was asked and left everything as it was.
+trait ObjectStore[e]
+    // The Object IDs of every object, in the order the store keeps them.
+    fn ids(var self) -> [Int] [e]
+
+    // The metadata of the object `id` as a copy, None for no such object.
+    fn meta(var self, id: Int) -> ?ObjectMeta [e]
+
+    // Take the name, the two timestamps and the properties of `meta` for the
+    // object `meta.id`; the id, the type and the sizes do not change.
+    fn set_meta(var self, meta: ObjectMeta) -> Bool [e]
+
+    // Whether the store takes an object of the type `kind`.
+    fn accepts(var self, kind: [u8]) -> Bool [e]
+
+    // The octets the store can still allocate for one object.
+    fn available(var self) -> Int [e]
+
+    // A new object of type `kind` with `size` octets reserved, empty, with no
+    // name: its Object ID (at least `ID_FIRST`), `CREATE_NO_ROOM` or
+    // `CREATE_FAILED`.
+    fn create(var self, kind: [u8], size: Int) -> Int [e]
+
+    // Remove the object `id`.
+    fn delete(var self, id: Int) -> Bool [e]
+
+    // `length` octets of the contents of `id` from `offset`; fewer where the
+    // object ends.
+    fn read(var self, id: Int, offset: Int, length: Int) -> [u8] [e]
+
+    // Write `data` into `id` from `offset`, at most the current size and
+    // within the allocated size; the current size becomes the end of the data
+    // when that is further.
+    fn write(var self, id: Int, offset: Int, data: [u8]) -> Bool [e]
+
+    // Set the current size to `size` and the allocated size to `allocated`
+    // (`size` is at most `allocated`); a shorter size drops the contents past
+    // it.  False when the store cannot allocate that much.
+    fn resize(var self, id: Int, size: Int, allocated: Int) -> Bool [e]
+
+    // Run the object `id` with the parameter `parameter` (OACP Execute): the
+    // result code of OTS Table 3.11 and the response parameter.
+    fn execute(var self, id: Int, parameter: [u8]) -> (Int, [u8]) [e]
+
+    // The date and time in UTC as a Date Time of 7 octets, all zero when the
+    // store has no clock.
+    fn now(var self) -> [u8] [e]
+
+// ── Pure helpers ────────────────────────────────────────────────────
+
+// Seven zero octets: a Date Time that is not known.
+@tier(app)
+fn date_time_zero() -> [u8]
+    [0, 0, 0, 0, 0, 0, 0]
+
+// A new object's metadata: no name, the timestamps not known.
+@tier(app)
+fn new_meta(id: Int, kind: [u8], size: Int, allocated: Int, properties: Int) -> ObjectMeta
+    ObjectMeta {
+        id: id, name: [], kind: kind[:], size: size, allocated: allocated,
+        created: date_time_zero(), modified: date_time_zero(), properties: properties }
+
+// A copy of `m` that shares no list with it.
+@tier(app)
+fn copy_meta(m: ObjectMeta) -> ObjectMeta
+    ObjectMeta {
+        id: m.id, name: m.name[:], kind: m.kind[:], size: m.size, allocated: m.allocated,
+        created: m.created[:], modified: m.modified[:], properties: m.properties }
+
+// The CRC-32 register after `data`, starting from `crc`: the reflected
+// polynomial 0xEDB88320, fed least significant bit first.
+@tier(embedded)
+@no_alloc
+fn crc32_update(crc: Int, data: [u8]) -> Int
+    var c = crc
+    for b in data
+        c = c ^ (b as Int)
+        for _ in 0..8
+            if (c & 1) != 0
+                c = (c >>> 1) ^ 0xEDB88320
+            else
+                c = c >>> 1
+    c
+
+// The CRC-32 of `data` (ISO/IEC 3309, the check value of "123456789" is
+// 0xCBF43926).
+@tier(embedded)
+@no_alloc
+fn crc32(data: [u8]) -> Int
+    crc32_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF
+
+// A number that orders two Date Time values of 7 octets in time: the year, the
+// month, the day, the hours, the minutes and the seconds, most significant
+// first.  0 for a value that is not 7 octets.
+@tier(embedded)
+@no_alloc
+fn date_time_key(b: [u8]) -> Int
+    if list.len(b) != 7
+        return 0
+    let year = (b[0] as Int) | ((b[1] as Int) << 8)
+    (((((year * 16 + (b[2] as Int)) * 32 + (b[3] as Int)) * 32 + (b[4] as Int)) * 64 + (b[5] as Int)) * 64) + (b[6] as Int)
+
+// Whether `b` is a Date Time of 7 octets that GSS 3.70 allows: a year of 1582
+// to 9999 or 0, a month of 0 to 12, a day of 0 to 31 and a time of day.
+@tier(embedded)
+@no_alloc
+fn date_time_ok(b: [u8]) -> Bool
+    if list.len(b) != 7
+        return false
+    wire.date_time_valid(wire.get_date_time(b, 0))
+
+// Whether the Date Time `b` names a day: a year, a month and a day that are not
+// "not known".  A timestamp that does not is not compared by a filter (OTS
+// 3.5.1.7).
+@tier(embedded)
+@no_alloc
+fn date_time_known(b: [u8]) -> Bool
+    if list.len(b) != 7
+        return false
+    ((b[0] as Int) | ((b[1] as Int) << 8)) != 0 and (b[2] as Int) != 0 and (b[3] as Int) != 0
+
+// The 16 octets of the UUID `u`, least significant octet first: a 16-bit UUID
+// is put on the Bluetooth Base UUID.  An empty list for a UUID of another
+// length.
+@tier(app)
+fn uuid_expand(u: [u8]) -> [u8]
+    if list.len(u) == 16
+        return u[:]
+    if list.len(u) != 2
+        return []
+    [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, u[0], u[1], 0x00, 0x00]
+
+// Whether `u` is a UUID of 2 or 16 octets.
+@tier(embedded)
+@no_alloc
+fn uuid_ok(u: [u8]) -> Bool
+    list.len(u) == 2 or list.len(u) == 16
+
+// Compare two UUIDs as the 128-bit numbers they are, most significant octet
+// first: -1, 0 or 1.  A UUID of a bad length is the smallest.
+@tier(app)
+fn uuid_compare(a: [u8], b: [u8]) -> Int
+    let x = uuid_expand(a)
+    let y = uuid_expand(b)
+    if list.len(x) == 0 and list.len(y) == 0
+        return 0
+    if list.len(x) == 0
+        return -1
+    if list.len(y) == 0
+        return 1
+    for k in 0..16
+        let i = 15 - k
+        if x[i] != y[i]
+            return if x[i] < y[i] then -1 else 1
+    0
+
+// Whether `b` is well-formed UTF-8 (RFC 3629): no overlong form, no surrogate,
+// nothing above U+10FFFF.
+@tier(embedded)
+@no_alloc
+fn utf8_valid(b: [u8]) -> Bool
+    let n = list.len(b)
+    var skip = 0
+    for i in 0..n
+        if skip > 0
+            let c = b[i] as Int
+            if (c & 0xC0) != 0x80
+                return false
+            skip = skip - 1
+        else
+            let c = b[i] as Int
+            if c >= 0x80
+                if c >= 0xC2 and c <= 0xDF
+                    skip = 1
+                elif c >= 0xE0 and c <= 0xEF
+                    skip = 2
+                elif c >= 0xF0 and c <= 0xF4
+                    skip = 3
+                else
+                    return false
+                // The second octet of the three forms that have a narrower range.
+                if skip > 0
+                    if i + 1 >= n
+                        return false
+                    let d = b[i + 1] as Int
+                    if c == 0xE0 and d < 0xA0
+                        return false
+                    if c == 0xED and d > 0x9F
+                        return false
+                    if c == 0xF0 and d < 0x90
+                        return false
+                    if c == 0xF4 and d > 0x8F
+                        return false
+    skip == 0
+
+// Whether the UTF-8 text `b` holds an ASCII control character (OTP 2.6): DEL,
+// a code of the C0 set (0x00 to 0x1F) or of the C1 set (U+0080 to U+009F, the
+// octets 0xC2 0x80 to 0xC2 0x9F).
+@tier(embedded)
+@no_alloc
+fn has_control_character(b: [u8]) -> Bool
+    let n = list.len(b)
+    for i in 0..n
+        let c = b[i] as Int
+        if c < 0x20 or c == 0x7F
+            return true
+        if c == 0xC2 and i + 1 < n and (b[i + 1] as Int) >= 0x80 and (b[i + 1] as Int) <= 0x9F
+            return true
+    false
+
+// Whether `name` is a name a client may give an object: 1 to `NAME_MAX` octets
+// of well-formed UTF-8 with no control character.
+@tier(embedded)
+@no_alloc
+fn name_ok(name: [u8]) -> Bool
+    list.len(name) >= 1 and list.len(name) <= NAME_MAX and utf8_valid(name) and not has_control_character(name)
+
+// Whether `h` starts with `p`, ends with it, or holds it: the three name
+// filters of OTS 3.5.1.2 to 3.5.1.4, byte for byte, so case-sensitive.
+@tier(embedded)
+@no_alloc
+fn starts_with(h: [u8], p: [u8]) -> Bool
+    let n = list.len(p)
+    if n > list.len(h)
+        return false
+    for i in 0..n
+        if h[i] != p[i]
+            return false
+    true
+
+@tier(embedded)
+@no_alloc
+fn ends_with(h: [u8], p: [u8]) -> Bool
+    let n = list.len(p)
+    let m = list.len(h)
+    if n > m
+        return false
+    for i in 0..n
+        if h[m - n + i] != p[i]
+            return false
+    true
+
+@tier(embedded)
+@no_alloc
+fn contains(h: [u8], p: [u8]) -> Bool
+    let n = list.len(p)
+    let m = list.len(h)
+    if n > m
+        return false
+    for s in 0..(m - n + 1)
+        var same = true
+        for i in 0..n
+            if h[s + i] != p[i]
+                same = false
+        if same
+            return true
+    false
+
+// Compare two names as sequences of octets (the order of the code points of
+// UTF-8): -1, 0 or 1.
+@tier(embedded)
+@no_alloc
+fn bytes_compare(a: [u8], b: [u8]) -> Int
+    let n = if list.len(a) < list.len(b) then list.len(a) else list.len(b)
+    for i in 0..n
+        if a[i] != b[i]
+            return if a[i] < b[i] then -1 else 1
+    if list.len(a) == list.len(b)
+        return 0
+    if list.len(a) < list.len(b) then -1 else 1
+
+// ── The in-memory store ─────────────────────────────────────────────
+
+// One object of a `MemoryStore`: its metadata and its contents.  The contents
+// hold `meta.size` octets.
+struct MemoryObject
+    var meta: ObjectMeta
+    var data: [u8]
+
+// The store of a program with no storage of its own.  `capacity` is the total
+// of the allocated sizes the store allows and `max_objects` the number of
+// objects; `kinds` lists the types it accepts (empty accepts any); `clock` is
+// the Date Time `now` answers; `properties` the properties a new object gets
+// (the Write bit is always added); `executed` lists the Object IDs `execute`
+// ran and `execute_result` and `execute_response` what it answers.
+struct MemoryStore
+    var objects: [MemoryObject]
+    var next_id: Int
+    var capacity: Int
+    var max_objects: Int
+    var kinds: [[u8]]
+    var clock: [u8]
+    var properties: Int
+    var executed: [Int]
+    var execute_result: Int
+    var execute_response: [u8]
+
+// An empty store of `capacity` octets and room for `max_objects` objects that
+// takes any type, a new object with Delete, Read, Write, Append, Truncate and
+// Patch.
+@tier(app)
+fn new_memory_store(capacity: Int, max_objects: Int) -> MemoryStore
+    MemoryStore {
+        objects: [], next_id: ID_FIRST, capacity: capacity, max_objects: max_objects, kinds: [],
+        clock: date_time_zero(), properties: PROP_DELETE | PROP_READ | PROP_WRITE | PROP_APPEND | PROP_TRUNCATE | PROP_PATCH,
+        executed: [], execute_result: EXECUTE_SUCCESS, execute_response: [] }
+
+// The index of the object `id` in `store`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn memory_index(repo: MemoryStore, id: Int) -> Int
+    for i in 0..list.len(repo.objects)
+        if repo.objects[i].meta.id == id
+            return i
+    -1
+
+// The octets all the objects have allocated.
+@tier(embedded)
+@no_alloc
+fn memory_allocated(repo: MemoryStore) -> Int
+    var total = 0
+    for o in repo.objects
+        total = total + o.meta.allocated
+    total
+
+// Put an object in the store with the name, the contents and the properties
+// given, allocated exactly as large as its contents: the objects a test or a
+// product starts with.  The Object ID, -1 when there is no room.
+@tier(app)
+fn memory_add(var repo: MemoryStore, name: [u8], kind: [u8], data: [u8], properties: Int) -> Int
+    if list.len(repo.objects) >= repo.max_objects or memory_allocated(repo) + list.len(data) > repo.capacity
+        return -1
+    let id = repo.next_id
+    repo.next_id = id + 1
+    var meta = new_meta(id, kind, list.len(data), list.len(data), properties)
+    meta.name = name[:]
+    list.push(repo.objects, MemoryObject { meta: meta, data: data[:] })
+    id
+
+impl ObjectStore[] for MemoryStore
+    @tier(app)
+    fn ids(var self) -> [Int]
+        var out: [Int] = []
+        for o in self.objects
+            list.push(out, o.meta.id)
+        out
+
+    @tier(app)
+    fn meta(var self, id: Int) -> ?ObjectMeta
+        let i = memory_index(self, id)
+        if i < 0
+            return None
+        Some(copy_meta(self.objects[i].meta))
+
+    @tier(app)
+    fn set_meta(var self, meta: ObjectMeta) -> Bool
+        let i = memory_index(self, meta.id)
+        if i < 0
+            return false
+        self.objects[i].meta.name = meta.name[:]
+        self.objects[i].meta.created = meta.created[:]
+        self.objects[i].meta.modified = meta.modified[:]
+        self.objects[i].meta.properties = meta.properties & PROP_STORED
+        true
+
+    @tier(embedded)
+    @no_alloc
+    fn accepts(var self, kind: [u8]) -> Bool
+        if list.len(self.kinds) == 0
+            return true
+        for k in self.kinds
+            if gatt_server.uuid_equal(k, kind)
+                return true
+        false
+
+    @tier(embedded)
+    @no_alloc
+    fn available(var self) -> Int
+        let free = self.capacity - memory_allocated(self)
+        if free < 0 then 0 else free
+
+    @tier(app)
+    fn create(var self, kind: [u8], size: Int) -> Int
+        if list.len(self.objects) >= self.max_objects or size > self.capacity - memory_allocated(self)
+            return CREATE_NO_ROOM
+        let id = self.next_id
+        if id > ID_LAST
+            return CREATE_FAILED
+        self.next_id = id + 1
+        let properties = self.properties | PROP_WRITE
+        list.push(self.objects, MemoryObject { meta: new_meta(id, kind, 0, size, properties), data: [] })
+        id
+
+    @tier(app)
+    fn delete(var self, id: Int) -> Bool
+        let i = memory_index(self, id)
+        if i < 0
+            return false
+        var kept: [MemoryObject] = []
+        for k in 0..list.len(self.objects)
+            if k != i
+                list.push(kept, self.objects[k])
+        self.objects = kept
+        true
+
+    @tier(app)
+    fn read(var self, id: Int, offset: Int, length: Int) -> [u8]
+        let i = memory_index(self, id)
+        if i < 0 or offset < 0 or length <= 0 or offset >= list.len(self.objects[i].data)
+            return []
+        let data = self.objects[i].data
+        let end = if offset + length > list.len(data) then list.len(data) else offset + length
+        data[offset:end]
+
+    @tier(app)
+    fn write(var self, id: Int, offset: Int, data: [u8]) -> Bool
+        let i = memory_index(self, id)
+        if i < 0 or offset < 0
+            return false
+        let size = self.objects[i].meta.size
+        let end = offset + list.len(data)
+        if offset > size or end > self.objects[i].meta.allocated
+            return false
+        let old = self.objects[i].data
+        var next: [u8] = old[0:offset]
+        list.append(next, data)
+        if end < size
+            list.append(next, old[end:size])
+        self.objects[i].data = next
+        if end > size
+            self.objects[i].meta.size = end
+        true
+
+    @tier(app)
+    fn resize(var self, id: Int, size: Int, allocated: Int) -> Bool
+        let i = memory_index(self, id)
+        if i < 0 or size < 0 or size > allocated
+            return false
+        let grow = allocated - self.objects[i].meta.allocated
+        if grow > self.capacity - memory_allocated(self)
+            return false
+        let old = self.objects[i].data
+        var next: [u8] = []
+        if size <= list.len(old)
+            next = old[0:size]
+        else
+            next = old[:]
+            for _ in 0..(size - list.len(old))
+                list.push(next, 0)
+        self.objects[i].data = next
+        self.objects[i].meta.size = size
+        self.objects[i].meta.allocated = allocated
+        true
+
+    @tier(app)
+    fn execute(var self, id: Int, parameter: [u8]) -> (Int, [u8])
+        let _ = parameter
+        list.push(self.executed, id)
+        (self.execute_result, self.execute_response[:])
+
+    @tier(app)
+    fn now(var self) -> [u8]
+        self.clock[:]

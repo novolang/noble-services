@@ -1,0 +1,173 @@
+// src/bond_management.nv — the Bond Management Service (0x181E),
+// with which a client asks an LE device to delete bonds.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Bond Management Control Point  0x2AA4  Write; an Op Code and an optional
+//                                          Authorization Code
+//   Bond Management Feature        0x2AA5  Read; a bit field, only the octets
+//                                          up to the highest set bit
+//
+// This is an LE-only device, so the Op Codes of the LE transport are the ones
+// it takes ([BMS] Table 3.3):
+//
+//   0x03  Delete bond of requesting device (LE)            mandatory
+//   0x06  Delete all bonds on server (LE)                  optional
+//   0x09  Delete all bonds but the active one (LE)         optional
+//
+// Every other Op Code, the BR/EDR ones included, is answered Op Code Not
+// Supported (0x80).  A write is evaluated before its Write Response: an Op
+// Code that is not supported is 0x80; an Authorization Code that differs from
+// the one the product requires (`BmsConfig.authorization_code`, UTF-8 digits,
+// empty for none) is Insufficient Authorization; a policy that cannot delete
+// the bonds is Operation Failed (0x81).  The deletion itself is the product's:
+// `BmsPolicy.delete_bonds` is told the scope and the requesting peer and does
+// it once the link is gone ([BMS] 3.1.2.2).
+//
+// The Feature value names what the service supports: the bit for the
+// operation, and the bit "with authorization code" when a code is required.
+// The value is static, so the characteristic has no Indicate property.  Both
+// characteristics need an authenticated link (Table 3.1).  The Reliable Write
+// of the control point (its optional Extended Properties) is NOT IMPLEMENTED.
+//
+// Specification checked against: Bond Management Service 1.0.1.
+//
+// Satisfies: REQ-BLE-BMS-001.
+
+use att
+use links
+use gatt_server
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+
+const UUID_BOND_MANAGEMENT_SERVICE = 0x181E
+const UUID_BOND_MANAGEMENT_CONTROL_POINT = 0x2AA4
+const UUID_BOND_MANAGEMENT_FEATURE = 0x2AA5
+
+const OP_DELETE_REQUESTING_LE = 0x03
+const OP_DELETE_ALL_LE = 0x06
+const OP_DELETE_ALL_BUT_ACTIVE_LE = 0x09
+
+// The scope a policy is asked to delete.
+const SCOPE_REQUESTING = 1
+const SCOPE_ALL = 2
+const SCOPE_ALL_BUT_ACTIVE = 3
+
+// The Application Error Codes of Table 1.2.
+const ERR_OP_CODE_NOT_SUPPORTED = 0x80
+const ERR_OPERATION_FAILED = 0x81
+
+trait BmsPolicy[e]
+    // Delete the bonds of `scope` for the requesting `peer`, once the link is
+    // down; false when the product cannot (or the user declined at its
+    // interface).
+    fn delete_bonds(var self, peer: links.LinkId, scope: Int) -> Bool [e]
+
+// The policy of a device that deletes nothing.
+@value
+struct DefaultBmsPolicy
+    placeholder: Int
+
+@tier(embedded)
+fn default_bms_policy() -> DefaultBmsPolicy
+    DefaultBmsPolicy { placeholder: 0 }
+
+impl BmsPolicy[] for DefaultBmsPolicy
+    fn delete_bonds(var self, peer: links.LinkId, scope: Int) -> Bool
+        let _ = peer
+        let _ = scope
+        false
+
+// The operations beyond the mandatory one, the Authorization Code required
+// (empty for none) and the access to the characteristics.
+struct BmsConfig
+    delete_all: Bool
+    delete_all_but_active: Bool
+    authorization_code: [u8]
+    access: gatt_server.Access
+
+@tier(app)
+fn default_bms_config() -> BmsConfig
+    BmsConfig { delete_all: true, delete_all_but_active: true, authorization_code: [], access: gatt_server.Access.Authenticated }
+
+@value
+struct BmsHandles
+    service: u16
+    control_point: u16
+    feature: u16
+
+// The Bond Management Feature value of `config`: bits 4 and 5 of octet 0 for
+// the requesting device, bits 2 and 3 of octet 1 for all bonds, bits 0 and 1
+// of octet 2 for all but the active one; the second bit of each pair is "with
+// authorization code".  Only the octets up to the highest set bit.
+@tier(app)
+fn bms_feature_value(config: BmsConfig) -> [u8]
+    let with_code = list.len(config.authorization_code) > 0
+    let octet0 = if with_code then 0x20 else 0x10
+    let octet1 = if not config.delete_all then 0 else if with_code then 0x08 else 0x04
+    let octet2 = if not config.delete_all_but_active then 0 else if with_code then 0x02 else 0x01
+    if octet2 != 0
+        return wire.octets([octet0, octet1, octet2])
+    if octet1 != 0
+        return wire.octets([octet0, octet1])
+    wire.octets([octet0])
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_bms_service(var db: GattDb, config: BmsConfig) -> Result<BmsHandles, profile_builder.ProfileError>
+    if list.len(config.authorization_code) > 511
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_BOND_MANAGEMENT_SERVICE))!
+    let control_point = profile_builder.add_value(
+        var db, gatt_server.PROP_WRITE, profile_builder.write_only(config.access),
+        gatt_server.le16(UUID_BOND_MANAGEMENT_CONTROL_POINT), [])!
+    if not gatt_server.set_max_length(var db, control_point, 512)
+        return Err(profile_builder.ProfileError.NoRoom)
+    let feature = profile_builder.add_value(
+        var db, gatt_server.PROP_READ, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_BOND_MANAGEMENT_FEATURE), bms_feature_value(config))!
+    Ok(BmsHandles { service: service as u16, control_point: control_point as u16, feature: feature as u16 })
+
+// The scope of the Op Code `op` for `config`, 0 when the service does not
+// support it.
+@tier(embedded)
+@no_alloc
+fn bms_scope(config: BmsConfig, op: Int) -> Int
+    if op == OP_DELETE_REQUESTING_LE
+        return SCOPE_REQUESTING
+    if op == OP_DELETE_ALL_LE and config.delete_all
+        return SCOPE_ALL
+    if op == OP_DELETE_ALL_BUT_ACTIVE_LE and config.delete_all_but_active
+        return SCOPE_ALL_BUT_ACTIVE
+    0
+
+// The Error Code a write of `value` to the control point gets, 0 for none: the
+// evaluation of Section 3.1.2.1, in its order.  Asking the policy is the last
+// step, and it is asked only when everything else holds.
+@tier(app)
+fn bms_write_error<P: BmsPolicy[e]>(config: BmsConfig, var policy: P, peer: links.LinkId, value: [u8]) -> Int [e, mutate]
+    let op = if list.len(value) == 0 then 0 else value[0] as Int
+    let scope = bms_scope(config, op)
+    if scope == 0
+        return ERR_OP_CODE_NOT_SUPPORTED
+    let code = if list.len(value) > 1 then value[1:list.len(value)] else []
+    if list.len(config.authorization_code) > 0 and not gatt_server.same_bytes(code, config.authorization_code)
+        return att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+    if not policy.delete_bonds(peer, scope)
+        return ERR_OPERATION_FAILED
+    0
+
+// Answer one ATT PDU of `peer`: a write request to the control point is
+// evaluated before its Write Response.
+@tier(app)
+fn bms_receive<P: BmsPolicy[e]>(var db: GattDb, var link: AttLink, handles: BmsHandles, config: BmsConfig, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) >= 3 and pdu[0] as Int == att.ATT_OP_WRITE_REQ and gatt_server.read_le16(pdu, 1) == handles.control_point
+        let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.control_point), true)
+        if access != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, access)
+        let error = bms_write_error(config, var policy, peer, pdu[3:list.len(pdu)])
+        if error != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handles.control_point, error)
+    gatt_server.receive(var db, var link, pdu, now_ms)

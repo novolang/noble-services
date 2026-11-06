@@ -1,0 +1,1696 @@
+// src/object_transfer.nv — the Object Transfer Service (0x1825),
+// with which a client lists, selects, creates, deletes, reads and writes the
+// objects of a server.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   OTS Feature                0x2ABD  Read; the OACP Features and the OLCP
+//                                      Features, two uint32
+//   Object Name                0x2ABE  Read, optionally Write; UTF-8, 0 to 120 octets
+//   Object Type                0x2ABF  Read; a UUID of 2 or 16 octets
+//   Object Size                0x2AC0  Read; Current Size and Allocated Size, two uint32
+//   Object First-Created       0x2AC1  Read, optionally Write; a Date Time (optional)
+//   Object Last-Modified       0x2AC2  Read, optionally Write; a Date Time (optional)
+//   Object ID                  0x2AC3  Read; a uint48 (with more than one object)
+//   Object Properties          0x2AC4  Read, optionally Write; 32 bits
+//   Object Action Control
+//   Point (OACP)               0x2AC5  Write, Indicate
+//   Object List Control
+//   Point (OLCP)               0x2AC6  Write, Indicate (with more than one object)
+//   Object List Filter x 3     0x2AC7  Read, Write (optional, with more than one object)
+//   Object Changed             0x2AC8  Indicate (optional)
+//
+// The object transfer channel of the service is an L2CAP LE Credit Based
+// channel on the fixed PSM 0x0025; its data moves in `object_channel.nv`, and
+// this module starts a transfer when a client writes Read or Write to the OACP.
+// The store behind the service is a product's (`object_store.nv`): the service
+// holds no object.
+//
+// What a client sees.  The Object Metadata characteristics (Name, Type, Size,
+// First-Created, Last-Modified, ID, Properties) are those of the client's
+// Current Object, which is selected by the OLCP (First, Last, Previous, Next,
+// Go To) or made by the OACP Create.  They are per-connection values of the
+// GATT server (`gatt_server.make_per_link`), refreshed from the store for each
+// request, so two clients that selected different objects read different
+// values.  While the Current Object is an Invalid Object (deleted, or excluded
+// by the client's filters) a read or a write of one of them is answered Object
+// Not Selected (0x81).  A write to a metadata characteristic is stored first
+// and then checked against the store: a name that is empty, not UTF-8, holds a
+// control character or is the name of another object, a timestamp out of range
+// or a properties value with a reserved bit is answered with an Application
+// Error Code (0x80 Write Request Rejected, 0x83 Object Name Already Exists) and
+// the old value is put back.  This also holds for a Write Long.
+//
+// A write to a control point is evaluated before its Write Response and is
+// answered by one indication, the response code (0x60 for OACP, 0x70 for OLCP),
+// the request op code and a result code:
+//
+//   ATT errors     the link security; 0xFD without indications enabled and 0xFE
+//                  while an indication is unconfirmed (the Common Profile and
+//                  Service Error Codes); 0x0D for a parameter of the wrong size,
+//                  as OTS 3.3.2.8 asks
+//   OACP results   Create, Delete, Calculate Checksum, Execute, Read, Write,
+//                  Abort, each with the errors of OTS Tables 3.12 to 3.20 in the
+//                  order the tables give them
+//   OLCP results   First, Last, Previous, Next, Go To, Order, Request Number of
+//                  Objects, Clear Marking, with the priority of OTS Table 3.26
+//
+// A client's state is `OtsClient` (the Current Object, its three filters, its
+// order, the objects it created) and the state of all clients is `OtsShared`
+// (the concurrency pool, the transfers under way, the marks of each client, the
+// Object Changed events).  A product keeps one `OtsClient` for each connection
+// and one `OtsShared`, and names the client of a connection with
+// `gatt_server.set_identity`: the same identity on every connection of a bonded
+// peer, which is what marks and Limited Access are kept under.  When a device
+// serves at most `OtsConfig.concurrency` clients, the next one that touches an
+// attribute of the service is answered Concurrency Limit Exceeded (0x82).
+//
+// The Directory Listing Object (Object ID 0) is generated from the store when
+// `OtsConfig.directory` is set: a client reaches it with Go To 0, not with First,
+// Last, Previous or Next, and it is not counted by Request Number of Objects.
+//
+// Mechanism and policy.  The ObjectStore is the product's, and so is
+// `OtsConfig`: which procedures the device supports, which optional
+// characteristics it has, whether it has a clock, and how many clients and
+// objects it holds.  The service keeps the rules that the specification fixes.
+//
+// A program wires the service in this order: `add_ots_service` once; for each
+// connection a `new_ots_client`, `gatt_server.set_identity` and `ots_listen` on
+// the connection's channel table; `ots_receive` for each ATT PDU of the
+// connection and `object_channel.ots_poll` after each K-frame, each credit and
+// each tick of a clock; `ots_take_changes` with `ots_indicate_change` for each
+// connection to report the changes; `ots_disconnected` when the connection ends.
+// The objects themselves are put in the store by the product.
+//
+// NOT IMPLEMENTED: the BR/EDR transport of the service (its SDP record and the
+// Enhanced Retransmission Mode channel); the collation of ISO/IEC 14651 for the
+// ordering of names; the Enhanced ATT bearers (a request is answered on the
+// unenhanced bearer, as in the other service modules).
+//
+// Specification checked against: Object Transfer Service 1.0 and Object Transfer
+// Profile 1.0 (the Object Server role), the GATT Specification Supplement v9
+// (Sections 3.70 and 3.158 to 3.162) and the Assigned Numbers of 2026-10-14
+// (PSM 0x0025, Object Types 0x2ACA and 0x2ACB).
+//
+// Satisfies: REQ-BLE-OTS-001.
+
+use std.test
+use att
+use gatt_server
+use l2cap
+use l2cap_coc
+use object_list
+use object_store
+use profile_builder
+use sensor_control
+use fixtures.{ req }
+use wire
+
+const UUID_OBJECT_TRANSFER_SERVICE = 0x1825
+const UUID_OTS_FEATURE = 0x2ABD
+const UUID_OBJECT_NAME = 0x2ABE
+const UUID_OBJECT_TYPE = 0x2ABF
+const UUID_OBJECT_SIZE = 0x2AC0
+const UUID_OBJECT_FIRST_CREATED = 0x2AC1
+const UUID_OBJECT_LAST_MODIFIED = 0x2AC2
+const UUID_OBJECT_ID = 0x2AC3
+const UUID_OBJECT_PROPERTIES = 0x2AC4
+const UUID_OACP = 0x2AC5
+const UUID_OLCP = 0x2AC6
+const UUID_OBJECT_LIST_FILTER = 0x2AC7
+const UUID_OBJECT_CHANGED = 0x2AC8
+
+// The fixed PSM of the Object Transfer Channel and the transport of its
+// listener (the LE-U logical link).
+const OTS_PSM = 0x0025
+const OTS_TRANSPORT_LE = 0x01
+
+// The OACP Features field (OTS Table 3.3) and the OLCP Features field (Table 3.4).
+const OACP_CREATE = 0x001
+const OACP_DELETE = 0x002
+const OACP_CHECKSUM = 0x004
+const OACP_EXECUTE = 0x008
+const OACP_READ = 0x010
+const OACP_WRITE = 0x020
+const OACP_APPEND = 0x040
+const OACP_TRUNCATE = 0x080
+const OACP_PATCH = 0x100
+const OACP_ABORT = 0x200
+const OACP_DEFINED = 0x3FF
+const OLCP_GO_TO = 0x1
+const OLCP_ORDER = 0x2
+const OLCP_COUNT = 0x4
+const OLCP_CLEAR_MARKING = 0x8
+const OLCP_DEFINED = 0xF
+
+// The OACP op codes (Table 3.9), the Response Code and the Mode bit of Write.
+const OACP_OP_CREATE = 0x01
+const OACP_OP_DELETE = 0x02
+const OACP_OP_CHECKSUM = 0x03
+const OACP_OP_EXECUTE = 0x04
+const OACP_OP_READ = 0x05
+const OACP_OP_WRITE = 0x06
+const OACP_OP_ABORT = 0x07
+const OACP_OP_RESPONSE = 0x60
+const MODE_TRUNCATE = 0x02
+
+// The OACP result codes (Table 3.11).
+const OACP_RESULT_SUCCESS = 0x01
+const OACP_RESULT_NOT_SUPPORTED = 0x02
+const OACP_RESULT_INVALID_PARAMETER = 0x03
+const OACP_RESULT_INSUFFICIENT_RESOURCES = 0x04
+const OACP_RESULT_INVALID_OBJECT = 0x05
+const OACP_RESULT_CHANNEL_UNAVAILABLE = 0x06
+const OACP_RESULT_UNSUPPORTED_TYPE = 0x07
+const OACP_RESULT_NOT_PERMITTED = 0x08
+const OACP_RESULT_LOCKED = 0x09
+const OACP_RESULT_FAILED = 0x0A
+
+// The OLCP op codes (Table 3.22) and the Response Code.
+const OLCP_OP_FIRST = 0x01
+const OLCP_OP_LAST = 0x02
+const OLCP_OP_PREVIOUS = 0x03
+const OLCP_OP_NEXT = 0x04
+const OLCP_OP_GO_TO = 0x05
+const OLCP_OP_ORDER = 0x06
+const OLCP_OP_COUNT = 0x07
+const OLCP_OP_CLEAR_MARKING = 0x08
+const OLCP_OP_RESPONSE = 0x70
+
+// The OLCP result codes (Table 3.25).
+const OLCP_RESULT_SUCCESS = 0x01
+const OLCP_RESULT_NOT_SUPPORTED = 0x02
+const OLCP_RESULT_INVALID_PARAMETER = 0x03
+const OLCP_RESULT_FAILED = 0x04
+const OLCP_RESULT_OUT_OF_BOUNDS = 0x05
+const OLCP_RESULT_TOO_MANY = 0x06
+const OLCP_RESULT_NO_OBJECT = 0x07
+const OLCP_RESULT_ID_NOT_FOUND = 0x08
+
+// The Application Error Codes of OTS Table 1.2 (Write Request Rejected is
+// `object_list.ERR_WRITE_REQUEST_REJECTED`).
+const ERR_OBJECT_NOT_SELECTED = 0x81
+const ERR_CONCURRENCY_LIMIT = 0x82
+const ERR_NAME_EXISTS = 0x83
+
+// The bits of the Flags field of Object Changed (Table 3.31).
+const CHANGE_BY_CLIENT = 0x01
+const CHANGE_CONTENTS = 0x02
+const CHANGE_METADATA = 0x04
+const CHANGE_CREATION = 0x08
+const CHANGE_DELETION = 0x10
+
+// The time without progress after which a transfer is given up (OTS 3.8).
+const TRANSFER_TIMEOUT_MS = 30000
+
+// The states of a transfer.  Active: data may still move.  Done: all the
+// octets moved.  Aborted: the client asked to stop a Read.  Expired: no
+// progress for `TRANSFER_TIMEOUT_MS`.  Failed: the store could not take the data
+// or the client sent more than it announced.  The channel of an expired or failed
+// transfer is closed by `object_channel.ots_poll`.
+const T_ACTIVE = 0
+const T_DONE = 1
+const T_ABORTED = 2
+const T_EXPIRED = 3
+const T_FAILED = 4
+
+// The longest Object List Filter value: the Filter octet and a name of
+// `NAME_MAX` octets.
+const FILTER_MAX = 121
+
+// The longest values of the control points: an op code and 20 octets of
+// parameter (OACP), an op code and 6 octets (OLCP).
+const OACP_MAX = 21
+const OLCP_MAX = 7
+
+// What a device with the service supports.  `oacp` and `olcp` are the OACP
+// Features and the OLCP Features fields of the OTS Feature value.  `multiple`
+// says the store holds more than one object: the OLCP, the Object ID
+// characteristic and the filters then exist.  `filter` adds the three Object List
+// Filter characteristics, `changed` the Object Changed characteristic,
+// `directory` the Directory Listing Object.  `first_created` and `last_modified`
+// add those two characteristics; with `rtc` the server sets the modification time
+// itself (the store's clock) and the characteristic cannot be written, without it
+// a client writes it.  A writable Object Name and First-Created are implied by the
+// Create procedure; `name_writable`, `created_writable` and `properties_writable`
+// open them otherwise.  `object_id` adds the Object ID characteristic to a
+// single-object server.  `concurrency` is the number of clients served at once
+// (MAX_CONCURRENCY), `max_list` the most objects a list holds (more is Too Many
+// Objects) and `max_patch` the most octets a patch of an existing object may
+// carry, since a patch is applied only when all of it has arrived.  `secondary`
+// makes the service a secondary service, which OTS 2 recommends.
+struct OtsConfig
+    var access: gatt_server.Access
+    var secondary: Bool
+    var oacp: Int
+    var olcp: Int
+    var multiple: Bool
+    var filter: Bool
+    var changed: Bool
+    var directory: Bool
+    var first_created: Bool
+    var last_modified: Bool
+    var rtc: Bool
+    var name_writable: Bool
+    var created_writable: Bool
+    var properties_writable: Bool
+    var object_id: Bool
+    var concurrency: Int
+    var max_list: Int
+    var max_patch: Int
+
+// A server for many objects that supports every procedure, every optional
+// characteristic and two clients, on an encrypted link, without a clock.
+@tier(app)
+fn default_ots_config() -> OtsConfig
+    OtsConfig {
+        access: gatt_server.Access.Encrypted, secondary: false, oacp: OACP_DEFINED, olcp: OLCP_DEFINED,
+        multiple: true, filter: true, changed: true, directory: true, first_created: true, last_modified: true,
+        rtc: false, name_writable: true, created_writable: true, properties_writable: true, object_id: true,
+        concurrency: 2, max_list: 64, max_patch: 1024 }
+
+// A server that holds one object which a client reads and checksums: no list,
+// no filters, no Object ID.
+@tier(app)
+fn single_object_config() -> OtsConfig
+    OtsConfig {
+        access: gatt_server.Access.Encrypted, secondary: false, oacp: OACP_READ | OACP_CHECKSUM | OACP_ABORT, olcp: 0,
+        multiple: false, filter: false, changed: false, directory: false, first_created: false, last_modified: false,
+        rtc: false, name_writable: false, created_writable: false, properties_writable: false, object_id: false,
+        concurrency: 1, max_list: 1, max_patch: 0 }
+
+// The handles of the service; 0 for a characteristic the device lacks.  `last`
+// is the last handle of the service.  `filters` holds the three Object List
+// Filter value handles, none for a device without them.
+struct OtsHandles
+    service: Int
+    last: Int
+    feature: Int
+    name: Int
+    kind: Int
+    size: Int
+    created: Int
+    modified: Int
+    id: Int
+    properties: Int
+    oacp: Int
+    oacp_cccd: Int
+    olcp: Int
+    olcp_cccd: Int
+    filters: [Int]
+    changed: Int
+    changed_cccd: Int
+
+// One client: the Current Object (`NO_OBJECT` until one is selected), its three
+// Object List Filter values, its List Sort Order (0 is the store's), and the
+// Object IDs it created and has not given a name yet.
+struct OtsClient
+    var current: Int
+    var filters: [[u8]]
+    var order: Int
+    var created: [Int]
+
+// A change to report with Object Changed: the Flags field, the Object ID, and
+// the identity of the client that made it (the flags say whether one did).
+@value
+struct OtsChange
+    flags: u8
+    id: Int
+    source: Int
+
+// One object transfer.  `owner` is the identity of the client that asked,
+// `channel` the number of the L2CAP channel it uses (towards the upper layer),
+// `offset` and `length` the range of the request.  `done` counts the octets that
+// moved: handed to the channel for a Read, taken from it for a Write.  `on_air`
+// counts the octets of a Read that left the channel's queue, the progress the
+// timeout watches.  `last_ms` is the time of the last progress.  `patching`
+// says a Write overwrites octets of the object, which are kept in `data` until
+// all arrived; `data` also holds the Directory Listing Object a Read sends.
+// `touched` says the contents were changed.  `excess` says the client sent more
+// than it announced.  `settled` says what follows the end of the transfer (the
+// modification time, closing the channel) is done.
+struct Transfer
+    owner: Int
+    object: Int
+    reading: Bool
+    channel: Int
+    offset: Int
+    length: Int
+    patching: Bool
+    var done: Int
+    var on_air: Int
+    var last_ms: Int
+    var state: Int
+    var data: [u8]
+    var touched: Bool
+    var excess: Bool
+    var settled: Bool
+
+// What all the clients of the service share.  `pool` holds the identities that
+// are being served, `transfers` the transfers, `marks` pairs of an identity and
+// an Object ID, and `changes` the events Object Changed has not reported yet.
+struct OtsShared
+    var pool: [Int]
+    var transfers: [Transfer]
+    var marks: [Int]
+    var changes: [OtsChange]
+
+@tier(app)
+fn new_ots_shared() -> OtsShared
+    OtsShared { pool: [], transfers: [], marks: [], changes: [] }
+
+// A client that has selected nothing and has no filter.
+@tier(app)
+fn new_ots_client() -> OtsClient
+    OtsClient { current: object_store.NO_OBJECT, filters: no_filters(), order: 0, created: [] }
+
+@tier(app)
+fn no_filters() -> [[u8]]
+    [[0], [0], [0]]
+
+// ── What the configuration says ─────────────────────────────────────
+
+// Whether the access is one the service allows: an encrypted link or better
+// (OTS Table 3.1 asks for encryption on every characteristic).
+@tier(embedded)
+@no_alloc
+fn ots_access_ok(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// The rule of the configuration that is broken, 0 for none: 1 the OACP
+// Features (none, or an undefined bit), 2 the OLCP Features, 3 Abort without
+// Read, 4 Append, Truncate or Patch without Write, 5 a list, a filter or a
+// Directory Listing Object for a single object, 6 no client, 7 no list.
+@tier(embedded)
+@no_alloc
+fn ots_config_error(config: OtsConfig) -> Int
+    if config.oacp == 0 or (config.oacp & (0xFFFFFFFF ^ OACP_DEFINED)) != 0
+        return 1
+    if (config.olcp & (0xFFFFFFFF ^ OLCP_DEFINED)) != 0
+        return 2
+    if (config.oacp & OACP_ABORT) != 0 and (config.oacp & OACP_READ) == 0
+        return 3
+    if (config.oacp & (OACP_APPEND | OACP_TRUNCATE | OACP_PATCH)) != 0 and (config.oacp & OACP_WRITE) == 0
+        return 4
+    if not config.multiple and (config.olcp != 0 or config.filter or config.directory)
+        return 5
+    if config.concurrency < 1
+        return 6
+    if config.max_list < 1
+        return 7
+    0
+
+@tier(embedded)
+@no_alloc
+fn ots_name_writable(config: OtsConfig) -> Bool
+    config.name_writable or (config.oacp & OACP_CREATE) != 0
+
+@tier(embedded)
+@no_alloc
+fn ots_created_writable(config: OtsConfig) -> Bool
+    config.created_writable or (config.oacp & OACP_CREATE) != 0
+
+@tier(embedded)
+@no_alloc
+fn ots_has_id(config: OtsConfig) -> Bool
+    config.object_id or config.multiple
+
+// The bit of the OACP Features field that an op code needs, 0 for an op code
+// that is reserved.
+@tier(embedded)
+@no_alloc
+fn oacp_bit(op: Int) -> Int
+    if op == OACP_OP_CREATE
+        return OACP_CREATE
+    if op == OACP_OP_DELETE
+        return OACP_DELETE
+    if op == OACP_OP_CHECKSUM
+        return OACP_CHECKSUM
+    if op == OACP_OP_EXECUTE
+        return OACP_EXECUTE
+    if op == OACP_OP_READ
+        return OACP_READ
+    if op == OACP_OP_WRITE
+        return OACP_WRITE
+    if op == OACP_OP_ABORT
+        return OACP_ABORT
+    0
+
+@tier(embedded)
+@no_alloc
+fn ots_oacp_supported(config: OtsConfig, op: Int) -> Bool
+    let bit = oacp_bit(op)
+    bit != 0 and (config.oacp & bit) != 0
+
+// The bit of the OLCP Features field that an optional op code needs; the four
+// movements need none.
+@tier(embedded)
+@no_alloc
+fn olcp_bit(op: Int) -> Int
+    if op == OLCP_OP_GO_TO
+        return OLCP_GO_TO
+    if op == OLCP_OP_ORDER
+        return OLCP_ORDER
+    if op == OLCP_OP_COUNT
+        return OLCP_COUNT
+    if op == OLCP_OP_CLEAR_MARKING
+        return OLCP_CLEAR_MARKING
+    0
+
+@tier(embedded)
+@no_alloc
+fn ots_olcp_supported(config: OtsConfig, op: Int) -> Bool
+    if op >= OLCP_OP_FIRST and op <= OLCP_OP_NEXT
+        return true
+    let bit = olcp_bit(op)
+    bit != 0 and (config.olcp & bit) != 0
+
+// Whether `n` octets are a whole OACP value for the op code `op`: the op code
+// and its parameter (OTS Table 3.9).  An op code the device cannot run has no
+// length to check; it is answered with a result code.
+@tier(embedded)
+@no_alloc
+fn oacp_length_ok(op: Int, n: Int) -> Bool
+    if op == OACP_OP_CREATE
+        return n == 7 or n == 21
+    if op == OACP_OP_DELETE or op == OACP_OP_ABORT
+        return n == 1
+    if op == OACP_OP_CHECKSUM or op == OACP_OP_READ
+        return n == 9
+    if op == OACP_OP_WRITE
+        return n == 10
+    if op == OACP_OP_EXECUTE
+        return n >= 1 and n <= OACP_MAX
+    true
+
+// The same for an OLCP value (Table 3.22).
+@tier(embedded)
+@no_alloc
+fn olcp_length_ok(op: Int, n: Int) -> Bool
+    if op == OLCP_OP_GO_TO
+        return n == 7
+    if op == OLCP_OP_ORDER
+        return n == 2
+    if op >= OLCP_OP_FIRST and op <= OLCP_OP_NEXT
+        return n == 1
+    if op == OLCP_OP_COUNT or op == OLCP_OP_CLEAR_MARKING
+        return n == 1
+    true
+
+// ── Values ──────────────────────────────────────────────────────────
+
+// The OTS Feature value: the OACP Features and the OLCP Features, 4 octets each.
+@tier(app)
+fn ots_feature_value(config: OtsConfig) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, config.oacp, 4)
+    wire.put(var out, config.olcp, 4)
+    out
+
+// The Object Size value: Current Size and Allocated Size.
+@tier(app)
+fn ots_size_value(size: Int, allocated: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, size, 4)
+    wire.put(var out, allocated, 4)
+    out
+
+@tier(app)
+fn ots_id_value(id: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, id, 6)
+    out
+
+@tier(app)
+fn ots_properties_value(properties: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, properties, 4)
+    out
+
+// The 16-bit UUID `v` as the octets of an Object Type.
+@tier(app)
+fn ots_uuid16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+// A response value: the Response Code, the request op code and the result.
+@tier(app)
+fn ots_response(code: Int, op: Int, result: Int) -> [u8]
+    [code as u8, op as u8, result as u8]
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Make the attribute `handle` a per-connection value that a client may write up
+// to `max_length` octets.
+@tier(app)
+fn ots_per_link(var db: GattDb, handle: Int, max_length: Int) -> Result<Int, profile_builder.ProfileError>
+    if not gatt_server.make_per_link(var db, handle) or not gatt_server.set_max_length(var db, handle, max_length)
+        return Err(profile_builder.ProfileError.NoRoom)
+    Ok(handle)
+
+// Add the service to `db` after its last attribute.  The configuration is
+// refused with `InvalidValue` when it breaks a rule of `ots_config_error` and
+// with `NotPermitted` when the access is below an encrypted link.
+@tier(app)
+fn add_ots_service(var db: GattDb, config: OtsConfig) -> Result<OtsHandles, profile_builder.ProfileError>
+    if not ots_access_ok(config.access)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if ots_config_error(config) != 0
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = gatt_server.add_service(var db, config.secondary, gatt_server.le16(UUID_OBJECT_TRANSFER_SERVICE))
+    if service < 0
+        return Err(profile_builder.ProfileError.NoRoom)
+    let read = profile_builder.read_only(config.access)
+    let both = gatt_server.both_ways(config.access)
+    let feature = profile_builder.add_value(var db, gatt_server.PROP_READ, read, gatt_server.le16(UUID_OTS_FEATURE), ots_feature_value(config))!
+    let name_writable = ots_name_writable(config)
+    let name_properties = if name_writable then gatt_server.PROP_READ | gatt_server.PROP_WRITE else gatt_server.PROP_READ
+    let name = profile_builder.add_value(var db, name_properties, if name_writable then both else read, gatt_server.le16(UUID_OBJECT_NAME), [])!
+    let _ = ots_per_link(var db, name, object_store.NAME_MAX)!
+    let kind = profile_builder.add_value(var db, gatt_server.PROP_READ, read, gatt_server.le16(UUID_OBJECT_TYPE), ots_uuid16(object_store.TYPE_UNSPECIFIED))!
+    let _ = ots_per_link(var db, kind, 16)!
+    let size = profile_builder.add_value(var db, gatt_server.PROP_READ, read, gatt_server.le16(UUID_OBJECT_SIZE), ots_size_value(0, 0))!
+    let _ = ots_per_link(var db, size, 8)!
+    var created = 0
+    if config.first_created
+        let writable = ots_created_writable(config)
+        created = profile_builder.add_value(
+            var db, if writable then gatt_server.PROP_READ | gatt_server.PROP_WRITE else gatt_server.PROP_READ,
+            if writable then both else read, gatt_server.le16(UUID_OBJECT_FIRST_CREATED), object_store.date_time_zero())!
+        let _ = ots_per_link(var db, created, 7)!
+    var modified = 0
+    if config.last_modified
+        let writable = not config.rtc
+        modified = profile_builder.add_value(
+            var db, if writable then gatt_server.PROP_READ | gatt_server.PROP_WRITE else gatt_server.PROP_READ,
+            if writable then both else read, gatt_server.le16(UUID_OBJECT_LAST_MODIFIED), object_store.date_time_zero())!
+        let _ = ots_per_link(var db, modified, 7)!
+    var id = 0
+    if ots_has_id(config)
+        id = profile_builder.add_value(var db, gatt_server.PROP_READ, read, gatt_server.le16(UUID_OBJECT_ID), ots_id_value(0))!
+        let _ = ots_per_link(var db, id, 6)!
+    let properties_writable = config.properties_writable
+    let properties = profile_builder.add_value(
+        var db, if properties_writable then gatt_server.PROP_READ | gatt_server.PROP_WRITE else gatt_server.PROP_READ,
+        if properties_writable then both else read, gatt_server.le16(UUID_OBJECT_PROPERTIES), ots_properties_value(0))!
+    let _ = ots_per_link(var db, properties, 4)!
+    let cccd = gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access }
+    let oacp = sensor_control.add_control_point_with_errors(
+        var db, UUID_OACP, config.access, cccd, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED,
+        att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+    if not gatt_server.set_max_length(var db, oacp.0, OACP_MAX)
+        return Err(profile_builder.ProfileError.NoRoom)
+    var olcp = (0, 0)
+    if config.multiple
+        olcp = sensor_control.add_control_point_with_errors(
+            var db, UUID_OLCP, config.access, cccd, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED,
+            att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+        if not gatt_server.set_max_length(var db, olcp.0, OLCP_MAX)
+            return Err(profile_builder.ProfileError.NoRoom)
+    var filters: [Int] = []
+    if config.filter
+        for _ in 0..3
+            let f = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE, both, gatt_server.le16(UUID_OBJECT_LIST_FILTER), [0])!
+            let _ = ots_per_link(var db, f, FILTER_MAX)!
+            list.push(filters, f)
+    var changed = 0
+    var changed_cccd = 0
+    if config.changed
+        changed = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_OBJECT_CHANGED), [0, 0, 0, 0, 0, 0, 0])!
+        changed_cccd = profile_builder.add_cccd(var db, cccd)!
+    Ok(OtsHandles {
+        service: service, last: gatt_server.last_handle(db), feature: feature, name: name, kind: kind, size: size,
+        created: created, modified: modified, id: id, properties: properties, oacp: oacp.0, oacp_cccd: oacp.1,
+        olcp: olcp.0, olcp_cccd: olcp.1, filters: filters, changed: changed, changed_cccd: changed_cccd })
+
+// Listen on the PSM of the Object Transfer Channel, with the largest SDU this
+// device receives, on the channel table of one connection.  A client opens the
+// channel before it writes Read or Write to the OACP (OTP 4.5.10).
+@tier(app)
+fn ots_listen(var coc: l2cap_coc.CocState, mtu: Int)
+    l2cap_coc.listen(var coc, OTS_PSM, OTS_TRANSPORT_LE, mtu, l2cap_coc.LISTEN_SUCCESS)
+
+// ── The Current Object ──────────────────────────────────────────────
+
+// Whether `client` marked the object `id`.
+@tier(embedded)
+@no_alloc
+fn ots_marked(shared: OtsShared, identity: Int, id: Int) -> Bool
+    let n = list.len(shared.marks) / 2
+    for k in 0..n
+        if shared.marks[2 * k] == identity and shared.marks[2 * k + 1] == id
+            return true
+    false
+
+// Mark the object `id` for the client `identity`, or remove the mark.
+@tier(app)
+fn ots_set_mark(var shared: OtsShared, identity: Int, id: Int, on: Bool)
+    var kept: [Int] = []
+    let n = list.len(shared.marks) / 2
+    for k in 0..n
+        if not (shared.marks[2 * k] == identity and shared.marks[2 * k + 1] == id)
+            list.push(kept, shared.marks[2 * k])
+            list.push(kept, shared.marks[2 * k + 1])
+    if on
+        list.push(kept, identity)
+        list.push(kept, id)
+    shared.marks = kept
+
+// Every object of the store as metadata with the Mark bit of the client, in the
+// order the store keeps them.
+@tier(app)
+fn ots_all<S: object_store.ObjectStore[e]>(shared: OtsShared, identity: Int, var repo: S) -> [ObjectMeta] [e, mutate]
+    var out: [ObjectMeta] = []
+    let ids = repo.ids()
+    for id in ids
+        match repo.meta(id)
+            Some(m) =>
+                var x = object_store.copy_meta(m)
+                if ots_marked(shared, identity, id)
+                    x.properties = x.properties | object_store.PROP_MARK
+                list.push(out, x)
+            None => ()
+    out
+
+// The Directory Listing Object: its metadata and its contents.  The contents list
+// the object itself and every object of the store by name, and the size of the
+// object is the length of the contents.
+@tier(app)
+fn ots_directory<S: object_store.ObjectStore[e]>(config: OtsConfig, shared: OtsShared, identity: Int, var repo: S) -> (ObjectMeta, [u8]) [e, mutate]
+    var metas = ots_all(shared, identity, var repo)
+    var directory = object_store.new_meta(
+        object_store.ID_DIRECTORY, ots_uuid16(object_store.TYPE_DIRECTORY_LISTING), 0, 0, object_store.PROP_READ)
+    directory.name = wire.text(object_list.DIRECTORY_NAME)
+    list.push(metas, directory)
+    object_list.sort_metas(var metas, object_list.ORDER_NAME)
+    let total = list.len(object_list.directory_contents(metas, config.first_created, config.last_modified))
+    // `directory` is the element of `metas`, so its sizes are those of its own record.
+    directory.size = total
+    directory.allocated = total
+    (directory, object_list.directory_contents(metas, config.first_created, config.last_modified))
+
+// The Object ID of the Current Object, `NO_OBJECT` when none is selected.  A
+// device that holds one object has it always.
+@tier(app)
+fn ots_current_id<S: object_store.ObjectStore[e]>(config: OtsConfig, client: OtsClient, var repo: S) -> Int [e, mutate]
+    if config.multiple
+        return client.current
+    let ids = repo.ids()
+    if list.len(ids) > 0 then ids[0] else object_store.NO_OBJECT
+
+// The Current Object of the client `identity` as the client sees it (with its
+// Mark bit), None for an Invalid Object: nothing selected, deleted, or excluded
+// by the client's filters (OTS 1.8).
+@tier(app)
+fn ots_current<S: object_store.ObjectStore[e]>(config: OtsConfig, shared: OtsShared, client: OtsClient, identity: Int, var repo: S) -> ?ObjectMeta [e, mutate]
+    let id = ots_current_id(config, client, var repo)
+    if id < 0
+        return None
+    if id == object_store.ID_DIRECTORY
+        if not config.directory
+            return None
+        return Some(ots_directory(config, shared, identity, var repo).0)
+    match repo.meta(id)
+        None => None
+        Some(m) =>
+            var x = object_store.copy_meta(m)
+            let marked = ots_marked(shared, identity, id)
+            if marked
+                x.properties = x.properties | object_store.PROP_MARK
+            if config.multiple and not object_list.filters_match(client.filters, x, marked)
+                return None
+            Some(x)
+
+// The objects the client reaches with First, Last, Previous and Next: those
+// that pass its filters, in its order.
+@tier(app)
+fn ots_list<S: object_store.ObjectStore[e]>(shared: OtsShared, client: OtsClient, identity: Int, var repo: S) -> [ObjectMeta] [e, mutate]
+    var out: [ObjectMeta] = []
+    let all = ots_all(shared, identity, var repo)
+    for m in all
+        if object_list.filters_match(client.filters, m, (m.properties & object_store.PROP_MARK) != 0)
+            list.push(out, m)
+    object_list.sort_metas(var out, client.order)
+    out
+
+// The position of the object `id` in `metas`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn ots_position(metas: [ObjectMeta], id: Int) -> Int
+    for k in 0..list.len(metas)
+        if metas[k].id == id
+            return k
+    -1
+
+// The contents of the object `m` from `offset`, `length` octets: the generated
+// listing for the Directory Listing Object, the store's octets otherwise.
+@tier(app)
+fn ots_contents<S: object_store.ObjectStore[e]>(config: OtsConfig, shared: OtsShared, identity: Int, var repo: S, m: ObjectMeta, offset: Int, length: Int) -> [u8] [e, mutate]
+    if m.id == object_store.ID_DIRECTORY
+        let all = ots_directory(config, shared, identity, var repo).1
+        let end = if offset + length > list.len(all) then list.len(all) else offset + length
+        if offset >= end
+            return []
+        return all[offset:end]
+    repo.read(m.id, offset, length)
+
+// ── Changes ─────────────────────────────────────────────────────────
+
+// Record a change to report with Object Changed, when the device has it.  The
+// Directory Listing Object is never reported (OTS 3.6.1).
+@tier(app)
+fn ots_push_change(config: OtsConfig, var shared: OtsShared, flags: Int, id: Int, source: Int)
+    if config.changed and id != object_store.ID_DIRECTORY
+        list.push(shared.changes, OtsChange { flags: flags as u8, id: id, source: source })
+
+// The device itself changed the object `id` (the user interface of the product):
+// `flags` is `CHANGE_CONTENTS`, `CHANGE_METADATA`, `CHANGE_CREATION` or
+// `CHANGE_DELETION`, ored as OTS 3.6.1.1 allows.
+@tier(app)
+fn ots_local_change(config: OtsConfig, var shared: OtsShared, flags: Int, id: Int)
+    ots_push_change(config, var shared, flags & (0xFF ^ CHANGE_BY_CLIENT), id, 0)
+
+// Take the changes that Object Changed has not reported yet, in order.
+@tier(app)
+fn ots_take_changes(var shared: OtsShared) -> [OtsChange]
+    let out = shared.changes[:]
+    shared.changes = []
+    out
+
+// The Object Changed value of a change: the Flags and the Object ID.
+@tier(app)
+fn ots_change_value(c: OtsChange) -> [u8]
+    var out: [u8] = [c.flags as u8]
+    wire.put(var out, c.id, 6)
+    out
+
+// Indicate a change to the client of `link`, when it enabled the indications of
+// Object Changed.  A change that a client made is not indicated to that client
+// (OTS Table 3.30).
+@tier(app)
+fn ots_indicate_change(var db: GattDb, var link: AttLink, handles: OtsHandles, change: OtsChange, now_ms: Int) -> [[u8]]
+    if handles.changed == 0
+        return []
+    if (change.flags & CHANGE_BY_CLIENT) != 0 and change.source == link.identity
+        return []
+    let _ = gatt_server.set_value(var db, handles.changed, ots_change_value(change))
+    gatt_server.send_value(var db, var link, handles.changed, now_ms)
+
+// ── Clients and transfers ───────────────────────────────────────────
+
+// Let the client `identity` use the service: it is in the pool or there is room
+// for it.  A device serves `OtsConfig.concurrency` clients (OTS 1.12).
+@tier(app)
+fn ots_admit(config: OtsConfig, var shared: OtsShared, identity: Int) -> Bool
+    for p in shared.pool
+        if p == identity
+            return true
+    if list.len(shared.pool) >= config.concurrency
+        return false
+    list.push(shared.pool, identity)
+    true
+
+// Whether a transfer under way uses the object `id`: the object is locked.
+@tier(embedded)
+@no_alloc
+fn ots_busy(shared: OtsShared, id: Int) -> Bool
+    for t in shared.transfers
+        if t.state == T_ACTIVE and t.object == id
+            return true
+    false
+
+// Whether a transfer of the client `identity` under way uses `channel`.
+@tier(embedded)
+@no_alloc
+fn ots_channel_busy(shared: OtsShared, identity: Int, channel: Int) -> Bool
+    for t in shared.transfers
+        if t.state == T_ACTIVE and t.owner == identity and t.channel == channel
+            return true
+    false
+
+// The number of an Object Transfer Channel of the connection that no transfer of
+// the client uses, -1 for none.
+@tier(app)
+fn ots_free_channel(coc: l2cap_coc.CocState, shared: OtsShared, identity: Int) -> Int
+    for c in l2cap_coc.channels_of_psm(coc, OTS_PSM)
+        if not ots_channel_busy(shared, identity, c.id)
+            return c.id
+    -1
+
+// Give up the transfers that made no progress for `TRANSFER_TIMEOUT_MS`: the
+// object is no longer locked.  The channel is closed by `object_channel`.
+@tier(embedded)
+@no_alloc
+fn ots_expire(var shared: OtsShared, now_ms: Int)
+    for k in 0..list.len(shared.transfers)
+        if shared.transfers[k].state == T_ACTIVE and now_ms - shared.transfers[k].last_ms >= TRANSFER_TIMEOUT_MS
+            shared.transfers[k].state = T_EXPIRED
+
+// Drop the transfers that are over and settled.
+@tier(app)
+fn ots_prune(var shared: OtsShared)
+    var kept: [Transfer] = []
+    for t in shared.transfers
+        if t.state == T_ACTIVE or not t.settled
+            list.push(kept, t)
+    shared.transfers = kept
+
+// The contents of the object `id` were changed by the client `source`: the
+// modification time is the clock's when the device has one and not known
+// otherwise (OTS 3.2.6.1), and a change is reported.
+@tier(app)
+fn ots_touch<S: object_store.ObjectStore[e]>(config: OtsConfig, var shared: OtsShared, var repo: S, id: Int, source: Int) [e, mutate]
+    match repo.meta(id)
+        None => ()
+        Some(m) =>
+            var u = object_store.copy_meta(m)
+            u.modified = if config.rtc then repo.now() else object_store.date_time_zero()
+            let _ = repo.set_meta(u)
+    ots_push_change(config, var shared, CHANGE_BY_CLIENT | CHANGE_CONTENTS | CHANGE_METADATA, id, source)
+
+// ── The Object Action Control Point ─────────────────────────────────
+
+// A result without a response parameter.
+@tier(app)
+fn oacp_result(op: Int, result: Int) -> [u8]
+    ots_response(OACP_OP_RESPONSE, op, result)
+
+// Create (OTS 3.3.2.1, Table 3.12): a new empty object of the type and size
+// given becomes the Current Object, and the client's filters are reset.
+@tier(app)
+fn ots_create<S: object_store.ObjectStore[e]>(config: OtsConfig, var shared: OtsShared, var client: OtsClient, var repo: S, identity: Int, param: [u8]) -> [u8] [e, mutate]
+    let size = wire.get(param, 0, 4)
+    let kind = param[4:list.len(param)]
+    if not repo.accepts(kind) or (config.directory and gatt_server.uuid_equal(kind, ots_uuid16(object_store.TYPE_DIRECTORY_LISTING)))
+        return oacp_result(OACP_OP_CREATE, OACP_RESULT_UNSUPPORTED_TYPE)
+    if size > repo.available()
+        return oacp_result(OACP_OP_CREATE, OACP_RESULT_INSUFFICIENT_RESOURCES)
+    if not config.multiple and list.len(repo.ids()) > 0
+        return oacp_result(OACP_OP_CREATE, OACP_RESULT_FAILED)
+    let id = repo.create(kind, size)
+    if id == object_store.CREATE_NO_ROOM
+        return oacp_result(OACP_OP_CREATE, OACP_RESULT_INSUFFICIENT_RESOURCES)
+    if id < object_store.ID_FIRST
+        return oacp_result(OACP_OP_CREATE, OACP_RESULT_FAILED)
+    client.current = id
+    client.filters = no_filters()
+    list.push(client.created, id)
+    ots_push_change(config, var shared, CHANGE_BY_CLIENT | CHANGE_CREATION, id, identity)
+    oacp_result(OACP_OP_CREATE, OACP_RESULT_SUCCESS)
+
+// Delete (OTS 3.3.2.2, Table 3.13): the Current Object is removed and the
+// client has none until it selects another.
+@tier(app)
+fn ots_delete<S: object_store.ObjectStore[e]>(config: OtsConfig, var shared: OtsShared, var client: OtsClient, var repo: S, identity: Int, m: ObjectMeta) -> [u8] [e, mutate]
+    if (m.properties & object_store.PROP_DELETE) == 0
+        return oacp_result(OACP_OP_DELETE, OACP_RESULT_NOT_PERMITTED)
+    if ots_busy(shared, m.id)
+        return oacp_result(OACP_OP_DELETE, OACP_RESULT_LOCKED)
+    if not repo.delete(m.id)
+        return oacp_result(OACP_OP_DELETE, OACP_RESULT_FAILED)
+    client.current = object_store.NO_OBJECT
+    var kept: [Int] = []
+    for c in client.created
+        if c != m.id
+            list.push(kept, c)
+    client.created = kept
+    ots_push_change(config, var shared, CHANGE_BY_CLIENT | CHANGE_DELETION, m.id, identity)
+    oacp_result(OACP_OP_DELETE, OACP_RESULT_SUCCESS)
+
+// Calculate Checksum (OTS 3.3.2.3, Table 3.14): the CRC-32 of a range of the
+// contents.
+@tier(app)
+fn ots_checksum<S: object_store.ObjectStore[e]>(config: OtsConfig, shared: OtsShared, var repo: S, identity: Int, m: ObjectMeta, param: [u8]) -> [u8] [e, mutate]
+    let offset = wire.get(param, 0, 4)
+    let length = wire.get(param, 4, 4)
+    if offset + length > m.size
+        return oacp_result(OACP_OP_CHECKSUM, OACP_RESULT_INVALID_PARAMETER)
+    if ots_busy(shared, m.id)
+        return oacp_result(OACP_OP_CHECKSUM, OACP_RESULT_LOCKED)
+    var crc = 0xFFFFFFFF
+    var at = offset
+    let end = offset + length
+    while at < end
+        let step = if end - at > 256 then 256 else end - at
+        let piece = ots_contents(config, shared, identity, var repo, m, at, step)
+        if list.len(piece) != step
+            return oacp_result(OACP_OP_CHECKSUM, OACP_RESULT_FAILED)
+        crc = object_store.crc32_update(crc, piece)
+        at = at + step
+    var out = oacp_result(OACP_OP_CHECKSUM, OACP_RESULT_SUCCESS)
+    wire.put(var out, crc ^ 0xFFFFFFFF, 4)
+    out
+
+// Execute (OTS 3.3.2.4, Table 3.15): the store runs the object.  What it means
+// is the product's (the parameter and the response parameter are defined by the
+// profile that uses the service).
+@tier(app)
+fn ots_execute<S: object_store.ObjectStore[e]>(shared: OtsShared, var repo: S, m: ObjectMeta, param: [u8]) -> [u8] [e, mutate]
+    if (m.properties & object_store.PROP_EXECUTE) == 0
+        return oacp_result(OACP_OP_EXECUTE, OACP_RESULT_NOT_PERMITTED)
+    if ots_busy(shared, m.id)
+        return oacp_result(OACP_OP_EXECUTE, OACP_RESULT_LOCKED)
+    let r = repo.execute(m.id, param)
+    var code = OACP_RESULT_FAILED
+    if r.0 == OACP_RESULT_SUCCESS or r.0 == OACP_RESULT_INVALID_PARAMETER or r.0 == OACP_RESULT_NOT_PERMITTED or r.0 == OACP_RESULT_LOCKED
+        code = r.0
+    var out = oacp_result(OACP_OP_EXECUTE, code)
+    if code == OACP_RESULT_SUCCESS
+        let room = if list.len(r.1) > 17 then 17 else list.len(r.1)
+        list.append(out, r.1[0:room])
+    out
+
+// Read (OTS 3.3.2.5, Table 3.16): a transfer that sends a range of the contents
+// through the Object Transfer Channel, started when the channel is there.
+@tier(app)
+fn ots_read<S: object_store.ObjectStore[e]>(config: OtsConfig, coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, identity: Int, m: ObjectMeta, param: [u8], now_ms: Int) -> [u8] [e, mutate]
+    let offset = wire.get(param, 0, 4)
+    let length = wire.get(param, 4, 4)
+    if (m.properties & object_store.PROP_READ) == 0
+        return oacp_result(OACP_OP_READ, OACP_RESULT_NOT_PERMITTED)
+    let channel = ots_free_channel(coc, shared, identity)
+    if channel < 0
+        return oacp_result(OACP_OP_READ, OACP_RESULT_CHANNEL_UNAVAILABLE)
+    if offset > m.size or offset + length > m.size
+        return oacp_result(OACP_OP_READ, OACP_RESULT_INVALID_PARAMETER)
+    if ots_busy(shared, m.id)
+        return oacp_result(OACP_OP_READ, OACP_RESULT_LOCKED)
+    ots_prune(var shared)
+    // The listing is read as it is now, whatever the store does while it is sent.
+    let data = if m.id == object_store.ID_DIRECTORY then ots_directory(config, shared, identity, var repo).1 else []
+    list.push(shared.transfers, Transfer {
+        owner: identity, object: m.id, reading: true, channel: channel, offset: offset, length: length,
+        patching: false, done: 0, on_air: 0, last_ms: now_ms, state: if length == 0 then T_DONE else T_ACTIVE,
+        data: data[:], touched: false, excess: false, settled: length == 0 })
+    oacp_result(OACP_OP_READ, OACP_RESULT_SUCCESS)
+
+// Write (OTS 3.3.2.6, Tables 3.17 to 3.19): a transfer that takes `length`
+// octets from the channel into the object from `offset`.  Truncation and growth of
+// the allocated size are done now, before any octet arrives.
+@tier(app)
+fn ots_write<S: object_store.ObjectStore[e]>(config: OtsConfig, coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, identity: Int, m: ObjectMeta, param: [u8], now_ms: Int) -> [u8] [e, mutate]
+    let offset = wire.get(param, 0, 4)
+    let length = wire.get(param, 4, 4)
+    let mode = param[8] as Int
+    let truncate = (mode & MODE_TRUNCATE) != 0
+    let patching = offset < m.size and not truncate
+    if (m.properties & object_store.PROP_WRITE) == 0
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED)
+    if patching and ((config.oacp & OACP_PATCH) == 0 or (m.properties & object_store.PROP_PATCH) == 0)
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED)
+    if truncate and ((config.oacp & OACP_TRUNCATE) == 0 or (m.properties & object_store.PROP_TRUNCATE) == 0)
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED)
+    let channel = ots_free_channel(coc, shared, identity)
+    if channel < 0
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_CHANNEL_UNAVAILABLE)
+    if (mode & (0xFF ^ MODE_TRUNCATE)) != 0
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER)
+    if offset > m.size
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER)
+    let end = offset + length
+    let grows = end > m.allocated
+    if grows and (config.oacp & OACP_APPEND) == 0
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INVALID_PARAMETER)
+    if patching and length > config.max_patch
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INSUFFICIENT_RESOURCES)
+    if ots_busy(shared, m.id)
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_LOCKED)
+    if grows and (m.properties & object_store.PROP_APPEND) == 0
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_NOT_PERMITTED)
+    if grows and end - m.allocated > repo.available()
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INSUFFICIENT_RESOURCES)
+    var size = m.size
+    if truncate and offset < size
+        if not repo.resize(m.id, offset, m.allocated)
+            return oacp_result(OACP_OP_WRITE, OACP_RESULT_FAILED)
+        size = offset
+    if grows and not repo.resize(m.id, size, end)
+        return oacp_result(OACP_OP_WRITE, OACP_RESULT_INSUFFICIENT_RESOURCES)
+    ots_prune(var shared)
+    list.push(shared.transfers, Transfer {
+        owner: identity, object: m.id, reading: false, channel: channel, offset: offset, length: length,
+        patching: patching, done: 0, on_air: 0, last_ms: now_ms, state: if length == 0 then T_DONE else T_ACTIVE,
+        data: [], touched: size != m.size and length > 0, excess: false, settled: length == 0 })
+    if length == 0 and size != m.size
+        ots_touch(config, var shared, var repo, m.id, identity)
+    oacp_result(OACP_OP_WRITE, OACP_RESULT_SUCCESS)
+
+// Cut the data that waits in the channel of a Read that was aborted, except the
+// SDU whose K-frames have begun to leave: a half-sent SDU would corrupt the next
+// one on the channel.
+@tier(app)
+fn ots_cancel_queue(var coc: l2cap_coc.CocState, channel: Int)
+    let i = l2cap_coc.index_of(coc, channel)
+    if i < 0
+        return
+    var c = coc.channels[i]
+    if c.tx_at > 0 and list.len(c.tx) > 0
+        c.tx = [c.tx[0]]
+    else
+        c.tx = []
+
+// Abort (OTS 3.3.2.7, Table 3.20): the Reads under way of this client stop.
+@tier(app)
+fn ots_abort(var coc: l2cap_coc.CocState, var shared: OtsShared, identity: Int) -> [u8]
+    var found = false
+    for k in 0..list.len(shared.transfers)
+        if shared.transfers[k].state == T_ACTIVE and shared.transfers[k].owner == identity and shared.transfers[k].reading
+            shared.transfers[k].state = T_ABORTED
+            ots_cancel_queue(var coc, shared.transfers[k].channel)
+            found = true
+    oacp_result(OACP_OP_ABORT, if found then OACP_RESULT_SUCCESS else OACP_RESULT_FAILED)
+
+// Run the OACP value `value` of the client `identity`: the value to indicate.
+@tier(app)
+fn ots_oacp<S: object_store.ObjectStore[e]>(config: OtsConfig, var coc: l2cap_coc.CocState, var shared: OtsShared, var client: OtsClient, var repo: S, identity: Int, value: [u8], now_ms: Int) -> [u8] [e, mutate]
+    let op = value[0] as Int
+    let param = value[1:list.len(value)]
+    if not ots_oacp_supported(config, op)
+        return oacp_result(op, OACP_RESULT_NOT_SUPPORTED)
+    if op == OACP_OP_CREATE
+        return ots_create(config, var shared, var client, var repo, identity, param)
+    if op == OACP_OP_ABORT
+        return ots_abort(var coc, var shared, identity)
+    match ots_current(config, shared, client, identity, var repo)
+        None => oacp_result(op, OACP_RESULT_INVALID_OBJECT)
+        Some(m) =>
+            if op == OACP_OP_DELETE
+                return ots_delete(config, var shared, var client, var repo, identity, m)
+            if op == OACP_OP_CHECKSUM
+                return ots_checksum(config, shared, var repo, identity, m, param)
+            if op == OACP_OP_EXECUTE
+                return ots_execute(shared, var repo, m, param)
+            if op == OACP_OP_READ
+                return ots_read(config, coc, var shared, var repo, identity, m, param, now_ms)
+            ots_write(config, coc, var shared, var repo, identity, m, param, now_ms)
+
+// ── The Object List Control Point ───────────────────────────────────
+
+@tier(app)
+fn olcp_result(op: Int, result: Int) -> [u8]
+    ots_response(OLCP_OP_RESPONSE, op, result)
+
+// Select the object `id` and reset the filters: Go To and Create do both.
+@tier(app)
+fn ots_select(var client: OtsClient, id: Int)
+    client.current = id
+    client.filters = no_filters()
+
+// Go To (OTS 3.4.2.5): any object, whatever the filters say; the Directory
+// Listing Object has the Object ID 0.
+@tier(app)
+fn ots_go_to<S: object_store.ObjectStore[e]>(config: OtsConfig, var client: OtsClient, var repo: S, param: [u8]) -> [u8] [e, mutate]
+    let id = wire.get(param, 0, 6)
+    if id == object_store.ID_DIRECTORY and config.directory
+        ots_select(var client, id)
+        return olcp_result(OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS)
+    match repo.meta(id)
+        Some(_) =>
+            ots_select(var client, id)
+            olcp_result(OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS)
+        None =>
+            if list.len(repo.ids()) == 0
+                olcp_result(OLCP_OP_GO_TO, OLCP_RESULT_NO_OBJECT)
+            else
+                olcp_result(OLCP_OP_GO_TO, OLCP_RESULT_ID_NOT_FOUND)
+
+// Run the OLCP value `value` of the client `identity`: the value to indicate.
+@tier(app)
+fn ots_olcp<S: object_store.ObjectStore[e]>(config: OtsConfig, var shared: OtsShared, var client: OtsClient, var repo: S, identity: Int, value: [u8]) -> [u8] [e, mutate]
+    let op = value[0] as Int
+    let param = value[1:list.len(value)]
+    if not ots_olcp_supported(config, op)
+        return olcp_result(op, OLCP_RESULT_NOT_SUPPORTED)
+    if op == OLCP_OP_GO_TO
+        return ots_go_to(config, var client, var repo, param)
+    let objects = ots_list(shared, client, identity, var repo)
+    if list.len(objects) == 0
+        return olcp_result(op, OLCP_RESULT_NO_OBJECT)
+    if list.len(objects) > config.max_list
+        return olcp_result(op, OLCP_RESULT_TOO_MANY)
+    let last = list.len(objects) - 1
+    if op == OLCP_OP_FIRST
+        client.current = objects[0].id
+        return olcp_result(op, OLCP_RESULT_SUCCESS)
+    if op == OLCP_OP_LAST
+        client.current = objects[last].id
+        return olcp_result(op, OLCP_RESULT_SUCCESS)
+    if op == OLCP_OP_PREVIOUS or op == OLCP_OP_NEXT
+        let current = client.current
+        let at = ots_position(objects, current)
+        // The Directory Listing Object comes before the first object.
+        let before_first = current == object_store.ID_DIRECTORY and config.directory
+        if at < 0 and not before_first
+            return olcp_result(op, OLCP_RESULT_FAILED)
+        if op == OLCP_OP_PREVIOUS
+            if before_first or at == 0
+                return olcp_result(op, OLCP_RESULT_OUT_OF_BOUNDS)
+            client.current = objects[at - 1].id
+            return olcp_result(op, OLCP_RESULT_SUCCESS)
+        if before_first
+            client.current = objects[0].id
+            return olcp_result(op, OLCP_RESULT_SUCCESS)
+        if at == last
+            return olcp_result(op, OLCP_RESULT_OUT_OF_BOUNDS)
+        client.current = objects[at + 1].id
+        return olcp_result(op, OLCP_RESULT_SUCCESS)
+    if op == OLCP_OP_ORDER
+        let order = param[0] as Int
+        if not object_list.order_valid(order)
+            return olcp_result(op, OLCP_RESULT_INVALID_PARAMETER)
+        client.order = order
+        return olcp_result(op, OLCP_RESULT_SUCCESS)
+    if op == OLCP_OP_COUNT
+        var out = olcp_result(op, OLCP_RESULT_SUCCESS)
+        wire.put(var out, list.len(objects), 4)
+        return out
+    for m in objects
+        ots_set_mark(var shared, identity, m.id, false)
+    olcp_result(op, OLCP_RESULT_SUCCESS)
+
+// ── Requests ────────────────────────────────────────────────────────
+
+// The handle of a metadata characteristic the PDU `pdu` reads or writes, 0 for
+// none: Object Not Selected is the answer when the Current Object is invalid.
+@tier(embedded)
+@no_alloc
+fn ots_is_metadata(handles: OtsHandles, handle: Int) -> Bool
+    handle != 0 and (handle == handles.name or handle == handles.kind or handle == handles.size or handle == handles.created
+        or handle == handles.modified or handle == handles.id or handle == handles.properties)
+
+@tier(app)
+fn ots_metadata_named(handles: OtsHandles, pdu: [u8]) -> Int
+    let op = pdu[0] as Int
+    let n = list.len(pdu)
+    if (op == 0x0A or op == 0x0C or op == 0x12 or op == 0x52 or op == 0x16) and n >= 3
+        let h = gatt_server.read_le16(pdu, 1)
+        return if ots_is_metadata(handles, h) then h else 0
+    if op == 0x0E or op == 0x20
+        for k in 0..(n - 1) / 2
+            let h = gatt_server.read_le16(pdu, 1 + 2 * k)
+            if ots_is_metadata(handles, h)
+                return h
+        return 0
+    if op == 0x08 and n >= 7
+        // Read By Type: the answer names the first handle of the range.
+        let start = gatt_server.read_le16(pdu, 1)
+        let end = gatt_server.read_le16(pdu, 3)
+        let kind = pdu[5:n]
+        for pair in [(handles.name, UUID_OBJECT_NAME), (handles.kind, UUID_OBJECT_TYPE), (handles.size, UUID_OBJECT_SIZE),
+                     (handles.created, UUID_OBJECT_FIRST_CREATED), (handles.modified, UUID_OBJECT_LAST_MODIFIED),
+                     (handles.id, UUID_OBJECT_ID), (handles.properties, UUID_OBJECT_PROPERTIES)]
+            if pair.0 != 0 and pair.0 >= start and pair.0 <= end and gatt_server.uuid_equal(kind, gatt_server.le16(pair.1))
+                return start
+    0
+
+// The first handle of the service a read or write PDU names, 0 for none: what
+// the concurrency pool is asked about.
+@tier(embedded)
+@no_alloc
+fn ots_named_handle(handles: OtsHandles, pdu: [u8]) -> Int
+    let op = pdu[0] as Int
+    let n = list.len(pdu)
+    if (op == 0x0A or op == 0x0C or op == 0x12 or op == 0x52 or op == 0x16) and n >= 3
+        let h = gatt_server.read_le16(pdu, 1)
+        return if h >= handles.service and h <= handles.last then h else 0
+    if op == 0x0E or op == 0x20
+        for k in 0..(n - 1) / 2
+            let h = gatt_server.read_le16(pdu, 1 + 2 * k)
+            if h >= handles.service and h <= handles.last
+                return h
+    0
+
+// Put the values the client reads in step with the store: the Current Object's
+// metadata, and the client's filters.  The Current Object, None when it is an
+// Invalid Object (the metadata values then stay as they were: a read or a write
+// of them is answered before it reaches the GATT server).
+@tier(app)
+fn ots_refresh<S: object_store.ObjectStore[e]>(var db: GattDb, var link: AttLink, handles: OtsHandles, config: OtsConfig, shared: OtsShared, client: OtsClient, var repo: S) -> ?ObjectMeta [e, mutate]
+    for k in 0..list.len(handles.filters)
+        let _ = gatt_server.set_link_value(db, var link, handles.filters[k], client.filters[k])
+    let current = ots_current(config, shared, client, link.identity, var repo)
+    match current
+        None => ()
+        Some(m) =>
+            let _ = gatt_server.set_link_value(db, var link, handles.name, m.name)
+            let _ = gatt_server.set_link_value(db, var link, handles.kind, m.kind)
+            let _ = gatt_server.set_link_value(db, var link, handles.size, ots_size_value(m.size, m.allocated))
+            if handles.created != 0
+                let _ = gatt_server.set_link_value(db, var link, handles.created, m.created)
+            if handles.modified != 0
+                let _ = gatt_server.set_link_value(db, var link, handles.modified, m.modified)
+            if handles.id != 0
+                let _ = gatt_server.set_link_value(db, var link, handles.id, ots_id_value(m.id))
+            let _ = gatt_server.set_link_value(db, var link, handles.properties, ots_properties_value(m.properties))
+    current
+
+// The Error Code of a new Object Name `v` for the object `m`: 0, Write Request
+// Rejected for a name that is not a name or an object that cannot be renamed,
+// Object Name Already Exists for the name of another object.
+@tier(app)
+fn ots_name_error<S: object_store.ObjectStore[e]>(m: ObjectMeta, v: [u8], var repo: S) -> Int [e, mutate]
+    if m.id == object_store.ID_DIRECTORY or not object_store.name_ok(v)
+        return object_list.ERR_WRITE_REQUEST_REJECTED
+    let ids = repo.ids()
+    for id in ids
+        if id != m.id
+            match repo.meta(id)
+                Some(other) =>
+                    if gatt_server.same_bytes(other.name, v)
+                        return ERR_NAME_EXISTS
+                None => ()
+    0
+
+// The Error Code of a new Date Time `v`.
+@tier(embedded)
+@no_alloc
+fn ots_time_error(m: ObjectMeta, v: [u8]) -> Int
+    if m.id == object_store.ID_DIRECTORY
+        return object_list.ERR_WRITE_REQUEST_REJECTED
+    if list.len(v) != 7
+        return object_list.ERR_INVALID_LENGTH
+    if object_store.date_time_ok(v) then 0 else object_list.ERR_WRITE_REQUEST_REJECTED
+
+// The Error Code of a new Object Properties value `v`: 32 bits, the bits above
+// the Mark bit zero, and the Mark bit as it is (a client clears marks with Clear
+// Marking, and the server sets them).
+@tier(embedded)
+@no_alloc
+fn ots_properties_error(m: ObjectMeta, v: [u8]) -> Int
+    if m.id == object_store.ID_DIRECTORY
+        return object_list.ERR_WRITE_REQUEST_REJECTED
+    if list.len(v) != 4
+        return object_list.ERR_INVALID_LENGTH
+    let p = wire.get(v, 0, 4)
+    if (p & 0xFFFFFF00) != 0 or (p & object_store.PROP_MARK) != (m.properties & object_store.PROP_MARK)
+        return object_list.ERR_WRITE_REQUEST_REJECTED
+    0
+
+// The writes that the GATT server stored in the client's values, checked against
+// the store: a write that is acceptable changes the object (or the client's
+// filter), one that is not is undone.  The handle and the Error Code of the first
+// write refused, (0, 0) for none.  `before` is the Current Object as the request
+// found it: a write to a metadata characteristic is a write to that object, even
+// when the same request changes which object is current.
+@tier(app)
+fn ots_reconcile<S: object_store.ObjectStore[e]>(var db: GattDb, var link: AttLink, handles: OtsHandles, config: OtsConfig, var shared: OtsShared, var client: OtsClient, var repo: S, before: ?ObjectMeta) -> (Int, Int) [e, mutate]
+    let identity = link.identity
+    var bad_handle = 0
+    var bad_code = 0
+    for k in 0..list.len(handles.filters)
+        let h = handles.filters[k]
+        let v = gatt_server.value_at(db, link, gatt_server.index_of(db, h))
+        if not gatt_server.same_bytes(v, client.filters[k])
+            let code = object_list.filter_write_error(v)
+            if code == 0
+                client.filters[k] = v[:]
+            else
+                let _ = gatt_server.set_link_value(db, var link, h, client.filters[k])
+                if bad_code == 0
+                    bad_handle = h
+                    bad_code = code
+    match before
+        None => ()
+        Some(m) =>
+            var changed = false
+            var u = object_store.copy_meta(m)
+            // The Object Name.
+            let name = gatt_server.value_at(db, link, gatt_server.index_of(db, handles.name))
+            if not gatt_server.same_bytes(name, m.name)
+                let code = ots_name_error(m, name, var repo)
+                if code == 0
+                    u.name = name[:]
+                    changed = true
+                else
+                    let _ = gatt_server.set_link_value(db, var link, handles.name, m.name)
+                    if bad_code == 0
+                        bad_handle = handles.name
+                        bad_code = code
+            // The two timestamps.
+            if handles.created != 0
+                let v = gatt_server.value_at(db, link, gatt_server.index_of(db, handles.created))
+                if not gatt_server.same_bytes(v, m.created)
+                    let code = ots_time_error(m, v)
+                    if code == 0
+                        u.created = v[:]
+                        changed = true
+                    else
+                        let _ = gatt_server.set_link_value(db, var link, handles.created, m.created)
+                        if bad_code == 0
+                            bad_handle = handles.created
+                            bad_code = code
+            if handles.modified != 0
+                let v = gatt_server.value_at(db, link, gatt_server.index_of(db, handles.modified))
+                if not gatt_server.same_bytes(v, m.modified)
+                    let code = ots_time_error(m, v)
+                    if code == 0
+                        u.modified = v[:]
+                        changed = true
+                    else
+                        let _ = gatt_server.set_link_value(db, var link, handles.modified, m.modified)
+                        if bad_code == 0
+                            bad_handle = handles.modified
+                            bad_code = code
+            // The Object Properties.
+            let props = gatt_server.value_at(db, link, gatt_server.index_of(db, handles.properties))
+            if not gatt_server.same_bytes(props, ots_properties_value(m.properties))
+                let code = ots_properties_error(m, props)
+                if code == 0
+                    u.properties = wire.get(props, 0, 4) & object_store.PROP_STORED
+                    changed = true
+                else
+                    let _ = gatt_server.set_link_value(db, var link, handles.properties, ots_properties_value(m.properties))
+                    if bad_code == 0
+                        bad_handle = handles.properties
+                        bad_code = code
+            if changed
+                let _ = repo.set_meta(u)
+                ots_push_change(config, var shared, CHANGE_BY_CLIENT | CHANGE_METADATA, m.id, identity)
+    (bad_handle, bad_code)
+
+// The value the client last wrote to the control point `handle` as a prepared
+// write would make it, None when a part does not fit.
+@tier(app)
+fn ots_queued_value(db: GattDb, link: AttLink, handle: Int) -> ?[u8]
+    var cur: [u8] = gatt_server.value_at(db, link, gatt_server.index_of(db, handle))
+    for w in link.prepare_queue
+        if w.handle == handle
+            if w.offset > list.len(cur)
+                return None
+            var next = cur[0:w.offset]
+            list.append(next, w.value)
+            cur = next
+    Some(cur)
+
+// Whether `value` is a whole value of the control point `handle`.  An op code
+// the device does not support has no size to be wrong in: it is answered with a
+// result code.
+@tier(embedded)
+@no_alloc
+fn ots_value_ok(config: OtsConfig, handles: OtsHandles, handle: Int, value: [u8]) -> Bool
+    if list.len(value) == 0
+        return false
+    let op = value[0] as Int
+    if handle == handles.oacp
+        return not ots_oacp_supported(config, op) or oacp_length_ok(op, list.len(value))
+    not ots_olcp_supported(config, op) or olcp_length_ok(op, list.len(value))
+
+// Run the value of the control point `handle` and indicate its response.
+@tier(app)
+fn ots_run_control<S: object_store.ObjectStore[e]>(var db: GattDb, var link: AttLink, handles: OtsHandles, config: OtsConfig, var coc: l2cap_coc.CocState, var shared: OtsShared, var client: OtsClient, var repo: S, handle: Int, value: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    let identity = link.identity
+    let response = if handle == handles.oacp then ots_oacp(config, var coc, var shared, var client, var repo, identity, value, now_ms) else ots_olcp(config, var shared, var client, var repo, identity, value)
+    let _ = gatt_server.set_value(var db, handle, response)
+    gatt_server.send_value(var db, var link, handle, now_ms)
+
+// Answer one ATT PDU of the client of `link` (on the unenhanced bearer).  A write
+// to a control point is evaluated before its Write Response and answered by
+// an indication, the metadata the client reads are those of its Current Object,
+// and a write to a metadata characteristic or a filter is checked against the
+// store.  Everything else is the GATT server's.
+@tier(app)
+fn ots_receive<S: object_store.ObjectStore[e]>(var db: GattDb, var link: AttLink, handles: OtsHandles, config: OtsConfig, var coc: l2cap_coc.CocState, var shared: OtsShared, var client: OtsClient, var repo: S, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) == 0
+        return []
+    let op = pdu[0] as Int
+    ots_expire(var shared, now_ms)
+    let named = ots_named_handle(handles, pdu)
+    if named != 0 and not ots_admit(config, var shared, link.identity)
+        if op == att.ATT_OP_WRITE_CMD
+            return []
+        return gatt_server.error(op, named, ERR_CONCURRENCY_LIMIT)
+    let before = ots_refresh(var db, var link, handles, config, shared, client, var repo)
+    let valid = ots_found(before)
+    if not valid
+        let selected = ots_metadata_named(handles, pdu)
+        if selected != 0
+            if op == att.ATT_OP_WRITE_CMD
+                return []
+            return gatt_server.error(op, selected, ERR_OBJECT_NOT_SELECTED)
+    if op == att.ATT_OP_WRITE_REQ and list.len(pdu) >= 3
+        let handle = gatt_server.read_le16(pdu, 1)
+        if handle == handles.oacp or (handles.olcp != 0 and handle == handles.olcp)
+            let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+            if access != 0
+                return gatt_server.error(op, handle, access)
+            let value = pdu[3:list.len(pdu)]
+            if not ots_value_ok(config, handles, handle, value)
+                return gatt_server.error(op, handle, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+            var out = gatt_server.receive(var db, var link, pdu, now_ms)
+            if list.len(out) > 0 and out[0][0] as Int == att.ATT_OP_WRITE_RSP
+                list.append(out, ots_run_control(var db, var link, handles, config, var coc, var shared, var client, var repo, handle, value, now_ms))
+            return out
+    // A Write Long to a control point is run when it is executed.
+    var controls: [Int] = []
+    if op == att.ATT_OP_EXECUTE_WRITE_REQ and list.len(pdu) == 2 and (pdu[1] as Int) == att.ATT_EXECUTE_WRITE_FLAG_WRITE
+        for w in link.prepare_queue
+            if (w.handle == handles.oacp or (handles.olcp != 0 and w.handle == handles.olcp)) and not ots_listed(controls, w.handle)
+                list.push(controls, w.handle)
+        for h in controls
+            match ots_queued_value(db, link, h)
+                Some(v) =>
+                    if not ots_value_ok(config, handles, h, v)
+                        link.prepare_queue = []
+                        link.prepare_generation = -1
+                        return gatt_server.error(op, h, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+                None => ()
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    let wrote = op == att.ATT_OP_WRITE_REQ or op == att.ATT_OP_WRITE_CMD or op == att.ATT_OP_EXECUTE_WRITE_REQ or op == att.ATT_OP_SIGNED_WRITE_CMD
+    if not wrote
+        return out
+    let done = list.len(out) > 0 and (out[0][0] as Int == att.ATT_OP_WRITE_RSP or out[0][0] as Int == att.ATT_OP_EXECUTE_WRITE_RSP)
+    let refused = ots_reconcile(var db, var link, handles, config, var shared, var client, var repo, before)
+    if refused.1 != 0 and done
+        return gatt_server.error(op, refused.0, refused.1)
+    if op == att.ATT_OP_EXECUTE_WRITE_REQ and done
+        for h in controls
+            let value = gatt_server.value_at(db, link, gatt_server.index_of(db, h))
+            list.append(out, ots_run_control(var db, var link, handles, config, var coc, var shared, var client, var repo, h, value, now_ms))
+    out
+
+@tier(embedded)
+@no_alloc
+fn ots_found(m: ?ObjectMeta) -> Bool
+    match m
+        Some(_) => true
+        None => false
+
+@tier(embedded)
+@no_alloc
+fn ots_listed(handles: [Int], h: Int) -> Bool
+    for x in handles
+        if x == h
+            return true
+    false
+
+// The connection of the client `identity` ended: the client leaves the pool, its
+// transfers end (their locks are released and the octets already written stay),
+// and an object it created and never named is deleted, even when its properties
+// do not allow deletion (OTS 3.7).
+@tier(app)
+fn ots_disconnected<S: object_store.ObjectStore[e]>(config: OtsConfig, var shared: OtsShared, var client: OtsClient, var repo: S, identity: Int) [e, mutate]
+    var pool: [Int] = []
+    for p in shared.pool
+        if p != identity
+            list.push(pool, p)
+    shared.pool = pool
+    // The octets a write left stay in the object, and the modification time says so.
+    for t in shared.transfers
+        if t.owner == identity and not t.reading and t.touched and not t.settled
+            ots_touch(config, var shared, var repo, t.object, identity)
+    var kept: [Transfer] = []
+    for t in shared.transfers
+        if t.owner != identity
+            list.push(kept, t)
+    shared.transfers = kept
+    for id in client.created
+        match repo.meta(id)
+            Some(m) =>
+                if list.len(m.name) == 0
+                    if repo.delete(id)
+                        ots_push_change(config, var shared, CHANGE_DELETION, id, 0)
+            None => ()
+    client.created = []
+    client.current = object_store.NO_OBJECT
+    client.filters = no_filters()
+    client.order = 0
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// The octets of `v` as `n` little-endian integers.
+@tier(app)
+fn le(v: Int, n: Int) -> [Int]
+    var out: [Int] = []
+    for k in 0..n
+        list.push(out, (v >>> (8 * k)) & 0xFF)
+    out
+
+// One client of the tests: its connection state, its client state and the
+// channel table of its connection.
+struct Peer
+    var link: AttLink
+    var client: OtsClient
+    var coc: l2cap_coc.CocState
+
+// A server, the store behind it and two clients (identities 1 and 2).
+struct Rig
+    var db: GattDb
+    h: OtsHandles
+    config: OtsConfig
+    var shared: OtsShared
+    var repo: MemoryStore
+    var a: Peer
+    var b: Peer
+    var now: Int
+
+// A client of the server with the indications of the control points and of
+// Object Changed enabled, on an encrypted link, listening on the PSM.
+@tier(app)
+fn new_peer(var db: GattDb, h: OtsHandles, identity: Int) -> Peer
+    var link = gatt_server.new_att_link(db)
+    gatt_server.set_security(var link, gatt_server.link_security(true, 2, 16, true))
+    gatt_server.set_identity(var link, identity)
+    for cccd in [h.oacp_cccd, h.olcp_cccd, h.changed_cccd]
+        if cccd != 0
+            test.assert_eq(gatt_server.receive(var db, var link, req(0x12, cccd, [2, 0]), 0)[0], [0x13])
+    var coc = l2cap_coc.new_state()
+    ots_listen(var coc, 247)
+    Peer { link: link, client: new_ots_client(), coc: coc }
+
+// Three objects: alpha (10 octets, every property), beta (3 octets, Read only)
+// and gamma (20 octets, Delete, Read and Write).
+@tier(app)
+fn fixture_repo() -> MemoryStore
+    var repo = object_store.new_memory_store(2000, 8)
+    let _ = object_store.memory_add(var repo, wire.text("alpha"), ots_uuid16(0x2ACA), wire.text("0123456789"), 0x7F)
+    let _ = object_store.memory_add(var repo, wire.text("beta"), ots_uuid16(0x2BAB), wire.text("abc"), object_store.PROP_READ)
+    let _ = object_store.memory_add(var repo, wire.text("gamma"), ots_uuid16(0x2ACA), wire.text("abcdefghijklmnopqrst"), 0x0D)
+    repo
+
+@tier(app)
+fn rig(config: OtsConfig) -> Rig
+    var db = gatt_server.new_db([], 65)
+    let h = add_ots_service(var db, config)!
+    let a = new_peer(var db, h, 1)
+    let b = new_peer(var db, h, 2)
+    Rig { db: db, h: h, config: config, shared: new_ots_shared(), repo: fixture_repo(), a: a, b: b, now: 0 }
+
+// Answer one PDU of the client `who` (0 or 1).
+@tier(app)
+fn pdu(var r: Rig, who: Int, raw: [u8]) -> [[u8]] [mutate]
+    if who == 0
+        return ots_receive(var r.db, var r.a.link, r.h, r.config, var r.a.coc, var r.shared, var r.a.client, var r.repo, raw, r.now)
+    ots_receive(var r.db, var r.b.link, r.h, r.config, var r.b.coc, var r.shared, var r.b.client, var r.repo, raw, r.now)
+
+// Write `value` to the control point `handle` as `who`: the Write Response and
+// one indication, which is confirmed; the value indicated.
+@tier(app)
+fn control(var r: Rig, who: Int, handle: Int, value: [Int]) -> [u8] [mutate]
+    let out = pdu(var r, who, req(0x12, handle, value))
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1][0] as Int, 0x1D)
+    test.assert_eq(gatt_server.read_le16(out[1], 1), handle)
+    let v = out[1][3:list.len(out[1])]
+    test.assert_eq(list.len(pdu(var r, who, [0x1E])), 0)
+    v
+
+@tier(app)
+fn oacp_as(var r: Rig, who: Int, value: [Int]) -> [u8] [mutate]
+    control(var r, who, r.h.oacp, value)
+
+@tier(app)
+fn olcp_as(var r: Rig, who: Int, value: [Int]) -> [u8] [mutate]
+    control(var r, who, r.h.olcp, value)
+
+@tier(app)
+fn oacp(var r: Rig, value: [Int]) -> [u8] [mutate]
+    control(var r, 0, r.h.oacp, value)
+
+@tier(app)
+fn olcp(var r: Rig, value: [Int]) -> [u8] [mutate]
+    control(var r, 0, r.h.olcp, value)
+
+// The value a control point indicates for a result.
+@tier(app)
+fn answer(code: Int, op: Int, r: Int) -> [u8]
+    wire.octets([code, op, r])
+
+// Select the object `id` as `who` with Go To.
+@tier(app)
+fn choose_as(var r: Rig, who: Int, id: Int) [mutate]
+    var value: [Int] = [OLCP_OP_GO_TO]
+    list.append(value, le(id, 6))
+    test.assert_eq(olcp_as(var r, who, value), answer(0x70, OLCP_OP_GO_TO, OLCP_RESULT_SUCCESS))
+
+@tier(app)
+fn choose(var r: Rig, id: Int) [mutate]
+    choose_as(var r, 0, id)
+
+// The value of the attribute `handle` as `who` reads it.
+@tier(app)
+fn peek_as(var r: Rig, who: Int, handle: Int) -> [u8] [mutate]
+    let out = pdu(var r, who, req(0x0A, handle, []))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][0] as Int, 0x0B)
+    out[0][1:list.len(out[0])]
+
+@tier(app)
+fn peek(var r: Rig, handle: Int) -> [u8] [mutate]
+    peek_as(var r, 0, handle)
+
+// Write `value` to `handle` as `who` with a Write Request.
+@tier(app)
+fn write_as(var r: Rig, who: Int, handle: Int, value: [u8]) -> [[u8]] [mutate]
+    var raw: [u8] = req(0x12, handle, [])
+    list.append(raw, value)
+    pdu(var r, who, raw)
+
+@tier(app)
+fn write_to(var r: Rig, handle: Int, value: [u8]) -> [[u8]] [mutate]
+    write_as(var r, 0, handle, value)
+
+// Whether a Write Request was answered with a Write Response.
+@tier(app)
+fn accepted(out: [[u8]]) -> Bool
+    list.len(out) == 1 and out[0] == [0x13]
+
+// A channel on the PSM of the Object Transfer Channel, opened by the peer with
+// the given MTU, MPS and credits: its number.
+@tier(app)
+fn open_channel(var coc: l2cap_coc.CocState, scid: Int, mtu: Int, mps: Int, credits: Int) -> Int
+    var body: [u8] = []
+    wire.put(var body, OTS_PSM, 2)
+    wire.put(var body, scid, 2)
+    wire.put(var body, mtu, 2)
+    wire.put(var body, mps, 2)
+    wire.put(var body, credits, 2)
+    let out = l2cap_coc.receive_signaling(var coc, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 1, body)
+    test.assert_eq(list.len(out), 1)
+    let channels = l2cap_coc.channels_of_psm(coc, OTS_PSM)
+    channels[list.len(channels) - 1].id
+
+// ── Read, Write and Abort: the checks before a transfer starts ───────
+
+@tier(app)
+fn read_value(offset: Int, length: Int) -> [Int]
+    var v: [Int] = [OACP_OP_READ]
+    list.append(v, le(offset, 4))
+    list.append(v, le(length, 4))
+    v
+
+@tier(app)
+fn write_value(offset: Int, length: Int, mode: Int) -> [Int]
+    var v: [Int] = [OACP_OP_WRITE]
+    list.append(v, le(offset, 4))
+    list.append(v, le(length, 4))
+    list.push(v, mode)
+    v

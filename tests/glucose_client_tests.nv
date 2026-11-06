@@ -1,0 +1,169 @@
+// tests/glucose_client_tests.nv — the unit tests of src/glucose_client.nv.
+//
+//   novo test tests/glucose_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use glucose
+use racp
+use sensor_client
+use wire
+use glucose_client.{ GlMeasurement, RESPONSE_CODE, RESPONSE_COUNT, gl_client_new, gl_client_start, gl_client_write, gl_decode, gl_decode_context, gl_decode_features, gl_decode_response, gl_milligram_per_decilitre, gl_offset_minutes, gl_request, gl_request_abort, gl_request_count_from, gl_request_delete_all, gl_request_report_all, gl_request_report_from }
+
+@tier(app)
+fn must(m: ?GlMeasurement) -> GlMeasurement
+    match m
+        Some(v) => v
+        None =>
+            test.fail("a measurement")
+            GlMeasurement {
+                sequence: 0, base_time: wire.date_time_unknown(), has_offset: false, offset: 0, has_concentration: false,
+                concentration: 0, mol: false, sample_type: 0, location: 0, has_status: false, status: 0, context_follows: false }
+
+@tier(app)
+fn expect_response(b: [u8], kind: Int, request_op: Int, value: Int)
+    match gl_decode_response(b)
+        Some(r) =>
+            test.assert_eq(r.kind, kind)
+            test.assert_eq(r.request_op, request_op)
+            test.assert_eq(r.value, value)
+        None => test.fail("a response")
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_measurement_is_decoded_field_by_field()
+    var st = glucose.new_gls_store(4, 0x07FF, true)
+    let m = glucose.gls_with_status(glucose.gls_with_offset(
+        glucose.gls_measurement(wire.date_time(2026, 11, 1, 8, 30, 0), wire.sfloat(55, -4), true, 9, 15), -60), 0x0801)
+    let _ = glucose.gls_store_add(var st, m, true, glucose.gls_context_meal(glucose.gls_context_empty(), 1))
+    let d = must(gl_decode(glucose.gls_measurement_value(st.items[0].measurement, false)))
+    test.assert_eq(d.sequence, 0)
+    test.assert_eq(d.base_time.minutes as Int, 30)
+    test.assert_eq(d.offset, -60)
+    test.assert(d.mol)
+    test.assert_eq(d.sample_type, 9)
+    test.assert_eq(d.location, 15)
+    test.assert_eq(d.status, 0x0801)
+    test.assert(d.context_follows)
+    // 5.5 mmol/L is 99.1 mg/dL.
+    test.assert_eq(gl_milligram_per_decilitre(d), 99086)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_mg_per_dl_in_kilograms_per_litre_is_converted()
+    var st = glucose.new_gls_store(4, 0, false)
+    let _ = glucose.gls_store_add(var st, glucose.gls_measurement(wire.date_time(2026, 11, 1, 8, 30, 0), wire.sfloat(95, -5), false, 1, 1), false, glucose.gls_context_empty())
+    let d = must(gl_decode(glucose.gls_measurement_value(st.items[0].measurement, false)))
+    // 95e-5 kg/L is 95 mg/dL.
+    test.assert_eq(gl_milligram_per_decilitre(d), 95000)
+    test.assert_eq(gl_offset_minutes(d), 0)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_every_prefix_of_a_measurement_and_an_unknown_base_time_are_refused()
+    var st = glucose.new_gls_store(4, 0x07FF, true)
+    let m = glucose.gls_with_status(glucose.gls_with_offset(
+        glucose.gls_measurement(wire.date_time(2026, 11, 1, 8, 30, 0), wire.sfloat(55, -4), true, 9, 15), 5), 0x0001)
+    let _ = glucose.gls_store_add(var st, m, false, glucose.gls_context_empty())
+    let whole = glucose.gls_measurement_value(st.items[0].measurement, false)
+    test.assert(gl_decode(whole) != None)
+    for n in 0..list.len(whole)
+        test.assert_eq(gl_decode(whole[0:n]), None)
+    var bad = whole[:]
+    bad[5] = 0
+    test.assert_eq(gl_decode(bad), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_context_is_decoded_and_every_prefix_is_refused()
+    let c = glucose.gls_context_hba1c(glucose.gls_context_medication(glucose.gls_context_exercise(glucose.gls_context_tester_health(
+        glucose.gls_context_meal(glucose.gls_context_carbohydrate(glucose.gls_context_empty(), 3, wire.sfloat(5, -2)), 2), 1, 5), 3600, 40),
+        2, wire.sfloat(8, -6), true), wire.sfloat(65, -1))
+    let whole = glucose.gls_context_value(258, c)
+    match gl_decode_context(whole)
+        Some(d) =>
+            test.assert_eq(d.sequence, 258)
+            test.assert_eq(d.carbohydrate_id, 3)
+            test.assert_eq(d.meal, 2)
+            test.assert_eq(d.tester, 1)
+            test.assert_eq(d.health, 5)
+            test.assert_eq(d.duration, 3600)
+            test.assert_eq(d.intensity, 40)
+            test.assert_eq(d.medication_id, 2)
+            test.assert(d.litres)
+            test.assert_eq(d.hba1c, wire.sfloat(65, -1))
+        None => test.fail("a context")
+    for n in 0..list.len(whole)
+        test.assert_eq(gl_decode_context(whole[0:n]), None)
+    // An Extended Flags octet is skipped.
+    let extended = wire.octets([0x82, 1, 0, 0, 3])
+    match gl_decode_context(extended)
+        Some(d) => test.assert_eq(d.meal, 3)
+        None => test.fail("an extended context")
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_requests_and_responses_have_the_wire_form_of_the_control_point()
+    test.assert_eq(gl_request_report_all(), wire.octets([1, 1]))
+    test.assert_eq(gl_request_report_from(0x0102), wire.octets([1, 3, 1, 2, 1]))
+    test.assert_eq(gl_request_count_from(5), wire.octets([4, 3, 1, 5, 0]))
+    test.assert_eq(gl_request_delete_all(), wire.octets([2, 1]))
+    test.assert_eq(gl_request_abort(), wire.octets([3, 0]))
+    test.assert_eq(gl_request(1, 4, 2, 9), wire.octets([1, 4, 1, 2, 0, 9, 0]))
+    test.assert_eq(gl_request(1, 2, 2, 9), wire.octets([1, 2, 1, 9, 0]))
+    expect_response(wire.octets([6, 0, 1, 6]), RESPONSE_CODE, 1, 6)
+    expect_response(wire.octets([5, 0, 3, 1]), RESPONSE_COUNT, 0, 259)
+    test.assert_eq(gl_decode_response(wire.octets([5, 1, 3, 1])), None)
+    test.assert_eq(gl_decode_response(wire.octets([6, 0, 1])), None)
+    test.assert_eq(gl_decode_features(wire.octets([0xFF, 0x07])), Some(0x07FF))
+    test.assert_eq(gl_decode_features(wire.octets([1])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_session_reads_the_records_the_server_reports()
+    if not fixtures.client_engine_present()
+        return
+    let config = glucose.full_config()
+    var built = glucose.server(config)
+    var s = built.0
+    let h = built.1
+    var st = glucose.new_gls_store(10, config.features, true)
+    var session = glucose.new_gls_session()
+    let _ = glucose.gls_store_add(var st, glucose.reading(1), false, glucose.gls_context_empty())
+    let _ = glucose.gls_store_add(var st, glucose.reading(2), true, glucose.gls_context_meal(glucose.gls_context_empty(), 1))
+    let both = sensor_client.test_open(glucose.UUID_GLUCOSE_SERVICE)
+    var t = both.0
+    var c = gl_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, gl_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(gl_decode_features(sensor_client.sc_value(c)), Some(0x07FF))
+    // The server dispatches the control point write through gls_receive, so the session
+    // writes with the plain engine and the test then carries the request out.
+    let w = gl_client_write(var t, var c, gl_request_report_from(1), 0)
+    test.assert(w.pdus != [])
+    let reply = glucose.gls_receive(var s.db, var s.link, h, config.support, var st, var session, w.pdus[0], 0)
+    test.assert_eq(reply, [[0x13]])
+    let sent = glucose.gls_pump(var s.db, var s.link, h, var st, var session, 10, 0)
+    test.assert_eq(list.len(sent), 3)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [sent[0]]), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), glucose.UUID_GLUCOSE_MEASUREMENT)
+    test.assert_eq(must(gl_decode(sensor_client.sc_value(c))).sequence, 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [sent[1]]), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), glucose.UUID_GLUCOSE_MEASUREMENT_CONTEXT)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [sent[2]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    expect_response(sensor_client.sc_value(c), RESPONSE_CODE, 1, 1)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(glucose.UUID_GLUCOSE_SERVICE)
+    var t = both.0
+    var c = gl_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, gl_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

@@ -1,0 +1,250 @@
+// src/pulse_oximeter_client.nv — the Collector side of the Pulse Oximeter
+// Service (0x1822): the decoders of its characteristics and the client session.
+//
+//   PLX Spot-Check Measurement   0x2A5E   decoded by `plx_decode_spot_check`; indicated
+//   PLX Continuous Measurement   0x2A5F   decoded by `plx_decode_continuous`; notified
+//   PLX Features                 0x2A60   decoded by `plx_decode_features`; read, and
+//                                         indicated when the oximeter's features change
+//
+// Layout of a spot-check measurement ([PLXS] Table 3.2): the flags octet (bit 0 a time
+// stamp, bit 1 the Measurement Status, bit 2 the Device and Sensor Status, bit 3 the Pulse
+// Amplitude Index, bit 4 the clock was not set, bits 5 to 7 reserved), SpO2 and pulse rate
+// as two SFLOATs, then the time stamp (a seven-octet Date Time, [GSS] 3.70), the
+// Measurement Status (two octets), the Device and Sensor Status (three octets) and the
+// Pulse Amplitude Index (an SFLOAT), each when its flag is set.  A continuous measurement
+// ([PLXS] Table 3.6) has the flags (bit 0 the fast pair, bit 1 the slow pair, bit 2 the
+// Measurement Status, bit 3 the Device and Sensor Status, bit 4 the Pulse Amplitude Index),
+// the normal SpO2 and pulse rate, then the fast pair, the slow pair, the two statuses and
+// the index in that order.  PLX Features ([PLXS] Table 3.8) is the Supported Features (two
+// octets), the Measurement Status Support (two octets) when feature bit 0 is set and the
+// Device and Sensor Status Support (three octets) when feature bit 1 is set.
+//
+// Every value says in its own flags which fields it holds, so a decoder needs no
+// Features.  A decoder answers `None` for a value too short for the fields its flags name
+// and for a time stamp that is not a Date Time.  The SFLOATs stay raw in the struct;
+// `plx_sfloat_kind` tells a number from the special values (NaN for a value the oximeter
+// cannot give) and `plx_scaled` reads a number with a number of decimals.  Octets after
+// the fields are not read.  A decoder allocates nothing and keeps no state.
+//
+// The session (`plx_client_*`) runs on `sensor_client.nv`: discover the service, read PLX
+// Features, enable the indication of the spot-check measurement and the notification of
+// the continuous measurement, and enable the indication of the Features.  The service has
+// at least one of the two measurements and the session cannot tell which one it needs, so
+// it enables whichever the peer has; the program checks that one arrived.
+//
+// Satisfies: REQ-BLE-PRFC-010.
+
+use gatt_client
+use links
+use pulse_oximeter
+use sensor_client
+use wire
+
+// The sizes of the fields, in octets.
+const PLX_PAIR_SIZE = 4
+const PLX_STATUS_SIZE = 2
+const PLX_DEVICE_SIZE = 3
+const PLX_TIME_SIZE = 7
+const PLX_SFLOAT_SIZE = 2
+
+// One decoded spot-check measurement.  The `has_` bits say which optional fields the value
+// held; a field it did not hold is 0 (the time stamp is all zero, the index is the SFLOAT
+// NaN).  `clock_not_set` is the flag of bit 4 where the value has a time stamp.
+@value
+struct PlxSpotCheckReading
+    spo2: Int
+    pulse_rate: Int
+    has_time: Bool
+    time: wire.DateTime
+    clock_not_set: Bool
+    has_measurement_status: Bool
+    measurement_status: Int
+    has_device_status: Bool
+    device_status: Int
+    has_index: Bool
+    pulse_amplitude_index: Int
+
+// One decoded continuous measurement.  A pair or a field the value did not hold is the SFLOAT NaN
+// (the statuses are 0).
+@value
+struct PlxContinuousReading
+    spo2: Int
+    pulse_rate: Int
+    has_fast: Bool
+    fast_spo2: Int
+    fast_pulse_rate: Int
+    has_slow: Bool
+    slow_spo2: Int
+    slow_pulse_rate: Int
+    has_measurement_status: Bool
+    measurement_status: Int
+    has_device_status: Bool
+    device_status: Int
+    has_index: Bool
+    pulse_amplitude_index: Int
+
+// The decoded PLX Features: the Supported Features bits, and the support fields where the
+// features say the oximeter has the status (0 otherwise).
+@value
+struct PlxFeatures
+    supported: Int
+    measurement_status_support: Int
+    device_status_support: Int
+
+// Whether the length `n` of a value holds `need` octets.
+@tier(embedded)
+@no_alloc
+fn plx_fits(n: Int, at: Int, need: Int) -> Bool
+    n >= at + need
+
+// The spot-check measurement in `b`, `None` when `b` is not a whole one.
+@tier(embedded)
+@no_alloc
+fn plx_decode_spot_check(b: [u8]) -> ?PlxSpotCheckReading
+    let n = list.len(b)
+    if n < 1 + PLX_PAIR_SIZE
+        return None
+    let flags = b[0] as Int
+    var at = 1 + PLX_PAIR_SIZE
+    let has_time = (flags & pulse_oximeter.SPOT_TIMESTAMP) != 0
+    var stamp = wire.date_time_unknown()
+    if has_time
+        if not plx_fits(n, at, PLX_TIME_SIZE)
+            return None
+        stamp = wire.get_date_time(b, at)
+        if not wire.date_time_valid(stamp)
+            return None
+        at = at + PLX_TIME_SIZE
+    let has_status = (flags & pulse_oximeter.SPOT_MEASUREMENT_STATUS) != 0
+    var status = 0
+    if has_status
+        if not plx_fits(n, at, PLX_STATUS_SIZE)
+            return None
+        status = wire.get(b, at, PLX_STATUS_SIZE)
+        at = at + PLX_STATUS_SIZE
+    let has_device = (flags & pulse_oximeter.SPOT_DEVICE_STATUS) != 0
+    var device = 0
+    if has_device
+        if not plx_fits(n, at, PLX_DEVICE_SIZE)
+            return None
+        device = wire.get(b, at, PLX_DEVICE_SIZE)
+        at = at + PLX_DEVICE_SIZE
+    let has_index = (flags & pulse_oximeter.SPOT_PULSE_AMPLITUDE_INDEX) != 0
+    var index = wire.SFLOAT_NAN
+    if has_index
+        if not plx_fits(n, at, PLX_SFLOAT_SIZE)
+            return None
+        index = wire.get(b, at, PLX_SFLOAT_SIZE)
+    Some(PlxSpotCheckReading {
+        spo2: wire.get(b, 1, 2), pulse_rate: wire.get(b, 3, 2), has_time: has_time, time: stamp,
+        clock_not_set: has_time and (flags & pulse_oximeter.SPOT_CLOCK_NOT_SET) != 0,
+        has_measurement_status: has_status, measurement_status: status,
+        has_device_status: has_device, device_status: device, has_index: has_index, pulse_amplitude_index: index })
+
+// The continuous measurement in `b`, `None` when `b` is not a whole one.
+@tier(embedded)
+@no_alloc
+fn plx_decode_continuous(b: [u8]) -> ?PlxContinuousReading
+    let n = list.len(b)
+    if n < 1 + PLX_PAIR_SIZE
+        return None
+    let flags = b[0] as Int
+    var at = 1 + PLX_PAIR_SIZE
+    let has_fast = (flags & pulse_oximeter.CONTINUOUS_FAST) != 0
+    var fast_spo2 = wire.SFLOAT_NAN
+    var fast_pr = wire.SFLOAT_NAN
+    if has_fast
+        if not plx_fits(n, at, PLX_PAIR_SIZE)
+            return None
+        fast_spo2 = wire.get(b, at, 2)
+        fast_pr = wire.get(b, at + 2, 2)
+        at = at + PLX_PAIR_SIZE
+    let has_slow = (flags & pulse_oximeter.CONTINUOUS_SLOW) != 0
+    var slow_spo2 = wire.SFLOAT_NAN
+    var slow_pr = wire.SFLOAT_NAN
+    if has_slow
+        if not plx_fits(n, at, PLX_PAIR_SIZE)
+            return None
+        slow_spo2 = wire.get(b, at, 2)
+        slow_pr = wire.get(b, at + 2, 2)
+        at = at + PLX_PAIR_SIZE
+    let has_status = (flags & pulse_oximeter.CONTINUOUS_MEASUREMENT_STATUS) != 0
+    var status = 0
+    if has_status
+        if not plx_fits(n, at, PLX_STATUS_SIZE)
+            return None
+        status = wire.get(b, at, PLX_STATUS_SIZE)
+        at = at + PLX_STATUS_SIZE
+    let has_device = (flags & pulse_oximeter.CONTINUOUS_DEVICE_STATUS) != 0
+    var device = 0
+    if has_device
+        if not plx_fits(n, at, PLX_DEVICE_SIZE)
+            return None
+        device = wire.get(b, at, PLX_DEVICE_SIZE)
+        at = at + PLX_DEVICE_SIZE
+    let has_index = (flags & pulse_oximeter.CONTINUOUS_PULSE_AMPLITUDE_INDEX) != 0
+    var index = wire.SFLOAT_NAN
+    if has_index
+        if not plx_fits(n, at, PLX_SFLOAT_SIZE)
+            return None
+        index = wire.get(b, at, PLX_SFLOAT_SIZE)
+    Some(PlxContinuousReading {
+        spo2: wire.get(b, 1, 2), pulse_rate: wire.get(b, 3, 2),
+        has_fast: has_fast, fast_spo2: fast_spo2, fast_pulse_rate: fast_pr,
+        has_slow: has_slow, slow_spo2: slow_spo2, slow_pulse_rate: slow_pr,
+        has_measurement_status: has_status, measurement_status: status,
+        has_device_status: has_device, device_status: device, has_index: has_index, pulse_amplitude_index: index })
+
+// PLX Features in `b`, `None` unless it is the length its Supported Features imply: two octets, plus
+// two for the Measurement Status Support when bit 0 is set, plus three for the Device and Sensor
+// Status Support when bit 1 is set.
+@tier(embedded)
+@no_alloc
+fn plx_decode_features(b: [u8]) -> ?PlxFeatures
+    let n = list.len(b)
+    if n < 2
+        return None
+    let supported = wire.get(b, 0, 2)
+    var at = 2
+    var status = 0
+    if (supported & pulse_oximeter.FEATURE_MEASUREMENT_STATUS) != 0
+        if not plx_fits(n, at, PLX_STATUS_SIZE)
+            return None
+        status = wire.get(b, at, PLX_STATUS_SIZE)
+        at = at + PLX_STATUS_SIZE
+    var device = 0
+    if (supported & pulse_oximeter.FEATURE_DEVICE_STATUS) != 0
+        if not plx_fits(n, at, PLX_DEVICE_SIZE)
+            return None
+        device = wire.get(b, at, PLX_DEVICE_SIZE)
+        at = at + PLX_DEVICE_SIZE
+    if n != at
+        return None
+    Some(PlxFeatures { supported: supported, measurement_status_support: status, device_status_support: device })
+
+// What the SFLOAT `raw` holds: one of the `wire.KIND_` values.
+@tier(embedded)
+@no_alloc
+fn plx_sfloat_kind(raw: Int) -> Int
+    wire.sfloat_kind(raw)
+
+// The number the SFLOAT `raw` holds, times 10^`decimals`, rounded; 0 for a special value.
+@tier(embedded)
+@no_alloc
+fn plx_scaled(raw: Int, decimals: Int) -> Int
+    wire.sfloat_scaled(raw, decimals)
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn plx_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, pulse_oximeter.UUID_PULSE_OXIMETER_SERVICE)
+
+// Discover the service, read PLX Features, enable the indication of the spot-check measurement, the
+// notification of the continuous measurement and the indication of the Features, each optional.
+@tier(app)
+fn plx_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, pulse_oximeter.UUID_PLX_FEATURES, false)
+    sensor_client.sc_queue_subscribe(var c, pulse_oximeter.UUID_PLX_SPOT_CHECK_MEASUREMENT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, pulse_oximeter.UUID_PLX_CONTINUOUS_MEASUREMENT, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, pulse_oximeter.UUID_PLX_FEATURES, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)

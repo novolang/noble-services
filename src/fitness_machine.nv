@@ -1,0 +1,880 @@
+// src/fitness_machine.nv — the Fitness Machine Service
+// (0x1826).
+//
+// A treadmill or an indoor bike reports its data to a client and takes
+// targets and commands from it. The service holds, in the order the builder
+// adds them:
+//
+//   Fitness Machine Feature   0x2ACC   Read; 8 octets, the machine features
+//                                      and the target setting features
+//                                      (mandatory)
+//   Treadmill Data            0x2ACD   Notify, with a descriptor; optional
+//   Indoor Bike Data          0x2AD2   Notify, with a descriptor; optional
+//   Training Status           0x2AD3   Read, Notify, with a descriptor;
+//                                      optional
+//   Fitness Machine Control Point 0x2AD9   Write, Indicate, with a
+//                                      descriptor; optional
+//   Fitness Machine Status    0x2ADA   Notify, with a descriptor; present
+//                                      with the control point
+//   Supported Speed, Inclination, Resistance Level, Power and Heart Rate
+//   Range                     0x2AD4 to 0x2AD8   Read; one for each target
+//                                      setting feature the machine offers
+//
+// Checked against the Fitness Machine Service 1.0.1 (FTMS), the Fitness
+// Machine Profile 1.0.1 (FTMP) and the FTMP and FTMS test specifications:
+// the feature bits, the flags bits of the two data characteristics, the
+// Training Status values and flags, the control point opcodes, parameters
+// and results, the Fitness Machine Status opcodes and parameters, the
+// Reset, Start and Stop behaviour, the Error Codes 0xFD and 0xFE, the
+// splitting of a data record and the security levels. Not checked, because
+// the Assigned Numbers are not among those documents: the characteristic
+// UUIDs, the widths and units of the data fields (the control point and
+// status parameters name their units in FTMS), the octet order and width of
+// the Supported Range fields beyond the lengths of 6, 6, 3, 6 and 3 octets
+// that the FTMP test specification lists, and the AD type number 0x16 of the
+// Service Data record.
+//
+// Treadmill Data and Indoor Bike Data build the fields of speed, average
+// speed, distance, inclination, expended energy, heart rate, elapsed and
+// remaining time, and for the bike the cadence and the power. The pace,
+// elevation gain, metabolic equivalent, force on belt and power output
+// fields, and the resistance level of the bike (its width is in the
+// Assigned Numbers) are not built. A record that does not fit one
+// notification is split over several, the More Data bit set in all but the
+// last, which holds the speed (FTMS section 4.19). A field a machine cannot
+// compute is Data Not Available: the expended energy fields take a negative
+// number for it.
+//
+// The control point takes these procedures, written as an opcode and a
+// parameter, and answers each with an indication of 0x80, the opcode and a
+// result:
+//
+//   0x00 Request Control        0x05 Set Target Power, SINT16, watts
+//   0x01 Reset                  0x06 Set Target Heart Rate, UINT8, bpm
+//   0x02 Set Target Speed       0x07 Start or Resume
+//   0x03 Set Target Inclination 0x08 Stop or Pause, UINT8: 1 stop, 2 pause
+//   0x04 Set Target Resistance Level, UINT8, unitless in steps of 0.1
+//
+// A target outside its Supported Range, or a parameter of the wrong length,
+// is answered Invalid Parameter; a Start or Resume of a machine that runs
+// and a Stop or Pause of one that does not are Operation Failed. The
+// procedures 0x09 to 0x13 and 0x15 (the targeted expended energy, steps,
+// strides, distance, training time and heart rate zones, the indoor bike
+// simulation parameters, the wheel circumference, the spin down and the
+// targeted cadence) are not built: they answer Op Code Not Supported. FTMS
+// Table 4.15 numbers the targeted cadence 0x14, which the FTMP test
+// specification gives as 0x15.
+//
+// A procedure needs control, which Request Control grants and which ends
+// with the link, with Reset, or with `fitness_control_permission_lost`
+// (FTMS section 4.16.2.1); a target needs its bit in the target setting
+// features. `fitness_handle_control_point` applies a write to a
+// `FitnessMachineState`, answers the response indication and the Fitness
+// Machine Status notification the procedure calls for, and after a Reset
+// sets the Training Status to Idle. A client that has not enabled
+// indications on the control point is refused with the Error Code 0xFD, and
+// one that writes while an indication is unconfirmed with 0xFE; the
+// indication that the client does not confirm within the ATT transaction
+// timeout ends the use of the bearer (`gatt_server.tick`). The service
+// serves one client: the notifications to other connected clients and the
+// loss of control to a second client that asks for it are the program's.
+//
+// Security (FTMP section 6.1): every characteristic is open to a link of
+// security mode 1 level 1, except the control point, whose write needs level
+// 2 or higher. `add_fitness_machine_service` refuses a configuration whose
+// control point write is Open, Authorized or Denied, and one whose Feature
+// and Training Status cannot be read.
+
+use gap
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_FITNESS_MACHINE_SERVICE = 0x1826
+const UUID_FITNESS_MACHINE_FEATURE = 0x2ACC
+const UUID_TREADMILL_DATA = 0x2ACD
+const UUID_INDOOR_BIKE_DATA = 0x2AD2
+const UUID_TRAINING_STATUS = 0x2AD3
+const UUID_FITNESS_MACHINE_CONTROL_POINT = 0x2AD9
+const UUID_FITNESS_MACHINE_STATUS = 0x2ADA
+const UUID_SUPPORTED_SPEED_RANGE = 0x2AD4
+const UUID_SUPPORTED_INCLINATION_RANGE = 0x2AD5
+const UUID_SUPPORTED_RESISTANCE_LEVEL_RANGE = 0x2AD6
+const UUID_SUPPORTED_HEART_RATE_RANGE = 0x2AD7
+const UUID_SUPPORTED_POWER_RANGE = 0x2AD8
+
+// The bits of the Fitness Machine Type field of the Service Data, and the
+// Fitness Machine Available bit of its Flags (FTMS section 3.1).
+const FITNESS_TYPE_TREADMILL = 0x0001
+const FITNESS_TYPE_CROSS_TRAINER = 0x0002
+const FITNESS_TYPE_STEP_CLIMBER = 0x0004
+const FITNESS_TYPE_STAIR_CLIMBER = 0x0008
+const FITNESS_TYPE_ROWER = 0x0010
+const FITNESS_TYPE_INDOOR_BIKE = 0x0020
+const FLAGS_AVAILABLE = 0x01
+
+// The More Data bit of the flags of a data characteristic, and the values
+// that mean Data Not Available (FTMS sections 4.4.1 and 4.9.1).
+const MORE_DATA = 0x0001
+const NOT_AVAILABLE_ENERGY = 0xFFFF
+const NOT_AVAILABLE_PER_MINUTE = 0xFF
+const NOT_AVAILABLE_SINT16 = 0x7FFF
+
+// The bits of the machine features field of Fitness Machine Feature.
+const MACHINE_AVERAGE_SPEED = 0x00000001
+const MACHINE_CADENCE = 0x00000002
+const MACHINE_TOTAL_DISTANCE = 0x00000004
+const MACHINE_INCLINATION = 0x00000008
+const MACHINE_RESISTANCE_LEVEL = 0x00000080
+const MACHINE_EXPENDED_ENERGY = 0x00000200
+const MACHINE_HEART_RATE = 0x00000400
+const MACHINE_ELAPSED_TIME = 0x00001000
+const MACHINE_REMAINING_TIME = 0x00002000
+const MACHINE_POWER_MEASUREMENT = 0x00004000
+
+// The bits of the target setting features field.
+const TARGET_SPEED = 0x00000001
+const TARGET_INCLINATION = 0x00000002
+const TARGET_RESISTANCE = 0x00000004
+const TARGET_POWER = 0x00000008
+const TARGET_HEART_RATE = 0x00000010
+
+// The opcodes of the control point, and the code of a response.
+const OP_REQUEST_CONTROL = 0x00
+const OP_RESET = 0x01
+const OP_SET_TARGET_SPEED = 0x02
+const OP_SET_TARGET_INCLINATION = 0x03
+const OP_SET_TARGET_RESISTANCE = 0x04
+const OP_SET_TARGET_POWER = 0x05
+const OP_SET_TARGET_HEART_RATE = 0x06
+const OP_START_OR_RESUME = 0x07
+const OP_STOP_OR_PAUSE = 0x08
+const OP_RESPONSE_CODE = 0x80
+
+// The parameter of Stop or Pause.
+const STOP = 0x01
+const PAUSE = 0x02
+
+// The result of a procedure.
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_PARAMETER = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+const RESULT_CONTROL_NOT_PERMITTED = 0x05
+
+// The Error Codes of a write to the control point: the client has not
+// enabled indications, and an indication is unconfirmed.
+const ERR_CCCD_IMPROPERLY_CONFIGURED = 0xFD
+const ERR_PROCEDURE_ALREADY_IN_PROGRESS = 0xFE
+
+// The opcodes of a Fitness Machine Status notification.
+const STATUS_RESET = 0x01
+const STATUS_STOPPED_OR_PAUSED = 0x02
+const STATUS_STOPPED_BY_SAFETY_KEY = 0x03
+const STATUS_STARTED_OR_RESUMED = 0x04
+const STATUS_TARGET_SPEED_CHANGED = 0x05
+const STATUS_TARGET_INCLINATION_CHANGED = 0x06
+const STATUS_TARGET_RESISTANCE_CHANGED = 0x07
+const STATUS_TARGET_POWER_CHANGED = 0x08
+const STATUS_TARGET_HEART_RATE_CHANGED = 0x09
+const STATUS_CONTROL_PERMISSION_LOST = 0xFF
+
+// The Training Status values (FTMS section 4.10.1.2), and the bits of its
+// flags octet.
+const TRAINING_OTHER = 0x00
+const TRAINING_IDLE = 0x01
+const TRAINING_WARMING_UP = 0x02
+const TRAINING_LOW_INTENSITY_INTERVAL = 0x03
+const TRAINING_HIGH_INTENSITY_INTERVAL = 0x04
+const TRAINING_RECOVERY_INTERVAL = 0x05
+const TRAINING_ISOMETRIC = 0x06
+const TRAINING_HEART_RATE_CONTROL = 0x07
+const TRAINING_FITNESS_TEST = 0x08
+const TRAINING_SPEED_OUTSIDE_CONTROL_LOW = 0x09
+const TRAINING_SPEED_OUTSIDE_CONTROL_HIGH = 0x0A
+const TRAINING_COOL_DOWN = 0x0B
+const TRAINING_WATT_CONTROL = 0x0C
+const TRAINING_MANUAL_MODE = 0x0D
+const TRAINING_PRE_WORKOUT = 0x0E
+const TRAINING_POST_WORKOUT = 0x0F
+const TRAINING_STRING_PRESENT = 0x01
+const TRAINING_EXTENDED_STRING = 0x02
+
+// The bits of the flags field of Treadmill Data. Bit 0 is clear when the
+// instantaneous speed is in the value, which it always is here.
+const TREADMILL_AVERAGE_SPEED = 0x0002
+const TREADMILL_TOTAL_DISTANCE = 0x0004
+const TREADMILL_INCLINATION = 0x0008
+const TREADMILL_EXPENDED_ENERGY = 0x0080
+const TREADMILL_HEART_RATE = 0x0100
+const TREADMILL_ELAPSED_TIME = 0x0400
+const TREADMILL_REMAINING_TIME = 0x0800
+
+// The bits of the flags field of Indoor Bike Data; bit 0 is clear when the
+// instantaneous speed is in the value.
+const BIKE_AVERAGE_SPEED = 0x0002
+const BIKE_INSTANTANEOUS_CADENCE = 0x0004
+const BIKE_AVERAGE_CADENCE = 0x0008
+const BIKE_TOTAL_DISTANCE = 0x0010
+const BIKE_INSTANTANEOUS_POWER = 0x0040
+const BIKE_AVERAGE_POWER = 0x0080
+const BIKE_EXPENDED_ENERGY = 0x0100
+const BIKE_HEART_RATE = 0x0200
+const BIKE_ELAPSED_TIME = 0x0800
+const BIKE_REMAINING_TIME = 0x1000
+
+// The value of Fitness Machine Feature: the machine features, then the
+// target setting features, 32 bits each.
+fn fitness_machine_feature_value(machine: Int, targets: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, machine, 4)
+    wire.put(var out, targets, 4)
+    out
+
+// The `octets`-octet little-endian field of `v`.
+fn field_of(v: Int, octets: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, v, octets)
+    out
+
+// The expended energy of a data field: kilocalories in total, per hour and
+// per minute. A negative value is Data Not Available.
+struct ExpendedEnergy
+    total: Int
+    per_hour: Int
+    per_minute: Int
+
+fn put_energy(var out: [u8], e: ExpendedEnergy)
+    wire.put(var out, if e.total < 0 then NOT_AVAILABLE_ENERGY else wire.clamp(e.total, 0, 0xFFFE), 2)
+    wire.put(var out, if e.per_hour < 0 then NOT_AVAILABLE_ENERGY else wire.clamp(e.per_hour, 0, 0xFFFE), 2)
+    wire.put(var out, if e.per_minute < 0 then NOT_AVAILABLE_PER_MINUTE else wire.clamp(e.per_minute, 0, 0xFE), 1)
+
+// The optional fields of a Data Record, each with the flags bit that
+// announces it, in the order they follow the Instantaneous Speed field.
+struct DataItems
+    var bits: [Int]
+    var fields: [[u8]]
+
+fn new_items() -> DataItems
+    DataItems { bits: [], fields: [] }
+
+fn add_item(var items: DataItems, bit: Int, field: [u8])
+    list.push(items.bits, bit)
+    list.push(items.fields, field[:])
+
+// The octets of the fields from the one at `at` on.
+fn items_octets(items: DataItems, at: Int) -> Int
+    var n = 0
+    for i in at..list.len(items.fields)
+        n = n + list.len(items.fields[i])
+    n
+
+// The notification values of one Data Record (FTMS section 4.19). A record
+// whose flags, Instantaneous Speed and fields fit `capacity` octets is one
+// value. A longer one is split: every value but the last has the More Data
+// bit set and carries some of the fields and no speed, and the last has the
+// bit clear, the speed and the fields that remain.
+fn data_records(items: DataItems, speed: [u8], capacity: Int) -> [[u8]]
+    var records: [[u8]] = []
+    let n = list.len(items.bits)
+    var at = 0
+    while 2 + list.len(speed) + items_octets(items, at) > capacity
+        var flags = MORE_DATA
+        var room = capacity - 2
+        var chunk: [u8] = []
+        var took = 0
+        while at < n and (took == 0 or list.len(items.fields[at]) <= room)
+            flags = flags | items.bits[at]
+            list.append(chunk, items.fields[at])
+            room = room - list.len(items.fields[at])
+            at = at + 1
+            took = took + 1
+        if took == 0
+            break
+        var record: [u8] = []
+        wire.put(var record, flags, 2)
+        list.append(record, chunk)
+        list.push(records, record)
+    var last_flags = 0
+    var rest: [u8] = []
+    for i in at..n
+        last_flags = last_flags | items.bits[i]
+        list.append(rest, items.fields[i])
+    var last: [u8] = []
+    wire.put(var last, last_flags, 2)
+    list.append(last, speed)
+    list.append(last, rest)
+    list.push(records, last)
+    records
+
+// One Treadmill Data value. `speed` is in units of 0.01 kilometre per hour.
+// A field of -1, or an `energy` or `inclination` flag that is false, is not
+// in the value. `average_speed` has the unit of `speed`, `total_distance`
+// is in metres (24 bits), `inclination` in units of 0.1 percent with its
+// `ramp_angle` in units of 0.1 degree, `heart_rate` in beats per minute and
+// the two times in seconds. These units are the ones the service
+// specification names for the control point and the status; the data
+// fields' own widths and units are in the Assigned Numbers.
+struct TreadmillData
+    speed: Int
+    average_speed: Int
+    total_distance: Int
+    has_inclination: Bool
+    inclination: Int
+    ramp_angle: Int
+    has_energy: Bool
+    energy: ExpendedEnergy
+    heart_rate: Int
+    elapsed_time: Int
+    remaining_time: Int
+
+// Treadmill Data of `speed` and nothing else.
+fn treadmill_speed_only(speed: Int) -> TreadmillData
+    TreadmillData {
+        speed: speed, average_speed: -1, total_distance: -1, has_inclination: false, inclination: 0, ramp_angle: 0,
+        has_energy: false, energy: ExpendedEnergy { total: 0, per_hour: 0, per_minute: 0 }, heart_rate: -1,
+        elapsed_time: -1, remaining_time: -1 }
+
+fn treadmill_items(d: TreadmillData) -> DataItems
+    var items = new_items()
+    if d.average_speed >= 0
+        add_item(var items, TREADMILL_AVERAGE_SPEED, field_of(wire.clamp(d.average_speed, 0, 0xFFFF), 2))
+    if d.total_distance >= 0
+        add_item(var items, TREADMILL_TOTAL_DISTANCE, field_of(wire.clamp(d.total_distance, 0, 0xFFFFFF), 3))
+    if d.has_inclination
+        var f = field_of(wire.clamp(d.inclination, -32768, 32767), 2)
+        wire.put(var f, wire.clamp(d.ramp_angle, -32768, 32767), 2)
+        add_item(var items, TREADMILL_INCLINATION, f)
+    if d.has_energy
+        var f: [u8] = []
+        put_energy(var f, d.energy)
+        add_item(var items, TREADMILL_EXPENDED_ENERGY, f)
+    if d.heart_rate >= 0
+        add_item(var items, TREADMILL_HEART_RATE, field_of(wire.clamp(d.heart_rate, 0, 0xFF), 1))
+    if d.elapsed_time >= 0
+        add_item(var items, TREADMILL_ELAPSED_TIME, field_of(wire.clamp(d.elapsed_time, 0, 0xFFFF), 2))
+    if d.remaining_time >= 0
+        add_item(var items, TREADMILL_REMAINING_TIME, field_of(wire.clamp(d.remaining_time, 0, 0xFFFF), 2))
+    items
+
+// The notification values of Treadmill Data for an ATT payload of `capacity`
+// octets (ATT_MTU less three): one, or several when the record is split.
+fn treadmill_data_records(d: TreadmillData, capacity: Int) -> [[u8]]
+    data_records(treadmill_items(d), field_of(wire.clamp(d.speed, 0, 0xFFFF), 2), capacity)
+
+// The value of Treadmill Data as one notification.
+fn treadmill_data_value(d: TreadmillData) -> [u8]
+    treadmill_data_records(d, gatt_server.ATT_VALUE_MAX)[0]
+
+// One Indoor Bike Data value. `speed` is in units of 0.01 kilometre per
+// hour, the cadences in units of 0.5 revolution per minute, `total_distance`
+// in metres (24 bits), the powers in watts and the times in seconds. A field
+// of -1, or a `has_power` or `has_energy` flag that is false, is not in the
+// value. The resistance level field is not built: its width and unit are in
+// the Assigned Numbers, which have not been checked.
+struct IndoorBikeData
+    speed: Int
+    average_speed: Int
+    cadence: Int
+    average_cadence: Int
+    total_distance: Int
+    has_power: Bool
+    power: Int
+    average_power: Int
+    has_energy: Bool
+    energy: ExpendedEnergy
+    heart_rate: Int
+    elapsed_time: Int
+    remaining_time: Int
+
+// Indoor Bike Data of `speed` and nothing else.
+fn bike_speed_only(speed: Int) -> IndoorBikeData
+    IndoorBikeData {
+        speed: speed, average_speed: -1, cadence: -1, average_cadence: -1, total_distance: -1, has_power: false,
+        power: 0, average_power: 0, has_energy: false, energy: ExpendedEnergy { total: 0, per_hour: 0, per_minute: 0 },
+        heart_rate: -1, elapsed_time: -1, remaining_time: -1 }
+
+// The average power is in the value when `has_power` is set and
+// `average_power` is not negative.
+fn bike_items(d: IndoorBikeData) -> DataItems
+    var items = new_items()
+    if d.average_speed >= 0
+        add_item(var items, BIKE_AVERAGE_SPEED, field_of(wire.clamp(d.average_speed, 0, 0xFFFF), 2))
+    if d.cadence >= 0
+        add_item(var items, BIKE_INSTANTANEOUS_CADENCE, field_of(wire.clamp(d.cadence, 0, 0xFFFF), 2))
+    if d.average_cadence >= 0
+        add_item(var items, BIKE_AVERAGE_CADENCE, field_of(wire.clamp(d.average_cadence, 0, 0xFFFF), 2))
+    if d.total_distance >= 0
+        add_item(var items, BIKE_TOTAL_DISTANCE, field_of(wire.clamp(d.total_distance, 0, 0xFFFFFF), 3))
+    if d.has_power
+        add_item(var items, BIKE_INSTANTANEOUS_POWER, field_of(wire.clamp(d.power, -32768, 32767), 2))
+        if d.average_power >= 0
+            add_item(var items, BIKE_AVERAGE_POWER, field_of(wire.clamp(d.average_power, 0, 32767), 2))
+    if d.has_energy
+        var f: [u8] = []
+        put_energy(var f, d.energy)
+        add_item(var items, BIKE_EXPENDED_ENERGY, f)
+    if d.heart_rate >= 0
+        add_item(var items, BIKE_HEART_RATE, field_of(wire.clamp(d.heart_rate, 0, 0xFF), 1))
+    if d.elapsed_time >= 0
+        add_item(var items, BIKE_ELAPSED_TIME, field_of(wire.clamp(d.elapsed_time, 0, 0xFFFF), 2))
+    if d.remaining_time >= 0
+        add_item(var items, BIKE_REMAINING_TIME, field_of(wire.clamp(d.remaining_time, 0, 0xFFFF), 2))
+    items
+
+// The notification values of Indoor Bike Data for an ATT payload of
+// `capacity` octets: one, or several when the record is split.
+fn indoor_bike_data_records(d: IndoorBikeData, capacity: Int) -> [[u8]]
+    data_records(bike_items(d), field_of(wire.clamp(d.speed, 0, 0xFFFF), 2), capacity)
+
+// The value of Indoor Bike Data as one notification.
+fn indoor_bike_data_value(d: IndoorBikeData) -> [u8]
+    indoor_bike_data_records(d, gatt_server.ATT_VALUE_MAX)[0]
+
+// The value of Training Status: the flags octet, the status and, when
+// `text` is not empty, the status string as UTF-8, which the flags
+// announce. The Extended String bit is set when the string does not fit a
+// notification of an ATT_MTU of `mtu` (the MTU less 5 octets), and the client
+// reads the rest with Read Long.
+fn training_status_value(status: Int, text: [u8], mtu: Int) -> [u8]
+    let present = if list.len(text) > 0 then TRAINING_STRING_PRESENT else 0
+    let extended = if list.len(text) > mtu - 5 then TRAINING_EXTENDED_STRING else 0
+    var out: [u8] = list.with_capacity(2 + list.len(text))
+    list.append(out, [(present | extended) as u8, status as u8])
+    list.append(out, text)
+    out
+
+// The minimum, the maximum and the minimum increment of a target the client
+// may set; a Supported Range characteristic holds them.
+struct FitnessRange
+    minimum: Int
+    maximum: Int
+    increment: Int
+
+// The five ranges. The characteristic of a range is present when its target
+// setting feature is; a target outside it is answered Invalid Parameter.
+struct FitnessRanges
+    speed: FitnessRange
+    inclination: FitnessRange
+    resistance: FitnessRange
+    power: FitnessRange
+    heart_rate: FitnessRange
+
+// Every value the parameter type can hold, in steps of 1.
+fn full_ranges() -> FitnessRanges
+    FitnessRanges {
+        speed: FitnessRange { minimum: 0, maximum: 0xFFFF, increment: 1 },
+        inclination: FitnessRange { minimum: -32768, maximum: 32767, increment: 1 },
+        resistance: FitnessRange { minimum: 0, maximum: 0xFF, increment: 1 },
+        power: FitnessRange { minimum: -32768, maximum: 32767, increment: 1 },
+        heart_rate: FitnessRange { minimum: 0, maximum: 0xFF, increment: 1 } }
+
+// The value of a Supported Range characteristic: three fields of `octets`
+// octets, the minimum, the maximum and the increment.
+fn range_value(r: FitnessRange, octets: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, r.minimum, octets)
+    wire.put(var out, r.maximum, octets)
+    wire.put(var out, r.increment, octets)
+    out
+
+// What the control point has done and what a client may do. `control_granted`
+// is true after Request Control, `running` after Start or Resume and `paused`
+// after Pause. A target is -1 until the client sets it, and again after
+// Reset, which stands for the default of the target; the signed ones have a
+// flag beside them. `target_features` is the target setting features the
+// machine offers and `ranges` what a target may be.
+struct FitnessMachineState
+    target_features: Int
+    ranges: FitnessRanges
+    var control_granted: Bool
+    var running: Bool
+    var paused: Bool
+    var target_speed: Int
+    var target_inclination_set: Bool
+    var target_inclination: Int
+    var target_resistance: Int
+    var target_power_set: Bool
+    var target_power: Int
+    var target_heart_rate: Int
+
+// A state whose ranges are all the values the parameters can hold.
+fn new_fitness_machine_state(target_features: Int) -> FitnessMachineState
+    state_with_ranges(target_features, full_ranges())
+
+fn state_with_ranges(target_features: Int, ranges: FitnessRanges) -> FitnessMachineState
+    FitnessMachineState {
+        target_features: target_features, ranges: ranges, control_granted: false, running: false, paused: false,
+        target_speed: -1, target_inclination_set: false, target_inclination: 0, target_resistance: -1,
+        target_power_set: false, target_power: 0, target_heart_rate: -1 }
+
+// A response and the status notification that goes with it, empty when the
+// procedure calls for none.
+struct FitnessOutcome
+    response: [u8]
+    status: [u8]
+
+fn outcome(op: Int, result: Int, status: [u8]) -> FitnessOutcome
+    FitnessOutcome { response: [OP_RESPONSE_CODE, op as u8, result as u8], status: status }
+
+fn status_with(op: Int, parameter: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(1 + list.len(parameter))
+    list.append(out, [op as u8])
+    list.append(out, parameter)
+    out
+
+fn clear_targets(var state: FitnessMachineState)
+    state.target_speed = -1
+    state.target_inclination_set = false
+    state.target_inclination = 0
+    state.target_resistance = -1
+    state.target_power_set = false
+    state.target_power = 0
+    state.target_heart_rate = -1
+
+// Whether `v` lies in `r`.
+fn in_range(r: FitnessRange, v: Int) -> Bool
+    v >= r.minimum and v <= r.maximum
+
+// Whether the machine takes the procedure `op`, given the target setting
+// features.
+fn supports(state: FitnessMachineState, op: Int) -> Bool
+    match op
+        OP_REQUEST_CONTROL => true
+        OP_RESET => true
+        OP_SET_TARGET_SPEED => (state.target_features & TARGET_SPEED) != 0
+        OP_SET_TARGET_INCLINATION => (state.target_features & TARGET_INCLINATION) != 0
+        OP_SET_TARGET_RESISTANCE => (state.target_features & TARGET_RESISTANCE) != 0
+        OP_SET_TARGET_POWER => (state.target_features & TARGET_POWER) != 0
+        OP_SET_TARGET_HEART_RATE => (state.target_features & TARGET_HEART_RATE) != 0
+        OP_START_OR_RESUME => true
+        OP_STOP_OR_PAUSE => true
+        _ => false
+
+// The outcome of the procedure `op`, which needs control, with the request
+// octets that follow the opcode in `parameter`. Reset ends the control
+// (FTMS section 4.16.2.1). A parameter outside the supported range, or of the
+// wrong length, is Invalid Parameter, and a Start or Resume of a machine that
+// runs, or a Stop or Pause of one that does not, is Operation Failed
+// (section 4.16.2.22).
+fn apply_procedure(var state: FitnessMachineState, op: Int, parameter: [u8]) -> FitnessOutcome
+    let n = list.len(parameter)
+    match op
+        OP_RESET =>
+            state.running = false
+            state.paused = false
+            state.control_granted = false
+            clear_targets(var state)
+            outcome(op, RESULT_SUCCESS, [STATUS_RESET])
+        OP_SET_TARGET_SPEED =>
+            if n != 2 or not in_range(state.ranges.speed, wire.get(parameter, 0, 2))
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            state.target_speed = wire.get(parameter, 0, 2)
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_TARGET_SPEED_CHANGED, parameter))
+        OP_SET_TARGET_INCLINATION =>
+            if n != 2 or not in_range(state.ranges.inclination, wire.get_signed(parameter, 0, 2))
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            state.target_inclination = wire.get_signed(parameter, 0, 2)
+            state.target_inclination_set = true
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_TARGET_INCLINATION_CHANGED, parameter))
+        OP_SET_TARGET_RESISTANCE =>
+            if n != 1 or not in_range(state.ranges.resistance, wire.get(parameter, 0, 1))
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            state.target_resistance = wire.get(parameter, 0, 1)
+            // The request holds a UINT8, the status a SINT16.
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_TARGET_RESISTANCE_CHANGED, field_of(state.target_resistance, 2)))
+        OP_SET_TARGET_POWER =>
+            if n != 2 or not in_range(state.ranges.power, wire.get_signed(parameter, 0, 2))
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            state.target_power = wire.get_signed(parameter, 0, 2)
+            state.target_power_set = true
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_TARGET_POWER_CHANGED, parameter))
+        OP_SET_TARGET_HEART_RATE =>
+            if n != 1 or not in_range(state.ranges.heart_rate, wire.get(parameter, 0, 1))
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            state.target_heart_rate = wire.get(parameter, 0, 1)
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_TARGET_HEART_RATE_CHANGED, parameter))
+        OP_START_OR_RESUME =>
+            if state.running
+                return outcome(op, RESULT_OPERATION_FAILED, [])
+            state.running = true
+            state.paused = false
+            outcome(op, RESULT_SUCCESS, [STATUS_STARTED_OR_RESUMED])
+        OP_STOP_OR_PAUSE =>
+            if n != 1 or (parameter[0] as Int != STOP and parameter[0] as Int != PAUSE)
+                return outcome(op, RESULT_INVALID_PARAMETER, [])
+            let pause = parameter[0] as Int == PAUSE
+            if not state.running and (pause or not state.paused)
+                return outcome(op, RESULT_OPERATION_FAILED, [])
+            state.running = false
+            state.paused = pause
+            outcome(op, RESULT_SUCCESS, status_with(STATUS_STOPPED_OR_PAUSED, parameter))
+        _ => outcome(op, RESULT_OP_CODE_NOT_SUPPORTED, [])
+
+// The outcome of the request written to the control point.
+fn fitness_control_point_outcome(var state: FitnessMachineState, request: [u8]) -> FitnessOutcome
+    if list.len(request) == 0
+        return outcome(0, RESULT_OP_CODE_NOT_SUPPORTED, [])
+    let op = request[0] as Int
+    if not supports(state, op)
+        return outcome(op, RESULT_OP_CODE_NOT_SUPPORTED, [])
+    if op == OP_REQUEST_CONTROL
+        state.control_granted = true
+        return outcome(op, RESULT_SUCCESS, [])
+    if not state.control_granted
+        return outcome(op, RESULT_CONTROL_NOT_PERMITTED, [])
+    apply_procedure(var state, op, request[1:])
+
+// The configuration of the service, in two parts.
+//
+// What the service makes mandatory (FTMS table 4.1): `machine_features` and `target_features`
+// are the two fields of Fitness Machine Feature, and `read` is the access to
+// the Feature and the Training Status (never Denied). A Supported Range
+// characteristic is mandatory with its target setting feature, so `ranges`
+// is used for the targets `target_features` names.
+//
+// What it leaves optional: `treadmill`, `indoor_bike` and `training_status`
+// say which of those characteristics are present, and `control_point`
+// whether the control point and the Fitness Machine Status are.
+// `data_cccd` is the access to the descriptors of the data, the Training
+// Status and the Status, `control_point_write` the access to the control
+// point and `control_point_cccd` the access to its descriptor. The profile
+// asks for security level 2 or higher on the control point (section 6.1), so
+// `control_point_write` is Encrypted, Authenticated or SecureConnections.
+struct FitnessMachineConfig
+    machine_features: Int
+    target_features: Int
+    ranges: FitnessRanges
+    read: gatt_server.Access
+    treadmill: Bool
+    indoor_bike: Bool
+    training_status: Bool
+    control_point: Bool
+    data_cccd: gatt_server.Permissions
+    control_point_write: gatt_server.Access
+    control_point_cccd: gatt_server.Permissions
+
+// The access to the control point's descriptor: any client reads it, and
+// the write needs an encrypted link, as the control point does.
+fn encrypted_control_point_cccd() -> gatt_server.Permissions
+    gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted }
+
+// A treadmill with the training status and the control point, open to any
+// client except for the control point, which needs an encrypted link.
+fn default_treadmill_config(machine_features: Int, target_features: Int) -> FitnessMachineConfig
+    FitnessMachineConfig {
+        machine_features: machine_features, target_features: target_features, ranges: full_ranges(),
+        read: gatt_server.Access.Open, treadmill: true, indoor_bike: false, training_status: true, control_point: true,
+        data_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Encrypted,
+        control_point_cccd: encrypted_control_point_cccd() }
+
+// An indoor bike with the training status and the control point, open to
+// any client except for the control point, which needs an encrypted link.
+fn default_indoor_bike_config(machine_features: Int, target_features: Int) -> FitnessMachineConfig
+    FitnessMachineConfig {
+        machine_features: machine_features, target_features: target_features, ranges: full_ranges(),
+        read: gatt_server.Access.Open, treadmill: false, indoor_bike: true, training_status: true, control_point: true,
+        data_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Encrypted,
+        control_point_cccd: encrypted_control_point_cccd() }
+
+// The state for a machine of `config`: its target setting features and ranges.
+fn fitness_state_for(config: FitnessMachineConfig) -> FitnessMachineState
+    state_with_ranges(config.target_features, config.ranges)
+
+// Whether `access` is at least security mode 1 level 2, which the profile
+// asks of the control point.
+fn is_encrypted_access(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        Open => false
+        Authorized => false
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+
+// Whether a client can read at `access` at all.
+fn is_readable_access(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        _ => true
+
+// The handles of the service; a characteristic or descriptor that is not
+// present is 0.
+struct FitnessMachineHandles
+    service: Int
+    feature: Int
+    treadmill: Int
+    treadmill_cccd: Int
+    indoor_bike: Int
+    indoor_bike_cccd: Int
+    training_status: Int
+    training_status_cccd: Int
+    control_point: Int
+    control_point_cccd: Int
+    status: Int
+    status_cccd: Int
+    speed_range: Int
+    inclination_range: Int
+    resistance_range: Int
+    power_range: Int
+    heart_rate_range: Int
+
+// Add a notified value with its descriptor: the value handle and the
+// descriptor handle.
+fn add_notified(var db: GattDb, uuid16: Int, cccd: gatt_server.Permissions) -> Result<(Int, Int), profile_builder.ProfileError>
+    let value = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(uuid16), [])!
+    let descriptor = profile_builder.add_cccd(var db, cccd)!
+    Ok((value, descriptor))
+
+// Add a Supported Range characteristic when the target setting feature
+// `bit` is set: its handle, 0 when it is not.
+fn add_range(var db: GattDb, config: FitnessMachineConfig, bit: Int, uuid16: Int, r: FitnessRange, octets: Int) -> Result<Int, profile_builder.ProfileError>
+    if (config.target_features & bit) == 0
+        return Ok(0)
+    profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read), gatt_server.le16(uuid16), range_value(r, octets))
+
+// Add the service after the last attribute of `server`.
+fn add_fitness_machine_service(var db: GattDb, config: FitnessMachineConfig) -> Result<FitnessMachineHandles, profile_builder.ProfileError>
+    if not is_readable_access(config.read)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if config.control_point and not is_encrypted_access(config.control_point_write)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_FITNESS_MACHINE_SERVICE))!
+    let feature = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read),
+        gatt_server.le16(UUID_FITNESS_MACHINE_FEATURE), fitness_machine_feature_value(config.machine_features, config.target_features))!
+    var treadmill = (0, 0)
+    if config.treadmill
+        treadmill = add_notified(var db, UUID_TREADMILL_DATA, config.data_cccd)!
+    var bike = (0, 0)
+    if config.indoor_bike
+        bike = add_notified(var db, UUID_INDOOR_BIKE_DATA, config.data_cccd)!
+    var training = (0, 0)
+    if config.training_status
+        let value = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY,
+            profile_builder.read_only(config.read), gatt_server.le16(UUID_TRAINING_STATUS),
+            training_status_value(TRAINING_IDLE, [], gatt_server.ATT_DEFAULT_MTU))!
+        training = (value, profile_builder.add_cccd(var db, config.data_cccd)!)
+    var control = (0, 0)
+    var status = (0, 0)
+    if config.control_point
+        var blank: [u8] = []
+        for _ in 0..20
+            list.push(blank, 0)
+        let value = profile_builder.add_value(var db, gatt_server.PROP_WRITE | gatt_server.PROP_INDICATE,
+            profile_builder.write_only(config.control_point_write), gatt_server.le16(UUID_FITNESS_MACHINE_CONTROL_POINT), blank)!
+        control = (value, profile_builder.add_cccd(var db, config.control_point_cccd)!)
+        if not gatt_server.require_indication(var db, value, ERR_CCCD_IMPROPERLY_CONFIGURED, ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+            return Err(profile_builder.ProfileError.NoRoom)
+        status = add_notified(var db, UUID_FITNESS_MACHINE_STATUS, config.data_cccd)!
+    let speed_range = add_range(var db, config, TARGET_SPEED, UUID_SUPPORTED_SPEED_RANGE, config.ranges.speed, 2)!
+    let inclination_range = add_range(var db, config, TARGET_INCLINATION, UUID_SUPPORTED_INCLINATION_RANGE, config.ranges.inclination, 2)!
+    let resistance_range = add_range(var db, config, TARGET_RESISTANCE, UUID_SUPPORTED_RESISTANCE_LEVEL_RANGE, config.ranges.resistance, 1)!
+    let power_range = add_range(var db, config, TARGET_POWER, UUID_SUPPORTED_POWER_RANGE, config.ranges.power, 2)!
+    let heart_rate_range = add_range(var db, config, TARGET_HEART_RATE, UUID_SUPPORTED_HEART_RATE_RANGE, config.ranges.heart_rate, 1)!
+    Ok(FitnessMachineHandles {
+        service: service, feature: feature, treadmill: treadmill.0, treadmill_cccd: treadmill.1,
+        indoor_bike: bike.0, indoor_bike_cccd: bike.1, training_status: training.0, training_status_cccd: training.1,
+        control_point: control.0, control_point_cccd: control.1, status: status.0, status_cccd: status.1,
+        speed_range: speed_range, inclination_range: inclination_range, resistance_range: resistance_range,
+        power_range: power_range, heart_rate_range: heart_rate_range })
+
+// Store each of `values` as the value of `handle` and answer the
+// notification PDUs, in order: the notifications when the client enabled
+// them, none otherwise. The value is not kept for a client that is not
+// there to be notified of it, except for the Training Status, which a client
+// may read.
+fn notify_values(var db: GattDb, var link: AttLink, handle: Int, values: [[u8]], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for v in values
+        let _ = gatt_server.set_value(var db, handle, v)
+        list.append(out, gatt_server.send_value(var db, var link, handle, now_ms))
+    out
+
+// The payload an ATT_MTU leaves for a notification on the first bearer.
+fn notification_room(link: AttLink) -> Int
+    gatt_server.mtu_of(link, 0) - 3
+
+// Store `d` as Treadmill Data and answer the notification PDUs: one
+// notification per value of the record when the client enabled them, none
+// otherwise. A record longer than an ATT_MTU is split (section 4.19).
+fn treadmill_notify(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, d: TreadmillData, now_ms: Int) -> [[u8]]
+    if handles.treadmill == 0
+        return []
+    notify_values(var db, var link, handles.treadmill, treadmill_data_records(d, notification_room(link)), now_ms)
+
+// The same for Indoor Bike Data.
+fn indoor_bike_notify(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, d: IndoorBikeData, now_ms: Int) -> [[u8]]
+    if handles.indoor_bike == 0
+        return []
+    notify_values(var db, var link, handles.indoor_bike, indoor_bike_data_records(d, notification_room(link)), now_ms)
+
+// Store `status` (a Training Status value) with the optional `text` and
+// answer the notification PDUs.
+fn training_status_notify(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, status: Int, text: [u8], now_ms: Int) -> [[u8]]
+    if handles.training_status == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.training_status, training_status_value(status, text, gatt_server.mtu_of(link, 0)))
+    gatt_server.send_value(var db, var link, handles.training_status, now_ms)
+
+// Notify a Fitness Machine Status `value`, whose first octet is the opcode.
+fn fitness_status_notify(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, value: [u8], now_ms: Int) -> [[u8]]
+    if handles.status == 0 or list.len(value) == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.status, value)
+    gatt_server.send_value(var db, var link, handles.status, now_ms)
+
+// The link to the client ended: the control it held ends with it (profile
+// section 4.4.14.2.1). The targets and the machine's run state stay, as the
+// machine goes on with its session.
+fn fitness_link_lost(var state: FitnessMachineState)
+    state.control_granted = false
+
+// Take control from the client: the machine's own user interface or a safety
+// condition ends the client's control. Answers the status notification.
+fn fitness_control_permission_lost(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, var state: FitnessMachineState, now_ms: Int) -> [[u8]]
+    state.control_granted = false
+    fitness_status_notify(var db, var link, handles, [STATUS_CONTROL_PERMISSION_LOST], now_ms)
+
+// The machine stopped on its safety key: the run state ends and the
+// status notification says so.
+fn fitness_stopped_by_safety_key(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, var state: FitnessMachineState, now_ms: Int) -> [[u8]]
+    state.running = false
+    state.paused = false
+    fitness_status_notify(var db, var link, handles, [STATUS_STOPPED_BY_SAFETY_KEY], now_ms)
+
+// Answer the request the client wrote to the control point: apply it to
+// `state` and answer the indication PDUs, the response and then the status
+// notification the procedure calls for. A Reset also sets the Training
+// Status to Idle (FTMS section 4.16.2.2). Call it once for each write, when
+// `gatt_server.take_changed` names the control point.
+fn fitness_handle_control_point(var db: GattDb, var link: AttLink, handles: FitnessMachineHandles, var state: FitnessMachineState, now_ms: Int) -> [[u8]]
+    if handles.control_point == 0
+        return []
+    let i = gatt_server.index_of(db, handles.control_point)
+    let request = db.attributes[i].value[:]
+    let result = fitness_control_point_outcome(var state, request)
+    let _ = gatt_server.set_value(var db, handles.control_point, result.response)
+    var out = gatt_server.send_value(var db, var link, handles.control_point, now_ms)
+    if list.len(result.status) > 0
+        list.append(out, fitness_status_notify(var db, var link, handles, result.status, now_ms))
+    if list.len(request) > 0 and request[0] as Int == OP_RESET and result.response[2] as Int == RESULT_SUCCESS
+        list.append(out, training_status_notify(var db, var link, handles, TRAINING_IDLE, [], now_ms))
+    out
+
+// The Service Data AD structure of a Fitness Machine (FTMS section 3.1):
+// the service UUID, the Flags octet with the Fitness Machine Available bit
+// and the Fitness Machine Type field, whose bits are the FITNESS_TYPE_*
+// constants.
+fn fitness_machine_service_data(available: Bool, types: Int) -> [u8]
+    var data: [u8] = [(if available then FLAGS_AVAILABLE else 0) as u8]
+    wire.put(var data, types, 2)
+    gap.build_service_data_16_record(UUID_FITNESS_MACHINE_SERVICE, data)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// An encrypted link of security mode 1 level 2, which the control point needs.
+fn secure(var s: GattServer)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))

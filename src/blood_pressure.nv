@@ -1,0 +1,576 @@
+// src/blood_pressure.nv — the Blood Pressure Service (0x1810), with
+// which a blood pressure monitor sends measurements to a collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists or
+// records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Blood Pressure Measurement          0x2A35  Indicate; flags, three SFLOATs (the
+//                                               Compound Value), then a time stamp,
+//                                               a pulse rate, a user and a status
+//   Intermediate Cuff Pressure          0x2A36  Notify; optional, the same format
+//                                               with the cuff pressure in the first
+//                                               SFLOAT and NaN in the other two
+//   Blood Pressure Feature              0x2A49  Read; 16 bits, Indicate optional
+//   Enhanced Blood Pressure Measurement 0x2B34  Indicate; optional, the time stamp a
+//                                               uint32 of seconds since an epoch
+//                                               and an optional User Facing Time
+//   Enhanced Intermediate Cuff Pressure 0x2B35  Notify; optional, one SFLOAT
+//
+// Every characteristic with Indicate or Notify has a Client Characteristic
+// Configuration descriptor.  The measurements are time-sensitive data ([BLS]
+// 3.8): the service sends the one it is given and keeps none.
+//
+// Security.  The service imposes none ([BLS] Table 3.1).  The Blood Pressure
+// Profile 1.1.1 raises it ([BLP] 6.1): every supported characteristic is at
+// security mode 1, level 2 or 3.  So `add_bps_service` takes the access of the
+// service as Encrypted, Authenticated or SecureConnections, refuses the others with
+// `NotPermitted`, and puts it on each value and descriptor.
+//
+// The two measurements.  The Enhanced characteristics carry the same fields as the
+// classic ones, with the time stamp as seconds since January 1 of 1900 or 2000 (the
+// Epoch Start 2000 flag) and the User Facing Time ([BLS] 3.4.1.3, 3.4.1.7).  The
+// service has both when `enhanced` is set, and a collector should enable one of
+// them ([BLS] 3.1.1); a service whose collector enabled both indicates in each
+// characteristic it is asked to.
+//
+// The Feature.  Bit 0 to 4 name the detections the Measurement Status may report,
+// and a status bit of a detection the Feature does not name is refused ([BLS]
+// 3.3.1.1 to 3.3.1.5).  Bit 5 (Multiple Bond) is the product's statement.  Bit 8
+// (User Facing Time) allows the field in the Enhanced characteristics.
+//
+// NOT IMPLEMENTED: the Record Access Control Point and the Blood Pressure Record of
+// the Enhanced Blood Pressure Service ([BLS] 3.6, 3.7) with the E2E-CRC (Feature bit
+// 6, refused as NotPermitted), the User Data Service (bit 7 is a declaration the
+// product makes; the service does not include it) and Device Time (bit 8 only
+// allows the field; the clock is the product's).  The storage of measurements for
+// a later connection ([BLS] 3.8) is the product's: it indicates the stored
+// measurements oldest first.
+//
+// Specification checked against: Blood Pressure Service 1.1.1 (BLS), Blood
+// Pressure Profile 1.1.1 (BLP) and the GATT Specification Supplement v9, Sections
+// 3.30, 3.31, 3.86, 3.87 and 3.125.
+//
+// Satisfies: REQ-BLE-BPS-001.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_BLOOD_PRESSURE_SERVICE = 0x1810
+const UUID_BLOOD_PRESSURE_MEASUREMENT = 0x2A35
+const UUID_INTERMEDIATE_CUFF_PRESSURE = 0x2A36
+const UUID_BLOOD_PRESSURE_FEATURE = 0x2A49
+const UUID_ENHANCED_BLOOD_PRESSURE_MEASUREMENT = 0x2B34
+const UUID_ENHANCED_INTERMEDIATE_CUFF_PRESSURE = 0x2B35
+
+// The bits of the Flags field ([GSS] Tables 3.49 and 3.145).
+const FLAG_KPA = 0x01
+const FLAG_TIME_STAMP = 0x02
+const FLAG_PULSE_RATE = 0x04
+const FLAG_USER_ID = 0x08
+const FLAG_MEASUREMENT_STATUS = 0x10
+const FLAG_USER_FACING_TIME = 0x20
+const FLAG_EPOCH_START_2000 = 0x40
+
+// The bits of the Blood Pressure Feature ([GSS] Table 3.47).
+const FEATURE_BODY_MOVEMENT_DETECTION = 0x0001
+const FEATURE_CUFF_FIT_DETECTION = 0x0002
+const FEATURE_IRREGULAR_PULSE_DETECTION = 0x0004
+const FEATURE_PULSE_RATE_RANGE_DETECTION = 0x0008
+const FEATURE_MEASUREMENT_POSITION_DETECTION = 0x0010
+const FEATURE_MULTIPLE_BOND = 0x0020
+const FEATURE_E2E_CRC = 0x0040
+const FEATURE_USER_DATA_SERVICE = 0x0080
+const FEATURE_USER_FACING_TIME = 0x0100
+const FEATURE_DEFINED_BITS = 0x01FF
+
+// The bits of the Measurement Status ([GSS] Table 3.51).
+const STATUS_BODY_MOVEMENT = 0x0001
+const STATUS_CUFF_TOO_LOOSE = 0x0002
+const STATUS_IRREGULAR_PULSE = 0x0004
+const STATUS_PULSE_RATE_RANGE = 0x0018
+const STATUS_PULSE_RATE_EXCEEDS_UPPER = 0x0008
+const STATUS_PULSE_RATE_BELOW_LOWER = 0x0010
+const STATUS_IMPROPER_POSITION = 0x0020
+
+// What the service has.  `access` is the access of every value and descriptor
+// (Encrypted, Authenticated or SecureConnections).  `features` is the Feature
+// value, `feature_indicate` adds the Indicate property to it for a sensor whose
+// features can change, `intermediate` adds the Intermediate Cuff Pressure and
+// `enhanced` the two Enhanced characteristics.
+struct BpsConfig
+    access: gatt_server.Access
+    features: Int
+    feature_indicate: Bool
+    intermediate: Bool
+    enhanced: Bool
+
+// A monitor with the Blood Pressure Measurement and a Feature of no detection, on
+// an encrypted link.
+@tier(app)
+fn default_bps_config() -> BpsConfig
+    BpsConfig {
+        access: gatt_server.Access.Encrypted, features: 0, feature_indicate: false,
+        intermediate: false, enhanced: false }
+
+// The handles of the service; 0 for a characteristic or descriptor it does not
+// have.
+@value
+struct BpsHandles
+    service: u16
+    measurement: u16
+    measurement_cccd: u16
+    intermediate: u16
+    intermediate_cccd: u16
+    feature: u16
+    feature_cccd: u16
+    enhanced: u16
+    enhanced_cccd: u16
+    enhanced_intermediate: u16
+    enhanced_intermediate_cccd: u16
+
+// One measurement.  `systolic`, `diastolic` and `map` are raw SFLOATs
+// (`wire.sfloat(120, 0)`, `wire.SFLOAT_NAN` for a value that is not available) in
+// mmHg, or in kPa when `kpa` is set.  `has_time` puts the Date Time `time` in the
+// classic value; its month and day are never 0 ([BLS] 3.1.1.3).  `has_stamp` puts
+// the uint32 `stamp` in the Enhanced value, `has_user_facing` the uint32
+// `user_facing` after it, and `epoch_2000` sets the epoch both count from.
+// `pulse_rate` is a raw SFLOAT, `user_id` one octet (0xFF for an unknown user) and
+// `status` the Measurement Status.
+@value
+struct BpsMeasurement
+    kpa: Bool
+    systolic: Int
+    diastolic: Int
+    map: Int
+    has_time: Bool
+    time: wire.DateTime
+    has_stamp: Bool
+    stamp: Int
+    has_user_facing: Bool
+    user_facing: Int
+    epoch_2000: Bool
+    has_pulse_rate: Bool
+    pulse_rate: Int
+    has_user_id: Bool
+    user_id: Int
+    has_status: Bool
+    status: Int
+
+// A measurement of the three pressures and nothing else.
+@tier(embedded)
+@no_alloc
+fn bps_measurement(systolic: Int, diastolic: Int, map: Int, kpa: Bool) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: kpa, systolic: systolic, diastolic: diastolic, map: map,
+        has_time: false, time: wire.date_time_unknown(), has_stamp: false, stamp: 0,
+        has_user_facing: false, user_facing: 0, epoch_2000: false,
+        has_pulse_rate: false, pulse_rate: 0, has_user_id: false, user_id: 0,
+        has_status: false, status: 0 }
+
+// `m` with the classic Date Time stamp `time`.
+@tier(embedded)
+@no_alloc
+fn bps_with_time(m: BpsMeasurement, time: wire.DateTime) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: true, time: time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: m.has_status, status: m.status }
+
+// `m` with the Enhanced time stamp `stamp` of seconds since the epoch, 2000 when
+// `epoch_2000` is set and 1900 otherwise.
+@tier(embedded)
+@no_alloc
+fn bps_with_stamp(m: BpsMeasurement, stamp: Int, epoch_2000: Bool) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: m.has_time, time: m.time, has_stamp: true, stamp: stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: m.has_status, status: m.status }
+
+// `m` with the User Facing Time `user_facing`.
+@tier(embedded)
+@no_alloc
+fn bps_with_user_facing(m: BpsMeasurement, user_facing: Int) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: m.has_time, time: m.time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: true, user_facing: user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: m.has_status, status: m.status }
+
+// `m` with the pulse rate `pulse_rate`, a raw SFLOAT.
+@tier(embedded)
+@no_alloc
+fn bps_with_pulse_rate(m: BpsMeasurement, pulse_rate: Int) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: m.has_time, time: m.time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: true, pulse_rate: pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: m.has_status, status: m.status }
+
+// `m` with the user `user_id`.
+@tier(embedded)
+@no_alloc
+fn bps_with_user_id(m: BpsMeasurement, user_id: Int) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: m.has_time, time: m.time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: true, user_id: user_id,
+        has_status: m.has_status, status: m.status }
+
+// `m` with the Measurement Status `status`.
+@tier(embedded)
+@no_alloc
+fn bps_with_status(m: BpsMeasurement, status: Int) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: m.systolic, diastolic: m.diastolic, map: m.map,
+        has_time: m.has_time, time: m.time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: true, status: status }
+
+// `m` with the pressures `systolic`, `diastolic` and `map` (raw SFLOATs).
+@tier(embedded)
+@no_alloc
+fn bps_with_pressures(m: BpsMeasurement, systolic: Int, diastolic: Int, map: Int) -> BpsMeasurement
+    BpsMeasurement {
+        kpa: m.kpa, systolic: systolic, diastolic: diastolic, map: map,
+        has_time: m.has_time, time: m.time, has_stamp: m.has_stamp, stamp: m.stamp,
+        has_user_facing: m.has_user_facing, user_facing: m.user_facing, epoch_2000: m.epoch_2000,
+        has_pulse_rate: m.has_pulse_rate, pulse_rate: m.pulse_rate, has_user_id: m.has_user_id, user_id: m.user_id,
+        has_status: m.has_status, status: m.status }
+
+// Whether `raw` is an SFLOAT the service may send: 16 bits and not the reserved
+// value of [BLS] Table 4.1.
+@tier(embedded)
+@no_alloc
+fn bps_sfloat_valid(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) != wire.KIND_RESERVED
+
+// Whether `status` is a Measurement Status the Feature `features` allows: a bit of
+// a detection the Feature does not name is 0 ([BLS] 3.3.1.1 to 3.3.1.5), the
+// reserved bits are 0 and the two Pulse Rate Range bits are not both set.
+@tier(embedded)
+@no_alloc
+fn bps_status_valid(features: Int, status: Int) -> Bool
+    if status < 0 or status > 0xFFFF or (status & 0xFFC0) != 0
+        return false
+    if (status & STATUS_BODY_MOVEMENT) != 0 and (features & FEATURE_BODY_MOVEMENT_DETECTION) == 0
+        return false
+    if (status & STATUS_CUFF_TOO_LOOSE) != 0 and (features & FEATURE_CUFF_FIT_DETECTION) == 0
+        return false
+    if (status & STATUS_IRREGULAR_PULSE) != 0 and (features & FEATURE_IRREGULAR_PULSE_DETECTION) == 0
+        return false
+    if (status & STATUS_PULSE_RATE_RANGE) != 0 and (features & FEATURE_PULSE_RATE_RANGE_DETECTION) == 0
+        return false
+    if (status & STATUS_PULSE_RATE_RANGE) == STATUS_PULSE_RATE_RANGE
+        return false
+    if (status & STATUS_IMPROPER_POSITION) != 0 and (features & FEATURE_MEASUREMENT_POSITION_DETECTION) == 0
+        return false
+    true
+
+// Whether the fields every format shares are fine: the SFLOATs, the pulse rate,
+// the user id and the status.  `pressures` says how many of the three pressure
+// SFLOATs the format carries.
+@tier(embedded)
+@no_alloc
+fn bps_common_valid(features: Int, m: BpsMeasurement) -> Bool
+    if not bps_sfloat_valid(m.systolic) or not bps_sfloat_valid(m.diastolic) or not bps_sfloat_valid(m.map)
+        return false
+    if m.has_pulse_rate and not bps_sfloat_valid(m.pulse_rate)
+        return false
+    if m.has_user_id and (m.user_id < 0 or m.user_id > 0xFF)
+        return false
+    if m.has_status and not bps_status_valid(features, m.status)
+        return false
+    true
+
+// Whether the service can send `m` in the classic Blood Pressure Measurement or
+// Intermediate Cuff Pressure: the common fields and a time stamp that is a Date
+// Time with a month and a day.  The Enhanced fields are not part of the format.
+@tier(embedded)
+@no_alloc
+fn bps_classic_valid(features: Int, m: BpsMeasurement) -> Bool
+    if m.has_stamp or m.has_user_facing or m.epoch_2000 or not bps_common_valid(features, m)
+        return false
+    if not m.has_time
+        return true
+    wire.date_time_valid(m.time) and m.time.month != 0 and m.time.day != 0
+
+// Whether the service can send `m` in an Enhanced characteristic: the common
+// fields, a time stamp of 32 bits, and a User Facing Time only when the Feature
+// names it and the time stamp is there ([BLS] 3.4.1.7).  The classic Date Time is
+// not part of the format.
+@tier(embedded)
+@no_alloc
+fn bps_enhanced_valid(features: Int, m: BpsMeasurement) -> Bool
+    if m.has_time or not bps_common_valid(features, m)
+        return false
+    if m.has_stamp and (m.stamp < 0 or m.stamp > 0xFFFFFFFF)
+        return false
+    if m.has_user_facing
+        if (features & FEATURE_USER_FACING_TIME) == 0 or not m.has_stamp or m.user_facing < 0 or m.user_facing > 0xFFFFFFFF
+            return false
+    true
+
+// The Flags field of `m`.
+@tier(embedded)
+@no_alloc
+fn bps_flags(m: BpsMeasurement, enhanced: Bool) -> Int
+    var flags = 0
+    if m.kpa
+        flags = flags | FLAG_KPA
+    if m.has_time or m.has_stamp
+        flags = flags | FLAG_TIME_STAMP
+    if m.has_pulse_rate
+        flags = flags | FLAG_PULSE_RATE
+    if m.has_user_id
+        flags = flags | FLAG_USER_ID
+    if m.has_status
+        flags = flags | FLAG_MEASUREMENT_STATUS
+    if enhanced
+        if m.has_user_facing
+            flags = flags | FLAG_USER_FACING_TIME
+        if m.epoch_2000
+            flags = flags | FLAG_EPOCH_START_2000
+    flags
+
+// Append the fields after the pressures: the time stamp, pulse rate, user id and
+// status, and, in an Enhanced value, the User Facing Time.
+@tier(app)
+fn bps_put_tail(var out: [u8], m: BpsMeasurement, enhanced: Bool)
+    if enhanced
+        if m.has_stamp
+            wire.put(var out, m.stamp, 4)
+    else if m.has_time
+        wire.put_date_time(var out, m.time)
+    if m.has_pulse_rate
+        wire.put(var out, m.pulse_rate, 2)
+    if m.has_user_id
+        wire.put(var out, m.user_id, 1)
+    if m.has_status
+        wire.put(var out, m.status, 2)
+    if enhanced and m.has_user_facing
+        wire.put(var out, m.user_facing, 4)
+
+// The value of Blood Pressure Measurement: the Flags field, the Compound Value of
+// systolic, diastolic and mean arterial pressure, then the optional fields.
+@tier(app)
+fn bps_measurement_value(m: BpsMeasurement) -> [u8]
+    var out: [u8] = [bps_flags(m, false) as u8]
+    wire.put(var out, m.systolic, 2)
+    wire.put(var out, m.diastolic, 2)
+    wire.put(var out, m.map, 2)
+    bps_put_tail(var out, m, false)
+    out
+
+// The value of Intermediate Cuff Pressure: the Compound Value has the current cuff
+// pressure in its first SFLOAT, which is `m.systolic`, and the special value NaN in
+// the two unused ones ([BLS] 3.2.1.2).
+@tier(app)
+fn bps_cuff_value(m: BpsMeasurement) -> [u8]
+    var out: [u8] = [bps_flags(m, false) as u8]
+    wire.put(var out, m.systolic, 2)
+    wire.put(var out, wire.SFLOAT_NAN, 2)
+    wire.put(var out, wire.SFLOAT_NAN, 2)
+    bps_put_tail(var out, m, false)
+    out
+
+// The value of Enhanced Blood Pressure Measurement.
+@tier(app)
+fn bps_enhanced_value(m: BpsMeasurement) -> [u8]
+    var out: [u8] = [bps_flags(m, true) as u8]
+    wire.put(var out, m.systolic, 2)
+    wire.put(var out, m.diastolic, 2)
+    wire.put(var out, m.map, 2)
+    bps_put_tail(var out, m, true)
+    out
+
+// The value of Enhanced Intermediate Cuff Pressure: one SFLOAT, `m.systolic`.
+@tier(app)
+fn bps_enhanced_cuff_value(m: BpsMeasurement) -> [u8]
+    var out: [u8] = [bps_flags(m, true) as u8]
+    wire.put(var out, m.systolic, 2)
+    bps_put_tail(var out, m, true)
+    out
+
+// The Feature value, two octets.
+@tier(app)
+fn bps_feature_value(features: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, features, 2)
+    out
+
+// Whether `access` is a security level the Blood Pressure Profile allows.
+@tier(embedded)
+@no_alloc
+fn bps_access_secure(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+// What is wrong with `config`, the first thing: CONFIG_NOT_PERMITTED for an access
+// below the profile's or the E2E-CRC bit, which belongs to the Blood Pressure
+// Record the service does not have, and CONFIG_INVALID for a Feature with a
+// reserved bit or a User Facing Time without the Enhanced characteristics.
+@tier(embedded)
+@no_alloc
+fn bps_config_error(config: BpsConfig) -> Int
+    if not bps_access_secure(config.access)
+        return CONFIG_NOT_PERMITTED
+    if (config.features & FEATURE_E2E_CRC) != 0
+        return CONFIG_NOT_PERMITTED
+    if config.features < 0 or (config.features & 0xFE00) != 0
+        return CONFIG_INVALID
+    if (config.features & FEATURE_USER_FACING_TIME) != 0 and not config.enhanced
+        return CONFIG_INVALID
+    CONFIG_OK
+
+// Add the service to `db` after its last attribute, the characteristics in the
+// order of [BLS] Table 3.1.
+@tier(app)
+fn add_bps_service(var db: GattDb, config: BpsConfig) -> Result<BpsHandles, profile_builder.ProfileError>
+    let problem = bps_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_BLOOD_PRESSURE_SERVICE))!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_BLOOD_PRESSURE_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, both)!
+    var intermediate = 0
+    var intermediate_cccd = 0
+    if config.intermediate
+        intermediate = profile_builder.add_value(
+            var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_INTERMEDIATE_CUFF_PRESSURE), [])!
+        intermediate_cccd = profile_builder.add_cccd(var db, both)!
+    var feature_properties = gatt_server.PROP_READ
+    if config.feature_indicate
+        feature_properties = feature_properties | gatt_server.PROP_INDICATE
+    let feature = profile_builder.add_value(
+        var db, feature_properties, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_BLOOD_PRESSURE_FEATURE), bps_feature_value(config.features))!
+    var feature_cccd = 0
+    if config.feature_indicate
+        feature_cccd = profile_builder.add_cccd(var db, both)!
+    var enhanced = 0
+    var enhanced_cccd = 0
+    var enhanced_intermediate = 0
+    var enhanced_intermediate_cccd = 0
+    if config.enhanced
+        enhanced = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(),
+            gatt_server.le16(UUID_ENHANCED_BLOOD_PRESSURE_MEASUREMENT), [])!
+        enhanced_cccd = profile_builder.add_cccd(var db, both)!
+        if config.intermediate
+            enhanced_intermediate = profile_builder.add_value(
+                var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(),
+                gatt_server.le16(UUID_ENHANCED_INTERMEDIATE_CUFF_PRESSURE), [])!
+            enhanced_intermediate_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(BpsHandles {
+        service: service as u16, measurement: measurement as u16, measurement_cccd: measurement_cccd as u16,
+        intermediate: intermediate as u16, intermediate_cccd: intermediate_cccd as u16,
+        feature: feature as u16, feature_cccd: feature_cccd as u16,
+        enhanced: enhanced as u16, enhanced_cccd: enhanced_cccd as u16,
+        enhanced_intermediate: enhanced_intermediate as u16, enhanced_intermediate_cccd: enhanced_intermediate_cccd as u16 })
+
+// The attribute value at `handle`, empty for none.
+@tier(app)
+fn bps_attribute(db: GattDb, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// The Feature value the service holds, 0 for a service without the handle.
+@tier(app)
+fn bps_features(db: GattDb, handles: BpsHandles) -> Int
+    wire.get(bps_attribute(db, handles.feature), 0, 2)
+
+// Store `m` as the Blood Pressure Measurement and answer the indication PDU: the
+// indication when the client enabled it, none otherwise (and none for a
+// measurement the service cannot send, which is not stored).  A second indication
+// waits for the confirmation of the first.
+@tier(app)
+fn bps_indicate(var db: GattDb, var link: AttLink, handles: BpsHandles, m: BpsMeasurement, now_ms: Int) -> [[u8]]
+    if not bps_classic_valid(bps_features(db, handles), m) or not gatt_server.set_value(var db, handles.measurement, bps_measurement_value(m))
+        return []
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// Store `m` as the Intermediate Cuff Pressure and answer the notification PDU.  The
+// current cuff pressure is `m.systolic`; the other two SFLOATs are not part of `m`
+// ([BLS] 3.2.1.2).  None when the client did not enable it or the service has no
+// such characteristic.
+@tier(app)
+fn bps_cuff_notify(var db: GattDb, var link: AttLink, handles: BpsHandles, m: BpsMeasurement, now_ms: Int) -> [[u8]]
+    if handles.intermediate == 0 or not bps_classic_valid(bps_features(db, handles), m)
+        return []
+    if not gatt_server.set_value(var db, handles.intermediate, bps_cuff_value(m))
+        return []
+    gatt_server.send_value(var db, var link, handles.intermediate, now_ms)
+
+// Store `m` as the Enhanced Blood Pressure Measurement and answer the indication
+// PDU, none without the characteristic or the subscription.
+@tier(app)
+fn bps_enhanced_indicate(var db: GattDb, var link: AttLink, handles: BpsHandles, m: BpsMeasurement, now_ms: Int) -> [[u8]]
+    if handles.enhanced == 0 or not bps_enhanced_valid(bps_features(db, handles), m)
+        return []
+    if not gatt_server.set_value(var db, handles.enhanced, bps_enhanced_value(m))
+        return []
+    gatt_server.send_value(var db, var link, handles.enhanced, now_ms)
+
+// Store `m` as the Enhanced Intermediate Cuff Pressure and answer the notification
+// PDU.
+@tier(app)
+fn bps_enhanced_cuff_notify(var db: GattDb, var link: AttLink, handles: BpsHandles, m: BpsMeasurement, now_ms: Int) -> [[u8]]
+    if handles.enhanced_intermediate == 0 or not bps_enhanced_valid(bps_features(db, handles), m)
+        return []
+    if not gatt_server.set_value(var db, handles.enhanced_intermediate, bps_enhanced_cuff_value(m))
+        return []
+    gatt_server.send_value(var db, var link, handles.enhanced_intermediate, now_ms)
+
+// Change the Feature at the monitor itself; false (and the old value kept) for a
+// value the service cannot describe.  A client that enabled the Indicate hears of
+// it when `bps_indicate_feature` sends it, which [BLS] 3.3.1 asks of a sensor that
+// bonds, after the reconnection.
+@tier(app)
+fn bps_set_features(var db: GattDb, handles: BpsHandles, features: Int) -> Bool
+    if features < 0 or (features & 0xFE00) != 0 or (features & FEATURE_E2E_CRC) != 0
+        return false
+    if (features & FEATURE_USER_FACING_TIME) != 0 and handles.enhanced == 0
+        return false
+    gatt_server.set_value(var db, handles.feature, bps_feature_value(features))
+
+// Indicate the Feature; none unless the characteristic indicates and the client
+// enabled it.
+@tier(app)
+fn bps_indicate_feature(var db: GattDb, var link: AttLink, handles: BpsHandles, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.feature, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// Everything the service can have: all the detections, multiple bonds, the User
+// Facing Time, the intermediate pressure and the Enhanced characteristics, with the
+// Feature indicating.
+@tier(app)
+fn full_config() -> BpsConfig
+    BpsConfig {
+        access: gatt_server.Access.Encrypted, features: 0x013F, feature_indicate: true,
+        intermediate: true, enhanced: true }

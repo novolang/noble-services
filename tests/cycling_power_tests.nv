@@ -1,0 +1,228 @@
+// tests/cycling_power_tests.nv — the unit tests of src/cycling_power.nv.
+//
+//   novo test tests/cycling_power_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+use cycling_power.{ CyclingPowerConfig, CyclingPowerHandles, CyclingPowerMeasurement, FEATURE_ACCUMULATED_ENERGY, FEATURE_CRANK_REVOLUTION_DATA, FEATURE_OFFSET_COMPENSATION_INDICATOR, FEATURE_PEDAL_POWER_BALANCE, FEATURE_WHEEL_REVOLUTION_DATA, add_cycling_power_service, cycling_power_control_point_response, cycling_power_handle_control_point, cycling_power_measurement_value, cycling_power_notify, default_cycling_power_config, power_only }
+
+fn added(var s: GattServer, config: CyclingPowerConfig) -> CyclingPowerHandles
+    match add_cycling_power_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            CyclingPowerHandles { feature_bits: 0, service: 0, measurement: 0, measurement_cccd: 0, feature: 0, location: 0, control_point: 0, control_point_cccd: 0 }
+
+fn request(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+@test
+fn test_power_only_measurement()
+    test.assert_eq(cycling_power_measurement_value(power_only(250)), [0x00, 0x00, 0xFA, 0x00])
+    // A negative power is two's complement.
+    test.assert_eq(cycling_power_measurement_value(power_only(-1)), [0x00, 0x00, 0xFF, 0xFF])
+
+@test
+fn test_every_field_in_the_order_of_the_flags()
+    let m = CyclingPowerMeasurement {
+        power: 300, pedal_balance: 100, balance_left: true, accumulated_torque: 0x0140, torque_crank_based: true,
+        has_wheel: true, wheel_revolutions: 0x01020304, last_wheel_event: 0x0A0B, has_crank: true,
+        crank_revolutions: 0x0C0D, last_crank_event: 0x0E0F, accumulated_energy: 0x1234, offset_compensated: true }
+    // Flags: balance 0x0001, left 0x0002, torque 0x0004, crank-based 0x0008, wheel 0x0010,
+    // crank 0x0020, energy 0x0800, offset 0x1000.
+    test.assert(cycling_power_measurement_value(m) == [
+        0x3F, 0x18, 0x2C, 0x01, 100, 0x40, 0x01, 0x04, 0x03, 0x02, 0x01, 0x0B, 0x0A, 0x0D, 0x0C, 0x0F, 0x0E, 0x34, 0x12])
+
+@test
+fn test_balance_without_a_reference_and_torque_at_the_wheel()
+    let m = CyclingPowerMeasurement {
+        power: 1, pedal_balance: 90, balance_left: false, accumulated_torque: 32, torque_crank_based: false,
+        has_wheel: false, wheel_revolutions: 0, last_wheel_event: 0, has_crank: false, crank_revolutions: 0,
+        last_crank_event: 0, accumulated_energy: -1, offset_compensated: false }
+    test.assert_eq(cycling_power_measurement_value(m), [0x05, 0x00, 0x01, 0x00, 90, 32, 0x00])
+
+@test
+fn test_layout_and_reads()
+    var s = gatt_server.new_server([], 65)
+    let feature = FEATURE_PEDAL_POWER_BALANCE | FEATURE_CRANK_REVOLUTION_DATA | FEATURE_ACCUMULATED_ENERGY
+    let h = added(var s, default_cycling_power_config(feature, sensor_control.SensorLocation.RightCrank))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.feature, 6)
+    test.assert_eq(h.location, 8)
+    test.assert_eq(h.control_point, 10)
+    test.assert_eq(h.control_point_cccd, 11)
+    test.assert_eq(s.db.attributes[0].value, [0x18, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x10, 0x03, 0x00, 0x63, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x02, 0x06, 0x00, 0x65, 0x2A])
+    test.assert_eq(s.db.attributes[8].value, [0x28, 0x0A, 0x00, 0x66, 0x2A])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x89, 0x00, 0x00, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 6])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.feature, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+fn test_notification_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cycling_power_config(0, sensor_control.SensorLocation.Other))
+    test.assert_eq(list.len(cycling_power_notify(var s.db, var s.link, h, power_only(180), 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(cycling_power_notify(var s.db, var s.link, h, power_only(180), 0)[0], [0x1B, 0x03, 0x00, 0x00, 0x00, 180, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.measurement, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_control_point_procedures()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cycling_power_config(0, sensor_control.SensorLocation.LeftCrank))
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.LeftCrank, [5, 6], true, false)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3]), 0)[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    // The Common Profile and Service Error Codes: Client Characteristic Configuration
+    // Descriptor Improperly Configured is 0xFD and Procedure Already In Progress 0xFE.
+    test.assert_eq(att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED, 0xFD)
+    test.assert_eq(att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS, 0xFE)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    // Request Supported Sensor Locations.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3]), 0)
+    test.assert_eq(cycling_power_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x20, 0x03, 0x01, 5, 6])
+    // A write before the confirmation is refused.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2, 6]), 0)[0][4] as Int, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Update Sensor Location, then read the characteristic.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2, 6]), 0)
+    test.assert_eq(cycling_power_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x20, 0x02, 0x01])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 6])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Set Cumulative Value.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 5, 0, 0, 0]), 0)
+    test.assert_eq(cycling_power_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x20, 0x01, 0x01])
+    test.assert_eq(st.cumulative_value, 5)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // A procedure outside the subset: Op Code Not Supported.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0x04, 0xA4, 0x01]), 0)
+    test.assert_eq(cycling_power_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x20, 0x04, 0x02])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // A location not in the list.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2, 9]), 0)
+    test.assert_eq(cycling_power_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x20, 0x02, 0x03])
+    test.assert_eq(cycling_power_control_point_response(var st, []), [0x20, 0x00, 0x02])
+
+@test
+fn test_permissions_are_enforced_per_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let config = CyclingPowerConfig {
+        feature: 0, location: sensor_control.SensorLocation.Hip, control_point: true, read: gatt_server.Access.Authenticated,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted },
+        control_point_write: gatt_server.Access.Authenticated,
+        control_point_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authenticated } }
+    let h = added(var s, config)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0, 0, 0, 0])
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, CyclingPowerConfig {
+        feature: 0, location: sensor_control.SensorLocation.Hip, control_point: true, read: gatt_server.Access.Authorized,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Authorized,
+        control_point_cccd: gatt_server.open_permissions() })
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    let _ = gatt_server.receive(var z.db, var z.link, request(0x12, hz.control_point_cccd, [2, 0]), 0)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.control_point, [3]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.Hip, [], false, false)
+    var bare = gatt_server.new_server([], 65)
+    let hb = added(var bare, CyclingPowerConfig {
+        feature: 0, location: sensor_control.SensorLocation.Other, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() })
+    test.assert_eq(list.len(cycling_power_handle_control_point(var bare.db, var bare.link, hb, var st, 0)), 0)
+
+@test
+fn test_the_sensor_location_is_required()
+    var s = gatt_server.new_server([], 65)
+    let before = list.len(s.db.attributes)
+    match add_cycling_power_service(var s.db, default_cycling_power_config(0, sensor_control.SensorLocation.Absent))
+        Ok(_) => test.fail("a service without a Sensor Location is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.NotPermitted)
+    test.assert_eq(list.len(s.db.attributes), before)
+
+@test
+fn test_the_wheel_revolution_data_needs_the_control_point()
+    var s = gatt_server.new_server([], 65)
+    let with = CyclingPowerConfig {
+        feature: FEATURE_WHEEL_REVOLUTION_DATA, location: sensor_control.SensorLocation.Other, control_point: false,
+        read: gatt_server.Access.Open, measurement_cccd: gatt_server.open_permissions(),
+        control_point_write: gatt_server.Access.Open, control_point_cccd: gatt_server.open_permissions() }
+    match add_cycling_power_service(var s.db, with)
+        Ok(_) => test.fail("wheel revolution data without a control point is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.NotPermitted)
+    // Without the wheel data the control point is optional.
+    let without = CyclingPowerConfig {
+        feature: FEATURE_CRANK_REVOLUTION_DATA, location: sensor_control.SensorLocation.Other, control_point: false,
+        read: gatt_server.Access.Open, measurement_cccd: gatt_server.open_permissions(),
+        control_point_write: gatt_server.Access.Open, control_point_cccd: gatt_server.open_permissions() }
+    let h = added(var s, without)
+    test.assert_eq(h.control_point, 0)
+
+@test
+fn test_accesses_beyond_the_profile_are_refused()
+    var s = gatt_server.new_server([], 65)
+    let level4 = CyclingPowerConfig {
+        feature: 0, location: sensor_control.SensorLocation.Other, control_point: false, read: gatt_server.Access.SecureConnections,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+    match add_cycling_power_service(var s.db, level4)
+        Ok(_) => test.fail("security level 4 is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.NotPermitted)
+    let no_subscription = CyclingPowerConfig {
+        feature: 0, location: sensor_control.SensorLocation.Other, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Denied },
+        control_point_write: gatt_server.Access.Open, control_point_cccd: gatt_server.open_permissions() }
+    match add_cycling_power_service(var s.db, no_subscription)
+        Ok(_) => test.fail("a descriptor no client writes is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.NotPermitted)
+
+@test
+fn test_reserved_feature_bits_read_as_zero()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cycling_power_config(0xFFFFFFFF, sensor_control.SensorLocation.Other))
+    test.assert_eq(h.feature_bits, 0x003FFFFF)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0xFF, 0xFF, 0x3F, 0x00])
+
+@test
+fn test_the_measurement_leaves_out_what_the_feature_does_not_name()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cycling_power_config(FEATURE_PEDAL_POWER_BALANCE, sensor_control.SensorLocation.Other))
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)
+    let m = CyclingPowerMeasurement {
+        power: 10, pedal_balance: 100, balance_left: true, accumulated_torque: 64, torque_crank_based: true,
+        has_wheel: true, wheel_revolutions: 1, last_wheel_event: 2, has_crank: true, crank_revolutions: 3,
+        last_crank_event: 4, accumulated_energy: 5, offset_compensated: true }
+    // Only the pedal power balance is named: its flags and its octet.
+    test.assert_eq(cycling_power_notify(var s.db, var s.link, h, m, 0)[0], [0x1B, 0x03, 0x00, 0x03, 0x00, 10, 0x00, 100])
+    // The offset compensation indicator is the Feature bit 8.
+    var t = gatt_server.new_server([], 65)
+    let ht = added(var t, default_cycling_power_config(FEATURE_OFFSET_COMPENSATION_INDICATOR, sensor_control.SensorLocation.Other))
+    let _ = gatt_server.receive(var t.db, var t.link, request(0x12, ht.measurement_cccd, [1, 0]), 0)
+    test.assert_eq(cycling_power_notify(var t.db, var t.link, ht, m, 0)[0], [0x1B, 0x03, 0x00, 0x00, 0x10, 10, 0x00])
+
+fn wheel_only(revolutions: Int) -> CyclingPowerMeasurement
+    CyclingPowerMeasurement {
+        power: 1, pedal_balance: -1, balance_left: false, accumulated_torque: -1, torque_crank_based: false,
+        has_wheel: true, wheel_revolutions: revolutions, last_wheel_event: 7, has_crank: false, crank_revolutions: 0,
+        last_crank_event: 0, accumulated_energy: -1, offset_compensated: false }
+
+@test
+fn test_the_wheel_revolutions_neither_roll_over_nor_fall_below_zero()
+    test.assert_eq(cycling_power_measurement_value(wheel_only(0x1FFFFFFFF)), [0x10, 0x00, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00])
+    test.assert_eq(cycling_power_measurement_value(wheel_only(-5)), [0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00])

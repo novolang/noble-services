@@ -1,0 +1,78 @@
+// src/tx_power.nv — the Tx Power Service (0x1804).
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+// The service exposes the transmit power of the device in a connection.  It
+// has one characteristic:
+//
+//   Tx Power Level   0x2A07   Read; sint8 in dBm, -100 to +20
+//
+// A client reads the level and, with the received signal strength it
+// measures, derives the path loss.  The value is read-only and has no
+// descriptor: Table 3.2 of the specification excludes Notify, Indicate and
+// Write for it (version 1.0), and the service imposes no security.  Values
+// outside -100 to +20 are Reserved for Future Use ([GSS] 3.237); `set_tx_power`
+// refuses them and keeps the level it held.
+//
+// The level is the one the Host is told, for example from the Controller's
+// LE Read Transmit Power command or the LE Power Control reports; the service
+// does not read it.
+//
+// Specification checked against: Tx Power Service 1.0 and the GATT
+// Specification Supplement v9, Section 3.237.
+//
+// Satisfies: REQ-BLE-TPS-001.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_TX_POWER_SERVICE = 0x1804
+const UUID_TX_POWER_LEVEL = 0x2A07
+
+const TX_POWER_MIN = -100
+const TX_POWER_MAX = 20
+
+// The access to read the level.
+struct TpsConfig
+    level: Int
+    read: gatt_server.Access
+
+// A level, in dBm, that any client reads.
+@tier(app)
+fn default_tps_config(level: Int) -> TpsConfig
+    TpsConfig { level: level, read: gatt_server.Access.Open }
+
+@value
+struct TpsHandles
+    service: u16
+    level: u16
+
+// Whether `dbm` is a Tx Power Level value.
+@tier(embedded)
+@no_alloc
+fn tx_power_valid(dbm: Int) -> Bool
+    dbm >= TX_POWER_MIN and dbm <= TX_POWER_MAX
+
+@tier(app)
+fn tx_power_value(dbm: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, dbm, 1)
+    out
+
+// Add the service to `db` after its last attribute; a level outside -100 to
+// +20 answers `InvalidValue`.
+@tier(app)
+fn add_tps_service(var db: GattDb, config: TpsConfig) -> Result<TpsHandles, profile_builder.ProfileError>
+    if not tx_power_valid(config.level)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_TX_POWER_SERVICE))!
+    let level = profile_builder.add_value(
+        var db, gatt_server.PROP_READ, profile_builder.read_only(config.read), gatt_server.le16(UUID_TX_POWER_LEVEL), tx_power_value(config.level))!
+    Ok(TpsHandles { service: service as u16, level: level as u16 })
+
+// Store a new level; false (and the old level kept) outside -100 to +20.
+@tier(app)
+fn set_tx_power(var db: GattDb, handles: TpsHandles, dbm: Int) -> Bool
+    tx_power_valid(dbm) and gatt_server.set_value(var db, handles.level, tx_power_value(dbm))

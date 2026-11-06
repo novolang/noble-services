@@ -1,0 +1,108 @@
+// tests/running_speed_cadence_client_tests.nv — the unit tests of src/running_speed_cadence_client.nv.
+//
+//   novo test tests/running_speed_cadence_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use running_speed_cadence
+use sensor_client
+use sensor_control
+use wire
+use running_speed_cadence_client.{ RscMeasurement, rsc_client_new, rsc_client_start, rsc_decode, rsc_decode_feature, rsc_decode_location, rsc_distance_delta_dm, rsc_speed_mm_per_s }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> RscMeasurement
+    match rsc_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            RscMeasurement { speed_256: 0, cadence: 0, has_stride: false, stride_cm: 0, has_distance: false, distance_dm: 0, running: false }
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-005")
+fn test_speed_cadence_and_the_optional_fields()
+    let a = must(octets([0x00, 0x00, 0x03, 90]))
+    test.assert_eq(a.speed_256, 768)
+    test.assert_eq(rsc_speed_mm_per_s(a), 3000)
+    test.assert_eq(a.cadence, 90)
+    test.assert_eq(a.has_stride, false)
+    test.assert_eq(a.running, false)
+    let s = must(octets([0x01, 0x80, 0x02, 160, 0x6E, 0x00]))
+    test.assert_eq(s.has_stride, true)
+    test.assert_eq(s.stride_cm, 110)
+    test.assert_eq(s.has_distance, false)
+    let d = must(octets([0x02, 0x00, 0x01, 1, 0x78, 0x56, 0x34, 0x12]))
+    test.assert_eq(d.has_distance, true)
+    test.assert_eq(d.distance_dm, 0x12345678)
+    let all = must(octets([0x07, 0x00, 0x04, 180, 0x64, 0x00, 0x10, 0x27, 0x00, 0x00]))
+    test.assert_eq(all.running, true)
+    test.assert_eq(all.stride_cm, 100)
+    test.assert_eq(all.distance_dm, 10000)
+    // Reserved bits 3 to 7 are ignored; the maximum cadence is the full octet.
+    test.assert_eq(must(octets([0xF8, 0x00, 0x00, 255])).cadence, 255)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-005")
+fn test_truncated_measurements_answer_none()
+    test.assert_eq(rsc_decode([]), None)
+    test.assert_eq(rsc_decode(octets([0x00, 0x00, 0x03])), None)
+    test.assert_eq(rsc_decode(octets([0x01, 0x00, 0x03, 90, 1])), None)
+    test.assert_eq(rsc_decode(octets([0x02, 0x00, 0x03, 90, 1, 2, 3])), None)
+    let full = octets([0x07, 0x00, 0x04, 180, 0x64, 0x00, 0x10, 0x27, 0x00, 0x00])
+    var whole = 0
+    for k in 0..list.len(full)
+        if rsc_decode(full[:k]) != None
+            whole = whole + 1
+    test.assert_eq(whole, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-005")
+fn test_feature_location_and_distance_delta()
+    test.assert_eq(rsc_decode_feature(octets([0x1F, 0x00])), Some(0x1F))
+    test.assert_eq(rsc_decode_feature(octets([0x1F])), None)
+    test.assert_eq(rsc_decode_location(octets([1])), Some(1))
+    test.assert_eq(rsc_decode_location([]), None)
+    let a = must(octets([0x02, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF]))
+    let b = must(octets([0x02, 0, 0, 0, 0x03, 0x00, 0x00, 0x00]))
+    test.assert_eq(rsc_distance_delta_dm(a, b), 5)
+
+@tier(app)
+fn server_with(feature: Int) -> (gatt_server.GattServer, running_speed_cadence.RscHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = running_speed_cadence.add_rsc_service(var s.db, running_speed_cadence.default_rsc_config(feature, sensor_control.SensorLocation.InShoe))!
+    (s, h)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-005")
+fn test_session_receives_measurements_and_the_control_point_answers()
+    if not fixtures.client_engine_present()
+        return
+    var built = server_with(running_speed_cadence.FEATURE_INSTANTANEOUS_STRIDE_LENGTH | running_speed_cadence.FEATURE_TOTAL_DISTANCE
+        | running_speed_cadence.FEATURE_CALIBRATION_PROCEDURE | running_speed_cadence.FEATURE_WALKING_OR_RUNNING_STATUS)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(running_speed_cadence.UUID_RUNNING_SPEED_AND_CADENCE_SERVICE)
+    var t = both.0
+    var c = rsc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, rsc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq(seen[1], running_speed_cadence.UUID_RSC_FEATURE)
+    let m = running_speed_cadence.RscMeasurement {
+        speed: 768, cadence: 85, has_stride_length: true, stride_length: 105, has_total_distance: true, total_distance: 5000, running: true }
+    let ev = sensor_client.test_deliver(var t, var c, running_speed_cadence.rsc_notify(var s.db, var s.link, h, m, 0))
+    test.assert_eq(ev, sensor_client.SE_VALUE)
+    let d = must(sensor_client.sc_value(c))
+    test.assert_eq(d.cadence, 85)
+    test.assert_eq(d.stride_cm, 105)
+    test.assert_eq(d.distance_dm, 5000)
+    test.assert_eq(d.running, true)

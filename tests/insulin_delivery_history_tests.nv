@@ -1,0 +1,478 @@
+// tests/insulin_delivery_history_tests.nv — the unit tests of src/insulin_delivery_history.nv.
+//
+//   novo test tests/insulin_delivery_history_tests.nv
+
+use std.test
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use insulin_delivery
+use profile_builder
+use racp
+use reconnection_configuration
+use wire
+use insulin_delivery_history.{ EVENT_ANNUNCIATION_STATUS_CHANGED_1, EVENT_ANNUNCIATION_STATUS_CHANGED_2, EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, EVENT_BOLUS_CALCULATED_1, EVENT_BOLUS_DELIVERED_2, EVENT_BOLUS_PROGRAMMED_1, EVENT_BOLUS_PROGRAMMED_2, EVENT_BOLUS_TEMPLATE_CHANGED_1, EVENT_BOLUS_TEMPLATE_CHANGED_2, EVENT_DATA_CORRUPTION, EVENT_DELIVERED_BASAL_RATE_CHANGED, EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, EVENT_MAX_BOLUS_AMOUNT_CHANGED, EVENT_OPERATIONAL_STATE_CHANGED, EVENT_POINTER, EVENT_PRIMING_DONE, EVENT_PRIMING_STARTED, EVENT_PROFILE_TEMPLATE_ACTIVATED, EVENT_REFERENCE_TIME, EVENT_REFERENCE_TIME_BASE_OFFSET, EVENT_RESERVOIR_REMAINING_AMOUNT_CHANGED, EVENT_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, EVENT_TBR_ADJUSTMENT_CHANGED, EVENT_TBR_ADJUSTMENT_ENDED, EVENT_TBR_ADJUSTMENT_STARTED, EVENT_TBR_TEMPLATE_CHANGED, EVENT_THERAPY_CONTROL_STATE_CHANGED, EVENT_TOTAL_DAILY_INSULIN_DELIVERY, IdsHistory, IdsHistoryHandles, IdsHistoryRecord, RACP_INVALID_OPERAND, RACP_INVALID_OPERATOR, RACP_OPERAND_NOT_SUPPORTED, RACP_OPERATOR_NOT_SUPPORTED, RACP_OP_CODE_NOT_SUPPORTED, add_ids_history, filled, history_of, ids_codeword8, ids_event_type_known, ids_event_valid, ids_history_abandon, ids_history_pump, ids_history_receive, ids_history_value, ids_racp_decode, ids_record_data_corruption, ids_record_event, ids_record_group, new_ids_history, reference_time }
+
+// The Features of a pump with every optional part.
+const ALL_FEATURES = 0x00FFFE
+
+// A server with the history, the descriptors enabled.
+@tier(app)
+fn rig(features: Int, dev: insulin_delivery.IdsDevice, h: IdsHistory) -> (GattServer, insulin_delivery.IdsHandles, IdsHistoryHandles, insulin_delivery.IdsConfig)
+    let config = insulin_delivery.IdsConfig {
+        access: gatt_server.Access.Authenticated, features: features, concentration: wire.sfloat(100, 0), features_indicate: false,
+        get_counter: false, get_delivered: false }
+    var built = insulin_delivery.server(config, dev)
+    var s = built.0
+    let hh = add_ids_history(var s.db, config, h)!
+    subscribe(var s, built.1.reader_cccd as Int, 2)
+    subscribe(var s, hh.racp_cccd as Int, 2)
+    subscribe(var s, hh.history_cccd as Int, 1)
+    (s, built.1, hh, config)
+
+@tier(app)
+fn write_racp(var s: GattServer, var dev: insulin_delivery.IdsDevice, var h: IdsHistory, hs: insulin_delivery.IdsHandles, hh: IdsHistoryHandles, config: insulin_delivery.IdsConfig, value: [Int]) -> [[u8]]
+    var pdu: [u8] = [0x12, (hh.racp & 0xFF) as u8, (hh.racp >>> 8) as u8]
+    list.append(pdu, wire.octets(value))
+    ids_history_receive(var s.db, var s.link, hs, hh, config, var dev, var h, pdu, 0)
+
+@tier(app)
+fn confirm(var s: GattServer)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_the_history_characteristics_follow_the_control_point_of_the_status_reader()
+    let (s, hs, hh, config) = rig(ALL_FEATURES, insulin_delivery.new_ids_device(ALL_FEATURES), history_of(10))
+    test.assert_eq(hs.reader, 14)
+    test.assert_eq(hs.reader_cccd, 15)
+    test.assert_eq(hh.racp, 17)
+    test.assert_eq(hh.racp_cccd, 18)
+    test.assert_eq(hh.history, 20)
+    test.assert_eq(hh.history_cccd, 21)
+    test.assert_eq(gatt_server.last_handle(s.db), 21)
+    // Write, Indicate: 0x28; Notify: 0x10.
+    test.assert_eq(s.db.attributes[15].value, [0x28, 17, 0, 0x27, 0x2B])
+    test.assert_eq(s.db.attributes[18].value, [0x10, 20, 0, 0x28, 0x2B])
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_the_codewords_of_the_enumerations_are_the_sixteen_of_the_hamming_code()
+    var count = 0
+    for v in 0..256
+        if ids_codeword8(v)
+            count = count + 1
+    test.assert_eq(count, 16)
+    for v in [0x00, 0x0F, 0x33, 0x3C, 0x55, 0x5A, 0x66, 0x69, 0x96, 0x99, 0xA5, 0xAA, 0xC3, 0xCC, 0xF0, 0xFF]
+        test.assert(ids_codeword8(v))
+    test.assert(not ids_codeword8(0x01))
+    test.assert(not ids_codeword8(0x100))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_records_are_numbered_from_zero_never_reuse_a_number_and_drop_the_oldest_at_capacity()
+    // IDS/SEN/HDE/BV-01-C.
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(3)
+    filled(var dev, var h)
+    test.assert_eq(list.len(h.records), 3)
+    test.assert_eq(h.records[0].sequence, 2)
+    test.assert_eq(h.records[2].sequence, 4)
+    test.assert_eq(h.next_sequence, 5)
+    test.assert_eq(dev.changed & insulin_delivery.CHANGED_HISTORY_EVENT_RECORDED, insulin_delivery.CHANGED_HISTORY_EVENT_RECORDED)
+    // The Sequence Number is not reset by a delete and does not roll over.
+    h.records = []
+    test.assert(ids_record_event(var dev, var h, EVENT_THERAPY_CONTROL_STATE_CHANGED, 1, wire.octets([0x33, 0x55])))
+    test.assert_eq(h.records[0].sequence, 5)
+    h.next_sequence = 0xFFFFFFFF
+    test.assert(not ids_record_event(var dev, var h, EVENT_THERAPY_CONTROL_STATE_CHANGED, 1, wire.octets([0x33, 0x55])))
+    // A Data Corruption event has Sequence Number 0xFFFFFFFF.
+    test.assert(ids_record_data_corruption(var dev, var h, 9))
+    test.assert_eq(h.records[list.len(h.records) - 1].sequence, 0xFFFFFFFF)
+    test.assert_eq(ids_history_value(0, h.records[list.len(h.records) - 1]), wire.octets([0xA6, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 9, 0]))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_a_history_value_has_the_type_the_number_the_offset_and_the_data_and_with_e2e_a_crc_and_no_counter()
+    let r = IdsHistoryRecord { event_type: 0x0303, sequence: 0x01020304, offset: 0x0506, data: wire.octets([0x33, 0x55]), group: -1 }
+    test.assert_eq(ids_history_value(0, r), wire.octets([0x03, 0x03, 0x04, 0x03, 0x02, 0x01, 0x06, 0x05, 0x33, 0x55]))
+    let with = ids_history_value(1, r)
+    test.assert_eq(list.len(with), 12)
+    test.assert_eq(wire.get(with, 10, 2), reconnection_configuration.crc16(with[0:10]))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_the_event_data_must_fit_its_type_and_the_features()
+    // IDS/SEN/HDE/BV-02-C: the size, flags, enumerations and features per type.
+    let all = ALL_FEATURES
+    test.assert(ids_event_valid(all, EVENT_REFERENCE_TIME, reference_time()))
+    test.assert(not ids_event_valid(all, EVENT_REFERENCE_TIME, reference_time()[0:9]))
+    test.assert(not ids_event_valid(all, EVENT_REFERENCE_TIME, wire.octets([0x34, 0xEA, 0x07, 10, 27, 9, 5, 3, 4, 0])))
+    test.assert(not ids_event_valid(all, EVENT_REFERENCE_TIME, wire.octets([0x33, 0xEA, 0x07, 13, 27, 9, 5, 3, 4, 0])))
+    test.assert(not ids_event_valid(all, EVENT_REFERENCE_TIME, wire.octets([0x33, 0xEA, 0x07, 10, 27, 9, 5, 3, 99, 0])))
+    test.assert(ids_event_valid(all, EVENT_REFERENCE_TIME_BASE_OFFSET, wire.octets([0x3C, 0xEA, 0x07, 10, 27, 9, 5, 3, 0x3C, 0x00])))
+    // The bolus parts: Fast has no extended part, Extended has no fast part, a type needs its Feature.
+    let fast = wire.octets([7, 0, FAST_TYPE, 0x0A, 0xF0, 0, 0, 0, 0])
+    test.assert(ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_1, fast))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_1, wire.octets([7, 0, FAST_TYPE, 0x0A, 0xF0, 1, 0, 0, 0])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_1, wire.octets([7, 0, FAST_TYPE, 0x0A, 0xF0, 0, 0, 5, 0])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_1, wire.octets([7, 0, 0x3C, 0x0A, 0xF0, 1, 0, 5, 0])))
+    test.assert(ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_1, wire.octets([7, 0, 0x3C, 0, 0, 1, 0, 5, 0])))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_FAST_BOLUS, EVENT_BOLUS_PROGRAMMED_1, wire.octets([7, 0, 0x3C, 0, 0, 1, 0, 5, 0])))
+    test.assert(not ids_event_valid(0, EVENT_BOLUS_PROGRAMMED_1, fast))
+    // The second part: the Flags name the delay, the template and the activation type.
+    test.assert(ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_2, wire.octets([0x00])))
+    test.assert(ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_2, wire.octets([0x07, 5, 0, 3, 0x33])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_2, wire.octets([0x07, 5, 0, 3])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_2, wire.octets([0x20])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_PROGRAMMED_2, wire.octets([0x04, 0x34])))
+    test.assert(ids_event_valid(all, EVENT_BOLUS_DELIVERED_2, wire.octets([0x07, 60, 0, 0, 0, 0x33, 0x3C, 1, 0])))
+    test.assert(not ids_event_valid(all, EVENT_BOLUS_DELIVERED_2, wire.octets([0x02, 60, 0, 0, 0, 0x34])))
+    // Basal rate and TBR events: the Feature, the Flags, the TBR Type.
+    test.assert(ids_event_valid(all, EVENT_DELIVERED_BASAL_RATE_CHANGED, wire.octets([0x01, 0x08, 0xF0, 0x0C, 0xF0, 0x33])))
+    test.assert(not ids_event_valid(0, EVENT_DELIVERED_BASAL_RATE_CHANGED, wire.octets([0x00, 0x08, 0xF0, 0x0C, 0xF0])))
+    test.assert(ids_event_valid(all, EVENT_TBR_ADJUSTMENT_STARTED, wire.octets([0x01, 0x33, 0x0C, 0xF0, 60, 0, 4])))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_BASAL_RATE | insulin_delivery.FEATURE_TBR_RELATIVE, EVENT_TBR_ADJUSTMENT_STARTED, wire.octets([0x00, 0x33, 0x0C, 0xF0, 60, 0])))
+    test.assert(ids_event_valid(all, EVENT_TBR_ADJUSTMENT_ENDED, wire.octets([0x03, 0x33, 20, 0, 0x3C, 4, 9, 0])))
+    test.assert(ids_event_valid(all, EVENT_TBR_ADJUSTMENT_CHANGED, wire.octets([0x00, 0x3C, 0x02, 0x00, 60, 0, 10, 0])))
+    // State changes, reservoir, priming, corruption, pointer.
+    test.assert(ids_event_valid(0, EVENT_THERAPY_CONTROL_STATE_CHANGED, wire.octets([0x0F, 0x55])))
+    test.assert(not ids_event_valid(0, EVENT_THERAPY_CONTROL_STATE_CHANGED, wire.octets([0x0F, 0x56])))
+    test.assert(ids_event_valid(0, EVENT_OPERATIONAL_STATE_CHANGED, wire.octets([0x33, 0x96])))
+    test.assert(not ids_event_valid(0, EVENT_RESERVOIR_REMAINING_AMOUNT_CHANGED, wire.octets([0x01, 0x08])))
+    test.assert(ids_event_valid(0, EVENT_PRIMING_STARTED, wire.octets([0x0A, 0x00])))
+    test.assert(ids_event_valid(0, EVENT_PRIMING_DONE, wire.octets([0x01, 0x05, 0x00, 0x3C, 3, 0])))
+    test.assert(not ids_event_valid(0, EVENT_PRIMING_DONE, wire.octets([0x01, 0x05, 0x00, 0x3C])))
+    test.assert(ids_event_valid(0, EVENT_DATA_CORRUPTION, []))
+    test.assert(ids_event_valid(0, EVENT_POINTER, []))
+    test.assert(not ids_event_valid(0, EVENT_POINTER, wire.octets([0])))
+    // Total daily insulin: the part the pump does not deliver is 0.
+    let daily = wire.octets([0x01, 12, 0, 18, 0, 0xEA, 0x07, 10, 27])
+    test.assert(ids_event_valid(all, EVENT_TOTAL_DAILY_INSULIN_DELIVERY, daily))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_BASAL_RATE, EVENT_TOTAL_DAILY_INSULIN_DELIVERY, daily))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_FAST_BOLUS, EVENT_TOTAL_DAILY_INSULIN_DELIVERY, daily))
+    // The manufacturer range takes up to ten octets, the rest of the types are unknown.
+    test.assert(ids_event_valid(0, 0xF030, wire.octets([1, 2, 3])))
+    test.assert(not ids_event_valid(0, 0xF030, wire.octets([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
+    test.assert(not ids_event_type_known(0x0304))
+    test.assert(ids_event_type_known(0xFFF0))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_the_annunciation_templates_and_limits_events_have_the_octets_of_their_tables()
+    let all = ALL_FEATURES
+    // Part 1: Flags, Instance ID, Type, Status and the AuxInfo fields named; Part 2: AuxInfo 3 to 5.
+    test.assert(ids_event_valid(all, EVENT_ANNUNCIATION_STATUS_CHANGED_1, wire.octets([0x03, 1, 0, 0x66, 0x00, 0x33, 1, 0, 2, 0])))
+    test.assert(not ids_event_valid(all, EVENT_ANNUNCIATION_STATUS_CHANGED_1, wire.octets([0x03, 1, 0, 0x66, 0x00, 0x33, 1, 0])))
+    test.assert(not ids_event_valid(all, EVENT_ANNUNCIATION_STATUS_CHANGED_1, wire.octets([0x00, 1, 0, 0x67, 0x00, 0x33])))
+    test.assert(ids_event_valid(all, EVENT_ANNUNCIATION_STATUS_CHANGED_2, wire.octets([0x05, 3, 0, 5, 0])))
+    test.assert(not ids_event_valid(all, EVENT_ANNUNCIATION_STATUS_CHANGED_2, wire.octets([0x08])))
+    // Profile time blocks.
+    test.assert(ids_event_valid(all, EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, wire.octets([1, 1, 0xA0, 0x05, 0x08, 0xF0])))
+    test.assert(not ids_event_valid(all, EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, wire.octets([1, 0, 0xA0, 0x05, 0x08, 0xF0])))
+    test.assert(ids_event_valid(all, EVENT_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, wire.octets([1, 1, 0xA0, 0x05, 0x64, 0x00, 0x78, 0x00])))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_BASAL_RATE, EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, wire.octets([1, 1, 0xA0, 0x05, 0x08, 0xF0])))
+    test.assert(ids_event_valid(all, EVENT_PROFILE_TEMPLATE_ACTIVATED, wire.octets([0x33, 0, 2])))
+    test.assert(not ids_event_valid(insulin_delivery.FEATURE_FAST_BOLUS, EVENT_PROFILE_TEMPLATE_ACTIVATED, wire.octets([0x33, 0, 2])))
+    test.assert(not ids_event_valid(all, EVENT_PROFILE_TEMPLATE_ACTIVATED, wire.octets([0x34, 0, 2])))
+    // Bolus templates, TBR templates, the maximum bolus.
+    test.assert(ids_event_valid(all, EVENT_BOLUS_TEMPLATE_CHANGED_1, wire.octets([2, 0x33, 0x0A, 0xF0, 0, 0, 0, 0])))
+    test.assert(ids_event_valid(all, EVENT_BOLUS_TEMPLATE_CHANGED_2, wire.octets([0x01, 5, 0])))
+    test.assert(not ids_event_valid(0, EVENT_BOLUS_TEMPLATE_CHANGED_2, wire.octets([0x00])))
+    test.assert(ids_event_valid(all, EVENT_TBR_TEMPLATE_CHANGED, wire.octets([1, 0x33, 0x0C, 0xF0, 30, 0])))
+    test.assert(not ids_event_valid(all, EVENT_TBR_TEMPLATE_CHANGED, wire.octets([1, 0x35, 0x0C, 0xF0, 30, 0])))
+    test.assert(ids_event_valid(all, EVENT_MAX_BOLUS_AMOUNT_CHANGED, wire.octets([0x0A, 0x00, 0x0F, 0x00])))
+    test.assert(ids_event_valid(all, EVENT_BOLUS_CALCULATED_1, wire.octets([1, 0, 2, 0, 3, 0, 4, 0])))
+    test.assert(ids_event_valid(all, EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED, wire.octets([1, 2, 0x10, 0x00, 0x32, 0x00])))
+
+const FAST_TYPE = 0x33
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_events_of_a_compound_group_are_recorded_together_or_not_at_all()
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(20)
+    let part1 = wire.octets([7, 0, FAST_TYPE, 0x0A, 0xF0, 0, 0, 0, 0])
+    let part2 = wire.octets([0x00])
+    // A grouped type does not stand alone; the group has its order and its parts.
+    test.assert(not ids_record_event(var dev, var h, EVENT_BOLUS_PROGRAMMED_1, 1, part1))
+    test.assert(not ids_record_group(var dev, var h, 1, [EVENT_BOLUS_PROGRAMMED_2, EVENT_BOLUS_PROGRAMMED_1], [part2, part1]))
+    test.assert(not ids_record_group(var dev, var h, 1, [EVENT_BOLUS_PROGRAMMED_1], [part1]))
+    test.assert(not ids_record_group(var dev, var h, 1, [EVENT_BOLUS_PROGRAMMED_1, EVENT_BOLUS_DELIVERED_2], [part1, part2]))
+    test.assert_eq(list.len(h.records), 0)
+    test.assert(ids_record_group(var dev, var h, 1, [EVENT_BOLUS_PROGRAMMED_1, EVENT_BOLUS_PROGRAMMED_2], [part1, part2]))
+    test.assert_eq(h.records[0].sequence, 0)
+    test.assert_eq(h.records[1].sequence, 1)
+    test.assert_eq(h.records[0].offset, 1)
+    test.assert_eq(h.records[1].offset, 1)
+    test.assert_eq(h.records[0].group, 0)
+    test.assert_eq(h.records[1].group, 0)
+    // A bad second part keeps nothing of the group.
+    test.assert(not ids_record_group(var dev, var h, 2, [EVENT_BOLUS_PROGRAMMED_1, EVENT_BOLUS_PROGRAMMED_2], [part1, wire.octets([0x07])]))
+    test.assert_eq(list.len(h.records), 2)
+    // A TBR and the basal rate change that goes with it.
+    let started = wire.octets([0x00, 0x33, 0x0C, 0xF0, 60, 0])
+    let basal = wire.octets([0x00, 0x08, 0xF0, 0x0C, 0xF0])
+    test.assert(ids_record_group(var dev, var h, 3, [EVENT_TBR_ADJUSTMENT_STARTED, EVENT_DELIVERED_BASAL_RATE_CHANGED], [started, basal]))
+    test.assert(not ids_record_group(var dev, var h, 3, [EVENT_DELIVERED_BASAL_RATE_CHANGED, EVENT_TBR_ADJUSTMENT_STARTED], [basal, started]))
+    // A profile is recorded in full: blocks 1 to n, one template, 1440 minutes.
+    let block1 = wire.octets([1, 1, 0xA0, 0x02, 0x08, 0xF0])
+    let block2 = wire.octets([1, 2, 0x00, 0x03, 0x0A, 0xF0])
+    let t = EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+    test.assert(ids_record_group(var dev, var h, 4, [t, t], [block1, block2]))
+    test.assert(not ids_record_group(var dev, var h, 4, [t], [block1]))
+    test.assert(not ids_record_group(var dev, var h, 4, [t, t], [block2, block1]))
+    test.assert(not ids_record_group(var dev, var h, 4, [t, t], [block1, wire.octets([2, 2, 0x00, 0x03, 0x0A, 0xF0])]))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_a_malformed_control_point_write_is_answered_with_the_error_of_the_specification()
+    // IDS/SEN/RAE/BI-03-C, BI-05-C, BI-06-C and CBE/BI-02-C.
+    let h = history_of(10)
+    let minimal = new_ids_history(10, racp.racp_support_minimal(), false)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x00, 0x33])).error, RACP_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x0F, 0x0F, 0x33, 1])).error, RACP_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x66, 0x0F])).error, RACP_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([])).error, RACP_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x3C, 0x33])).error, RACP_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x3C, 0x33])).error, 0)
+    // Operators: Null where one is needed, a codeword that is not defined, a value outside the code, unoffered.
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x0F])).error, RACP_INVALID_OPERATOR)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33])).error, RACP_INVALID_OPERATOR)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x96])).error, RACP_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x01])).error, RACP_INVALID_OPERATOR)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x3C, 0x0F, 1, 0, 0, 0])).error, RACP_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x5A, 0x0F, 1, 0, 0, 0, 2, 0, 0, 0])).error, RACP_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x66])).error, RACP_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x55, 0x0F, 1, 0, 0, 0])).error, 0)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x33])).error, 0)
+    // Operands: where none is used, a Filter Type that is not offered, a size, a range backward.
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x33, 0x0F, 1, 0, 0, 0])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x55])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x55, 0x0F, 1, 0, 0])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x55, 0x0F, 1, 0, 0, 0, 0])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x5A, 0x0F, 1, 0, 0, 0])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x5A, 0x0F, 9, 0, 0, 0, 2, 0, 0, 0])).error, RACP_INVALID_OPERAND)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x55, 0x01, 1, 0, 0, 0])).error, RACP_OPERAND_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(minimal, wire.octets([0x33, 0x55, 0x33, 1, 0, 0, 0])).error, RACP_OPERAND_NOT_SUPPORTED)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x33, 0x55, 0x33, 1, 0, 0, 0])).error, 0)
+    // Abort takes Null and no Operand; the sequence numbers are four octets.
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x55, 0x0F])).error, 0)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x55, 0x33])).error, RACP_INVALID_OPERATOR)
+    test.assert_eq(ids_racp_decode(h, wire.octets([0x55, 0x0F, 0x0F])).error, RACP_INVALID_OPERAND)
+    let within = ids_racp_decode(h, wire.octets([0x5A, 0x5A, 0x0F, 0x01, 0x02, 0x03, 0x04, 0xFF, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(within.error, 0)
+    test.assert_eq(within.lo, 0x04030201)
+    test.assert_eq(within.hi, 0xFFFFFFFF)
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_report_number_of_stored_records_counts_the_selected_records()
+    // IDS/SEN/RAN/BV-01-C and BV-02-C.
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(10)
+    let (s0, hs, hh, config) = rig(ALL_FEATURES, dev, h)
+    var s = s0
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x5A, 0x33])
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1][3:], wire.octets([0x66, 0x0F, 0, 0, 0, 0]))
+    filled(var dev, var h)
+    // Sequence numbers 0 to 4: two are Reference Time events (0 and 3).
+    let counts = [
+        ([0x5A, 0x33], 5), ([0x5A, 0x55, 0x0F, 3, 0, 0, 0], 2), ([0x5A, 0x3C, 0x0F, 1, 0, 0, 0], 2), ([0x5A, 0x5A, 0x0F, 1, 0, 0, 0, 3, 0, 0, 0], 3),
+        ([0x5A, 0x66], 1), ([0x5A, 0x69], 1), ([0x5A, 0x55, 0x33, 1, 0, 0, 0], 1),
+        ([0x5A, 0x55, 0x3C, 1, 0, 0, 0], 3), ([0x5A, 0x5A, 0x3C, 0, 0, 0, 0, 2, 0, 0, 0], 2), ([0x5A, 0x3C, 0x33, 2, 0, 0, 0], 1)]
+    for item in counts
+        confirm(var s)
+        out = write_racp(var s, var dev, var h, hs, hh, config, item.0)
+        test.assert_eq(out[1][3:], wire.octets([0x66, 0x0F, item.1, 0, 0, 0]))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_report_stored_records_notifies_the_records_oldest_first_and_ends_with_success()
+    // IDS/SEN/RAR/BV-01-C and RAE/BI-01-C.
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(10)
+    let (s0, hs, hh, config) = rig(ALL_FEATURES, dev, h)
+    var s = s0
+    filled(var dev, var h)
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x55, 0x0F, 2, 0, 0, 0])
+    test.assert_eq(out, [[0x13]])
+    test.assert(dev.busy)
+    let sent = ids_history_pump(var s.db, var s.link, hh, var dev, var h, 2, 0)
+    test.assert_eq(list.len(sent), 2)
+    test.assert_eq(sent[0][3:], ids_history_value(0, h.records[2]))
+    test.assert_eq(sent[1][3:], ids_history_value(0, h.records[3]))
+    test.assert_eq(sent[0][0], 0x1B)
+    test.assert(dev.busy)
+    let rest = ids_history_pump(var s.db, var s.link, hh, var dev, var h, 5, 0)
+    test.assert_eq(list.len(rest), 2)
+    test.assert_eq(rest[0][3:], ids_history_value(0, h.records[4]))
+    // The last PDU is the indication of the response: Response Code, Null, Report, Success.
+    test.assert_eq(rest[1][3:], wire.octets([0x0F, 0x0F, 0x33, 0xF0]))
+    test.assert(not dev.busy)
+    test.assert(not h.run.active)
+    // No match: No Records Found, nothing started.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x55, 0x0F, 9, 0, 0, 0])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x33, 0x06]))
+    test.assert(not dev.busy)
+    // Reference Time events only, and only the others.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x55, 0x33, 1, 0, 0, 0])
+    test.assert_eq(h.run.pending, [3])
+    h.run.active = false
+    dev.busy = false
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x3C, 0x3C, 2, 0, 0, 0])
+    test.assert_eq(h.run.pending, [1, 2])
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_delete_removes_records_keeps_the_sequence_and_refuses_part_of_a_group()
+    // IDS/SEN/RAD/BV-01-C.
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(20)
+    let (s0, hs, hh, config) = rig(ALL_FEATURES, dev, h)
+    var s = s0
+    filled(var dev, var h)
+    let part1 = wire.octets([7, 0, FAST_TYPE, 0x0A, 0xF0, 0, 0, 0, 0])
+    test.assert(ids_record_group(var dev, var h, 1, [EVENT_BOLUS_PROGRAMMED_1, EVENT_BOLUS_PROGRAMMED_2], [part1, wire.octets([0x00])]))
+    // Records 5 and 6 are a group: deleting 0 to 5 would split it.
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x3C, 0x5A, 0x0F, 0, 0, 0, 0, 5, 0, 0, 0])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x3C, 0x0A]))
+    test.assert_eq(list.len(h.records), 7)
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x3C, 0x5A, 0x0F, 0, 0, 0, 0, 4, 0, 0, 0])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x3C, 0xF0]))
+    test.assert_eq(list.len(h.records), 2)
+    // The group goes together; the Sequence Number goes on from 7.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x3C, 0x33])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x3C, 0xF0]))
+    test.assert_eq(list.len(h.records), 0)
+    test.assert(ids_record_event(var dev, var h, EVENT_THERAPY_CONTROL_STATE_CHANGED, 1, wire.octets([0x33, 0x55])))
+    test.assert_eq(h.records[0].sequence, 7)
+    // Nothing to delete is No Records Found.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x3C, 0x55, 0x0F, 9, 0, 0, 0])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x3C, 0x06]))
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_abort_stops_a_transfer_and_a_lost_link_abandons_it()
+    // IDS/SEN/RAA/BV-01-C.
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    var h = history_of(10)
+    let (s0, hs, hh, config) = rig(ALL_FEATURES, dev, h)
+    var s = s0
+    filled(var dev, var h)
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x33])
+    test.assert(h.run.active)
+    let first = ids_history_pump(var s.db, var s.link, hh, var dev, var h, 1, 0)
+    test.assert_eq(list.len(first), 1)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x55, 0x0F])
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x55, 0xF0]))
+    test.assert(not h.run.active)
+    test.assert(not dev.busy)
+    test.assert_eq(ids_history_pump(var s.db, var s.link, hh, var dev, var h, 5, 0), [])
+    // With nothing running there is nothing to stop, which is a success.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x55, 0x0F])
+    test.assert_eq(out[1][3:], wire.octets([0x0F, 0x0F, 0x55, 0xF0]))
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x33])
+    ids_history_abandon(var dev, var h)
+    test.assert(not h.run.active)
+    test.assert(not dev.busy)
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_a_write_is_refused_without_the_descriptors_and_during_a_procedure()
+    // IDS/SEN/RAE/BI-02-C and BI-04-C, CBE/BI-03-C: 0xFD and 0xFE.
+    let features = ALL_FEATURES
+    let config = insulin_delivery.IdsConfig {
+        access: gatt_server.Access.Authenticated, features: features, concentration: wire.sfloat(100, 0), features_indicate: false,
+        get_counter: false, get_delivered: false }
+    var dev = insulin_delivery.new_ids_device(features)
+    var h = history_of(10)
+    filled(var dev, var h)
+    var built = insulin_delivery.server(config, dev)
+    var s = built.0
+    let hs = built.1
+    let hh = add_ids_history(var s.db, config, h)!
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x5A, 0x33])
+    test.assert_eq(out[0][4], 0xFD)
+    subscribe(var s, hh.racp_cccd as Int, 2)
+    // Report Stored Records also needs the History Data notification; Report Number does not.
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x33])
+    test.assert_eq(out[0][4], 0xFD)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x5A, 0x33])
+    test.assert_eq(out[0], [0x13])
+    confirm(var s)
+    subscribe(var s, hh.history_cccd as Int, 1)
+    subscribe(var s, hs.reader_cccd as Int, 2)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x33, 0x33])
+    test.assert_eq(out[0], [0x13])
+    // While the transfer runs any other procedure, on either control point, is refused; Abort is not.
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x5A, 0x33])
+    test.assert_eq(out[0][4], 0xFE)
+    out = insulin_delivery.write_reader(var s, var dev, hs, config, insulin_delivery.request(features, insulin_delivery.SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(out[0][4], 0xFE)
+    out = write_racp(var s, var dev, var h, hs, hh, config, [0x55, 0x0F])
+    test.assert_eq(out[0], [0x13])
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_with_e2e_the_control_point_needs_the_counter_and_the_crc_and_history_has_a_crc()
+    let features = ALL_FEATURES | 1
+    var dev = insulin_delivery.new_ids_device(features)
+    var h = history_of(10)
+    let (s0, hs, hh, config) = rig(features, dev, h)
+    var s = s0
+    filled(var dev, var h)
+    // A value without its counter and CRC, a wrong CRC and a wrong counter.
+    var out = write_racp(var s, var dev, var h, hs, hh, config, [0x5A, 0x33])
+    test.assert_eq(out[0][4], insulin_delivery.ERR_INVALID_CRC)
+    var bad = insulin_delivery.ids_protect(features, wire.octets([0x5A, 0x33]), 1)
+    bad[list.len(bad) - 1] = 0
+    out = write_racp(var s, var dev, var h, hs, hh, config, list_of(bad))
+    test.assert_eq(out[0][4], insulin_delivery.ERR_INVALID_CRC)
+    out = write_racp(var s, var dev, var h, hs, hh, config, list_of(insulin_delivery.ids_protect(features, wire.octets([0x5A, 0x33]), 2)))
+    test.assert_eq(out[0][4], insulin_delivery.ERR_INVALID_COUNTER)
+    out = write_racp(var s, var dev, var h, hs, hh, config, list_of(insulin_delivery.ids_protect(features, wire.octets([0x5A, 0x33]), 1)))
+    test.assert_eq(out[0], [0x13])
+    let reply = out[1][3:]
+    test.assert_eq(reply[0:6], wire.octets([0x66, 0x0F, 5, 0, 0, 0]))
+    test.assert_eq(reply[6], 1)
+    test.assert_eq(wire.get(reply, 7, 2), reconnection_configuration.crc16(reply[0:7]))
+    // A transferred record carries its CRC and no counter; the Success response has the next counter.
+    confirm(var s)
+    out = write_racp(var s, var dev, var h, hs, hh, config, list_of(insulin_delivery.ids_protect(features, wire.octets([0x33, 0x66]), 2)))
+    let sent = ids_history_pump(var s.db, var s.link, hh, var dev, var h, 5, 0)
+    test.assert_eq(list.len(sent), 2)
+    test.assert_eq(sent[0][3:], ids_history_value(features, h.records[0]))
+    test.assert_eq(sent[1][3:][4], 2)
+
+@tier(app)
+fn list_of(b: [u8]) -> [Int]
+    var out: [Int] = []
+    for x in b
+        list.push(out, x as Int)
+    out
+
+@tier(app)
+fn add_history_error(config: insulin_delivery.IdsConfig, h: IdsHistory) -> ?profile_builder.ProfileError
+    var built = insulin_delivery.server(config, insulin_delivery.new_ids_device(config.features))
+    match add_ids_history(var built.0.db, config, h)
+        Ok(_) => None
+        Err(e) => Some(e)
+
+@test
+@satisfies("REQ-BLE-IDS-002")
+fn test_the_history_needs_a_store_and_authentication()
+    let ok = insulin_delivery.IdsConfig {
+        access: gatt_server.Access.Authenticated, features: 0, concentration: wire.sfloat(100, 0), features_indicate: false,
+        get_counter: false, get_delivered: false }
+    test.assert_eq(add_history_error(ok, history_of(1)), None)
+    test.assert_eq(add_history_error(ok, history_of(0)), Some(profile_builder.ProfileError.InvalidValue))

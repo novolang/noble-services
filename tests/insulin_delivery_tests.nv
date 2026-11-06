@@ -1,0 +1,489 @@
+// tests/insulin_delivery_tests.nv — the unit tests of src/insulin_delivery.nv.
+//
+//   novo test tests/insulin_delivery_tests.nv
+
+use std.test
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use reconnection_configuration
+use wire
+use insulin_delivery.{ ANNUNCIATION_CONFIRMED, ANNUNCIATION_PENDING, ANNUNCIATION_SNOOZED, ANNUNCIATION_TYPE_TEMPERATURE, BASAL_CONTEXT_REMOTE_CONTROL, BOLUS_SELECTION_DELIVERED, BOLUS_SELECTION_PROGRAMMED, BOLUS_TYPE_EXTENDED, BOLUS_TYPE_FAST, CHANGED_ANNUNCIATION_STATUS, CHANGED_OPERATIONAL_STATE, CHANGED_THERAPY_CONTROL_STATE, COUNTER_IDD_LIFETIME, COUNTER_IDD_LOANER_TIME, COUNTER_IDD_WARRANTY_TIME, COUNTER_SELECTION_ELAPSED, COUNTER_SELECTION_REMAINING, COUNTER_STATUS_CHANGED, COUNTER_STATUS_READER, ERR_INVALID_COUNTER, ERR_INVALID_CRC, FEATURE_BASAL_RATE, FEATURE_BOLUS_DELAY_TIME, FEATURE_EXTENDED_BOLUS, FEATURE_FAST_BOLUS, FEATURE_TBR_ABSOLUTE, FEATURE_TBR_RELATIVE, IdsAnnunciation, IdsBasal, IdsBolus, IdsConfig, IdsDevice, IdsHandles, OPERATIONAL_PRIMING, OPERATIONAL_READY, RESULT_INVALID_OPERAND, RESULT_OP_CODE_NOT_SUPPORTED, RESULT_PROCEDURE_NOT_APPLICABLE, SR_GET_ACTIVE_BASAL_RATE_DELIVERY, SR_GET_ACTIVE_BOLUS_DELIVERY, SR_GET_ACTIVE_BOLUS_IDS, SR_GET_COUNTER, SR_GET_DELIVERED_INSULIN, SR_GET_INSULIN_ON_BOARD, SR_GET_TOTAL_DAILY_INSULIN_STATUS, SR_RESET_STATUS, TBR_ABSOLUTE, TBR_RELATIVE, TBR_UNDETERMINED, THERAPY_RUN, add_ids_service, default_ids_config, device_for, e2e_config, full_config, ids_add_active_bolus, ids_annunciation, ids_annunciation_valid, ids_annunciation_value, ids_basal_delivery_record, ids_basal_valid, ids_bolus_delivery_record, ids_bolus_valid, ids_connection_reset, ids_features_valid, ids_features_value, ids_indicate, ids_raise, ids_receive, ids_set_annunciation, ids_set_basal, ids_set_counter, ids_set_delivered, ids_set_insulin_on_board, ids_set_operational_state, ids_set_reservoir, ids_set_therapy_control_state, ids_set_total_daily, ids_status_changed_value, ids_status_value, ids_with_aux, new_ids_device, request, sample_bolus, server, write_reader }
+
+@tier(app)
+fn minimal_config() -> IdsConfig
+    default_ids_config()
+
+@tier(app)
+fn ready(config: IdsConfig, dev: IdsDevice) -> (GattServer, IdsHandles)
+    var built = server(config, dev)
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.status_changed_cccd as Int, 2)
+    subscribe(var s, h.status_cccd as Int, 2)
+    subscribe(var s, h.annunciation_cccd as Int, 2)
+    subscribe(var s, h.reader_cccd as Int, 2)
+    (s, h)
+
+// The client confirms the indication in flight.
+@tier(app)
+fn confirm(var s: GattServer)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+
+// The indicated value that follows the Write Response in `answer`.
+@tier(app)
+fn indicated(answer: [[u8]]) -> [u8]
+    test.assert_eq(answer[0], [0x13])
+    test.assert_eq(answer[1][0] as Int, 0x1D)
+    answer[1][3:]
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_service_lists_its_characteristics_in_the_table_order()
+    let config = full_config()
+    let (s, h) = server(config, device_for(config))
+    test.assert_eq(h.status_changed, 3)
+    test.assert_eq(h.status_changed_cccd, 4)
+    test.assert_eq(h.status, 6)
+    test.assert_eq(h.status_cccd, 7)
+    test.assert_eq(h.annunciation, 9)
+    test.assert_eq(h.annunciation_cccd, 10)
+    test.assert_eq(h.features, 12)
+    test.assert_eq(h.features_cccd, 13)
+    test.assert_eq(h.reader, 15)
+    test.assert_eq(h.reader_cccd, 16)
+    test.assert_eq(gatt_server.last_handle(s.db), 16)
+    test.assert_eq(s.db.attributes[1].value, [0x22, 3, 0, 0x20, 0x2B])
+    // Read, Indicate: 0x22; Read alone for Features without the indication; Write, Indicate: 0x28.
+    test.assert_eq(s.db.attributes[4].value, [0x22, 6, 0, 0x21, 0x2B])
+    test.assert_eq(s.db.attributes[13].value, [0x28, 15, 0, 0x24, 0x2B])
+    let (plain, p) = server(minimal_config(), new_ids_device(0))
+    test.assert_eq(p.features, 12)
+    test.assert_eq(p.features_cccd, 0)
+    test.assert_eq(p.reader, 14)
+    test.assert_eq(plain.db.attributes[10].value, [0x02, 12, 0, 0x23, 0x2B])
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_features_value_has_the_crc_and_the_counter_in_front_even_without_e2e()
+    // [IDS] 3.5.1.1: 0xFFFF and 0 without E2E-Protection, then U100 and the 24 Flags.
+    test.assert_eq(ids_features_value(0x000002, wire.sfloat(100, 0), 0), wire.octets([0xFF, 0xFF, 0x00, 0x64, 0x00, 0x02, 0x00, 0x00]))
+    let with_e2e = ids_features_value(0x000003, wire.sfloat(100, 0), 1)
+    test.assert_eq(list.len(with_e2e), 8)
+    test.assert_eq(with_e2e[2] as Int, 1)
+    test.assert_eq(wire.get(with_e2e, 0, 2), reconnection_configuration.crc16(with_e2e[2:]))
+    // The sample of [IDS] 3.16: nine octets 01..09 after 0x3E give 0x2F01, sent 01 2F.
+    test.assert_eq(reconnection_configuration.crc16(wire.octets([0x3E, 1, 2, 3, 4, 5, 6, 7, 8, 9])), 0x2F01)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_status_changed_status_and_annunciation_have_the_octets_of_their_tables()
+    test.assert_eq(ids_status_changed_value(0, 0x00C1, 0), wire.octets([0xC1, 0x00]))
+    test.assert_eq(
+        ids_status_value(0, THERAPY_RUN, OPERATIONAL_READY, wire.sfloat(150, 0), true, 0),
+        wire.octets([0x55, 0x96, 0x96, 0x00, 0x01]))
+    // Without an annunciation the value is the Flags octet 0.
+    test.assert_eq(ids_annunciation_value(0, IdsAnnunciation { present: false, instance: 0, annunciation_type: 0, status: 0, aux_mask: 0, aux: [] }, 0), [0x00])
+    let a = ids_with_aux(ids_with_aux(ids_annunciation(0x1234, 0x0066, ANNUNCIATION_PENDING), 3, 0x00AB), 1, 0x0102)
+    test.assert_eq(a.aux_mask, 0x0A)
+    test.assert_eq(a.aux, [0x0102, 0x00AB])
+    test.assert_eq(ids_annunciation_value(0, a, 0), wire.octets([0x0B, 0x34, 0x12, 0x66, 0x00, 0x33, 0x02, 0x01, 0xAB, 0x00]))
+    // With E2E-Protection each value ends with the counter and the CRC over the rest.
+    let v = ids_status_changed_value(1, 0x0001, 7)
+    test.assert_eq(v[0:3], wire.octets([0x01, 0x00, 7]))
+    test.assert_eq(wire.get(v, 3, 2), reconnection_configuration.crc16(v[0:3]))
+    test.assert_eq(list.len(ids_annunciation_value(1, a, 9)), 13)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_a_value_the_service_does_not_define_is_refused()
+    var dev = new_ids_device(0)
+    test.assert(ids_set_therapy_control_state(var dev, THERAPY_RUN))
+    test.assert(not ids_set_therapy_control_state(var dev, 0x01))
+    test.assert_eq(dev.therapy, THERAPY_RUN)
+    test.assert(ids_set_operational_state(var dev, OPERATIONAL_PRIMING))
+    test.assert(not ids_set_operational_state(var dev, 0x34))
+    test.assert_eq(dev.changed, CHANGED_THERAPY_CONTROL_STATE | CHANGED_OPERATIONAL_STATE)
+    // No reservoir: the remaining amount is NaN whatever is given ([IDS] 3.3.1.3).
+    test.assert(ids_set_reservoir(var dev, false, wire.sfloat(50, 0)))
+    test.assert_eq(dev.reservoir, wire.SFLOAT_NAN)
+    test.assert(not ids_set_reservoir(var dev, true, wire.SFLOAT_RESERVED))
+    test.assert(ids_set_reservoir(var dev, true, wire.sfloat(180, 0)))
+    test.assert_eq(dev.reservoir, wire.sfloat(180, 0))
+    // Annunciations: a defined type and status, the AuxInfo fields the mask names.
+    test.assert(ids_set_annunciation(var dev, ids_annunciation(1, 0x0055, ANNUNCIATION_CONFIRMED)))
+    test.assert(not ids_set_annunciation(var dev, ids_annunciation(1, 0x0056, ANNUNCIATION_CONFIRMED)))
+    test.assert(not ids_set_annunciation(var dev, ids_annunciation(1, 0x0055, 0x01)))
+    test.assert(ids_set_annunciation(var dev, ids_annunciation(1, 0xF030, ANNUNCIATION_SNOOZED)))
+    test.assert(not ids_set_annunciation(var dev, IdsAnnunciation { present: false, instance: 0, annunciation_type: 0, status: 0, aux_mask: 0x02, aux: [1] }))
+    test.assert(not ids_set_annunciation(var dev, IdsAnnunciation { present: true, instance: 1, annunciation_type: 0x0055, status: 0x33, aux_mask: 0x02, aux: [] }))
+    // The Features: the Feature Extension bit and the reserved bits must be clear.
+    test.assert(ids_features_valid(0x00FFFF))
+    test.assert(not ids_features_valid(0x800000))
+    test.assert(not ids_features_valid(0x010000))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_temperature_annunciation_needs_its_aux_fields()
+    // [IDS] 3.4.1.6: AuxInfo1 the value, AuxInfo2 the Temperature Flags and the Context.
+    let base = ids_annunciation(5, ANNUNCIATION_TYPE_TEMPERATURE, ANNUNCIATION_PENDING)
+    test.assert(not ids_annunciation_valid(base))
+    let good = ids_with_aux(ids_with_aux(base, 1, wire.sfloat(375, -1)), 2, 0x0F01)
+    test.assert(ids_annunciation_valid(good))
+    // Too high (bit 7) is allowed, too low and too high together are not.
+    test.assert(ids_annunciation_valid(ids_with_aux(good, 2, 0x0F81)))
+    test.assert(not ids_annunciation_valid(ids_with_aux(good, 2, 0x0FC1)))
+    // Context 0x33 is the insulin, others are not defined.
+    test.assert(ids_annunciation_valid(ids_with_aux(good, 2, 0x3301)))
+    test.assert(not ids_annunciation_valid(ids_with_aux(good, 2, 0x3401)))
+    // An RFU bit of the Temperature Flags, and a bound that is not a number.
+    test.assert(not ids_annunciation_valid(ids_with_aux(good, 2, 0x0F03)))
+    test.assert(ids_annunciation_valid(ids_with_aux(good, 3, wire.sfloat(350, -1))))
+    test.assert(not ids_annunciation_valid(ids_with_aux(good, 3, wire.SFLOAT_NAN)))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_a_read_returns_the_value_with_the_next_counter_and_the_counter_rolls_from_255_to_1()
+    let config = e2e_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    var answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status_changed as Int, []), 0)
+    test.assert_eq(answer[0][1:], ids_status_changed_value(config.features, 0, 1))
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status_changed as Int, []), 0)
+    test.assert_eq(answer[0][1:], ids_status_changed_value(config.features, 0, 2))
+    // The counters of the characteristics are separate.
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status as Int, []), 0)
+    test.assert_eq(answer[0][6], 1)
+    dev.tx[COUNTER_STATUS_CHANGED] = 255
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status_changed as Int, []), 0)
+    test.assert_eq(answer[0][3], 255)
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status_changed as Int, []), 0)
+    test.assert_eq(answer[0][3], 1)
+    // A new connection starts all counters at 1 again.
+    ids_connection_reset(var dev)
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.status_changed as Int, []), 0)
+    test.assert_eq(answer[0][3], 1)
+    // The Features carry the counter too, and without E2E-Protection nothing moves.
+    answer = ids_receive(var s.db, var s.link, h, config, var dev, req(0x0A, h.features as Int, []), 0)
+    test.assert_eq(answer[0][3], 1)
+    let plain = minimal_config()
+    var plain_dev = device_for(plain)
+    var pb = ready(plain, plain_dev)
+    var ps = pb.0
+    let ph = pb.1
+    let first = ids_receive(var ps.db, var ps.link, ph, plain, var plain_dev, req(0x0A, ph.features as Int, []), 0)
+    test.assert_eq(first[0][1:], wire.octets([0xFF, 0xFF, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00]))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_indications_carry_the_next_counter_and_wait_for_the_client()
+    let config = e2e_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    ids_raise(var dev, CHANGED_ANNUNCIATION_STATUS)
+    let out = ids_indicate(var s.db, var s.link, h, config, var dev, h.status_changed as Int, 0)
+    test.assert_eq(out[0][3:], ids_status_changed_value(config.features, CHANGED_ANNUNCIATION_STATUS, 1))
+    // An unsubscribed characteristic sends nothing, and neither does Features without its indication.
+    var quiet = server(config, dev)
+    test.assert_eq(ids_indicate(var quiet.0.db, var quiet.0.link, quiet.1, config, var dev, quiet.1.status as Int, 0), [])
+    var plain = server(minimal_config(), new_ids_device(0))
+    test.assert_eq(ids_indicate(var plain.0.db, var plain.0.link, plain.1, minimal_config(), var dev, plain.1.features as Int, 0), [])
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_reset_status_clears_the_bits_that_are_set_and_keeps_the_others()
+    // IDS/SEN/RCP/BV-01-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    ids_raise(var dev, 0x00FF)
+    let answer = write_reader(var s, var dev, h, config, request(config.features, SR_RESET_STATUS, [0x0D, 0x00], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x03, 0x03, 0x0C, 0x03, 0x0F]))
+    test.assert_eq(dev.changed, 0x00F2)
+    // A bit that is already clear stays clear; an undefined bit is an invalid operand.
+    confirm(var s)
+    let again = write_reader(var s, var dev, h, config, request(config.features, SR_RESET_STATUS, [0x02, 0x01], 0))
+    test.assert_eq(indicated(again)[4] as Int, RESULT_INVALID_OPERAND)
+    test.assert_eq(dev.changed, 0x00F2)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_active_bolus_ids_come_oldest_first_and_at_most_seven()
+    // IDS/SEN/RCP/BV-02-C and BV-03-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    var answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_IDS, [], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x3F, 0x03, 0x00]))
+    test.assert(ids_add_active_bolus(var dev, sample_bolus(0x0102)))
+    test.assert(not ids_add_active_bolus(var dev, sample_bolus(0x0102)))
+    for id in 1..9
+        let _ = ids_add_active_bolus(var dev, sample_bolus(id))
+    // Confirm the earlier indication so the next procedure may start.
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_IDS, [], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x3F, 0x03, 7, 0x02, 0x01, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_active_bolus_delivery_has_the_amounts_of_the_selection()
+    // IDS/SEN/RCP/BV-04-C and BV-05-C, RCPE/BI-01-C and BI-02-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    test.assert(ids_add_active_bolus(var dev, sample_bolus(0x0007)))
+    let programmed = ids_bolus_delivery_record(dev.boluses[0], BOLUS_SELECTION_PROGRAMMED)
+    // Flags 0x07, ID 7, Multiwave, fast 1, extended 2, 60 minutes, delay 5, template 3, Manual.
+    test.assert_eq(programmed, wire.octets([0x07, 0x07, 0x00, 0x55, 0x01, 0x00, 0x02, 0x00, 60, 0, 5, 0, 3, 0x33]))
+    var answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_DELIVERY, [0x07, 0x00, BOLUS_SELECTION_PROGRAMMED], 0))
+    test.assert_eq(indicated(answer)[0:2], wire.octets([0x59, 0x03]))
+    test.assert_eq(indicated(answer)[2:], programmed)
+    // Delivered: the delay time is not applicable and is 0xFFFF.
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_DELIVERY, [0x07, 0x00, BOLUS_SELECTION_DELIVERED], 0))
+    let delivered = indicated(answer)[2:]
+    test.assert_eq(delivered[10:12], wire.octets([0xFF, 0xFF]))
+    // A bolus that is not active, a reserved selection and a missing operand.
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_DELIVERY, [0x08, 0x00, BOLUS_SELECTION_PROGRAMMED], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x03, 0x03, 0x56, 0x03, RESULT_PROCEDURE_NOT_APPLICABLE]))
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_DELIVERY, [0x07, 0x00, 0x34], 0))
+    test.assert_eq(indicated(answer)[4] as Int, RESULT_INVALID_OPERAND)
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BOLUS_DELIVERY, [0x07, 0x00], 0))
+    test.assert_eq(indicated(answer)[4] as Int, RESULT_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_a_fast_bolus_has_no_extended_part_and_an_extended_bolus_no_fast_part()
+    // [IDS] 3.6.2.3 and 4.5.2.6 footnotes.
+    var b = sample_bolus(1)
+    b = IdsBolus { id: 1, bolus_type: BOLUS_TYPE_FAST, template: -1, activation: -1, programmed: b.programmed, remaining: b.remaining, delivered: b.delivered }
+    let fast = ids_bolus_delivery_record(b, BOLUS_SELECTION_PROGRAMMED)
+    test.assert_eq(fast, wire.octets([0x01, 0x01, 0x00, 0x33, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 5, 0]))
+    let e = IdsBolus { id: 2, bolus_type: BOLUS_TYPE_EXTENDED, template: -1, activation: -1, programmed: b.programmed, remaining: b.remaining, delivered: b.delivered }
+    test.assert_eq(ids_bolus_delivery_record(e, BOLUS_SELECTION_PROGRAMMED), wire.octets([0x01, 0x02, 0x00, 0x3C, 0x00, 0x00, 0x02, 0x00, 60, 0, 5, 0]))
+    // A bolus type the Features do not name is refused; so are a template or an activation type without theirs.
+    test.assert(not ids_bolus_valid(FEATURE_FAST_BOLUS, e))
+    test.assert(ids_bolus_valid(FEATURE_FAST_BOLUS | FEATURE_EXTENDED_BOLUS | FEATURE_BOLUS_DELAY_TIME, e))
+    test.assert(not ids_bolus_valid(FEATURE_FAST_BOLUS | FEATURE_BOLUS_DELAY_TIME, sample_bolus(3)))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_active_basal_rate_has_the_tbr_and_the_context_when_they_are_present()
+    // IDS/SEN/RCP/BV-06-C and RCPE/BI-03-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    var answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BASAL_RATE_DELIVERY, [], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x03, 0x03, 0x65, 0x03, RESULT_PROCEDURE_NOT_APPLICABLE]))
+    let plain = IdsBasal {
+        active: true, template: 2, rate: wire.sfloat(8, -1), tbr_present: false, tbr_type: TBR_UNDETERMINED, tbr_value: 0,
+        tbr_programmed: 0, tbr_remaining: 0, tbr_template: -1, context: -1 }
+    test.assert(ids_set_basal(var dev, plain))
+    test.assert_eq(ids_basal_delivery_record(plain), wire.octets([0x00, 0x02, 0x08, 0xF0]))
+    let tbr = IdsBasal {
+        active: true, template: 2, rate: wire.sfloat(8, -1), tbr_present: true, tbr_type: TBR_ABSOLUTE, tbr_value: wire.sfloat(12, -1),
+        tbr_programmed: 60, tbr_remaining: 20, tbr_template: 4, context: BASAL_CONTEXT_REMOTE_CONTROL }
+    test.assert(ids_set_basal(var dev, tbr))
+    test.assert_eq(ids_basal_delivery_record(tbr), wire.octets([0x07, 0x02, 0x08, 0xF0, 0x33, 0x0C, 0xF0, 60, 0, 20, 0, 4, 0x3C]))
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_ACTIVE_BASAL_RATE_DELIVERY, [], 0))
+    test.assert_eq(indicated(answer)[0:2], wire.octets([0x6A, 0x03]))
+    test.assert_eq(indicated(answer)[2:], ids_basal_delivery_record(tbr))
+    // A relative TBR needs the Feature; a pump without the Basal Rate feature takes none.
+    let relative = IdsBasal {
+        active: true, template: 2, rate: 0, tbr_present: true, tbr_type: TBR_RELATIVE, tbr_value: wire.sfloat(2, 0),
+        tbr_programmed: 1, tbr_remaining: 1, tbr_template: -1, context: -1 }
+    test.assert(not ids_basal_valid(FEATURE_BASAL_RATE | FEATURE_TBR_ABSOLUTE, relative))
+    test.assert(ids_basal_valid(FEATURE_BASAL_RATE | FEATURE_TBR_RELATIVE, relative))
+    var bare = new_ids_device(0)
+    test.assert(not ids_set_basal(var bare, plain))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_total_daily_insulin_is_zero_for_what_the_pump_does_not_deliver()
+    // IDS/SEN/RCP/BV-07-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    test.assert(ids_set_total_daily(var dev, wire.sfloat(12, 0), wire.sfloat(18, 0), wire.sfloat(30, 0)))
+    test.assert(not ids_set_total_daily(var dev, wire.SFLOAT_RESERVED, 0, 0))
+    let answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(indicated(answer), wire.octets([0x9A, 0x03, 12, 0, 18, 0, 30, 0]))
+    // A pump with a bolus feature only reports the basal part as 0.
+    let bolus_only = IdsConfig {
+        access: gatt_server.Access.Authenticated, features: FEATURE_FAST_BOLUS, concentration: wire.sfloat(100, 0), features_indicate: false,
+        get_counter: false, get_delivered: false }
+    var bdev = device_for(bolus_only)
+    test.assert(ids_set_total_daily(var bdev, wire.sfloat(12, 0), wire.sfloat(18, 0), wire.sfloat(30, 0)))
+    var bb = ready(bolus_only, bdev)
+    let bolus_answer = write_reader(var bb.0, var bdev, bb.1, bolus_only, request(bolus_only.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(indicated(bolus_answer), wire.octets([0x9A, 0x03, 12, 0, 0, 0, 30, 0]))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_a_counter_is_read_by_type_and_selection_and_a_missing_one_is_an_invalid_operand()
+    // IDS/SEN/RCP/BV-08-C and RCPE/BI-04-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    test.assert(ids_set_counter(var dev, COUNTER_IDD_WARRANTY_TIME, COUNTER_SELECTION_REMAINING, -90))
+    test.assert(ids_set_counter(var dev, COUNTER_IDD_LIFETIME, COUNTER_SELECTION_ELAPSED, 1000))
+    test.assert(not ids_set_counter(var dev, COUNTER_IDD_LIFETIME, COUNTER_SELECTION_ELAPSED, -1))
+    test.assert(not ids_set_counter(var dev, 0x01, COUNTER_SELECTION_ELAPSED, 1))
+    test.assert(not ids_set_counter(var dev, COUNTER_IDD_LIFETIME, 0x01, 1))
+    var answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_COUNTER, [COUNTER_IDD_WARRANTY_TIME, COUNTER_SELECTION_REMAINING], 0))
+    test.assert_eq(indicated(answer), wire.octets([0xA9, 0x03, 0x33, 0x0F, 0xA6, 0xFF, 0xFF, 0xFF]))
+    // A type the device has no counter for, a reserved type and a reserved selection.
+    for operand in [[COUNTER_IDD_LOANER_TIME, COUNTER_SELECTION_REMAINING], [0x01, COUNTER_SELECTION_REMAINING], [COUNTER_IDD_LIFETIME, 0x01], [COUNTER_IDD_LIFETIME]]
+        confirm(var s)
+        answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_COUNTER, operand, 0))
+        test.assert_eq(indicated(answer)[4] as Int, RESULT_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_delivered_insulin_rolls_over_past_eighty_thousand_and_insulin_on_board_has_an_optional_duration()
+    // IDS/SEN/RCP/BV-09-C and BV-10-C.
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    ids_set_delivered(var dev, 123456, 8000001)
+    test.assert_eq(wire.float_scaled(dev.delivered_bolus, 2), 123456)
+    test.assert_eq(dev.delivered_basal, 0)
+    ids_set_delivered(var dev, 123456, 8000000)
+    test.assert_eq(wire.float_scaled(dev.delivered_basal, 2), 8000000)
+    var answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_DELIVERED_INSULIN, [], 0))
+    test.assert_eq(indicated(answer)[0:2], wire.octets([0xCF, 0x03]))
+    test.assert_eq(list.len(indicated(answer)), 10)
+    test.assert(ids_set_insulin_on_board(var dev, wire.sfloat(35, -1), 120))
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, config, request(config.features, SR_GET_INSULIN_ON_BOARD, [], 0))
+    test.assert_eq(indicated(answer), wire.octets([0xFC, 0x03, 0x01, 0x23, 0xF0, 120, 0]))
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_an_op_code_the_pump_does_not_offer_is_not_supported_and_a_stray_operand_is_invalid()
+    // IDS/SEN/RCPE/BI-05-C and CBE/BI-02-C for the Status Reader.
+    let bare = default_ids_config()
+    var dev = device_for(bare)
+    var built = ready(bare, dev)
+    var s = built.0
+    let h = built.1
+    for op in [SR_GET_ACTIVE_BOLUS_IDS, SR_GET_ACTIVE_BOLUS_DELIVERY, SR_GET_ACTIVE_BASAL_RATE_DELIVERY, SR_GET_COUNTER, SR_GET_DELIVERED_INSULIN, SR_GET_INSULIN_ON_BOARD, 0x0304, 0x033F, 0x0000]
+        let answer = write_reader(var s, var dev, h, bare, request(0, op, [], 0))
+        test.assert_eq(indicated(answer), wire.octets([0x03, 0x03, op & 0xFF, op >>> 8, RESULT_OP_CODE_NOT_SUPPORTED]))
+        confirm(var s)
+    // The two Op Codes every pump has take no operand (Reset Status takes two octets).
+    var answer = write_reader(var s, var dev, h, bare, request(0, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [1], 0))
+    test.assert_eq(indicated(answer)[4] as Int, RESULT_INVALID_OPERAND)
+    confirm(var s)
+    answer = write_reader(var s, var dev, h, bare, request(0, SR_RESET_STATUS, [1], 0))
+    test.assert_eq(indicated(answer)[4] as Int, RESULT_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_a_write_is_refused_before_it_is_accepted_without_the_descriptor_and_during_a_procedure()
+    // IDS/SEN/CBE/BI-01-C and BI-03-C: 0xFD, 0xFE.
+    let config = full_config()
+    var dev = device_for(config)
+    var unsub = server(config, dev)
+    var s = unsub.0
+    let h = unsub.1
+    var out = write_reader(var s, var dev, h, config, request(config.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(out, [[0x01, 0x12, (h.reader & 0xFF) as u8, (h.reader >>> 8) as u8, 0xFD]])
+    subscribe(var s, h.reader_cccd as Int, 2)
+    out = write_reader(var s, var dev, h, config, request(config.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(out[0], [0x13])
+    // The indication is not confirmed: the next write is a second procedure.
+    out = write_reader(var s, var dev, h, config, request(config.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(out[0][4], 0xFE)
+    confirm(var s)
+    out = write_reader(var s, var dev, h, config, request(config.features, SR_GET_TOTAL_DAILY_INSULIN_STATUS, [], 0))
+    test.assert_eq(out[0], [0x13])
+    // A write without an Op Code is a bad attribute length.
+    confirm(var s)
+    out = write_reader(var s, var dev, h, config, [0x03])
+    test.assert_eq(out[0][4], 0x0D)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_with_e2e_a_write_needs_the_right_crc_and_the_next_counter_and_the_response_carries_both()
+    // IDS/SEN/CBE/BI-05-C and BI-06-C.
+    let config = e2e_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    let op = SR_GET_TOTAL_DAILY_INSULIN_STATUS
+    // A counter of 2 as the first one, and a counter of 0, are Invalid Counter.
+    var out = write_reader(var s, var dev, h, config, request(config.features, op, [], 2))
+    test.assert_eq(out[0][4], ERR_INVALID_COUNTER)
+    out = write_reader(var s, var dev, h, config, request(config.features, op, [], 0))
+    test.assert_eq(out[0][4], ERR_INVALID_COUNTER)
+    // A wrong CRC is Invalid CRC, whichever the counter; so is a value too short for both.
+    var bad = request(config.features, op, [], 1)
+    bad[list.len(bad) - 1] = 0
+    out = write_reader(var s, var dev, h, config, bad)
+    test.assert_eq(out[0][4], ERR_INVALID_CRC)
+    out = write_reader(var s, var dev, h, config, wire.octets([0x95, 0x03]))
+    test.assert_eq(out[0][4], ERR_INVALID_CRC)
+    // The first counter 1 passes; the response has the transmit counter 1 and a CRC.
+    out = write_reader(var s, var dev, h, config, request(config.features, op, [], 1))
+    test.assert_eq(out[0], [0x13])
+    let reply = out[1][3:]
+    test.assert_eq(reply[0:2], wire.octets([0x9A, 0x03]))
+    test.assert_eq(reply[8] as Int, 1)
+    test.assert_eq(wire.get(reply, 9, 2), reconnection_configuration.crc16(reply[0:9]))
+    // The same counter again is not an increase; the next one is, and the response counter steps to 2.
+    confirm(var s)
+    out = write_reader(var s, var dev, h, config, request(config.features, op, [], 1))
+    test.assert_eq(out[0][4], ERR_INVALID_COUNTER)
+    out = write_reader(var s, var dev, h, config, request(config.features, op, [], 2))
+    test.assert_eq(out[1][3:][8], 2)
+    // Counter 255 is followed by 1.
+    dev.rx[COUNTER_STATUS_READER] = 255
+    confirm(var s)
+    out = write_reader(var s, var dev, h, config, request(config.features, op, [], 1))
+    test.assert_eq(out[0], [0x13])
+
+@tier(app)
+fn add_error(config: IdsConfig, dev: IdsDevice) -> ?profile_builder.ProfileError
+    var s = gatt_server.new_server([], 65)
+    match add_ids_service(var s.db, config, dev)
+        Ok(_) => None
+        Err(e) => Some(e)
+
+@test
+@satisfies("REQ-BLE-IDS-001")
+fn test_the_service_needs_authentication_and_valid_features()
+    let number = wire.sfloat(100, 0)
+    let off = gatt_server.Access.Authenticated
+    let encrypted = IdsConfig { access: gatt_server.Access.Encrypted, features: 0, concentration: number, features_indicate: false, get_counter: false, get_delivered: false }
+    test.assert_eq(add_error(encrypted, new_ids_device(0)), Some(profile_builder.ProfileError.NotPermitted))
+    let secure = IdsConfig { access: gatt_server.Access.SecureConnections, features: 0, concentration: number, features_indicate: false, get_counter: false, get_delivered: false }
+    test.assert_eq(add_error(secure, new_ids_device(0)), None)
+    let extension = IdsConfig { access: off, features: 0x800000, concentration: number, features_indicate: false, get_counter: false, get_delivered: false }
+    test.assert_eq(add_error(extension, new_ids_device(0x800000)), Some(profile_builder.ProfileError.InvalidValue))
+    let nan = IdsConfig { access: off, features: 0, concentration: wire.SFLOAT_NAN, features_indicate: false, get_counter: false, get_delivered: false }
+    test.assert_eq(add_error(nan, new_ids_device(0)), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(default_ids_config(), new_ids_device(1)), Some(profile_builder.ProfileError.InvalidValue))

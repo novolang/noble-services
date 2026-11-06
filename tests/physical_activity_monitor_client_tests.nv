@@ -1,0 +1,512 @@
+// tests/physical_activity_monitor_client_tests.nv — the unit tests of src/physical_activity_monitor_client.nv.
+//
+//   novo test tests/physical_activity_monitor_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use physical_activity_monitor
+use sensor_client
+use wire
+use physical_activity_monitor_client.{ PAM_ERR_ACTIVITY_TYPE, PAM_ERR_CCCD, PAM_ERR_IN_PROGRESS, PAM_ERR_NONE, PAM_ERR_NOTHING_TO_STOP, PAM_ERR_NO_DATA, PAM_ERR_NO_SESSIONS, PAM_ERR_NO_SESSION_RUNNING, PAM_ERR_OPERATION_FAILED, PAM_ERR_OP_CODE, PAM_ERR_OTHER, PAM_ERR_SESSION_ID, PAM_ERR_STILL_RUNNING, PAM_ERR_SUB_SESSION_ID, PAM_ERR_TYPE, PAM_RECORD_MAX, PAM_RESP_ENDED_DATA, PAM_RESP_ERROR, PAM_RESP_SESSIONS, PAM_RESP_SUB_SESSIONS, PAM_SEG_DONE, PAM_SEG_ERROR, PAM_SEG_MORE, PamRecord, pam_assembly_new, pam_client_new, pam_client_start, pam_client_write, pam_decode_current, pam_decode_descriptor, pam_decode_features, pam_decode_record, pam_decode_response, pam_error_kind, pam_feature_supported, pam_features_reserved, pam_request_delete, pam_request_enquire_sessions, pam_request_enquire_sub_sessions, pam_request_get_ended_session_data, pam_request_set_average_activity_type, pam_request_start, pam_request_stop, pam_segment_push }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+// The octets of a record of `kind`: the Flags field `flags`, the identifiers and then `fields` with each
+// value in the size of its field.
+@tier(app)
+fn record_octets(kind: Int, flags: Int, session: Int, sub: Int, time: Int, seq: Int, fields: [Int]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, flags, physical_activity_monitor.pams_flags_size(kind))
+    wire.put(var out, session, 2)
+    wire.put(var out, sub, 2)
+    wire.put(var out, time, 4)
+    wire.put(var out, seq, 4)
+    let sizes = physical_activity_monitor.pams_sizes(kind)
+    var k = 0
+    for i in 0..list.len(sizes)
+        if ((flags >>> i) & 1) != 0
+            wire.put(var out, fields[k], sizes[i])
+            k = k + 1
+    out
+
+@tier(app)
+fn record_of(kind: Int, b: [u8]) -> PamRecord
+    match pam_decode_record(kind, b)
+        Some(r) => r
+        None =>
+            test.fail("a record")
+            PamRecord { kind: 0, flags: 0, worn: false, session: 0, sub_session: 0, relative_time: 0, sequence: 0, present: 0, values: [] }
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_features_are_64_bits_with_at_least_one_set()
+    test.assert_eq(pam_decode_features(octets([1, 0, 0, 0, 0, 0, 0, 0])), Some(1))
+    test.assert_eq(pam_decode_features(octets([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00])), Some((1 << 55) - 1))
+    test.assert_eq(pam_decode_features(octets([0, 0, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(pam_decode_features(octets([1, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(pam_decode_features(octets([1, 0, 0, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(pam_decode_features([]), None)
+    // Bit 54 is the last defined bit, 55 the first reserved one.
+    test.assert(not pam_features_reserved(1 << 54))
+    test.assert(pam_features_reserved(1 << 55))
+    test.assert(pam_features_reserved(1 << 63))
+    test.assert(pam_feature_supported(1 << 24, 24))
+    test.assert(not pam_feature_supported(1 << 24, 23))
+    test.assert(not pam_feature_supported(1, 64))
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_the_segmentation_example_of_the_specification()
+    // [PAMS] Figure 2.1: a record in three segments with the counters 62, 63 and 0.
+    var a = pam_assembly_new()
+    test.assert_eq(pam_segment_push(var a, octets([(62 << 2) | 1, 1, 2, 3])), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(63 << 2), 4, 5])), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(0 << 2) | 2, 6])), PAM_SEG_DONE)
+    test.assert_eq(a.data, octets([1, 2, 3, 4, 5, 6]))
+    // A record in one segment has First and Last set; the counter runs on from the record before.
+    test.assert_eq(pam_segment_push(var a, octets([(1 << 2) | 3, 9, 9])), PAM_SEG_DONE)
+    test.assert_eq(a.data, octets([9, 9]))
+    // A first segment is taken at any counter.
+    test.assert_eq(pam_segment_push(var a, octets([(40 << 2) | 3, 7])), PAM_SEG_DONE)
+    test.assert_eq(a.data, octets([7]))
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_a_segment_out_of_order_ends_the_record()
+    var a = pam_assembly_new()
+    // Not first when no record is open; an empty segment; a header alone.
+    test.assert_eq(pam_segment_push(var a, octets([(5 << 2) | 2, 1])), PAM_SEG_ERROR)
+    test.assert_eq(pam_segment_push(var a, []), PAM_SEG_ERROR)
+    test.assert_eq(pam_segment_push(var a, octets([1])), PAM_SEG_ERROR)
+    // The counter skips one.
+    test.assert_eq(pam_segment_push(var a, octets([(5 << 2) | 1, 1])), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(7 << 2) | 2, 2])), PAM_SEG_ERROR)
+    test.assert_eq(list.len(a.data), 0)
+    // The counter repeats.
+    test.assert_eq(pam_segment_push(var a, octets([(5 << 2) | 1, 1])), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(5 << 2), 2])), PAM_SEG_ERROR)
+    // A first segment inside a record.
+    test.assert_eq(pam_segment_push(var a, octets([(5 << 2) | 1, 1])), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(6 << 2) | 1, 2])), PAM_SEG_ERROR)
+    // After an error a first segment starts a record again.
+    test.assert_eq(pam_segment_push(var a, octets([(9 << 2) | 3, 3])), PAM_SEG_DONE)
+    test.assert_eq(a.data, octets([3]))
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_a_record_over_the_bound_ends_with_an_error()
+    var a = pam_assembly_new()
+    var seg: [u8] = [1]
+    for _ in 0..PAM_RECORD_MAX
+        list.push(seg, 0)
+    test.assert_eq(pam_segment_push(var a, seg), PAM_SEG_MORE)
+    test.assert_eq(pam_segment_push(var a, octets([(1 << 2) | 2, 0])), PAM_SEG_ERROR)
+    // A record of exactly the bound is whole.
+    var whole: [u8] = [3]
+    for _ in 0..PAM_RECORD_MAX
+        list.push(whole, 0)
+    test.assert_eq(pam_segment_push(var a, whole), PAM_SEG_DONE)
+    test.assert_eq(list.len(a.data), PAM_RECORD_MAX)
+    // The bound holds the longest record of every kind.
+    for k in 0..7
+        test.assert(physical_activity_monitor.pams_longest(k) - 1 <= PAM_RECORD_MAX)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_a_record_with_no_optional_field_and_with_each_field_alone()
+    // General Activity Instantaneous: the fixed part alone, then each of the 11 fields on its own.
+    let bare = record_of(0, record_octets(0, 0, 3, 0xFFFF, 100, 7, []))
+    test.assert_eq(bare.session, 3)
+    test.assert_eq(bare.sub_session, 0xFFFF)
+    test.assert_eq(bare.relative_time, 100)
+    test.assert_eq(bare.sequence, 7)
+    test.assert_eq(bare.present, 0)
+    test.assert(not bare.worn)
+    let sizes = physical_activity_monitor.pams_sizes(0)
+    for i in 0..11
+        var v = 1
+        if i == 10
+            v = 0x0102
+        let r = record_of(0, record_octets(0, 1 << i, 1, 2, 3, 4, [v]))
+        test.assert_eq(r.present, 1 << i)
+        test.assert_eq(r.values[i], v)
+        test.assert_eq(list.len(r.values), 11)
+        test.assert_eq(sizes[i] > 0, true)
+    // Device Worn.
+    test.assert(record_of(0, record_octets(0, 1 << 23, 1, 2, 3, 4, [])).worn)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_every_kind_decodes_with_every_field_in_the_order_of_its_table()
+    for kind in 0..7
+        let sizes = physical_activity_monitor.pams_sizes(kind)
+        let n = list.len(sizes)
+        var fields: [Int] = []
+        for i in 0..n
+            // The activity fields take two sub-fields; the sleep stage keeps its reserved bits clear.
+            var v = (i + 1) & 0x7F
+            if (kind == 0 and i == 10) or (kind == 1 and i == 23)
+                v = 0x0201
+            if sizes[i] == 1 and v > 0xFF
+                v = 1
+            list.push(fields, v)
+        let flags = (1 << n) - 1
+        let r = record_of(kind, record_octets(kind, flags, 5, 6, 7, 8, fields))
+        test.assert_eq(r.present, flags)
+        for i in 0..n
+            test.assert_eq(r.values[i], fields[i])
+        // One octet more or less is not a record.
+        var longer = record_octets(kind, flags, 5, 6, 7, 8, fields)
+        list.push(longer, 0)
+        test.assert_eq(pam_decode_record(kind, longer), None)
+        let whole = record_octets(kind, flags, 5, 6, 7, 8, fields)
+        test.assert_eq(pam_decode_record(kind, whole[:list.len(whole) - 1]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_every_prefix_of_a_full_record_is_none()
+    let sizes = physical_activity_monitor.pams_sizes(0)
+    var fields: [Int] = []
+    for i in 0..11
+        list.push(fields, 1)
+    let whole = record_octets(0, (1 << 11) - 1, 1, 2, 3, 4, fields)
+    for k in 0..list.len(whole)
+        test.assert_eq(pam_decode_record(0, whole[:k]), None)
+    test.assert(pam_decode_record(0, whole) != None)
+    test.assert_eq(list.len(sizes), 11)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_the_elevation_is_signed_and_the_other_fields_are_not()
+    // Elevation is field 7 of General Activity Instantaneous: sint24.
+    let neg = record_of(0, record_octets(0, 1 << 7, 1, 2, 3, 4, [0xFFFFFF]))
+    test.assert_eq(neg.values[7], -1)
+    let low = record_of(0, record_octets(0, 1 << 7, 1, 2, 3, 4, [0x800000]))
+    test.assert_eq(low.values[7], -8388608)
+    let high = record_of(0, record_octets(0, 1 << 7, 1, 2, 3, 4, [0x7FFFFF]))
+    test.assert_eq(high.values[7], 8388607)
+    // Speed (field 5) is unsigned.
+    test.assert_eq(record_of(0, record_octets(0, 1 << 5, 1, 2, 3, 4, [0xFFFF])).values[5], 0xFFFF)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_reserved_flags_ids_and_values_are_none()
+    // A Flags bit that no field has: bit 11 of General Activity Instantaneous (fields 0 to 10, Device Worn 23).
+    test.assert_eq(pam_decode_record(0, record_octets(0, 1 << 11, 1, 2, 3, 4, [])), None)
+    test.assert_eq(pam_decode_record(0, record_octets(0, 1 << 22, 1, 2, 3, 4, [])), None)
+    // Device Worn is a flag of the instantaneous kinds only: bit 15 of Step Counter Summary (one Flags octet) is none.
+    test.assert_eq(pam_decode_record(4, record_octets(4, 1 << 7, 1, 2, 3, 4, [])), None)
+    // The Session ID 0xFFFF.
+    test.assert_eq(pam_decode_record(0, record_octets(0, 0, 0xFFFF, 2, 3, 4, [])), None)
+    // An Activity Type sub-field of 0x0F to 0xFE, in either octet.
+    test.assert_eq(pam_decode_record(0, record_octets(0, 1 << 10, 1, 2, 3, 4, [0x000F])), None)
+    test.assert_eq(pam_decode_record(0, record_octets(0, 1 << 10, 1, 2, 3, 4, [0x0F00])), None)
+    test.assert(pam_decode_record(0, record_octets(0, 1 << 10, 1, 2, 3, 4, [0xFF0E])) != None)
+    // A Sleep Stage with a reserved bit (field 3 of Sleep Activity Instantaneous).
+    test.assert_eq(pam_decode_record(5, record_octets(5, 1 << 3, 1, 2, 3, 4, [0x004000])), None)
+    test.assert(pam_decode_record(5, record_octets(5, 1 << 3, 1, 2, 3, 4, [0x003FFF])) != None)
+    // Kinds outside 0 to 6.
+    test.assert_eq(pam_decode_record(7, record_octets(0, 0, 1, 2, 3, 4, [])), None)
+    test.assert_eq(pam_decode_record(-1, record_octets(0, 0, 1, 2, 3, 4, [])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_the_current_session_is_17_octets()
+    let b = octets([1, 3, 0, 0x10, 0x20, 0x30, 0x40, 0xC4, 0xFF, 2, 0, 0x11, 0x21, 0x31, 0x41, 0x3C, 0x00])
+    let c = pam_decode_current(b)!
+    test.assert(c.running)
+    test.assert(not c.reserved)
+    test.assert_eq(c.session, 3)
+    test.assert_eq(c.session_start, 0x40302010)
+    test.assert_eq(c.session_offset, -60)
+    test.assert_eq(c.sub_session, 2)
+    test.assert_eq(c.sub_start, 0x41312111)
+    test.assert_eq(c.sub_offset, 60)
+    // Before the first session: all zeros, not running.
+    let z = pam_decode_current(octets([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))!
+    test.assert(not z.running)
+    test.assert(pam_decode_current(octets([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))!.reserved)
+    test.assert_eq(pam_decode_current(b[:16]), None)
+    test.assert_eq(pam_decode_current([]), None)
+    var long = b[:]
+    list.push(long, 0)
+    test.assert_eq(pam_decode_current(long), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_session_and_sub_session_descriptors()
+    // A running session: the end is left out.
+    let run = pam_decode_descriptor(octets([3, 7, 0, 1, 0, 0, 0, 0x3C, 0]))!
+    test.assert(run.describes_session and run.running and not run.deleted and not run.has_end)
+    test.assert_eq(run.session, 7)
+    test.assert_eq(run.sub_session, -1)
+    test.assert_eq(run.start_base, 1)
+    test.assert_eq(run.start_offset, 60)
+    // An ended, deleted session.
+    let end = pam_decode_descriptor(octets([5, 7, 0, 1, 0, 0, 0, 0xC4, 0xFF, 9, 0, 0, 0, 0x3C, 0]))!
+    test.assert(end.describes_session and not end.running and end.deleted and end.has_end)
+    test.assert_eq(end.start_offset, -60)
+    test.assert_eq(end.end_base, 9)
+    test.assert_eq(end.end_offset, 60)
+    // A sub-session, running and ended.
+    let sub = pam_decode_descriptor(octets([2, 7, 0, 4, 0, 5, 0, 0, 0, 0, 0]))!
+    test.assert(not sub.describes_session and sub.running and not sub.has_end)
+    test.assert_eq(sub.session, 7)
+    test.assert_eq(sub.sub_session, 4)
+    test.assert_eq(sub.start_base, 5)
+    let sub_end = pam_decode_descriptor(octets([0, 7, 0, 4, 0, 5, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0xFF, 0xFF]))!
+    test.assert(sub_end.has_end)
+    test.assert_eq(sub_end.end_base, 6)
+    test.assert_eq(sub_end.end_offset, -1)
+    // Lengths: the flags decide the length, every other length is none.
+    test.assert_eq(pam_decode_descriptor(octets([3, 7, 0, 1, 0, 0, 0, 0x3C])), None)
+    test.assert_eq(pam_decode_descriptor(octets([3, 7, 0, 1, 0, 0, 0, 0x3C, 0, 0])), None)
+    test.assert_eq(pam_decode_descriptor(octets([1, 7, 0, 1, 0, 0, 0, 0x3C, 0])), None)
+    test.assert_eq(pam_decode_descriptor(octets([2, 7, 0, 4, 0, 5, 0, 0, 0, 0])), None)
+    test.assert_eq(pam_decode_descriptor([]), None)
+    // The Session ID 0xFFFF; a reserved Flags bit is told.
+    test.assert_eq(pam_decode_descriptor(octets([3, 0xFF, 0xFF, 1, 0, 0, 0, 0, 0])), None)
+    test.assert(pam_decode_descriptor(octets([0x0B, 7, 0, 1, 0, 0, 0, 0, 0]))!.reserved)
+
+// Whether `b` decodes to a response of `kind` with `count` and `procedure`.
+@tier(app)
+fn response_is(b: [u8], kind: Int, count: Int, procedure: Int) -> Bool
+    match pam_decode_response(b)
+        Some(r) => r.kind == kind and r.count == count and r.procedure == procedure
+        None => false
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_control_point_responses()
+    test.assert(response_is(octets([0xFC, 3, 0]), PAM_RESP_SESSIONS, 3, 0xFC))
+    test.assert(response_is(octets([0xFB, 0xFF, 0xFF]), PAM_RESP_SUB_SESSIONS, 0xFFFF, 0xFB))
+    test.assert(response_is(octets([0xFA, 1, 0, 0]), PAM_RESP_ENDED_DATA, 1, 0xFA))
+    test.assert(response_is(octets([0xFA, 0xFF, 0xFF, 0xFF]), PAM_RESP_ENDED_DATA, 0xFFFFFF, 0xFA))
+    for op in [0xFF, 0xFE, 0xFD]
+        test.assert(response_is(octets([op, 0xFF]), PAM_RESP_ERROR, 0, op))
+        test.assert_eq(pam_decode_response(octets([op, 0xFE])), None)
+        test.assert_eq(pam_decode_response(octets([op, 0x00])), None)
+        test.assert_eq(pam_decode_response(octets([op])), None)
+        test.assert_eq(pam_decode_response(octets([op, 0xFF, 0])), None)
+    // A count of 0 is reserved; wrong lengths; opcodes that are requests or unassigned.
+    test.assert_eq(pam_decode_response(octets([0xFC, 0, 0])), None)
+    test.assert_eq(pam_decode_response(octets([0xFA, 0, 0, 0])), None)
+    test.assert_eq(pam_decode_response(octets([0xFC, 1])), None)
+    test.assert_eq(pam_decode_response(octets([0xFC, 1, 0, 0])), None)
+    test.assert_eq(pam_decode_response(octets([0xFA, 1, 0])), None)
+    test.assert_eq(pam_decode_response(octets([0x01, 1, 0])), None)
+    test.assert_eq(pam_decode_response(octets([0xF9, 1, 0])), None)
+    test.assert_eq(pam_decode_response([]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_the_requests()
+    test.assert_eq(pam_request_enquire_sessions(), octets([1]))
+    test.assert_eq(pam_request_enquire_sub_sessions(0x0102), Some(octets([2, 2, 1])))
+    test.assert_eq(pam_request_enquire_sub_sessions(0xFFFF), None)
+    test.assert_eq(pam_request_enquire_sub_sessions(-1), None)
+    test.assert_eq(pam_request_get_ended_session_data(1, 0xFFFF, 6), Some(octets([3, 1, 0, 0xFF, 0xFF, 6])))
+    test.assert_eq(pam_request_get_ended_session_data(0xFFFF, 0, 0), None)
+    test.assert_eq(pam_request_get_ended_session_data(1, 0x10000, 0), None)
+    test.assert_eq(pam_request_get_ended_session_data(1, 0, 7), None)
+    test.assert_eq(pam_request_get_ended_session_data(1, 0, -1), None)
+    test.assert_eq(pam_request_start(false), octets([4, 0]))
+    test.assert_eq(pam_request_start(true), octets([4, 1]))
+    test.assert_eq(pam_request_stop(), octets([5]))
+    test.assert_eq(pam_request_delete(9), Some(octets([6, 9, 0])))
+    test.assert_eq(pam_request_delete(0xFFFF), None)
+    test.assert_eq(pam_request_set_average_activity_type(false, 3), Some(octets([7, 0, 3])))
+    test.assert_eq(pam_request_set_average_activity_type(true, 0xFF), Some(octets([7, 1, 0xFF])))
+    test.assert_eq(pam_request_set_average_activity_type(true, 0x0E), Some(octets([7, 1, 0x0E])))
+    test.assert_eq(pam_request_set_average_activity_type(true, 0x0F), None)
+    test.assert_eq(pam_request_set_average_activity_type(true, 0xFE), None)
+    test.assert_eq(pam_request_set_average_activity_type(true, 0x100), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_the_errors_of_a_request_are_named()
+    test.assert_eq(pam_error_kind(0), PAM_ERR_NONE)
+    let names = [PAM_ERR_OP_CODE, PAM_ERR_SESSION_ID, PAM_ERR_SUB_SESSION_ID, PAM_ERR_STILL_RUNNING, PAM_ERR_NO_DATA,
+        PAM_ERR_NO_SESSIONS, PAM_ERR_TYPE, PAM_ERR_NO_SESSION_RUNNING, PAM_ERR_NOTHING_TO_STOP,
+        PAM_ERR_ACTIVITY_TYPE, PAM_ERR_OPERATION_FAILED]
+    for i in 0..11
+        test.assert_eq(pam_error_kind(0x80 + i), names[i])
+    test.assert_eq(pam_error_kind(0x8B), PAM_ERR_OTHER)
+    test.assert_eq(pam_error_kind(0xFD), PAM_ERR_CCCD)
+    test.assert_eq(pam_error_kind(0xFE), PAM_ERR_IN_PROGRESS)
+    test.assert_eq(pam_error_kind(0x03), PAM_ERR_OTHER)
+
+// A server for `config` on an authenticated link, and its state with the consent given.
+@tier(app)
+fn test_server(config: physical_activity_monitor.PamsConfig) -> (gatt_server.GattServer, physical_activity_monitor.PamsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = physical_activity_monitor.add_pams_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+// Carry `first` between the session and the server, which answers through `pams_receive`, and confirm every
+// indication.  The Control Point responses and descriptors the session saw are appended to `got` as
+// (handle-uuid, value) pairs flattened in `uuids` and `values`.
+@tier(app)
+fn pam_pump(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var s: gatt_server.GattServer, h: physical_activity_monitor.PamsHandles, config: physical_activity_monitor.PamsConfig, var state: physical_activity_monitor.PamsState, first: sensor_client.ScStep, var uuids: [Int], var values: [[u8]]) -> Int [mutate]
+    var all = first.event
+    var policy = physical_activity_monitor.default_pams_policy()
+    var pending = first.pdus[:]
+    for _ in 0..200
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            for a in physical_activity_monitor.pams_receive(var s.db, var s.link, h, config, var state, var policy, sensor_client.test_link(), item[:], 0)
+                let step = sensor_client.sc_on_pdu(var t, var c, a, 0)
+                list.append(next, step.pdus[:])
+                all = all | step.event
+                if (step.event & sensor_client.SE_VALUE) != 0
+                    list.push(uuids, sensor_client.sc_uuid(c))
+                    list.push(values, sensor_client.sc_value(c))
+        pending = next
+    all
+
+// The records the session heard from the server's own sends: deliver `pdus` and confirm until none is left.
+@tier(app)
+fn pam_deliver(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var s: gatt_server.GattServer, pdus: [[u8]], var uuids: [Int], var values: [[u8]]) -> Int [mutate]
+    var all = 0
+    var pending = pdus[:]
+    for _ in 0..200
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            let step = sensor_client.sc_on_pdu(var t, var c, item[:], 0)
+            all = all | step.event
+            if (step.event & sensor_client.SE_VALUE) != 0
+                list.push(uuids, sensor_client.sc_uuid(c))
+                list.push(values, sensor_client.sc_value(c))
+            for p in step.pdus
+                list.append(next, gatt_server.receive(var s.db, var s.link, p[:], 0))
+        pending = next
+    all
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    let config = physical_activity_monitor.default_pams_config((1 << physical_activity_monitor.FEATURE_BITS) - 1)
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = physical_activity_monitor.new_pams_state(config)
+    physical_activity_monitor.pams_set_consent(var state, true)
+    let both = sensor_client.test_open(physical_activity_monitor.UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE)
+    var t = both.0
+    var c = pam_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let all = pam_pump(var t, var c, var s, h, config, var state, pam_client_start(var t, var c, 0), var uuids, var values)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The Features then the Current Session were read.
+    test.assert_eq(uuids[0], physical_activity_monitor.UUID_PAM_FEATURES)
+    test.assert_eq(pam_decode_features(values[0]), Some((1 << 55) - 1))
+    test.assert_eq(uuids[1], physical_activity_monitor.UUID_PAM_CURRENT_SESSION)
+    test.assert(not pam_decode_current(values[1])!.running)
+    // Start a session through the Control Point: the Current Session is indicated, then the Control Point answers.
+    var u2: [Int] = []
+    var v2: [[u8]] = []
+    let st = pam_pump(var t, var c, var s, h, config, var state, pam_client_write(var t, var c, pam_request_start(false), 0), var u2, var v2)
+    test.assert((st & sensor_client.SE_DONE) != 0)
+    test.assert(list.len(u2) >= 1)
+    var current_seen = false
+    for i in 0..list.len(u2)
+        if u2[i] == physical_activity_monitor.UUID_PAM_CURRENT_SESSION
+            let cs = pam_decode_current(v2[i])!
+            test.assert(cs.running)
+            current_seen = true
+    test.assert(current_seen)
+    // A record of the General Activity Summary kind in segments, confirmed one by one.
+    var rec = physical_activity_monitor.pams_record(1, 0, 0, 30)
+    physical_activity_monitor.pams_set_field(var rec, 0, 1234)
+    physical_activity_monitor.pams_set_field(var rec, 16, 12)
+    physical_activity_monitor.pams_set_field(var rec, 24, 99)
+    let sent = physical_activity_monitor.pams_send_record(var s.db, var s.link, h, config, var state, rec, 0)
+    test.assert(list.len(sent) >= 1)
+    var u3: [Int] = []
+    var v3: [[u8]] = []
+    let dev = pam_deliver(var t, var c, var s, sent, var u3, var v3)
+    test.assert((dev & sensor_client.SE_INDICATION) != 0)
+    var a = pam_assembly_new()
+    var done = 0
+    for i in 0..list.len(v3)
+        test.assert_eq(u3[i], physical_activity_monitor.pams_kind_uuid(1))
+        if pam_segment_push(var a, v3[i]) == PAM_SEG_DONE
+            done = done + 1
+    test.assert_eq(done, 1)
+    let r = record_of(1, a.data[:])
+    test.assert_eq(r.session, 0)
+    test.assert_eq(r.relative_time, 30)
+    test.assert_eq(r.values[0], 1234)
+    test.assert_eq(r.values[16], 12)
+    test.assert_eq(r.values[24], 99)
+    test.assert_eq(r.present, (1 << 0) | (1 << 16) | (1 << 24))
+    // Enquire Sessions: one descriptor, then the success with the count.
+    var u4: [Int] = []
+    var v4: [[u8]] = []
+    let _ = pam_pump(var t, var c, var s, h, config, var state, pam_client_write(var t, var c, pam_request_enquire_sessions(), 0), var u4, var v4)
+    var counted = false
+    for i in 0..list.len(u4)
+        if u4[i] == physical_activity_monitor.UUID_PAM_SESSION_DESCRIPTOR
+            let d = pam_decode_descriptor(v4[i])!
+            test.assert(d.describes_session and d.running)
+            test.assert_eq(d.session, 0)
+        if u4[i] == physical_activity_monitor.UUID_PAM_CONTROL_POINT
+            test.assert_eq(pam_decode_response(v4[i])!.kind, PAM_RESP_SESSIONS)
+            test.assert_eq(pam_decode_response(v4[i])!.count, 1)
+            counted = true
+    test.assert(counted)
+    // A refused request: Enquire Sub-sessions of a session that does not exist.
+    var u5: [Int] = []
+    var v5: [[u8]] = []
+    let bad = pam_pump(var t, var c, var s, h, config, var state, pam_client_write(var t, var c, pam_request_enquire_sub_sessions(9)!, 0), var u5, var v5)
+    test.assert((bad & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(pam_error_kind(sensor_client.sc_status(c)), PAM_ERR_SESSION_ID)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_session_against_the_smallest_server()
+    if not fixtures.client_engine_present()
+        return
+    // Features bit 3 alone: the two mandatory data characteristics only.
+    let config = physical_activity_monitor.default_pams_config(1 << 3)
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = physical_activity_monitor.new_pams_state(config)
+    let both = sensor_client.test_open(physical_activity_monitor.UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE)
+    var t = both.0
+    var c = pam_client_new(sensor_client.test_link())
+    var uuids: [Int] = []
+    var values: [[u8]] = []
+    let all = pam_pump(var t, var c, var s, h, config, var state, pam_client_start(var t, var c, 0), var uuids, var values)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(pam_decode_features(values[0]), Some(8))
+    // The optional kinds are not there.
+    test.assert_eq(sensor_client.sc_handle(var t, c, physical_activity_monitor.pams_kind_uuid(2)), 0)
+    test.assert(sensor_client.sc_handle(var t, c, physical_activity_monitor.pams_kind_uuid(0)) != 0)
+
+@test
+@satisfies("REQ-BLE-PRFC-020")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(physical_activity_monitor.UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE)
+    var t = both.0
+    var c = pam_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, pam_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

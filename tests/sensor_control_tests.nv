@@ -1,0 +1,64 @@
+// tests/sensor_control_tests.nv — the unit tests of src/sensor_control.nv.
+//
+//   novo test tests/sensor_control_tests.nv
+
+use std.test
+use gatt_server
+use sensor_control.{ LOCATION_MAX, RESULT_INVALID_PARAMETER, RESULT_OP_CODE_NOT_SUPPORTED, RESULT_SUCCESS, SensorLocation, accesses_conform, list_locations, location_value, new_sc_state, response, set_cumulative, start_calibration, update_location }
+
+@test
+fn test_location_values()
+    test.assert_eq(location_value(SensorLocation.Absent), -1)
+    test.assert_eq(location_value(SensorLocation.Other), 0)
+    test.assert_eq(location_value(SensorLocation.LeftCrank), 5)
+    test.assert_eq(location_value(SensorLocation.RearHub), 13)
+    test.assert_eq(location_value(SensorLocation.ChainRing), LOCATION_MAX)
+
+@test
+fn test_update_location_procedure()
+    var single = new_sc_state(SensorLocation.Chest, [], true, true)
+    test.assert_eq(update_location(var single, [3]).0, RESULT_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(list_locations(single).0, RESULT_OP_CODE_NOT_SUPPORTED)
+    var multi = new_sc_state(SensorLocation.LeftCrank, [5, 6], true, true)
+    test.assert_eq(update_location(var multi, [6]).0, RESULT_SUCCESS)
+    test.assert_eq(multi.location, 6)
+    test.assert_eq(update_location(var multi, [4]).0, RESULT_INVALID_PARAMETER)
+    test.assert_eq(update_location(var multi, []).0, RESULT_INVALID_PARAMETER)
+    test.assert_eq(multi.location, 6)
+    let l = list_locations(multi)
+    test.assert_eq(l.0, RESULT_SUCCESS)
+    test.assert_eq(l.1, [5, 6])
+
+@test
+fn test_cumulative_and_calibration_procedures()
+    var state = new_sc_state(SensorLocation.Other, [], true, false)
+    test.assert_eq(set_cumulative(var state, [1, 2]), RESULT_INVALID_PARAMETER)
+    test.assert_eq(state.cumulative_set, false)
+    test.assert_eq(set_cumulative(var state, [0x78, 0x56, 0x34, 0x12]), RESULT_SUCCESS)
+    test.assert_eq(state.cumulative_value, 0x12345678)
+    test.assert(state.cumulative_set)
+    test.assert_eq(start_calibration(var state), RESULT_OP_CODE_NOT_SUPPORTED)
+    var calibrating = new_sc_state(SensorLocation.Other, [], false, true)
+    test.assert_eq(set_cumulative(var calibrating, [0, 0, 0, 0]), RESULT_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(start_calibration(var calibrating), RESULT_SUCCESS)
+    test.assert(calibrating.calibration_requested)
+
+@test
+fn test_accesses_conform_to_the_profiles()
+    let open = gatt_server.open_permissions()
+    let open_access = gatt_server.Access.Open
+    test.assert(accesses_conform(open_access, open, true, open_access, open))
+    test.assert(accesses_conform(gatt_server.Access.Authenticated, open, false, gatt_server.Access.Denied, open))
+    // Level 4 is beyond the levels the profiles allow.
+    test.assert(not accesses_conform(gatt_server.Access.SecureConnections, open, false, open_access, open))
+    test.assert(not accesses_conform(open_access, open, true, gatt_server.Access.SecureConnections, open))
+    test.assert(not accesses_conform(open_access, gatt_server.Permissions { read: open_access, write: gatt_server.Access.SecureConnections }, false, open_access, open))
+    // The service reads and writes each descriptor and reads its values.
+    test.assert(not accesses_conform(gatt_server.Access.Denied, open, false, open_access, open))
+    test.assert(not accesses_conform(open_access, gatt_server.Permissions { read: gatt_server.Access.Denied, write: open_access }, false, open_access, open))
+    test.assert(not accesses_conform(open_access, open, true, gatt_server.Access.Denied, open))
+    test.assert(not accesses_conform(open_access, open, true, open_access, gatt_server.Permissions { read: open_access, write: gatt_server.Access.Denied }))
+
+@test
+fn test_response_value()
+    test.assert_eq(response(0x10, 0x04, RESULT_SUCCESS, [5, 6]), [0x10, 0x04, 0x01, 5, 6])

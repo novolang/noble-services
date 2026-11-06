@@ -1,0 +1,147 @@
+// tests/battery_tests.nv — the unit tests of src/battery.nv.
+//
+//   novo test tests/battery_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use battery.{ BatteryConfig, BatteryHandles, add_battery_service, default_battery_config, secured_battery_config, set_battery_level }
+
+fn fixture() -> GattServer
+    var s = gatt_server.new_server([], 65)
+    s
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn added(var s: GattServer, config: BatteryConfig) -> BatteryHandles
+    match add_battery_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            BatteryHandles { service: 0, level: 0, cccd: 0 }
+
+@test
+fn test_battery_service_layout()
+    var s = fixture()
+    let h = added(var s, default_battery_config(87))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.level, 3)
+    test.assert_eq(h.cccd, 4)
+    test.assert_eq(gatt_server.last_handle(s.db), 4)
+    // The service declaration holds the UUID and groups the four handles.
+    test.assert(gatt_server.same_bytes(s.db.attributes[0].value, octets([0x0F, 0x18])))
+    test.assert_eq(gatt_server.group_end(s.db, 0), 4)
+    // The characteristic declaration: Read and Notify, the value handle, the UUID.
+    test.assert(gatt_server.same_bytes(s.db.attributes[1].value, octets([0x12, 0x03, 0x00, 0x19, 0x2A])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[2].value, octets([87])))
+    // Read-only value, writable descriptor.
+    test.assert_eq(s.db.attributes[2].permissions, gatt_server.PERM_READ)
+    test.assert_eq(s.db.attributes[3].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE)
+    test.assert_eq(gatt_server.configuration(s.link, h.cccd), 0)
+
+@test
+fn test_battery_level_is_cut_to_a_percentage()
+    var s = fixture()
+    let h = added(var s, default_battery_config(250))
+    test.assert_eq(s.db.attributes[2].value[0] as Int, 100)
+    let _ = set_battery_level(var s.db, var s.link, h, -5, 0)
+    test.assert_eq(s.db.attributes[2].value[0] as Int, 0)
+
+@test
+fn test_battery_round_trip_through_the_server()
+    var s = fixture()
+    let h = added(var s, default_battery_config(64))
+    // Read the level.
+    let read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.level & 0xFF, h.level >>> 8]), 0)
+    test.assert_eq(list.len(read), 1)
+    test.assert(gatt_server.same_bytes(read[0], octets([0x0B, 64])))
+    // The level cannot be written.
+    let refused = gatt_server.receive(var s.db, var s.link, octets([0x12, h.level & 0xFF, h.level >>> 8, 10]), 0)
+    test.assert(gatt_server.same_bytes(refused[0], octets([0x01, 0x12, h.level & 0xFF, h.level >>> 8, att.ATT_ERR_WRITE_NOT_PERMITTED])))
+    // No notification before the client subscribes.
+    test.assert_eq(list.len(set_battery_level(var s.db, var s.link, h, 63, 0)), 0)
+    // The client writes the configuration descriptor and reads it back.
+    let ok = gatt_server.receive(var s.db, var s.link, octets([0x12, h.cccd & 0xFF, h.cccd >>> 8, 0x01, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(ok[0], octets([0x13])))
+    let cfg = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.cccd & 0xFF, h.cccd >>> 8]), 0)
+    test.assert(gatt_server.same_bytes(cfg[0], octets([0x0B, 0x01, 0x00])))
+    // The new level goes out as a notification.
+    let ntf = set_battery_level(var s.db, var s.link, h, 62, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert(gatt_server.same_bytes(ntf[0], octets([0x1B, h.level & 0xFF, h.level >>> 8, 62])))
+    // Unsubscribed again: nothing.
+    let off = gatt_server.receive(var s.db, var s.link, octets([0x12, h.cccd & 0xFF, h.cccd >>> 8, 0x00, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(off[0], octets([0x13])))
+    test.assert_eq(list.len(set_battery_level(var s.db, var s.link, h, 61, 0)), 0)
+    // The service is found by its UUID.
+    let found = gatt_server.receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x0F, 0x18]), 0)
+    test.assert(gatt_server.same_bytes(found[0], octets([0x07, 0x01, 0x00, 0x04, 0x00])))
+
+@test
+fn test_encrypted_battery_level_waits_for_the_link()
+    var s = fixture()
+    let h = added(var s, secured_battery_config(50, gatt_server.Access.Encrypted))
+    test.assert_eq(s.db.attributes[2].permissions, gatt_server.PERM_READ_ENCRYPT)
+    test.assert_eq(s.db.attributes[3].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE_ENCRYPT)
+    let clear = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.level & 0xFF, h.level >>> 8]), 0)
+    test.assert_eq(clear[0][0] as Int, 0x01)
+    test.assert_eq(clear[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // The descriptor reads on any link and is refused a write in the clear.
+    let cfg = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.cccd & 0xFF, h.cccd >>> 8]), 0)
+    test.assert(gatt_server.same_bytes(cfg[0], octets([0x0B, 0x00, 0x00])))
+    let refused = gatt_server.receive(var s.db, var s.link, octets([0x12, h.cccd & 0xFF, h.cccd >>> 8, 0x01, 0x00]), 0)
+    test.assert_eq(refused[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    let no_link = gatt_server.receive(var s.db, var s.link, octets([0x12, h.cccd & 0xFF, h.cccd >>> 8, 0x01, 0x00]), 0)
+    test.assert_eq(no_link[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_configuration(var s.link, h.cccd, gatt_server.CCC_NOTIFICATION)
+    test.assert_eq(list.len(set_battery_level(var s.db, var s.link, h, 49, 0)), 0)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    let read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.level & 0xFF, h.level >>> 8]), 0)
+    test.assert(gatt_server.same_bytes(read[0], octets([0x0B, 49])))
+    let ok = gatt_server.receive(var s.db, var s.link, octets([0x12, h.cccd & 0xFF, h.cccd >>> 8, 0x01, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(ok[0], octets([0x13])))
+    test.assert_eq(list.len(set_battery_level(var s.db, var s.link, h, 48, 0)), 1)
+
+@test
+fn test_battery_levels_of_access()
+    // Authenticated: level 2 is encrypted but not authenticated.
+    var a = fixture()
+    let ha = added(var a, secured_battery_config(10, gatt_server.Access.Authenticated))
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x0A, ha.level, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x0A, ha.level, 0]), 0)[0][0] as Int, 0x0B)
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.cccd, 0, 1, 0]), 0)[0][0] as Int, 0x13)
+    // Secure Connections: level 3 is not enough.
+    var c = fixture()
+    let hc = added(var c, secured_battery_config(10, gatt_server.Access.SecureConnections))
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x0A, hc.level, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x0A, hc.level, 0]), 0)[0][0] as Int, 0x0B)
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.cccd, 0, 1, 0]), 0)[0][0] as Int, 0x13)
+    // Authorized: no client is.
+    var z = fixture()
+    let hz = added(var z, secured_battery_config(10, gatt_server.Access.Authorized))
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, octets([0x0A, hz.level, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, octets([0x12, hz.cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+
+@test
+fn test_battery_service_stops_when_the_table_is_full()
+    var s = fixture()
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    // A server whose last handle is the largest has no room for another service.
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_battery_service(var s.db, default_battery_config(1))
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

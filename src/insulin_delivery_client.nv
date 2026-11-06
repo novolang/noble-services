@@ -1,0 +1,680 @@
+// src/insulin_delivery_client.nv — the Collector side of the Insulin
+// Delivery Service (0x183A), as the Insulin Delivery Profile 1.0.2 describes it: the
+// decoders of its characteristics, the Status Reader Control Point requests and responses,
+// the E2E-Protection checks and the client session.
+//
+//   IDD Status Changed              0x2B20  `idd_decode_status_changed`
+//   IDD Status                      0x2B21  `idd_decode_status`
+//   IDD Annunciation Status         0x2B22  `idd_decode_annunciation`
+//   IDD Features                    0x2B23  `idd_decode_features`
+//   IDD Status Reader Control Point 0x2B24  requests by `idd_request_*`, responses by
+//                                           `idd_decode_reader` and the `idd_decode_*`
+//                                           of each response Operand
+//
+// Layout: see insulin_delivery.nv.  The Collector reads the Features first and passes the
+// E2E-Protection bit to the decoders ([IDP] 4.9).  With the bit set every value ends with
+// an E2E-Counter and an E2E-CRC: the decoders check the CRC, which is calculated over all
+// other octets ([IDP] 4.4), and `idd_counter_follows` checks that a received counter is
+// one after the last one of the same characteristic ([IDS] 3.15).  A request carries the
+// transmit E2E-Counter of the Collector, which steps by one for each write to a control
+// point and starts at 1 for each connection ([IDS] 3.1.1).
+//
+// The session (`idd_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Features, enable the indication of Status Changed, Status, Annunciation Status and the
+// Status Reader Control Point ([IDP] 4.5, 4.10) and, when the sensor has them, of the
+// Features, of the Record Access Control Point and the notification of the History Data.
+// The history is read with the Record Access Control Point: `idd_racp_*` builds the requests,
+// `idd_decode_racp` the responses and `idd_decode_history` each History Data record.  The
+// therapy is commanded with the Command Control Point: `idd_command_*` builds the requests of
+// the procedures without a template and `idd_decode_reader` reads the response (the Command
+// Control Point has the layout of the Status Reader Control Point).  NOT IMPLEMENTED yet: the
+// requests of the template procedures and the decoding of the IDD Command Data.
+//
+// Satisfies: REQ-BLE-PRFC-019.
+
+use gatt_client
+use gatt_server
+use links
+use insulin_delivery
+use insulin_delivery_command
+use insulin_delivery_history
+use reconnection_configuration
+use sensor_client
+use wire
+
+// The Features of a sensor: the E2E-CRC and E2E-Counter in front, the insulin concentration
+// as a raw SFLOAT in IU/mL and the 24 Flags.
+@value
+struct IddFeatures
+    e2e: Bool
+    concentration: Int
+    flags: Int
+    counter: Int
+
+// The Features in `b`: eight octets, and the extension octets a set Feature Extension bit
+// announces.  With E2E-Protection the CRC is checked; without it the CRC is 0xFFFF and the
+// counter 0 ([IDS] 3.5.1.1).  `None` otherwise.
+@tier(app)
+fn idd_decode_features(b: [u8]) -> ?IddFeatures
+    if list.len(b) < 8
+        return None
+    let flags = wire.get(b, 5, 3)
+    let e2e = (flags & insulin_delivery.FEATURE_E2E_PROTECTION) != 0
+    let crc = wire.get(b, 0, 2)
+    if e2e
+        if crc != reconnection_configuration.crc16(b[2:])
+            return None
+    else if crc != 0xFFFF or b[2] != 0
+        return None
+    Some(IddFeatures { e2e: e2e, concentration: wire.get(b, 3, 2), flags: flags & 0x7FFFFF, counter: b[2] as Int })
+
+// Whether the received E2E-Counter `current` is the one after `last`, 255 before the first
+// value of a connection ([IDS] 3.15): `current` minus `last` modulo 255 is 1.
+@tier(embedded)
+@no_alloc
+fn idd_counter_follows(last: Int, current: Int) -> Bool
+    current - (last % 255) == 1
+
+// The body of `b` and its counter when `b` has the E2E-Counter and a right CRC after
+// `min_body` octets or more; `None` for a CRC that does not match or a value too short.
+// Without E2E-Protection the value is the body and the counter 0.
+@tier(app)
+fn idd_unprotect(e2e: Bool, b: [u8], min_body: Int) -> ?([u8], Int)
+    if not e2e
+        if list.len(b) < min_body
+            return None
+        return Some((b[:], 0))
+    let n = list.len(b)
+    if n < min_body + 3
+        return None
+    if wire.get(b, n - 2, 2) != reconnection_configuration.crc16(b[0:n - 2])
+        return None
+    Some((b[0:n - 3], b[n - 3] as Int))
+
+// The Status Changed Flags in `b`, `None` for a value that does not fit or has a wrong CRC.
+@tier(app)
+fn idd_decode_status_changed(b: [u8], e2e: Bool) -> ?Int
+    match idd_unprotect(e2e, b, 2)
+        Some(v) =>
+            if list.len(v.0) != 2
+                return None
+            Some(wire.get(v.0, 0, 2))
+        None => None
+
+// One decoded IDD Status.  `reservoir` is the raw SFLOAT in IU, NaN without a reservoir.
+@value
+struct IddStatus
+    therapy: Int
+    operational: Int
+    reservoir: Int
+    attached: Bool
+    counter: Int
+
+@tier(app)
+fn idd_decode_status(b: [u8], e2e: Bool) -> ?IddStatus
+    match idd_unprotect(e2e, b, 5)
+        Some(v) =>
+            if list.len(v.0) != 5
+                return None
+            Some(IddStatus {
+                therapy: v.0[0] as Int, operational: v.0[1] as Int, reservoir: wire.get(v.0, 2, 2),
+                attached: (v.0[4] as Int & insulin_delivery.STATUS_RESERVOIR_ATTACHED) != 0, counter: v.1 })
+        None => None
+
+// One decoded IDD Annunciation Status; `aux` holds the AuxInfo fields the Flags announce.
+struct IddAnnunciation
+    present: Bool
+    instance: Int
+    annunciation_type: Int
+    status: Int
+    aux_mask: Int
+    aux: [Int]
+    counter: Int
+
+@tier(app)
+fn idd_decode_annunciation(b: [u8], e2e: Bool) -> ?IddAnnunciation
+    match idd_unprotect(e2e, b, 1)
+        Some(v) =>
+            let body = v.0
+            let flags = body[0] as Int
+            let mask = flags & insulin_delivery.ANNUNCIATION_AUX_ALL
+            var aux: [Int] = []
+            if (flags & insulin_delivery.ANNUNCIATION_PRESENT) == 0
+                if list.len(body) != 1 or mask != 0
+                    return None
+                return Some(IddAnnunciation { present: false, instance: 0, annunciation_type: 0, status: 0, aux_mask: 0, aux: aux, counter: v.1 })
+            var at = 6
+            for k in 1..6
+                if (mask & (1 << k)) != 0
+                    list.push(aux, wire.get(body, at, 2))
+                    at = at + 2
+            if list.len(body) != at
+                return None
+            Some(IddAnnunciation {
+                present: true, instance: wire.get(body, 1, 2), annunciation_type: wire.get(body, 3, 2), status: body[5] as Int,
+                aux_mask: mask, aux: aux, counter: v.1 })
+        None => None
+
+// An SFLOAT in IU as thousandths of an IU.
+@tier(embedded)
+@no_alloc
+fn idd_milli_iu(raw: Int) -> Int
+    wire.sfloat_scaled(raw, 3)
+
+// ── The Status Reader Control Point ─────────────────────────────────
+
+// The request: the Op Code, the Operand and, with E2E-Protection, the transmit E2E-Counter
+// and the CRC.
+@tier(app)
+fn idd_request(e2e: Bool, counter: Int, op: Int, operand: [u8]) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, op, 2)
+    list.append(body, operand)
+    insulin_delivery.ids_protect(if e2e then insulin_delivery.FEATURE_E2E_PROTECTION else 0, body, counter)
+
+@tier(app)
+fn idd_request_reset_status(e2e: Bool, counter: Int, flags: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, flags, 2)
+    idd_request(e2e, counter, insulin_delivery.SR_RESET_STATUS, operand)
+
+@tier(app)
+fn idd_request_get_active_bolus_ids(e2e: Bool, counter: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_ACTIVE_BOLUS_IDS, [])
+
+@tier(app)
+fn idd_request_get_active_bolus_delivery(e2e: Bool, counter: Int, bolus_id: Int, selection: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, bolus_id, 2)
+    list.push(operand, selection as u8)
+    idd_request(e2e, counter, insulin_delivery.SR_GET_ACTIVE_BOLUS_DELIVERY, operand)
+
+@tier(app)
+fn idd_request_get_active_basal_rate_delivery(e2e: Bool, counter: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_ACTIVE_BASAL_RATE_DELIVERY, [])
+
+@tier(app)
+fn idd_request_get_total_daily_insulin_status(e2e: Bool, counter: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_TOTAL_DAILY_INSULIN_STATUS, [])
+
+@tier(app)
+fn idd_request_get_counter(e2e: Bool, counter: Int, counter_type: Int, selection: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_COUNTER, [counter_type as u8, selection as u8])
+
+@tier(app)
+fn idd_request_get_delivered_insulin(e2e: Bool, counter: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_DELIVERED_INSULIN, [])
+
+@tier(app)
+fn idd_request_get_insulin_on_board(e2e: Bool, counter: Int) -> [u8]
+    idd_request(e2e, counter, insulin_delivery.SR_GET_INSULIN_ON_BOARD, [])
+
+// One response of the Status Reader Control Point: the Op Code, the Operand and the
+// E2E-Counter (0 without E2E-Protection).
+struct IddReaderResponse
+    op: Int
+    operand: [u8]
+    counter: Int
+
+@tier(app)
+fn idd_decode_reader(b: [u8], e2e: Bool) -> ?IddReaderResponse
+    match idd_unprotect(e2e, b, 2)
+        Some(v) => Some(IddReaderResponse { op: wire.get(v.0, 0, 2), operand: v.0[2:], counter: v.1 })
+        None => None
+
+// The Response Code Operand: the Request Op Code and the Response Code Value.
+@value
+struct IddResponseCode
+    request_op: Int
+    code: Int
+
+@tier(app)
+fn idd_decode_response_code(operand: [u8]) -> ?IddResponseCode
+    if list.len(operand) != 3
+        return None
+    Some(IddResponseCode { request_op: wire.get(operand, 0, 2), code: operand[2] as Int })
+
+// The Bolus IDs of a Get Active Bolus IDs Response: the Number of Active Boluses, then
+// that many IDs ([IDS] 4.5.2.4); `None` for a count above seven or an Operand of another size.
+@tier(app)
+fn idd_decode_active_bolus_ids(operand: [u8]) -> ?[Int]
+    if list.len(operand) < 1
+        return None
+    let n = operand[0] as Int
+    if n > insulin_delivery.ACTIVE_BOLUS_IDS_MAX or list.len(operand) != 1 + 2 * n
+        return None
+    var ids: [Int] = []
+    for i in 0..n
+        list.push(ids, wire.get(operand, 1 + 2 * i, 2))
+    Some(ids)
+
+// A decoded Active Bolus Delivery record; `delay`, `template` and `activation` are -1 when absent.
+@value
+struct IddBolusDelivery
+    id: Int
+    bolus_type: Int
+    fast: Int
+    extended: Int
+    duration: Int
+    delay: Int
+    template: Int
+    activation: Int
+
+@tier(app)
+fn idd_decode_bolus_delivery(operand: [u8]) -> ?IddBolusDelivery
+    if list.len(operand) < 10
+        return None
+    let flags = operand[0] as Int
+    var at = 10
+    var delay = -1
+    var template = -1
+    var activation = -1
+    if (flags & insulin_delivery.BOLUS_FLAG_DELAY_TIME) != 0
+        delay = wire.get(operand, at, 2)
+        at = at + 2
+    if (flags & insulin_delivery.BOLUS_FLAG_TEMPLATE_NUMBER) != 0
+        template = wire.get(operand, at, 1)
+        at = at + 1
+    if (flags & insulin_delivery.BOLUS_FLAG_ACTIVATION_TYPE) != 0
+        activation = wire.get(operand, at, 1)
+        at = at + 1
+    if list.len(operand) != at
+        return None
+    Some(IddBolusDelivery {
+        id: wire.get(operand, 1, 2), bolus_type: operand[3] as Int, fast: wire.get(operand, 4, 2), extended: wire.get(operand, 6, 2),
+        duration: wire.get(operand, 8, 2), delay: delay, template: template, activation: activation })
+
+// A decoded Active Basal Rate Delivery record; the TBR fields are used when `tbr_present`,
+// `tbr_template` and `context` are -1 when absent.
+@value
+struct IddBasalDelivery
+    template: Int
+    rate: Int
+    tbr_present: Bool
+    tbr_type: Int
+    tbr_value: Int
+    tbr_programmed: Int
+    tbr_remaining: Int
+    tbr_template: Int
+    context: Int
+
+@tier(app)
+fn idd_decode_basal_delivery(operand: [u8]) -> ?IddBasalDelivery
+    if list.len(operand) < 4
+        return None
+    let flags = operand[0] as Int
+    let tbr = (flags & insulin_delivery.BASAL_FLAG_TBR_PRESENT) != 0
+    var at = 4
+    var tbr_type = 0
+    var tbr_value = 0
+    var tbr_programmed = 0
+    var tbr_remaining = 0
+    var tbr_template = -1
+    var context = -1
+    if tbr
+        if list.len(operand) < at + 7
+            return None
+        tbr_type = operand[at] as Int
+        tbr_value = wire.get(operand, at + 1, 2)
+        tbr_programmed = wire.get(operand, at + 3, 2)
+        tbr_remaining = wire.get(operand, at + 5, 2)
+        at = at + 7
+        if (flags & insulin_delivery.BASAL_FLAG_TBR_TEMPLATE_NUMBER) != 0
+            tbr_template = wire.get(operand, at, 1)
+            at = at + 1
+    if (flags & insulin_delivery.BASAL_FLAG_DELIVERY_CONTEXT) != 0
+        context = wire.get(operand, at, 1)
+        at = at + 1
+    if list.len(operand) != at
+        return None
+    Some(IddBasalDelivery {
+        template: operand[1] as Int, rate: wire.get(operand, 2, 2), tbr_present: tbr, tbr_type: tbr_type, tbr_value: tbr_value,
+        tbr_programmed: tbr_programmed, tbr_remaining: tbr_remaining, tbr_template: tbr_template, context: context })
+
+// The three raw SFLOATs of a Total Daily Insulin Status record: bolus, basal and the sum.
+@value
+struct IddTotalDaily
+    bolus: Int
+    basal: Int
+    total: Int
+
+@tier(app)
+fn idd_decode_total_daily(operand: [u8]) -> ?IddTotalDaily
+    if list.len(operand) != 6
+        return None
+    Some(IddTotalDaily { bolus: wire.get(operand, 0, 2), basal: wire.get(operand, 2, 2), total: wire.get(operand, 4, 2) })
+
+// A Counter record: the type, the selection and the value in minutes.
+@value
+struct IddCounter
+    counter_type: Int
+    selection: Int
+    minutes: Int
+
+@tier(app)
+fn idd_decode_counter(operand: [u8]) -> ?IddCounter
+    if list.len(operand) != 6
+        return None
+    Some(IddCounter { counter_type: operand[0] as Int, selection: operand[1] as Int, minutes: wire.get_signed(operand, 2, 4) })
+
+// The delivered amounts in hundredths of an IU: bolus and basal.
+@value
+struct IddDelivered
+    bolus_centi: Int
+    basal_centi: Int
+
+@tier(app)
+fn idd_decode_delivered(operand: [u8]) -> ?IddDelivered
+    if list.len(operand) != 8
+        return None
+    Some(IddDelivered { bolus_centi: wire.float_scaled(wire.get(operand, 0, 4), 2), basal_centi: wire.float_scaled(wire.get(operand, 4, 4), 2) })
+
+// The Insulin On Board record: the raw SFLOAT in IU and the remaining duration in minutes,
+// -1 without one.
+@value
+struct IddInsulinOnBoard
+    amount: Int
+    remaining: Int
+
+@tier(app)
+fn idd_decode_insulin_on_board(operand: [u8]) -> ?IddInsulinOnBoard
+    if list.len(operand) < 3
+        return None
+    let has = (operand[0] as Int & 1) != 0
+    if list.len(operand) != (if has then 5 else 3)
+        return None
+    Some(IddInsulinOnBoard { amount: wire.get(operand, 1, 2), remaining: if has then wire.get(operand, 3, 2) else -1 })
+
+// ── The Record Access Control Point and the History Data ────────────
+
+// The request: the Op Code, the Operator, the Operand and, with E2E-Protection, the transmit
+// E2E-Counter and the CRC ([IDS] 3.9.1).
+@tier(app)
+fn idd_racp_request(e2e: Bool, counter: Int, op: Int, operator: Int, operand: [u8]) -> [u8]
+    var body: [u8] = [op as u8, operator as u8]
+    list.append(body, operand)
+    insulin_delivery.ids_protect(if e2e then insulin_delivery.FEATURE_E2E_PROTECTION else 0, body, counter)
+
+// The Operand of a filter: the Filter Type and the Sequence Number `lo`, and `hi` for the
+// range of Within range of ([IDS] 3.9.4.1).
+@tier(app)
+fn idd_racp_filter(filter: Int, lo: Int, hi: Int, range: Bool) -> [u8]
+    var operand: [u8] = [filter as u8]
+    wire.put(var operand, lo, 4)
+    if range
+        wire.put(var operand, hi, 4)
+    operand
+
+@tier(app)
+fn idd_racp_report_all(e2e: Bool, counter: Int) -> [u8]
+    idd_racp_request(e2e, counter, insulin_delivery_history.RACP_REPORT_STORED_RECORDS, insulin_delivery_history.RACP_OPERATOR_ALL_RECORDS, [])
+
+// Report Stored Records from the Sequence Number `first` on, by the Filter Type `filter`.
+@tier(app)
+fn idd_racp_report_from(e2e: Bool, counter: Int, filter: Int, first: Int) -> [u8]
+    idd_racp_request(e2e, counter, insulin_delivery_history.RACP_REPORT_STORED_RECORDS, insulin_delivery_history.RACP_OPERATOR_GREATER_THAN_OR_EQUAL_TO, idd_racp_filter(filter, first, 0, false))
+
+@tier(app)
+fn idd_racp_report_number_all(e2e: Bool, counter: Int) -> [u8]
+    idd_racp_request(e2e, counter, insulin_delivery_history.RACP_REPORT_NUMBER_OF_STORED_RECORDS, insulin_delivery_history.RACP_OPERATOR_ALL_RECORDS, [])
+
+// Delete Stored Records of the Sequence Numbers `lo` to `hi`, inclusive.
+@tier(app)
+fn idd_racp_delete_range(e2e: Bool, counter: Int, filter: Int, lo: Int, hi: Int) -> [u8]
+    idd_racp_request(e2e, counter, insulin_delivery_history.RACP_DELETE_STORED_RECORDS, insulin_delivery_history.RACP_OPERATOR_WITHIN_RANGE_OF, idd_racp_filter(filter, lo, hi, true))
+
+@tier(app)
+fn idd_racp_abort(e2e: Bool, counter: Int) -> [u8]
+    idd_racp_request(e2e, counter, insulin_delivery_history.RACP_ABORT_OPERATION, insulin_delivery_history.RACP_OPERATOR_NULL, [])
+
+// One response of the Record Access Control Point: a Response Code (`request_op`, `code`) or
+// a Number of Stored Records Response (`count`).
+@value
+struct IddRacpResponse
+    number: Bool
+    request_op: Int
+    code: Int
+    count: Int
+    counter: Int
+
+@tier(app)
+fn idd_decode_racp(b: [u8], e2e: Bool) -> ?IddRacpResponse
+    match idd_unprotect(e2e, b, 2)
+        Some(v) =>
+            let body = v.0
+            if body[0] as Int == insulin_delivery_history.RACP_RESPONSE_CODE and list.len(body) == 4 and body[1] as Int == insulin_delivery_history.RACP_OPERATOR_NULL
+                return Some(IddRacpResponse { number: false, request_op: body[2] as Int, code: body[3] as Int, count: 0, counter: v.1 })
+            if body[0] as Int == insulin_delivery_history.RACP_NUMBER_OF_STORED_RECORDS_RESPONSE and list.len(body) == 6 and body[1] as Int == insulin_delivery_history.RACP_OPERATOR_NULL
+                return Some(IddRacpResponse { number: true, request_op: 0, code: 0, count: wire.get(body, 2, 4), counter: v.1 })
+            None
+        None => None
+
+// One History Data record: the Event Type, the Sequence Number, the Relative Offset in
+// seconds and the Event Data; `data_ok` says the Event Data fits the type on a sensor with
+// the Features (`insulin_delivery_history.ids_event_valid`).
+struct IddHistory
+    event_type: Int
+    sequence: Int
+    offset: Int
+    data: [u8]
+    data_ok: Bool
+
+// The record in `b`: 8 to 20 octets, the CRC checked when `features` name E2E-Protection;
+// there is no E2E-Counter ([IDS] 4.9).
+@tier(app)
+fn idd_decode_history(b: [u8], features: Int) -> ?IddHistory
+    let e2e = insulin_delivery.ids_e2e(features)
+    let n = list.len(b)
+    let size = n - (if e2e then 2 else 0)
+    if size < 8 or size > 18
+        return None
+    if e2e and wire.get(b, n - 2, 2) != reconnection_configuration.crc16(b[0:n - 2])
+        return None
+    let t = wire.get(b, 0, 2)
+    let data = b[8:size]
+    Some(IddHistory {
+        event_type: t, sequence: wire.get(b, 2, 4), offset: wire.get(b, 6, 2), data: data,
+        data_ok: insulin_delivery_history.ids_event_valid(features, t, data) })
+
+// The Reference Time event ([IDS] 4.9.4.1): the Date Time, the Time Zone in quarter hours
+// (-128 unknown) and the DST Offset every later record's Relative Offset counts from.
+@value
+struct IddReferenceTime
+    reason: Int
+    date_time: wire.DateTime
+    time_zone: Int
+    dst: Int
+
+@tier(app)
+fn idd_decode_reference_time(r: IddHistory) -> ?IddReferenceTime
+    if r.event_type != insulin_delivery_history.EVENT_REFERENCE_TIME or not r.data_ok
+        return None
+    Some(IddReferenceTime { reason: r.data[0] as Int, date_time: wire.get_date_time(r.data, 1), time_zone: wire.get_signed(r.data, 8, 1), dst: r.data[9] as Int })
+
+// The Reference Time Base Offset event ([IDS] 4.9.4.2): the Base Time and the Time Offset
+// in minutes.
+@value
+struct IddReferenceBaseOffset
+    reason: Int
+    base_time: wire.DateTime
+    time_offset: Int
+
+@tier(app)
+fn idd_decode_reference_base_offset(r: IddHistory) -> ?IddReferenceBaseOffset
+    if r.event_type != insulin_delivery_history.EVENT_REFERENCE_TIME_BASE_OFFSET or not r.data_ok
+        return None
+    Some(IddReferenceBaseOffset { reason: r.data[0] as Int, base_time: wire.get_date_time(r.data, 1), time_offset: wire.get_signed(r.data, 8, 2) })
+
+// ── The Command Control Point ───────────────────────────────────────
+
+// The request: the Op Code, the Operand and, with E2E-Protection, the transmit E2E-Counter
+// and the CRC ([IDS] 4.6).
+@tier(app)
+fn idd_command_request(e2e: Bool, counter: Int, op: Int, operand: [u8]) -> [u8]
+    idd_request(e2e, counter, op, operand)
+
+@tier(app)
+fn idd_command_set_therapy_control_state(e2e: Bool, counter: Int, state: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_THERAPY_CONTROL_STATE, [state as u8])
+
+@tier(app)
+fn idd_command_set_flight_mode(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_FLIGHT_MODE, [])
+
+@tier(app)
+fn idd_command_snooze_annunciation(e2e: Bool, counter: Int, instance: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, instance, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SNOOZE_ANNUNCIATION, operand)
+
+@tier(app)
+fn idd_command_confirm_annunciation(e2e: Bool, counter: Int, instance: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, instance, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_CONFIRM_ANNUNCIATION, operand)
+
+// Set TBR Adjustment of the type `kind` with the adjustment `value` (a raw SFLOAT) for
+// `duration` minutes; `change` overwrites the active TBR, `context` and `template` are -1
+// for none ([IDS] 4.6.2.12).
+@tier(app)
+fn idd_command_set_tbr_adjustment(e2e: Bool, counter: Int, kind: Int, value: Int, duration: Int, change: Bool, template: Int, context: Int) -> [u8]
+    let flags = (if template >= 0 then insulin_delivery_command.TBR_FLAG_TEMPLATE_NUMBER else 0)
+        | (if context >= 0 then insulin_delivery_command.TBR_FLAG_DELIVERY_CONTEXT else 0)
+        | (if change then insulin_delivery_command.TBR_FLAG_CHANGE else 0)
+    var operand: [u8] = [flags as u8, kind as u8]
+    wire.put(var operand, value, 2)
+    wire.put(var operand, duration, 2)
+    if template >= 0
+        list.push(operand, template as u8)
+    if context >= 0
+        list.push(operand, context as u8)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_TBR_ADJUSTMENT, operand)
+
+@tier(app)
+fn idd_command_cancel_tbr_adjustment(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_CANCEL_TBR_ADJUSTMENT, [])
+
+// Set Bolus of the type `kind` with the raw SFLOAT amounts `fast` and `extended`, `duration`
+// minutes, and the optional delay (minutes), template number and activation type (-1 for
+// none) ([IDS] 4.6.2.18).
+@tier(app)
+fn idd_command_set_bolus(e2e: Bool, counter: Int, kind: Int, fast: Int, extended: Int, duration: Int, delay: Int, template: Int, activation: Int) -> [u8]
+    let flags = (if delay >= 0 then insulin_delivery.BOLUS_FLAG_DELAY_TIME else 0)
+        | (if template >= 0 then insulin_delivery.BOLUS_FLAG_TEMPLATE_NUMBER else 0)
+        | (if activation >= 0 then insulin_delivery.BOLUS_FLAG_ACTIVATION_TYPE else 0)
+    var operand: [u8] = [flags as u8, kind as u8]
+    wire.put(var operand, fast, 2)
+    wire.put(var operand, extended, 2)
+    wire.put(var operand, duration, 2)
+    if delay >= 0
+        wire.put(var operand, delay, 2)
+    if template >= 0
+        list.push(operand, template as u8)
+    if activation >= 0
+        list.push(operand, activation as u8)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_BOLUS, operand)
+
+@tier(app)
+fn idd_command_cancel_bolus(e2e: Bool, counter: Int, bolus_id: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, bolus_id, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_CANCEL_BOLUS, operand)
+
+@tier(app)
+fn idd_command_get_available_boluses(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_GET_AVAILABLE_BOLUSES, [])
+
+// Start Priming with the raw SFLOAT `amount` in IU.
+@tier(app)
+fn idd_command_start_priming(e2e: Bool, counter: Int, amount: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, amount, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_START_PRIMING, operand)
+
+@tier(app)
+fn idd_command_stop_priming(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_STOP_PRIMING, [])
+
+@tier(app)
+fn idd_command_set_initial_reservoir_fill_level(e2e: Bool, counter: Int, level: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, level, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_INITIAL_RESERVOIR_FILL_LEVEL, operand)
+
+@tier(app)
+fn idd_command_reset_reservoir_insulin_operation_time(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_RESET_RESERVOIR_INSULIN_OPERATION_TIME, [])
+
+@tier(app)
+fn idd_command_get_max_bolus_amount(e2e: Bool, counter: Int) -> [u8]
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_GET_MAX_BOLUS_AMOUNT, [])
+
+@tier(app)
+fn idd_command_set_max_bolus_amount(e2e: Bool, counter: Int, amount: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, amount, 2)
+    idd_command_request(e2e, counter, insulin_delivery_command.CMD_SET_MAX_BOLUS_AMOUNT, operand)
+
+// The Bolus ID of a Set Bolus Response or a Cancel Bolus Response Operand, and the
+// Annunciation Instance ID of a Snooze or Confirm Annunciation Response Operand.
+@tier(app)
+fn idd_decode_command_id(operand: [u8]) -> ?Int
+    if list.len(operand) != 2
+        return None
+    Some(wire.get(operand, 0, 2))
+
+// The bolus types available now, from Get Available Boluses Response: Fast, Extended and
+// Multiwave as bits 0 to 2.
+@tier(app)
+fn idd_decode_available_boluses(operand: [u8]) -> ?Int
+    if list.len(operand) != 1 or (operand[0] as Int & 0xF8) != 0
+        return None
+    Some(operand[0] as Int)
+
+// ── The session ─────────────────────────────────────────────────────
+
+// A session on `link`.
+@tier(app)
+fn idd_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, insulin_delivery.UUID_INSULIN_DELIVERY_SERVICE)
+
+// Discover the service, read the Features, enable the indications of Status Changed, Status,
+// Annunciation Status and the Status Reader Control Point, and of the Features when the
+// sensor lets them be indicated.
+@tier(app)
+fn idd_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, insulin_delivery.UUID_IDD_FEATURES, true)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery.UUID_IDD_FEATURES, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery.UUID_IDD_STATUS_CHANGED, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery.UUID_IDD_STATUS, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery.UUID_IDD_ANNUNCIATION_STATUS, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery.UUID_IDD_STATUS_READER_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery_history.UUID_IDD_RECORD_ACCESS_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery_history.UUID_IDD_HISTORY_DATA, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery_command.UUID_IDD_COMMAND_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, insulin_delivery_command.UUID_IDD_COMMAND_DATA, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` to the Status Reader Control Point (see `idd_request_*`).
+@tier(app)
+fn idd_client_write_reader(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, insulin_delivery.UUID_IDD_STATUS_READER_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write `request` to the IDD Command Control Point (see `idd_command_*`).
+@tier(app)
+fn idd_client_write_command(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, insulin_delivery_command.UUID_IDD_COMMAND_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write `request` to the IDD Record Access Control Point (see `idd_racp_*`).
+@tier(app)
+fn idd_client_write_racp(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, insulin_delivery_history.UUID_IDD_RECORD_ACCESS_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Read the characteristic `uuid` (Status Changed, Status or Annunciation Status).
+@tier(app)
+fn idd_client_read(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, uuid: Int, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, uuid, true)
+    sensor_client.sc_kick(var t, var c, now_ms)

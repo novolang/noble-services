@@ -1,0 +1,214 @@
+// src/weight_scale_client.nv — the Collector side of the Weight Scale
+// Service (0x181D): the decoders of its characteristics and the client session.
+//
+//   Weight Scale Feature   0x2A9E   decoded by `ws_decode_features`; read, and indicated
+//                                    when the features change
+//   Weight Measurement     0x2A9D   decoded by `ws_decode`; indicated
+//
+// Layout of a measurement ([GSS] 3.250 and [WSS] 3.2): the flags octet (bit 0 the units,
+// SI when clear and imperial when set; bit 1 a time stamp; bit 2 a User ID; bit 3 the BMI
+// and Height pair; bits 4 to 7 reserved and ignored), the Weight as a uint16, then the time
+// stamp (a seven-octet Date Time, [GSS] 3.70), the User ID (one octet, 0xFF for an unknown
+// user), the BMI (a uint16, 0.1 kg/m2 or lb/in2) and the Height (a uint16), each when its
+// flag is set.  SI weights are in 0.005 kg and heights in 0.001 m; imperial weights are in
+// 0.01 lb and heights in 0.1 in.  A Weight of 0xFFFF says the measurement was unsuccessful;
+// only the time stamp and the User ID follow it, so the decoder ignores the BMI flag then.
+//
+// The Weight Scale Feature ([GSS] 3.251) is a uint32: bit 0 time stamp, bit 1 multiple
+// users, bit 2 BMI, bits 3 to 6 the Weight Measurement Resolution (0 not specified, 1 to 7),
+// bits 7 to 9 the Height Measurement Resolution (0 not specified, 1 to 3); the other bits
+// are reserved and ignored.  `ws_weight_step` and `ws_height_step` turn a resolution into
+// its step.
+//
+// A decoder answers `None` for a value too short for the fields its flags name and for a
+// time stamp that is not a Date Time with a known year, month and day.  It allocates
+// nothing and keeps no state.  Octets after the fields are not read.
+//
+// The session (`ws_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Weight Scale Feature, enable the indication of the measurement and enable the indication
+// of the Feature when the peer has it.  A Body Composition Service that the scale includes
+// is a secondary service, which the session does not discover; `body_composition_client.nv`
+// serves one that is a primary service.
+//
+// Satisfies: REQ-BLE-PRFC-011.
+
+use gatt_client
+use links
+use sensor_client
+use weight_scale
+use wire
+
+// The Weight of a measurement that did not succeed.
+const WS_UNSUCCESSFUL = 0xFFFF
+
+// The User ID of an unknown user.
+const WS_USER_UNKNOWN = 0xFF
+
+// The flag bits of a measurement.
+const WS_FLAG_IMPERIAL = 0x01
+const WS_FLAG_TIME_STAMP = 0x02
+const WS_FLAG_USER = 0x04
+const WS_FLAG_BMI = 0x08
+
+// One decoded measurement.  `weight` and `height` are the raw fields (see the units above);
+// `unsuccessful` is set for a Weight of 0xFFFF.  A field whose flag is clear is 0 (the time
+// stamp all zero) and its `has_` bit is false.
+@value
+struct WsMeasurement
+    imperial: Bool
+    weight: Int
+    unsuccessful: Bool
+    has_time: Bool
+    time: wire.DateTime
+    has_user: Bool
+    user_id: Int
+    has_bmi: Bool
+    bmi: Int
+    height: Int
+
+// The Weight Scale Feature: the three support bits and the two resolutions.
+@value
+struct WsFeatures
+    time_stamp: Bool
+    multiple_users: Bool
+    bmi: Bool
+    weight_resolution: Int
+    height_resolution: Int
+
+// The measurement in `b`, `None` when `b` is not a whole measurement.
+@tier(embedded)
+@no_alloc
+fn ws_decode(b: [u8]) -> ?WsMeasurement
+    let n = list.len(b)
+    if n < 3
+        return None
+    let flags = b[0] as Int
+    let weight = wire.get(b, 1, 2)
+    let unsuccessful = weight == WS_UNSUCCESSFUL
+    var at = 3
+    let has_time = (flags & WS_FLAG_TIME_STAMP) != 0
+    var stamp = wire.date_time_unknown()
+    if has_time
+        if n < at + 7
+            return None
+        stamp = wire.get_date_time(b, at)
+        if not wire.date_time_known(stamp)
+            return None
+        at = at + 7
+    let has_user = (flags & WS_FLAG_USER) != 0
+    var user = 0
+    if has_user
+        if n < at + 1
+            return None
+        user = b[at] as Int
+        at = at + 1
+    let has_bmi = (flags & WS_FLAG_BMI) != 0 and not unsuccessful
+    var bmi = 0
+    var height = 0
+    if has_bmi
+        if n < at + 4
+            return None
+        bmi = wire.get(b, at, 2)
+        height = wire.get(b, at + 2, 2)
+    Some(WsMeasurement {
+        imperial: (flags & WS_FLAG_IMPERIAL) != 0, weight: weight, unsuccessful: unsuccessful,
+        has_time: has_time, time: stamp, has_user: has_user, user_id: user, has_bmi: has_bmi, bmi: bmi, height: height })
+
+// The Weight Scale Feature in `b`, `None` unless it is four octets.
+@tier(embedded)
+@no_alloc
+fn ws_decode_features(b: [u8]) -> ?WsFeatures
+    if list.len(b) != 4
+        return None
+    let v = wire.get(b, 0, 4)
+    Some(WsFeatures {
+        time_stamp: (v & 0x01) != 0, multiple_users: (v & 0x02) != 0, bmi: (v & 0x04) != 0,
+        weight_resolution: (v >>> 3) & 0xF, height_resolution: (v >>> 7) & 0x7 })
+
+// `n / d` rounded once, halves away from zero.
+@tier(embedded)
+@no_alloc
+fn ws_div_round(n: Int, d: Int) -> Int
+    (n + d / 2) / d
+
+// The weight of `m` in grams; an imperial weight is converted, 0 for an unsuccessful measurement.
+@tier(embedded)
+@no_alloc
+fn ws_weight_grams(m: WsMeasurement) -> Int
+    if m.unsuccessful
+        return 0
+    if m.imperial
+        // 0.01 lb is 4.5359237 g.
+        return ws_div_round(m.weight * 45359237, 10000000)
+    m.weight * 5
+
+// The height of `m` in millimetres; an imperial height is converted.
+@tier(embedded)
+@no_alloc
+fn ws_height_mm(m: WsMeasurement) -> Int
+    if m.imperial
+        // 0.1 in is 2.54 mm.
+        return ws_div_round(m.height * 254, 100)
+    m.height
+
+// The step of a Weight Measurement Resolution (1 to 7), in grams for SI and in hundredths of a pound
+// for imperial; 0 for a resolution that is not specified or not defined.
+@tier(embedded)
+@no_alloc
+fn ws_weight_step(resolution: Int, imperial: Bool) -> Int
+    if resolution < 1 or resolution > 7
+        return 0
+    if imperial
+        if resolution == 1
+            return 100
+        if resolution == 2
+            return 50
+        if resolution == 3
+            return 20
+        if resolution == 4
+            return 10
+        if resolution == 5
+            return 5
+        if resolution == 6
+            return 2
+        return 1
+    if resolution == 1
+        return 500
+    if resolution == 2
+        return 200
+    if resolution == 3
+        return 100
+    if resolution == 4
+        return 50
+    if resolution == 5
+        return 20
+    if resolution == 6
+        return 10
+    5
+
+// The step of a Height Measurement Resolution (1 to 3), in millimetres for SI and in tenths of an inch
+// for imperial; 0 for a resolution that is not specified or not defined.
+@tier(embedded)
+@no_alloc
+fn ws_height_step(resolution: Int, imperial: Bool) -> Int
+    if resolution < 1 or resolution > 3
+        return 0
+    if resolution == 1
+        return 10
+    if resolution == 2
+        return 5
+    1
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn ws_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, weight_scale.UUID_WEIGHT_SCALE_SERVICE)
+
+// Discover the service, read the Feature (required), enable the indication of the measurement
+// (required) and of the Feature (optional).
+@tier(app)
+fn ws_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, weight_scale.UUID_WEIGHT_SCALE_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, weight_scale.UUID_WEIGHT_MEASUREMENT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, weight_scale.UUID_WEIGHT_SCALE_FEATURE, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)

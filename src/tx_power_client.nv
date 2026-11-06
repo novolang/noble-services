@@ -1,0 +1,53 @@
+// src/tx_power_client.nv — the client of the Tx Power Service
+// (0x1804): the decoder of its one characteristic and the client session.
+//
+//   Tx Power Level   0x2A07   decoded by `tps_decode_level`; read
+//
+// The characteristic is one sint8 in dBm.  The values -100 to +20 are defined;
+// every other value is reserved for future use ([GSS] 3.237).  The service
+// has no Notify, Indicate or Write ([TPS] 3.1), so the client reads the level
+// when it needs it.
+//
+// A decoder takes the octets of a value and answers `None` for a length other
+// than one octet and for a reserved level.  It allocates nothing and keeps no
+// state.
+//
+// The session (`tps_client_*`) runs on `sensor_client.nv`: discover the
+// service and read the level, which the service requires.  `tps_client_read`
+// reads it again.
+//
+// Satisfies: REQ-BLE-PRFC-017.
+
+use gatt_client
+use links
+use sensor_client
+use tx_power
+use wire
+
+// The Tx Power Level in `b`, in dBm: -100 to +20, `None` for another length or a reserved level.
+@tier(embedded)
+@no_alloc
+fn tps_decode_level(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    let dbm = wire.get_signed(b, 0, 1)
+    if not tx_power.tx_power_valid(dbm)
+        return None
+    Some(dbm)
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn tps_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, tx_power.UUID_TX_POWER_SERVICE)
+
+// Discover the service and read the Tx Power Level.
+@tier(app)
+fn tps_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, tx_power.UUID_TX_POWER_LEVEL, true)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Read the level again.  The session must have finished its plan.
+@tier(app)
+fn tps_client_read(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, tx_power.UUID_TX_POWER_LEVEL, true)
+    sensor_client.sc_kick(var t, var c, now_ms)

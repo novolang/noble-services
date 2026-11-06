@@ -1,0 +1,194 @@
+// tests/running_speed_cadence_tests.nv — the unit tests of src/running_speed_cadence.nv.
+//
+//   novo test tests/running_speed_cadence_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+use running_speed_cadence.{ FEATURE_CALIBRATION_PROCEDURE, FEATURE_INSTANTANEOUS_STRIDE_LENGTH, FEATURE_MULTIPLE_SENSOR_LOCATIONS, FEATURE_TOTAL_DISTANCE, FEATURE_WALKING_OR_RUNNING_STATUS, RscConfig, RscHandles, RscMeasurement, add_rsc_service, default_rsc_config, rsc_control_point_response, rsc_handle_control_point, rsc_measurement_value, rsc_notify }
+
+fn added(var s: GattServer, config: RscConfig) -> RscHandles
+    match add_rsc_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            RscHandles { feature_bits: 0, service: 0, measurement: 0, measurement_cccd: 0, feature: 0, location: 0, control_point: 0, control_point_cccd: 0 }
+
+fn request(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+fn all_features() -> Int
+    FEATURE_INSTANTANEOUS_STRIDE_LENGTH | FEATURE_TOTAL_DISTANCE | FEATURE_WALKING_OR_RUNNING_STATUS | FEATURE_CALIBRATION_PROCEDURE | FEATURE_MULTIPLE_SENSOR_LOCATIONS
+
+fn plain(speed: Int, cadence: Int) -> RscMeasurement
+    RscMeasurement {
+        speed: speed, cadence: cadence, has_stride_length: false, stride_length: 0, has_total_distance: false,
+        total_distance: 0, running: false }
+
+@test
+fn test_measurement_value()
+    // Speed 3 m/s is 768 in units of 1/256, cadence 160.
+    test.assert_eq(rsc_measurement_value(plain(768, 160)), [0x00, 0x00, 0x03, 160])
+    let running = RscMeasurement {
+        speed: 0x0102, cadence: 90, has_stride_length: true, stride_length: 0x0090, has_total_distance: true,
+        total_distance: 0x01020304, running: true }
+    test.assert_eq(rsc_measurement_value(running), [0x07, 0x02, 0x01, 90, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01])
+    let distance = RscMeasurement {
+        speed: 1, cadence: 2, has_stride_length: false, stride_length: 5, has_total_distance: true,
+        total_distance: 10, running: false }
+    test.assert_eq(rsc_measurement_value(distance), [0x02, 1, 0, 2, 10, 0, 0, 0])
+    // The cadence is one octet.
+    test.assert_eq(rsc_measurement_value(plain(0, 300))[3] as Int, 255)
+
+@test
+fn test_layout_and_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_rsc_config(all_features(), sensor_control.SensorLocation.InShoe))
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.feature, 6)
+    test.assert_eq(h.location, 8)
+    test.assert_eq(h.control_point, 10)
+    test.assert_eq(s.db.attributes[0].value, [0x14, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x10, 0x03, 0x00, 0x53, 0x2A])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x1F, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 2])
+    test.assert_eq(list.len(rsc_notify(var s.db, var s.link, h, plain(256, 80), 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(rsc_notify(var s.db, var s.link, h, plain(256, 80), 0)[0], [0x1B, 0x03, 0x00, 0x00, 0x00, 0x01, 80])
+
+@test
+fn test_control_point_procedures()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_rsc_config(all_features(), sensor_control.SensorLocation.InShoe))
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.InShoe, [2, 3], true, true)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 0, 0, 0, 0]), 0)[0][4] as Int, sensor_control.ERR_CCCD_IMPROPERLY_CONFIGURED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    // Set Cumulative Value: the total distance.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 0x10, 0x27, 0, 0]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x01, 0x01])
+    test.assert_eq(st.cumulative_value, 10000)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0][4] as Int, sensor_control.ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Calibration.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x02, 0x01])
+    test.assert(st.calibration_requested)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Update the location, then list the locations.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3, 3]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x03, 0x01])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 3])
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [4]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x04, 0x01, 2, 3])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Invalid parameter and unknown opcode.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3, 15]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x03, 0x03])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [9]), 0)
+    test.assert_eq(rsc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x09, 0x02])
+    test.assert_eq(rsc_control_point_response(var st, []), [0x10, 0x00, 0x02])
+
+@test
+fn test_permissions_are_enforced_per_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let config = RscConfig {
+        feature: FEATURE_TOTAL_DISTANCE | FEATURE_CALIBRATION_PROCEDURE | FEATURE_MULTIPLE_SENSOR_LOCATIONS,
+        location: sensor_control.SensorLocation.Hip, control_point: true, read: gatt_server.Access.Authenticated,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted },
+        control_point_write: gatt_server.Access.Authenticated,
+        control_point_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authenticated } }
+    let h = added(var s, config)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x1A, 0x00])
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, RscConfig {
+        feature: 1, location: sensor_control.SensorLocation.Hip, control_point: false, read: gatt_server.Access.Authorized,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authorized },
+        control_point_write: gatt_server.Access.Open, control_point_cccd: gatt_server.open_permissions() })
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(hz.control_point, 0)
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.Hip, [], false, false)
+    test.assert_eq(list.len(rsc_handle_control_point(var z.db, var z.link, hz, var st, 0)), 0)
+
+fn config_with(feature: Int, location: sensor_control.SensorLocation, control_point: Bool, read: gatt_server.Access) -> RscConfig
+    RscConfig {
+        feature: feature, location: location, control_point: control_point, read: read,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+
+fn is_refused(config: RscConfig) -> Bool
+    var s = gatt_server.new_server([], 65)
+    match add_rsc_service(var s.db, config)
+        Ok(_) => false
+        Err(e) => e == profile_builder.ProfileError.NotPermitted
+
+@test
+fn test_the_control_point_is_present_exactly_when_a_procedure_is()
+    let open = gatt_server.Access.Open
+    let other = sensor_control.SensorLocation.Other
+    // Total distance, calibration and multiple locations each need it.
+    test.assert(is_refused(config_with(FEATURE_TOTAL_DISTANCE, other, false, open)))
+    test.assert(is_refused(config_with(FEATURE_CALIBRATION_PROCEDURE, other, false, open)))
+    test.assert(is_refused(config_with(FEATURE_MULTIPLE_SENSOR_LOCATIONS, other, false, open)))
+    // Without a procedure the characteristic is excluded.
+    test.assert(is_refused(config_with(FEATURE_INSTANTANEOUS_STRIDE_LENGTH | FEATURE_WALKING_OR_RUNNING_STATUS, other, true, open)))
+    test.assert(is_refused(config_with(0, other, true, open)))
+    test.assert(not is_refused(config_with(FEATURE_TOTAL_DISTANCE, other, true, open)))
+    test.assert(not is_refused(config_with(FEATURE_WALKING_OR_RUNNING_STATUS, sensor_control.SensorLocation.Absent, false, open)))
+
+@test
+fn test_multiple_locations_need_the_sensor_location()
+    let open = gatt_server.Access.Open
+    test.assert(is_refused(config_with(FEATURE_MULTIPLE_SENSOR_LOCATIONS, sensor_control.SensorLocation.Absent, true, open)))
+    // Otherwise the characteristic is optional.
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, config_with(0, sensor_control.SensorLocation.Absent, false, open))
+    test.assert_eq(h.location, 0)
+
+@test
+fn test_accesses_beyond_the_profile_are_refused()
+    test.assert(is_refused(config_with(0, sensor_control.SensorLocation.Hip, false, gatt_server.Access.SecureConnections)))
+    test.assert(is_refused(config_with(0, sensor_control.SensorLocation.Hip, false, gatt_server.Access.Denied)))
+    let no_subscription = RscConfig {
+        feature: 0, location: sensor_control.SensorLocation.Hip, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Denied },
+        control_point_write: gatt_server.Access.Open, control_point_cccd: gatt_server.open_permissions() }
+    test.assert(is_refused(no_subscription))
+
+@test
+fn test_reserved_feature_bits_read_as_zero()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, config_with(0xFFFF, sensor_control.SensorLocation.Other, true, gatt_server.Access.Open))
+    test.assert_eq(h.feature_bits, 0x001F)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x1F, 0x00])
+
+@test
+fn test_the_measurement_leaves_out_what_the_feature_does_not_name()
+    let m = RscMeasurement {
+        speed: 256, cadence: 80, has_stride_length: true, stride_length: 100, has_total_distance: true,
+        total_distance: 5, running: true }
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, config_with(FEATURE_INSTANTANEOUS_STRIDE_LENGTH, sensor_control.SensorLocation.Other, false, gatt_server.Access.Open))
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)
+    // The stride length only: no total distance, no running status.
+    test.assert_eq(rsc_notify(var s.db, var s.link, h, m, 0)[0], [0x1B, 0x03, 0x00, 0x01, 0x00, 0x01, 80, 100, 0x00])
+    var t = gatt_server.new_server([], 65)
+    let ht = added(var t, config_with(FEATURE_TOTAL_DISTANCE | FEATURE_WALKING_OR_RUNNING_STATUS, sensor_control.SensorLocation.Other, true, gatt_server.Access.Open))
+    let _ = gatt_server.receive(var t.db, var t.link, request(0x12, ht.measurement_cccd, [1, 0]), 0)
+    test.assert_eq(rsc_notify(var t.db, var t.link, ht, m, 0)[0], [0x1B, 0x03, 0x00, 0x06, 0x00, 0x01, 80, 5, 0, 0, 0])

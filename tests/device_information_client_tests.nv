@@ -1,0 +1,83 @@
+// tests/device_information_client_tests.nv — the unit tests of src/device_information_client.nv.
+//
+//   novo test tests/device_information_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use device_information
+use sensor_client
+use wire
+use device_information_client.{ dis_all_characteristics, dis_client_new, dis_client_start, dis_decode_pnp_id, dis_decode_system_id, dis_text_length }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-008")
+fn test_text_is_checked_as_utf8_and_trailing_nuls_are_dropped()
+    test.assert_eq(dis_text_length(wire.text("Novo")), 4)
+    test.assert_eq(dis_text_length([]), 0)
+    test.assert_eq(dis_text_length(octets([0x41, 0x00, 0x00])), 1)
+    // Two-, three- and four-octet sequences: U+00E9, U+20AC, U+1F600.
+    test.assert_eq(dis_text_length(octets([0xC3, 0xA9])), 2)
+    test.assert_eq(dis_text_length(octets([0xE2, 0x82, 0xAC])), 3)
+    test.assert_eq(dis_text_length(octets([0xF0, 0x9F, 0x98, 0x80])), 4)
+    // A lone continuation, an overlong form, a surrogate, past U+10FFFF, and cut sequences.
+    test.assert_eq(dis_text_length(octets([0x80])), -1)
+    test.assert_eq(dis_text_length(octets([0xC0, 0x80])), -1)
+    test.assert_eq(dis_text_length(octets([0xED, 0xA0, 0x80])), -1)
+    test.assert_eq(dis_text_length(octets([0xF4, 0x90, 0x80, 0x80])), -1)
+    test.assert_eq(dis_text_length(octets([0xC3])), -1)
+    test.assert_eq(dis_text_length(octets([0xE2, 0x82])), -1)
+    test.assert_eq(dis_text_length(octets([0x41, 0xC3, 0x41])), -1)
+    test.assert_eq(dis_text_length(octets([0xFF])), -1)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-008")
+fn test_system_id_and_pnp_id()
+    match dis_decode_system_id(device_information.system_id_value(0x0102030405, 0xA1B2C3))
+        None => test.fail("a system id")
+        Some(s) =>
+            test.assert_eq(s.manufacturer, 0x0102030405)
+            test.assert_eq(s.oui, 0xA1B2C3)
+    test.assert_eq(dis_decode_system_id(octets([1, 2, 3, 4, 5, 6, 7])), None)
+    match dis_decode_pnp_id(device_information.pnp_id_value(2, 0x1915, 0x520F, 0x0100))
+        None => test.fail("a pnp id")
+        Some(p) =>
+            test.assert_eq(p.source, 2)
+            test.assert_eq(p.vendor, 0x1915)
+            test.assert_eq(p.product, 0x520F)
+            test.assert_eq(p.version, 0x0100)
+    test.assert_eq(dis_decode_pnp_id(octets([1, 2, 3, 4, 5, 6])), None)
+    test.assert_eq(dis_decode_pnp_id(octets([1, 2, 3, 4, 5, 6, 7, 8])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-008")
+fn test_session_reads_the_characteristics_the_peer_has()
+    if not fixtures.client_engine_present()
+        return
+    var s = gatt_server.new_server([], 65)
+    let info = device_information.DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: wire.text("Novo"), model: wire.text("N-1"), serial: [], hardware: [],
+        firmware: wire.text("1.2.3"), software: [], system_id: [], pnp_id: device_information.pnp_id_value(1, 0x0059, 2, 3) }
+    let _ = device_information.add_device_information_service(var s.db, info)!
+    let both = sensor_client.test_open(device_information.UUID_DEVICE_INFORMATION_SERVICE)
+    var t = both.0
+    var c = dis_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, dis_client_start(var t, var c, dis_all_characteristics(), 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // Four characteristics were there: four value events (the done event shares the last).
+    var values = 0
+    for k in 0..(list.len(seen) / 2)
+        if (seen[2 * k] & sensor_client.SE_VALUE) != 0
+            values = values + 1
+    test.assert_eq(values, 4)
+    test.assert_eq(seen[1], device_information.UUID_MANUFACTURER_NAME_STRING)
+    test.assert_eq(sensor_client.sc_value(c), device_information.pnp_id_value(1, 0x0059, 2, 3))

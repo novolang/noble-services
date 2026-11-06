@@ -1,0 +1,160 @@
+// tests/cgm_client_tests.nv — the unit tests of src/cgm_client.nv.
+//
+//   novo test tests/cgm_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use cgm
+use glucose_client
+use reconnection_configuration
+use sensor_client
+use wire
+use cgm_client.{ CgmMeasurement, cgm_client_new, cgm_client_start, cgm_client_write_ops, cgm_decode_features, cgm_decode_ops, cgm_decode_run_time, cgm_decode_start_time, cgm_decode_status, cgm_next_record, cgm_record_count, cgm_request_get_interval, cgm_request_set_interval, cgm_request_set_level, cgm_request_start_session, cgm_request_stop_session }
+
+@tier(app)
+fn first(b: [u8], at: Int, features: Int) -> CgmMeasurement
+    match cgm_next_record(b, at, features)
+        Some(r) => r.0
+        None =>
+            test.fail("a record")
+            CgmMeasurement { glucose: 0, offset: 0, annunciation: 0, has_trend: false, trend: 0, has_quality: false, quality: 0 }
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_a_notification_with_several_records_is_read_record_by_record()
+    let a = cgm.cgm_record_value(0x018003, cgm.cgm_with_trend_and_quality(cgm.cgm_with_annunciation(cgm.cgm_record(wire.sfloat(110, 0), 15), 0x020101), wire.sfloat(1, 0), wire.sfloat(95, 0)))
+    let b = cgm.cgm_record_value(0x018003, cgm.cgm_record(wire.sfloat(115, 0), 20))
+    var both = a[:]
+    list.append(both, b)
+    test.assert_eq(cgm_record_count(both, 0x018003), 2)
+    let r = first(both, 0, 0x018003)
+    test.assert_eq(r.glucose, wire.sfloat(110, 0))
+    test.assert_eq(r.offset, 15)
+    test.assert_eq(r.annunciation, 0x020101)
+    test.assert(r.has_trend)
+    test.assert_eq(r.quality, wire.sfloat(95, 0))
+    test.assert_eq(first(both, list.len(a), 0x018003).offset, 20)
+    test.assert(not first(both, list.len(a), 0x018003).has_trend)
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_a_record_that_does_not_fit_or_has_a_wrong_crc_is_refused()
+    let v = cgm.cgm_record_value(0x1000, cgm.cgm_record(wire.sfloat(110, 0), 15))
+    test.assert_eq(cgm_record_count(v, 0x1000), 1)
+    for n in 0..list.len(v)
+        test.assert_eq(cgm_record_count(v[0:n], 0x1000), if n == 0 then 0 else -1)
+    var bad = v[:]
+    bad[2] = 0x6F
+    test.assert_eq(cgm_record_count(bad, 0x1000), -1)
+    // A sensor without E2E-CRC has no CRC to check: the same octets are one record.
+    test.assert_eq(cgm_record_count(bad, 0), 1)
+    // A Size below six octets, or below what the flags name, is refused.
+    test.assert_eq(cgm_record_count(wire.octets([5, 0, 0, 0, 0, 0]), 0), -1)
+    test.assert_eq(cgm_record_count(wire.octets([6, 0x20, 0, 0, 0, 0]), 0), -1)
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_the_feature_status_start_time_and_run_time_are_decoded_with_and_without_a_crc()
+    match cgm_decode_features(cgm.cgm_feature_value(0x1001, 0x59))
+        Some(f) =>
+            test.assert_eq(f.mask, 0x1001)
+            test.assert_eq(f.type_sample, 0x59)
+        None => test.fail("a feature")
+    let bad_feature = cgm.cgm_feature_value(0x1001, 0x59)
+    var broken = bad_feature[:]
+    broken[3] = 0x19
+    test.assert_eq(cgm_decode_features(broken), None)
+    test.assert_eq(cgm_decode_features(wire.octets([1, 0, 0, 0x19, 0xFF, 0xFF])) != None, true)
+    test.assert_eq(cgm_decode_features(wire.octets([1, 0, 0])), None)
+    for f in [0, 0x1000]
+        let dev = cgm.new_cgm_device(f, 0x59, 5, 240, 5, 40, 400, true)
+        match cgm_decode_status(cgm.cgm_status_value(dev), f)
+            Some(s) => test.assert_eq(s.mask, 0x000100)
+            None => test.fail("a status")
+        match cgm_decode_start_time(cgm.cgm_start_time_value(dev), f)
+            Some(s) =>
+                test.assert_eq(s.time_zone, -128)
+                test.assert_eq(s.dst, 255)
+            None => test.fail("a start time")
+        test.assert_eq(cgm_decode_run_time(cgm.cgm_run_time_value(dev), f), Some(240))
+        test.assert_eq(cgm_decode_run_time(cgm.cgm_run_time_value(dev)[0:1], f), None)
+    // A wrong CRC is refused.
+    let dev = cgm.new_cgm_device(0x1000, 0x59, 5, 240, 5, 40, 400, true)
+    var status = cgm.cgm_status_value(dev)
+    status[0] = 9
+    test.assert_eq(cgm_decode_status(status, 0x1000), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_requests_carry_a_crc_with_e2e_and_responses_are_decoded()
+    test.assert_eq(cgm_request_set_interval(0, 10), wire.octets([1, 10]))
+    let with_crc = cgm_request_set_interval(0x1000, 10)
+    test.assert_eq(list.len(with_crc), 4)
+    test.assert_eq(wire.get(with_crc, 2, 2), reconnection_configuration.crc16([1, 10]))
+    test.assert_eq(cgm_request_get_interval(0), wire.octets([2]))
+    test.assert_eq(cgm_request_set_level(0, cgm.OP_SET_HYPO, wire.sfloat(60, 0)), wire.octets([0x0D, 0x3C, 0x00]))
+    test.assert_eq(cgm_request_start_session(0), wire.octets([0x1A]))
+    test.assert_eq(cgm_request_stop_session(0), wire.octets([0x1B]))
+    match cgm_decode_ops(wire.octets([0x1C, 0x01, 0x01]), 0)
+        Some(r) =>
+            test.assert_eq(r.request_op, 1)
+            test.assert_eq(r.code, 1)
+        None => test.fail("a response code")
+    match cgm_decode_ops(cgm.ops_level_response(0x1000, 0x09, wire.sfloat(180, 0)), 0x1000)
+        Some(r) =>
+            test.assert_eq(r.op, 0x09)
+            test.assert_eq(wire.get(r.operand, 0, 2), wire.sfloat(180, 0))
+        None => test.fail("a level response")
+    test.assert_eq(cgm_decode_ops(wire.octets([0x1C, 0x01]), 0), None)
+    test.assert_eq(cgm_decode_ops(wire.octets([0x1C, 0x01, 0x01, 0x00, 0x00]), 0x1000), None)
+    test.assert_eq(cgm_decode_ops(wire.octets([]), 0), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_session_against_the_server_runs_a_control_point_procedure()
+    if not fixtures.client_engine_present()
+        return
+    let config = cgm.full_config()
+    var dev = cgm.device_for(config)
+    var built = cgm.server(config, dev)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(cgm.UUID_CGM_SERVICE)
+    var t = both.0
+    var c = cgm_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, cgm_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    match cgm_decode_features(sensor_client.sc_value(c))
+        Some(f) => test.assert_eq(f.mask, config.features)
+        None => test.fail("the feature read")
+    let w = cgm_client_write_ops(var t, var c, cgm_request_get_interval(config.features), 0)
+    test.assert(w.pdus != [])
+    let answer = cgm.cgm_receive(var s.db, var s.link, h, config.support, var dev, w.pdus[0], 0)
+    test.assert_eq(answer[0], [0x13])
+    test.assert_eq(sensor_client.test_deliver(var t, var c, [answer[1]]), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    match cgm_decode_ops(sensor_client.sc_value(c), config.features)
+        Some(r) =>
+            test.assert_eq(r.op, cgm.OP_COMMUNICATION_INTERVAL_RESPONSE)
+            test.assert_eq(r.operand[0] as Int, 5)
+        None => test.fail("an interval response")
+    // A periodic notification reaches the decoder.
+    cgm.cgm_set_clock(var dev, 5)
+    test.assert(cgm.cgm_add_measurement(var dev, cgm.sample(104)))
+    let ntf = cgm.cgm_notify_periodic(var s.db, var s.link, h, var dev, 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(cgm_record_count(sensor_client.sc_value(c), config.features), 1)
+
+@test
+@satisfies("REQ-BLE-PRFC-018")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(cgm.UUID_CGM_SERVICE)
+    var t = both.0
+    var c = cgm_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, cgm_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

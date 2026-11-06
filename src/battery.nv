@@ -1,0 +1,81 @@
+// src/battery.nv — the Battery Service (0x180F).
+//
+// The service holds one characteristic, Battery Level (0x2A19): one octet
+// from 0 to 100, the charge left in percent.  A client reads it and may
+// configure notifications through the Client Characteristic Configuration
+// descriptor that follows the value.
+//
+//   service declaration
+//   Battery Level declaration   (Read, Notify)
+//   Battery Level value         (readable, not writable)
+//   Client Characteristic Configuration
+//
+// `add_battery_service` adds the service to a `GattServer` and answers the
+// handles; `set_battery_level` stores a new level and answers the
+// notification PDU when the client asked for it.
+
+use gatt_server
+use profile_builder
+
+const UUID_BATTERY_SERVICE = 0x180F
+const UUID_BATTERY_LEVEL = 0x2A19
+
+// Battery Level is a percentage ([Bluetooth Assigned Numbers]): values
+// above 100 are not levels.
+const BATTERY_LEVEL_MAX = 100
+
+// The configuration of the service.  `level` is the level the value starts
+// at, cut to 100.  `read` is the access a client needs to read the level,
+// and `cccd` the access it needs to read and to write the Client
+// Characteristic Configuration descriptor; the level is notified only
+// while the link grants the write of that descriptor.
+struct BatteryConfig
+    level: Int
+    read: gatt_server.Access
+    cccd: gatt_server.Permissions
+
+// A level that any client reads and subscribes to.
+fn default_battery_config(level: Int) -> BatteryConfig
+    BatteryConfig { level: level,
+        read: gatt_server.Access.Open,
+        cccd: gatt_server.open_permissions() }
+
+// A level that needs `access` to read and to subscribe to; the descriptor
+// stays readable on any link.
+fn secured_battery_config(level: Int, access: gatt_server.Access) -> BatteryConfig
+    BatteryConfig {
+        level: level, read: access,
+        cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: access } }
+
+// The handles of the service: `service` is the declaration, `level` the
+// Battery Level value an application passes to `set_battery_level` and
+// `cccd` the client's configuration descriptor.
+struct BatteryHandles
+    service: Int
+    level: Int
+    cccd: Int
+
+fn cut_level(level: Int) -> Int
+    if level < 0
+        0
+    else
+        if level > BATTERY_LEVEL_MAX
+            BATTERY_LEVEL_MAX
+        else
+            level
+
+// Add the Battery Service after the last attribute of `server`.
+fn add_battery_service(var db: GattDb,
+                       config: BatteryConfig) -> Result<BatteryHandles, profile_builder.ProfileError>
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_BATTERY_SERVICE))!
+    let level = profile_builder.add_value(var db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, profile_builder.read_only(config.read),
+        gatt_server.le16(UUID_BATTERY_LEVEL), [cut_level(config.level) as u8])!
+    let cccd = profile_builder.add_cccd(var db, config.cccd)!
+    Ok(BatteryHandles { service: service, level: level, cccd: cccd })
+
+// Store `level` (cut to 100) as the Battery Level and answer the PDUs to
+// send: the notification when the client enabled it, none otherwise.
+fn set_battery_level(var db: GattDb, var link: AttLink, handles: BatteryHandles, level: Int,
+                     now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handles.level, [cut_level(level) as u8])
+    gatt_server.send_value(var db, var link, handles.level, now_ms)

@@ -1,0 +1,273 @@
+// tests/environmental_sensing_client_tests.nv — the unit tests of src/environmental_sensing_client.nv.
+//
+//   novo test tests/environmental_sensing_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use environmental_sensing
+use sensor_client
+use wire
+use environmental_sensing_client.{ ES_EQUAL, ES_FIXED_INTERVAL, ES_GREATER, ES_GREATER_OR_EQUAL, ES_INACTIVE, ES_LESS, ES_LESS_OR_EQUAL, ES_LOGIC_AND, ES_LOGIC_OR, ES_MIN_INTERVAL, ES_NOT_EQUAL, ES_ON_CHANGE, EsRange, EsReading, EsTrigger, es_client_new, es_client_read, es_client_start, es_decode_change, es_decode_humidity, es_decode_logic, es_decode_measurement, es_decode_pressure, es_decode_range, es_decode_reading, es_decode_temperature, es_decode_trigger, es_logic_value, es_trigger_value, es_uncertainty_tenths, es_value_size }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+// Whether `r` is the known reading `value`.
+@tier(app)
+fn reading_is(r: ?EsReading, value: Int) -> Bool
+    match r
+        Some(x) => x.known and x.value == value
+        None => false
+
+// Whether `r` is the "not known" value.
+@tier(app)
+fn unknown_is(r: ?EsReading) -> Bool
+    match r
+        Some(x) => not x.known
+        None => false
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_the_temperature_ends_and_the_unknown_value()
+    test.assert(reading_is(es_decode_temperature(octets([0x66, 0x08])), 2150))
+    test.assert(reading_is(es_decode_temperature(octets([0x00, 0x00])), 0))
+    // -273.15 is the lowest, 327.67 the highest.
+    test.assert(reading_is(es_decode_temperature(octets([0x4D, 0x95])), -27315))
+    test.assert(reading_is(es_decode_temperature(octets([0xFF, 0x7F])), 32767))
+    test.assert(reading_is(es_decode_temperature(octets([0xFF, 0xFF])), -1))
+    // 0x8000 is not known; one above it is below the lowest temperature.
+    test.assert(unknown_is(es_decode_temperature(octets([0x00, 0x80]))))
+    test.assert_eq(es_decode_temperature(octets([0x4C, 0x95])), None)
+    test.assert_eq(es_decode_temperature(octets([0x01, 0x80])), None)
+    test.assert_eq(es_decode_temperature(octets([0x00])), None)
+    test.assert_eq(es_decode_temperature(octets([0, 0, 0])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_the_pressure_and_the_humidity()
+    test.assert(reading_is(es_decode_pressure(octets([0x20, 0x8D, 0x01, 0x00])), 101664))
+    test.assert(reading_is(es_decode_pressure(octets([0, 0, 0, 0])), 0))
+    test.assert(reading_is(es_decode_pressure(octets([0xFF, 0xFF, 0xFF, 0xFF])), 4294967295))
+    test.assert_eq(es_decode_pressure(octets([0, 0, 0])), None)
+    test.assert_eq(es_decode_pressure(octets([0, 0, 0, 0, 0])), None)
+    test.assert(reading_is(es_decode_humidity(octets([0x00, 0x00])), 0))
+    test.assert(reading_is(es_decode_humidity(octets([0x10, 0x27])), 10000))
+    test.assert(unknown_is(es_decode_humidity(octets([0xFF, 0xFF]))))
+    test.assert_eq(es_decode_humidity(octets([0x11, 0x27])), None)
+    test.assert_eq(es_decode_humidity(octets([0xFE, 0xFF])), None)
+    test.assert_eq(es_decode_humidity(octets([0])), None)
+    // The reading by UUID, and a UUID the module does not carry.
+    test.assert(reading_is(es_decode_reading(environmental_sensing.UUID_HUMIDITY, octets([0x10, 0x27])), 10000))
+    test.assert(reading_is(es_decode_reading(environmental_sensing.UUID_TEMPERATURE, octets([0x66, 0x08])), 2150))
+    test.assert(reading_is(es_decode_reading(environmental_sensing.UUID_PRESSURE, octets([1, 0, 0, 0])), 1))
+    test.assert_eq(es_decode_reading(0x2A6C, octets([1, 0])), None)
+    test.assert_eq(es_value_size(0x2A6C), 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_the_measurement_descriptor()
+    let b = octets([0, 0, 2, 0x10, 0x0E, 0, 0x84, 0x03, 0, 1, 25])
+    match es_decode_measurement(b)
+        None => test.fail("a measurement descriptor")
+        Some(m) =>
+            test.assert_eq(m.sampling, 2)
+            test.assert_eq(m.period_s, 3600)
+            test.assert_eq(m.interval_s, 900)
+            test.assert_eq(m.application, 1)
+            test.assert_eq(m.uncertainty, 25)
+            test.assert_eq(es_uncertainty_tenths(m), 125)
+    match es_decode_measurement(octets([0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0xFF]))
+        None => test.fail("a measurement descriptor")
+        Some(m) =>
+            test.assert_eq(m.period_s, 0xFFFFFF)
+            test.assert_eq(m.interval_s, 0xFFFFFF)
+            test.assert_eq(es_uncertainty_tenths(m), -1)
+    test.assert_eq(es_decode_measurement(octets([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])), None)
+    test.assert_eq(es_decode_measurement(octets([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_every_trigger_condition_and_its_operand()
+    let t = environmental_sensing.UUID_TEMPERATURE
+    let p = environmental_sensing.UUID_PRESSURE
+    let h = environmental_sensing.UUID_HUMIDITY
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x00])), ES_INACTIVE, 0))
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x03])), ES_ON_CHANGE, 0))
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x01, 60, 0, 0])), ES_FIXED_INTERVAL, 60))
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x02, 0xFF, 0xFF, 0xFF])), ES_MIN_INTERVAL, 0xFFFFFF))
+    // A comparison has the operand in the format of the characteristic: signed for the temperature.
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x04, 0x18, 0xFC])), ES_LESS, -1000))
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x05, 0x00, 0x00])), ES_LESS_OR_EQUAL, 0))
+    test.assert(trigger_is(es_decode_trigger(p, octets([0x06, 1, 2, 3, 4])), ES_GREATER, 0x04030201))
+    test.assert(trigger_is(es_decode_trigger(h, octets([0x07, 0x10, 0x27])), ES_GREATER_OR_EQUAL, 10000))
+    test.assert(trigger_is(es_decode_trigger(h, octets([0x08, 0x10, 0x27])), ES_EQUAL, 10000))
+    test.assert(trigger_is(es_decode_trigger(t, octets([0x09, 0x66, 0x08])), ES_NOT_EQUAL, 2150))
+    // Wrong lengths and the conditions the table does not define.
+    test.assert_eq(es_decode_trigger(t, []), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x00, 1])), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x03, 1])), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x01, 60, 0])), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x02, 60, 0, 0, 0])), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x04, 0x18])), None)
+    test.assert_eq(es_decode_trigger(p, octets([0x06, 1, 2])), None)
+    test.assert_eq(es_decode_trigger(t, octets([0x0A])), None)
+    // A comparison on a characteristic the module does not carry has no operand format.
+    test.assert_eq(es_decode_trigger(0x2A6C, octets([0x04])), None)
+
+// Whether `r` is the trigger `condition` with `operand`.
+@tier(app)
+fn trigger_is(r: ?EsTrigger, condition: Int, operand: Int) -> Bool
+    match r
+        Some(x) => x.condition == condition and x.operand == operand
+        None => false
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_trigger_writes_logic_range_and_change()
+    let t = environmental_sensing.UUID_TEMPERATURE
+    let p = environmental_sensing.UUID_PRESSURE
+    test.assert_eq(es_trigger_value(t, ES_INACTIVE, 5), octets([0x00]))
+    test.assert_eq(es_trigger_value(t, ES_ON_CHANGE, 5), octets([0x03]))
+    test.assert_eq(es_trigger_value(t, ES_FIXED_INTERVAL, 60), octets([0x01, 60, 0, 0]))
+    test.assert_eq(es_trigger_value(t, ES_MIN_INTERVAL, 0x1000000), octets([0x02, 0xFF, 0xFF, 0xFF]))
+    test.assert_eq(es_trigger_value(t, ES_LESS, -1000), octets([0x04, 0x18, 0xFC]))
+    test.assert_eq(es_trigger_value(p, ES_NOT_EQUAL, 0x04030201), octets([0x09, 1, 2, 3, 4]))
+    test.assert_eq(list.len(es_trigger_value(t, 10, 0)), 0)
+    test.assert_eq(list.len(es_trigger_value(t, -1, 0)), 0)
+    // A value the client builds is a value the decoder reads.
+    test.assert(trigger_is(es_decode_trigger(t, es_trigger_value(t, ES_GREATER, 3000)), ES_GREATER, 3000))
+    test.assert_eq(es_decode_logic(octets([0])), Some(ES_LOGIC_AND))
+    test.assert_eq(es_decode_logic(octets([1])), Some(ES_LOGIC_OR))
+    test.assert_eq(es_decode_logic(octets([2])), None)
+    test.assert_eq(es_decode_logic([]), None)
+    test.assert_eq(es_decode_logic(octets([0, 0])), None)
+    test.assert_eq(es_logic_value(ES_LOGIC_OR), octets([1]))
+    test.assert_eq(es_logic_value(300), octets([255]))
+    test.assert(range_is(es_decode_range(t, octets([0x18, 0xFC, 0x34, 0x21])), -1000, 8500))
+    test.assert(range_is(es_decode_range(environmental_sensing.UUID_HUMIDITY, octets([0, 0, 0x10, 0x27])), 0, 10000))
+    test.assert(range_is(es_decode_range(p, octets([1, 0, 0, 0, 2, 0, 0, 0])), 1, 2))
+    test.assert_eq(es_decode_range(t, octets([0x34, 0x21, 0x18, 0xFC])), None)
+    test.assert_eq(es_decode_range(t, octets([0, 0, 0])), None)
+    test.assert_eq(es_decode_range(0x2A6C, octets([0, 0])), None)
+    match es_decode_change(octets([0x08, 0x00, 0x6E, 0x2A]))
+        None => test.fail("a change")
+        Some(c) =>
+            test.assert_eq(c.flags, 0x08)
+            test.assert_eq(c.uuid, environmental_sensing.UUID_TEMPERATURE)
+    test.assert_eq(es_decode_change(octets([0x08, 0x00, 0x6E])), None)
+    test.assert_eq(es_decode_change(octets([0x08, 0x00, 0x6E, 0x2A, 0x00])), None)
+
+// Whether `r` is the range `low` to `high`.
+@tier(app)
+fn range_is(r: ?EsRange, low: Int, high: Int) -> Bool
+    match r
+        Some(x) => x.low == low and x.high == high
+        None => false
+
+@tier(app)
+fn test_server(config: environmental_sensing.EssConfig) -> (gatt_server.GattServer, environmental_sensing.EssHandles)
+    environmental_sensing.server(config)
+
+@tier(app)
+fn notifying(uuid: Int, value: Int) -> environmental_sensing.EssCharConfig
+    var c = environmental_sensing.ess_characteristic(uuid, value)
+    c.notify = true
+    c.triggers = [environmental_sensing.EssTrigger { condition: environmental_sensing.TRIGGER_ON_CHANGE, operand: 0 }]
+    c
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_session_against_the_server_reads_and_follows_notifications()
+    if not fixtures.client_engine_present()
+        return
+    let config = environmental_sensing.EssConfig {
+        characteristics: [
+            notifying(environmental_sensing.UUID_TEMPERATURE, 2150),
+            environmental_sensing.ess_characteristic(environmental_sensing.UUID_PRESSURE, 101664),
+            environmental_sensing.ess_characteristic(environmental_sensing.UUID_HUMIDITY, 5555)],
+        read: gatt_server.Access.Open, trigger_write: false, descriptors_change: true }
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(environmental_sensing.UUID_ENVIRONMENTAL_SENSING_SERVICE)
+    var t = both.0
+    var c = es_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, es_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The last read of the plan is the humidity.
+    test.assert_eq(sensor_client.sc_uuid(c), environmental_sensing.UUID_HUMIDITY)
+    test.assert(reading_is(es_decode_humidity(sensor_client.sc_value(c)), 5555))
+    // The three reads came in the order of the plan.
+    var order: [Int] = []
+    for i in 0..(list.len(seen) / 2)
+        if (seen[2 * i] & sensor_client.SE_VALUE) != 0
+            list.push(order, seen[2 * i + 1])
+    test.assert_eq(order, [environmental_sensing.UUID_TEMPERATURE, environmental_sensing.UUID_PRESSURE, environmental_sensing.UUID_HUMIDITY])
+    // The temperature changes and the server notifies the latest value.
+    let ch = h.characteristics[0]
+    test.assert(environmental_sensing.set_temperature(var s.db, ch, 2200))
+    let ntf = environmental_sensing.ess_notify(var s.db, var s.link, ch, 2150, 0, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), environmental_sensing.UUID_TEMPERATURE)
+    test.assert(reading_is(es_decode_temperature(sensor_client.sc_value(c)), 2200))
+    // A change of a descriptor is indicated and decoded.
+    let ind = environmental_sensing.ess_indicate_change(
+        var s.db, var s.link, h, environmental_sensing.DVC_MEASUREMENT, environmental_sensing.UUID_TEMPERATURE, 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), environmental_sensing.UUID_DESCRIPTOR_VALUE_CHANGED)
+    match es_decode_change(sensor_client.sc_value(c))
+        None => test.fail("a change")
+        Some(x) =>
+            test.assert_eq(x.flags, environmental_sensing.DVC_MEASUREMENT)
+            test.assert_eq(x.uuid, environmental_sensing.UUID_TEMPERATURE)
+    // A later read.
+    let again = sensor_client.test_pump(var t, var c, var s, es_client_read(var t, var c, environmental_sensing.UUID_PRESSURE, 0), var seen)
+    test.assert((again & sensor_client.SE_VALUE) != 0)
+    test.assert(reading_is(es_decode_pressure(sensor_client.sc_value(c)), 101664))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_session_with_a_one_characteristic_sensor_skips_the_rest()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(environmental_sensing.default_ess_config([
+        environmental_sensing.ess_characteristic(environmental_sensing.UUID_HUMIDITY, 4000)]))
+    var s = built.0
+    let both = sensor_client.test_open(environmental_sensing.UUID_ENVIRONMENTAL_SENSING_SERVICE)
+    var t = both.0
+    var c = es_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, es_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_uuid(c), environmental_sensing.UUID_HUMIDITY)
+    // The temperature is not there: a read of it ends with Not Found.
+    let r = es_client_read(var t, var c, environmental_sensing.UUID_TEMPERATURE, 0)
+    test.assert((r.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-013")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(environmental_sensing.UUID_ENVIRONMENTAL_SENSING_SERVICE)
+    var t = both.0
+    var c = es_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, es_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

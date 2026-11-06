@@ -1,0 +1,580 @@
+// src/object_transfer_client.nv — the Client of the Object Transfer Service
+// (0x1825), GATT part: the decoders of its characteristics, the Directory Listing Object, the
+// requests and responses of the two control points, the Object List Filter values, and the
+// client session.
+//
+//   OTS Feature            0x2ABD   decoded by `otc_decode_feature`
+//   Object Name            0x2ABE   `otc_decode_name`, `otc_name_value`
+//   Object Type            0x2ABF   `otc_decode_type`
+//   Object Size            0x2AC0   `otc_decode_size`
+//   Object First-Created   0x2AC1   `otc_decode_time`
+//   Object Last-Modified   0x2AC2   `otc_decode_time`
+//   Object ID              0x2AC3   `otc_decode_id`
+//   Object Properties      0x2AC4   `otc_decode_properties`
+//   OACP                   0x2AC5   requests `otc_oacp_*`, responses `otc_decode_oacp`
+//   OLCP                   0x2AC6   requests `otc_olcp_*`, responses `otc_decode_olcp`
+//   Object List Filter     0x2AC7   values `otc_filter_*`
+//   Object Changed         0x2AC8   `otc_decode_changed`
+//
+// The metadata characteristics describe the Current Object of the connection, chosen by the OLCP
+// ([OTS] 3.1).  A decoder takes the octets of a value and answers `None` for a length other than
+// the characteristic has, a name or type outside its format, a Date Time out of range and an
+// Object ID in the reserved range 1 to 0xFF.  It allocates nothing unless it returns a list and
+// keeps no state.  A reserved bit of a bit field (Feature, Properties, Object Changed Flags) is
+// kept and told by the `*_reserved` functions, since a client ignores bits it does not know.
+//
+// The control points are written with a value built by `otc_oacp_*` or `otc_olcp_*`, which answer
+// `None` for a parameter outside its range ([OTS] Tables 3.9 and 3.22).  Each answers with one
+// indication: the Response Code (0x60 or 0x70), the request Op Code, the Result Code and, for the
+// Calculate Checksum and Execute successes of the OACP and the Request Number of Objects success
+// of the OLCP, a Response Parameter; `otc_decode_oacp` and `otc_decode_olcp` answer `None` for a
+// reserved Op Code or Result Code and a Response Parameter the pair does not carry.  The ATT errors
+// of a write (0x80 to 0x83, 0xFD, 0xFE, 0x0D) are named by `otc_error_kind`.
+//
+// The Directory Listing Object ([OTS] 4.1) is the object with the Object ID 0; read through the
+// Object Transfer Channel, its octets are decoded by `otc_decode_listing` into one record for each
+// Object Record of Table 4.1.
+//
+// The Object Transfer Channel (the L2CAP LE Credit Based channel on the PSM 0x0025 through which
+// Read and Write move the contents) is NOT IMPLEMENTED in this module: the server side in
+// `object_channel.nv` is written against `ots_poll` and the channel table of the server and gives
+// the client no pattern to follow, so the client needs its own design for the channel
+// (opening it with `l2cap_coc.connect`, the credits, the K-frames and the progress timer).
+//
+// The session (`otc_client_*`) runs on `sensor_client.nv`: discover the service, read the OTS
+// Feature (required) and enable the indication of the OACP, the OLCP and Object Changed, each optional
+// where the Feature makes the characteristic optional; `otc_client_read_current` reads the metadata of
+// the Current Object and `otc_client_oacp`, `otc_client_olcp` write a request.  The three Object List
+// Filter characteristics share one UUID and the session finds the first of them only, so a program
+// that sets a filter writes it through the GATT client engine by handle.
+//
+// Satisfies: REQ-BLE-PRFC-022.
+
+use gatt_client
+use gatt_server
+use links
+use object_list
+use object_store
+use object_transfer
+use sensor_client
+use wire
+
+// What an ATT error of a write means.
+const OTC_ERR_NONE = 0
+const OTC_ERR_WRITE_REJECTED = 1
+const OTC_ERR_NOT_SELECTED = 2
+const OTC_ERR_CONCURRENCY = 3
+const OTC_ERR_NAME_EXISTS = 4
+const OTC_ERR_CCCD = 5
+const OTC_ERR_IN_PROGRESS = 6
+const OTC_ERR_INVALID_LENGTH = 7
+const OTC_ERR_OTHER = 8
+
+// The longest Execute parameter and Execute response parameter, in octets.
+const OTC_EXECUTE_PARAMETER_MAX = 20
+const OTC_EXECUTE_RESPONSE_MAX = 17
+
+// The OTS Feature: the OACP Features and the OLCP Features fields.
+@value
+struct OtcFeature
+    oacp: Int
+    olcp: Int
+
+// The OTS Feature in `b`: 8 octets, `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn otc_decode_feature(b: [u8]) -> ?OtcFeature
+    if list.len(b) != 8
+        return None
+    Some(OtcFeature { oacp: wire.get(b, 0, 4), olcp: wire.get(b, 4, 4) })
+
+// Whether the Feature holds a reserved bit.
+@tier(embedded)
+@no_alloc
+fn otc_feature_reserved(f: OtcFeature) -> Bool
+    (f.oacp & (0xFFFFFFFF ^ object_transfer.OACP_DEFINED)) != 0 or (f.olcp & (0xFFFFFFFF ^ object_transfer.OLCP_DEFINED)) != 0
+
+// Whether the Feature says the server supports the OACP procedure with the Op Code `op`.
+@tier(embedded)
+@no_alloc
+fn otc_oacp_supported(f: OtcFeature, op: Int) -> Bool
+    let bit = object_transfer.oacp_bit(op)
+    bit != 0 and (f.oacp & bit) != 0
+
+// Whether the Feature says the server supports the OLCP procedure with the Op Code `op`; the four
+// movements need no bit.
+@tier(embedded)
+@no_alloc
+fn otc_olcp_supported(f: OtcFeature, op: Int) -> Bool
+    if op >= object_transfer.OLCP_OP_FIRST and op <= object_transfer.OLCP_OP_NEXT
+        return true
+    let bit = object_transfer.olcp_bit(op)
+    bit != 0 and (f.olcp & bit) != 0
+
+// The Object Name in `b`: 0 to 120 octets of UTF-8 ([OTS] 3.2.2); `None` otherwise.  The octets are returned.
+@tier(app)
+fn otc_decode_name(b: [u8]) -> ?[u8]
+    if list.len(b) > object_store.NAME_MAX or not object_store.utf8_valid(b)
+        return None
+    Some(b[:])
+
+// The value to write to the Object Name for `name`: 1 to 120 octets of UTF-8 without a control character.
+@tier(app)
+fn otc_name_value(name: [u8]) -> ?[u8]
+    if not object_store.name_ok(name)
+        return None
+    Some(name[:])
+
+// The Object Type in `b`: a UUID of 2 or 16 octets.
+@tier(app)
+fn otc_decode_type(b: [u8]) -> ?[u8]
+    if not object_store.uuid_ok(b)
+        return None
+    Some(b[:])
+
+// The Object Size: Current Size and Allocated Size.
+@value
+struct OtcSize
+    size: Int
+    allocated: Int
+
+// The Object Size in `b`: 8 octets.
+@tier(embedded)
+@no_alloc
+fn otc_decode_size(b: [u8]) -> ?OtcSize
+    if list.len(b) != 8
+        return None
+    Some(OtcSize { size: wire.get(b, 0, 4), allocated: wire.get(b, 4, 4) })
+
+// The Date Time of Object First-Created or Last-Modified ([GSS] 3.70): 7 octets with a month and a day inside their ranges (a
+// part that is not known is 0); `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn otc_decode_time(b: [u8]) -> ?wire.DateTime
+    if not object_store.date_time_ok(b)
+        return None
+    Some(wire.get_date_time(b, 0))
+
+// The Object ID in `b`: 6 octets; 0 is the Directory Listing Object, 1 to 0xFF are reserved ([OTS] 3.2.7).
+@tier(embedded)
+@no_alloc
+fn otc_decode_id(b: [u8]) -> ?Int
+    if list.len(b) != 6
+        return None
+    let id = wire.get(b, 0, 6)
+    if id != object_store.ID_DIRECTORY and id < object_store.ID_FIRST
+        return None
+    Some(id)
+
+// The Object Properties in `b`: 4 octets of bits (Table 3.7).
+@tier(embedded)
+@no_alloc
+fn otc_decode_properties(b: [u8]) -> ?Int
+    if list.len(b) != 4
+        return None
+    Some(wire.get(b, 0, 4))
+
+// Whether the properties hold a reserved bit (8 to 31).
+@tier(embedded)
+@no_alloc
+fn otc_properties_reserved(p: Int) -> Bool
+    (p >>> 8) != 0
+
+// The value to write to the Object Properties: the defined bits 0 to 7; `None` otherwise.
+@tier(app)
+fn otc_properties_value(p: Int) -> ?[u8]
+    if p < 0 or p > 0xFF
+        return None
+    var out: [u8] = []
+    wire.put(var out, p, 4)
+    Some(out)
+
+// An Object Changed event: the Flags (bit 0 changed by a client, 1 contents, 2 metadata, 3 creation, 4 deletion)
+// and the Object ID.
+@value
+struct OtcChange
+    flags: Int
+    id: Int
+
+// The Object Changed value: 7 octets; `None` for another length and an Object ID in the reserved range.  The
+// Directory Listing Object does not report changes ([OTS] 3.6), so its ID 0 is not one either.
+@tier(embedded)
+@no_alloc
+fn otc_decode_changed(b: [u8]) -> ?OtcChange
+    if list.len(b) != 7
+        return None
+    let id = wire.get(b, 1, 6)
+    if id < object_store.ID_FIRST
+        return None
+    Some(OtcChange { flags: b[0] as Int, id: id })
+
+// Whether the Flags of an Object Changed event hold a reserved bit (5 to 7).
+@tier(embedded)
+@no_alloc
+fn otc_change_reserved(c: OtcChange) -> Bool
+    (c.flags & 0xE0) != 0
+
+// ── The Object Action Control Point ─────────────────────────────────
+
+// Whether `v` is a 32-bit unsigned value.
+@tier(embedded)
+@no_alloc
+fn otc_u32(v: Int) -> Bool
+    v >= 0 and v <= 0xFFFFFFFF
+
+// The OACP request Create for an object of `size` octets and the Object Type `kind` (2 or 16 octets).
+@tier(app)
+fn otc_oacp_create(size: Int, kind: [u8]) -> ?[u8]
+    if not otc_u32(size) or not object_store.uuid_ok(kind)
+        return None
+    var out: [u8] = [object_transfer.OACP_OP_CREATE as u8]
+    wire.put(var out, size, 4)
+    list.append(out, kind)
+    Some(out)
+
+// The OACP request Delete, and Abort.
+@tier(app)
+fn otc_oacp_delete() -> [u8]
+    [object_transfer.OACP_OP_DELETE as u8]
+
+@tier(app)
+fn otc_oacp_abort() -> [u8]
+    [object_transfer.OACP_OP_ABORT as u8]
+
+// An OACP request of the op code `op` with an Offset and a Length (Calculate Checksum 0x03, Read 0x05).
+@tier(app)
+fn otc_oacp_range(op: Int, offset: Int, length: Int) -> ?[u8]
+    if op != object_transfer.OACP_OP_CHECKSUM and op != object_transfer.OACP_OP_READ
+        return None
+    if not otc_u32(offset) or not otc_u32(length)
+        return None
+    var out: [u8] = [op as u8]
+    wire.put(var out, offset, 4)
+    wire.put(var out, length, 4)
+    Some(out)
+
+// The OACP request Write at `offset` of `length` octets; `truncate` sets the Truncate bit of the Mode.
+@tier(app)
+fn otc_oacp_write(offset: Int, length: Int, truncate: Bool) -> ?[u8]
+    if not otc_u32(offset) or not otc_u32(length)
+        return None
+    var out: [u8] = [object_transfer.OACP_OP_WRITE as u8]
+    wire.put(var out, offset, 4)
+    wire.put(var out, length, 4)
+    list.push(out, (if truncate then object_transfer.MODE_TRUNCATE else 0) as u8)
+    Some(out)
+
+// The OACP request Execute with `param` (0 to 20 octets, defined by the profile that uses the object).
+@tier(app)
+fn otc_oacp_execute(param: [u8]) -> ?[u8]
+    if list.len(param) > OTC_EXECUTE_PARAMETER_MAX
+        return None
+    var out: [u8] = [object_transfer.OACP_OP_EXECUTE as u8]
+    list.append(out, param)
+    Some(out)
+
+// An OACP response: the request Op Code, the Result Code, the checksum of a Calculate Checksum success (-1
+// otherwise) and the Response Parameter of an Execute success.
+struct OtcOacp
+    request: Int
+    result: Int
+    checksum: Int
+    param: [u8]
+
+// The OACP response value in `b` (after the Response Code 0x60 is checked here): `None` for a Response Code other
+// than 0x60, an Op Code outside 1 to 7, a Result Code outside 1 to 10 and a Response Parameter the pair does not carry.
+@tier(app)
+fn otc_decode_oacp(b: [u8]) -> ?OtcOacp
+    if list.len(b) < 3 or (b[0] as Int) != object_transfer.OACP_OP_RESPONSE
+        return None
+    let op = b[1] as Int
+    let result = b[2] as Int
+    if op < object_transfer.OACP_OP_CREATE or op > object_transfer.OACP_OP_ABORT
+        return None
+    if result < object_transfer.OACP_RESULT_SUCCESS or result > object_transfer.OACP_RESULT_FAILED
+        return None
+    let rest = list.len(b) - 3
+    let ok = result == object_transfer.OACP_RESULT_SUCCESS
+    if op == object_transfer.OACP_OP_CHECKSUM and ok
+        if rest != 4
+            return None
+        return Some(OtcOacp { request: op, result: result, checksum: wire.get(b, 3, 4), param: [] })
+    if op == object_transfer.OACP_OP_EXECUTE and ok
+        if rest > OTC_EXECUTE_RESPONSE_MAX
+            return None
+        return Some(OtcOacp { request: op, result: result, checksum: -1, param: b[3:list.len(b)] })
+    if rest != 0
+        return None
+    Some(OtcOacp { request: op, result: result, checksum: -1, param: [] })
+
+// ── The Object List Control Point ───────────────────────────────────
+
+// The OLCP request First, Last, Previous or Next (the op codes 1 to 4), Request Number of Objects (7) or Clear
+// Marking (8): one octet; `None` for another op code.
+@tier(app)
+fn otc_olcp_request(op: Int) -> ?[u8]
+    if (op >= object_transfer.OLCP_OP_FIRST and op <= object_transfer.OLCP_OP_NEXT) or op == object_transfer.OLCP_OP_COUNT or op == object_transfer.OLCP_OP_CLEAR_MARKING
+        return Some([op as u8])
+    None
+
+// The OLCP request Go To the object `id`: the Directory Listing Object (0) or an ID of 0x100 to 0xFFFFFFFFFFFF.
+@tier(app)
+fn otc_olcp_go_to(id: Int) -> ?[u8]
+    if id != object_store.ID_DIRECTORY and (id < object_store.ID_FIRST or id > object_store.ID_LAST)
+        return None
+    var out: [u8] = [object_transfer.OLCP_OP_GO_TO as u8]
+    wire.put(var out, id, 6)
+    Some(out)
+
+// The OLCP request Order for the List Sort Order `order` (Table 3.23): 0x01 to 0x05 ascending, 0x11 to 0x15 descending.
+@tier(app)
+fn otc_olcp_order(order: Int) -> ?[u8]
+    if not object_list.order_valid(order)
+        return None
+    Some([object_transfer.OLCP_OP_ORDER as u8, order as u8])
+
+// An OLCP response: the request Op Code, the Result Code and the number of objects of a Request Number of
+// Objects success (-1 otherwise).
+@value
+struct OtcOlcp
+    request: Int
+    result: Int
+    count: Int
+
+// The OLCP response value in `b`: `None` for a Response Code other than 0x70, an Op Code outside 1 to 8, a Result Code
+// outside 1 to 8 and a Response Parameter other than the count of a Request Number of Objects success.
+@tier(embedded)
+@no_alloc
+fn otc_decode_olcp(b: [u8]) -> ?OtcOlcp
+    if list.len(b) < 3 or (b[0] as Int) != object_transfer.OLCP_OP_RESPONSE
+        return None
+    let op = b[1] as Int
+    let result = b[2] as Int
+    if op < object_transfer.OLCP_OP_FIRST or op > object_transfer.OLCP_OP_CLEAR_MARKING
+        return None
+    if result < object_transfer.OLCP_RESULT_SUCCESS or result > object_transfer.OLCP_RESULT_ID_NOT_FOUND
+        return None
+    if op == object_transfer.OLCP_OP_COUNT and result == object_transfer.OLCP_RESULT_SUCCESS
+        if list.len(b) != 7
+            return None
+        return Some(OtcOlcp { request: op, result: result, count: wire.get(b, 3, 4) })
+    if list.len(b) != 3
+        return None
+    Some(OtcOlcp { request: op, result: result, count: -1 })
+
+// ── Object List Filter ──────────────────────────────────────────────
+
+// The value of the Object List Filter checked by the rules of the service: `None` for what `filter_write_error`
+// refuses.
+@tier(app)
+fn otc_filter_checked(value: [u8]) -> ?[u8]
+    if object_list.filter_write_error(value) != 0
+        return None
+    Some(value[:])
+
+// The filter No Filter (0x00) and Marked Objects (0x0A).
+@tier(app)
+fn otc_filter_none() -> [u8]
+    [object_list.FILTER_NONE as u8]
+
+@tier(app)
+fn otc_filter_marked() -> [u8]
+    [object_list.FILTER_MARKED as u8]
+
+// A name filter: `kind` is Name Starts With (1), Ends With (2), Contains (3) or Exactly (4); `text` is 1 to 120 octets of UTF-8.
+@tier(app)
+fn otc_filter_name(kind: Int, text: [u8]) -> ?[u8]
+    if kind < object_list.FILTER_NAME_STARTS or kind > object_list.FILTER_NAME_EXACT
+        return None
+    var out: [u8] = [kind as u8]
+    list.append(out, text)
+    otc_filter_checked(out)
+
+// The Object Type filter for the UUID `kind` (2 or 16 octets).
+@tier(app)
+fn otc_filter_type(kind: [u8]) -> ?[u8]
+    var out: [u8] = [object_list.FILTER_TYPE as u8]
+    list.append(out, kind)
+    otc_filter_checked(out)
+
+// A range of two Date Times of 7 octets (created, 0x06, or modified, 0x07) or of two sizes (current, 0x08, or allocated,
+// 0x09, from `low` to `high` inclusive): `None` when the bounds are backwards or out of range.
+@tier(app)
+fn otc_filter_times(kind: Int, from_time: [u8], to_time: [u8]) -> ?[u8]
+    if kind != object_list.FILTER_CREATED and kind != object_list.FILTER_MODIFIED
+        return None
+    var out: [u8] = [kind as u8]
+    list.append(out, from_time)
+    list.append(out, to_time)
+    otc_filter_checked(out)
+
+@tier(app)
+fn otc_filter_sizes(kind: Int, low: Int, high: Int) -> ?[u8]
+    if kind != object_list.FILTER_SIZE and kind != object_list.FILTER_ALLOCATED
+        return None
+    if not otc_u32(low) or not otc_u32(high)
+        return None
+    var out: [u8] = [kind as u8]
+    wire.put(var out, low, 4)
+    wire.put(var out, high, 4)
+    otc_filter_checked(out)
+
+// ── The Directory Listing Object ────────────────────────────────────
+
+// One Object Record of the Directory Listing Object (Table 4.1).  A field the record leaves out is -1 (or empty).
+// `kind` is the Object Type, 2 or 16 octets; `created` and `modified` are the 7 octets of a Date Time.
+struct OtcRecord
+    id: Int
+    name: [u8]
+    kind: [u8]
+    size: Int
+    allocated: Int
+    created: [u8]
+    modified: [u8]
+    properties: Int
+
+// The Object Record that starts at `at` in `b` and the offset after it; `None` for a record that is cut short, has a Length of
+// Record that is not the size of its fields, a name of 0 or over 120 octets or one that is not UTF-8, a reserved Flags bit
+// (6) or the Extended Flags bit (7), or a field outside its format.
+@tier(app)
+fn otc_decode_record(b: [u8], at: Int) -> ?(OtcRecord, Int)
+    let n = list.len(b)
+    if at < 0 or at + 2 > n
+        return None
+    let length = wire.get(b, at, 2)
+    if length < 2 + 6 + 1 + 1 + 1 + 2 or at + length > n
+        return None
+    let end = at + length
+    let id = wire.get(b, at + 2, 6)
+    let name_length = b[at + 8] as Int
+    var p = at + 9
+    if name_length < 1 or name_length > object_store.NAME_MAX or p + name_length + 1 > end
+        return None
+    let name = b[p:p + name_length]
+    if not object_store.name_ok(name)
+        return None
+    p = p + name_length
+    let flags = b[p] as Int
+    p = p + 1
+    if (flags & 0xC0) != 0
+        return None
+    let kind_length = if (flags & object_list.RECORD_TYPE_128) != 0 then 16 else 2
+    if p + kind_length > end
+        return None
+    let kind = b[p:p + kind_length]
+    p = p + kind_length
+    var size = -1
+    var allocated = -1
+    var created: [u8] = []
+    var modified: [u8] = []
+    var properties = -1
+    if (flags & object_list.RECORD_CURRENT_SIZE) != 0
+        if p + 4 > end
+            return None
+        size = wire.get(b, p, 4)
+        p = p + 4
+    if (flags & object_list.RECORD_ALLOCATED_SIZE) != 0
+        if p + 4 > end
+            return None
+        allocated = wire.get(b, p, 4)
+        p = p + 4
+    if (flags & object_list.RECORD_FIRST_CREATED) != 0
+        if p + 7 > end or not object_store.date_time_ok(b[p:p + 7])
+            return None
+        created = b[p:p + 7]
+        p = p + 7
+    if (flags & object_list.RECORD_LAST_MODIFIED) != 0
+        if p + 7 > end or not object_store.date_time_ok(b[p:p + 7])
+            return None
+        modified = b[p:p + 7]
+        p = p + 7
+    if (flags & object_list.RECORD_PROPERTIES) != 0
+        if p + 4 > end
+            return None
+        properties = wire.get(b, p, 4)
+        p = p + 4
+    if p != end
+        return None
+    Some((OtcRecord {
+        id: id, name: name, kind: kind, size: size, allocated: allocated, created: created, modified: modified,
+        properties: properties }, end))
+
+// The Directory Listing Object in `b`: the Object Records one after the other, until the end of the octets; `None`
+// when `b` is empty or a record is malformed.
+@tier(app)
+fn otc_decode_listing(b: [u8]) -> ?[OtcRecord]
+    if list.len(b) == 0
+        return None
+    var out: [OtcRecord] = []
+    var at = 0
+    for _ in 0..list.len(b)
+        if at < list.len(b)
+            match otc_decode_record(b, at)
+                None => return None
+                Some(r) =>
+                    list.push(out, r.0)
+                    at = r.1
+    Some(out)
+
+// What the ATT error `status` of a write means: one of the `OTC_ERR_` values.
+@tier(embedded)
+@no_alloc
+fn otc_error_kind(status: Int) -> Int
+    if status == 0
+        return OTC_ERR_NONE
+    if status == object_list.ERR_WRITE_REQUEST_REJECTED
+        return OTC_ERR_WRITE_REJECTED
+    if status == object_transfer.ERR_OBJECT_NOT_SELECTED
+        return OTC_ERR_NOT_SELECTED
+    if status == object_transfer.ERR_CONCURRENCY_LIMIT
+        return OTC_ERR_CONCURRENCY
+    if status == object_transfer.ERR_NAME_EXISTS
+        return OTC_ERR_NAME_EXISTS
+    if status == 0xFD
+        return OTC_ERR_CCCD
+    if status == 0xFE
+        return OTC_ERR_IN_PROGRESS
+    if status == object_list.ERR_INVALID_LENGTH
+        return OTC_ERR_INVALID_LENGTH
+    OTC_ERR_OTHER
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn otc_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, object_transfer.UUID_OBJECT_TRANSFER_SERVICE)
+
+// Discover the service, read the OTS Feature (required) and enable the indication of the OACP, the OLCP and Object
+// Changed (each optional).
+@tier(app)
+fn otc_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OTS_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, object_transfer.UUID_OACP, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, object_transfer.UUID_OLCP, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, object_transfer.UUID_OBJECT_CHANGED, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Read the metadata of the Current Object: the Name (Read Long), the Type, the Size, the First-Created, the Last-Modified,
+// the ID and the Properties, each optional.  The session must have finished its plan.  Each value arrives as an event; with no
+// Current Object the server answers Object Not Selected (0x81).
+@tier(app)
+fn otc_client_read_current(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read_long(var c, object_transfer.UUID_OBJECT_NAME, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_TYPE, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_SIZE, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_FIRST_CREATED, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_LAST_MODIFIED, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_ID, false)
+    sensor_client.sc_queue_read(var c, object_transfer.UUID_OBJECT_PROPERTIES, false)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write the OACP with a value built by one of the `otc_oacp_` functions.  The session must have finished its plan.
+@tier(app)
+fn otc_client_oacp(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, object_transfer.UUID_OACP, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write the OLCP with a value built by one of the `otc_olcp_` functions.  The session must have finished its plan.
+@tier(app)
+fn otc_client_olcp(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, object_transfer.UUID_OLCP, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

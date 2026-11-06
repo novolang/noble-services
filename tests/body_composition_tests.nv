@@ -1,0 +1,209 @@
+// tests/body_composition_tests.nv — the unit tests of src/body_composition.nv.
+//
+//   novo test tests/body_composition_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use fixtures.{ req }
+use wire
+use body_composition.{ BcsMeasurement, F_BASAL_METABOLISM, F_BODY_WATER_MASS, F_FAT_FREE_MASS, F_HEIGHT, F_IMPEDANCE, F_MULTIPLE_USERS, F_MUSCLE_MASS, F_MUSCLE_PERCENTAGE, F_SOFT_LEAN_MASS, F_SUPPORT_MASK, F_TIME_STAMP, F_WEIGHT, HEIGHT_RESOLUTION_SHIFT, UNSUCCESSFUL, WEIGHT_RESOLUTION_SHIFT, add_bcs_service, bcs_feature_value, bcs_features_changed, bcs_features_valid, bcs_indicate, bcs_measurement, bcs_pack, bcs_packets, default_bcs_config, full, server }
+
+// A measurement of `body_fat` with the date, the user and no other field.
+@tier(app)
+fn dated(body_fat: Int) -> BcsMeasurement
+    BcsMeasurement {
+        imperial: false, present: 0, body_fat: body_fat as u16, time: wire.date_time(2026, 10, 27, 9, 5, 3),
+        user_id: 7, basal_metabolism: 0, muscle_percentage: 0, muscle_mass: 0, fat_free_mass: 0, soft_lean_mass: 0,
+        body_water_mass: 0, impedance: 0, weight: 0, height: 0 }
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_the_service_has_a_readable_feature_and_an_indicated_measurement()
+    let (s, h) = server(default_bcs_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.feature_cccd, 0)
+    test.assert_eq(h.measurement, 5)
+    test.assert_eq(h.measurement_cccd, 6)
+    test.assert_eq(s.db.attributes[0].value, [0x1B, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 3, 0, 0x9B, 0x2A])
+    test.assert_eq(s.db.attributes[3].value, [0x20, 5, 0, 0x9C, 0x2A])
+    // The measurement cannot be read or written, the feature cannot be written.
+    var t = s
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x0A, h.measurement, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.measurement, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.feature, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // A value that can change adds the Indicate property and a descriptor; a secondary service builds too.
+    var changing = default_bcs_config()
+    changing.changes = true
+    changing.secondary = true
+    let (c, ch) = server(changing)
+    test.assert(ch.feature_cccd != 0)
+    test.assert_eq(c.db.attributes[1].value[0] as Int, 0x22)
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_the_feature_value_is_32_bits_with_the_two_resolutions()
+    var config = default_bcs_config()
+    test.assert_eq(bcs_feature_value(config), [0xFF, 0x07, 0x00, 0x00])
+    let (s, h) = server(config)
+    var t = s
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x0A, h.feature, []), 0)[0], [0x0B, 0xFF, 0x07, 0x00, 0x00])
+    // Weight resolution 7 (0.005 kg) in bits 11 to 14 and Height resolution 3 (0.001 m) in bits 15 to 17.
+    config.features = F_SUPPORT_MASK | (7 << WEIGHT_RESOLUTION_SHIFT) | (3 << HEIGHT_RESOLUTION_SHIFT)
+    test.assert_eq(bcs_feature_value(config), [0xFF, 0xBF, 0x01, 0x00])
+    test.assert(bcs_features_valid(config.features))
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_a_feature_value_with_reserved_bits_or_a_height_resolution_without_height_is_refused()
+    var s = gatt_server.new_server([], 65)
+    var bad: [Int] = [1 << 18, 8 << WEIGHT_RESOLUTION_SHIFT, 4 << HEIGHT_RESOLUTION_SHIFT, 1 << HEIGHT_RESOLUTION_SHIFT]
+    for features in bad
+        var config = default_bcs_config()
+        config.features = features
+        match add_bcs_service(var s.db, config)
+            Ok(_) => test.fail("a Feature value the service cannot hold")
+            Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    // The resolution is 0 without the Height, 1 with it.
+    test.assert(bcs_features_valid(F_WEIGHT | (7 << WEIGHT_RESOLUTION_SHIFT)))
+    test.assert(bcs_features_valid(F_HEIGHT | (1 << HEIGHT_RESOLUTION_SHIFT)))
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_a_measurement_with_no_optional_field_is_the_flags_and_the_body_fat()
+    let p = bcs_packets(0, bcs_measurement(0x0123), 23)
+    test.assert_eq(list.len(p), 1)
+    test.assert_eq(p[0], [0x00, 0x00, 0x23, 0x01])
+    // Imperial sets bit 0.
+    let imperial = BcsMeasurement { imperial: true, present: 0, body_fat: 0x0123, time: wire.date_time_unknown(), user_id: 0, basal_metabolism: 0, muscle_percentage: 0, muscle_mass: 0, fat_free_mass: 0, soft_lean_mass: 0, body_water_mass: 0, impedance: 0, weight: 0, height: 0 }
+    test.assert_eq(bcs_packets(0, imperial, 23)[0], [0x01, 0x00, 0x23, 0x01])
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_every_field_has_its_flag_its_size_and_its_place()
+    let flags = [F_TIME_STAMP, F_MULTIPLE_USERS, F_BASAL_METABOLISM, F_MUSCLE_PERCENTAGE, F_MUSCLE_MASS, F_FAT_FREE_MASS, F_SOFT_LEAN_MASS, F_BODY_WATER_MASS, F_IMPEDANCE, F_WEIGHT, F_HEIGHT]
+    let m = full()
+    // The Time Stamp.
+    test.assert_eq(bcs_pack(m, F_TIME_STAMP, false), [0x02, 0x00, 0x23, 0x01, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    // The User ID.
+    test.assert_eq(bcs_pack(m, F_MULTIPLE_USERS, false), [0x04, 0x00, 0x23, 0x01, 7])
+    // Each of the nine 16-bit fields: Flags bit k + 1, then the value.
+    let values = [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888, 0x9999]
+    for i in 0..9
+        let bit = flags[2 + i]
+        let p = bcs_pack(m, bit, false)
+        test.assert_eq(wire.get(p, 0, 2), bit << 1)
+        test.assert_eq(list.len(p), 6)
+        test.assert_eq(wire.get(p, 4, 2), values[i])
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_fields_the_device_lacks_are_left_out_and_time_stamp_and_user_id_are_always_in()
+    let features = F_TIME_STAMP | F_MULTIPLE_USERS | F_IMPEDANCE
+    // The product has every field, the device three of them.
+    let p = bcs_packets(features, full(), 23)
+    test.assert_eq(list.len(p), 1)
+    test.assert_eq(p[0], [0x06, 0x02, 0x23, 0x01, 0xEA, 0x07, 10, 27, 9, 5, 3, 7, 0x77, 0x77])
+    // The product has no Time Stamp or User ID set in `present`, the device supports them: they are sent.
+    let m = dated(0x0123)
+    test.assert_eq(list.len(bcs_packets(features, m, 23)[0]), 4 + 7 + 1)
+    // Without the features the date is not sent and need not be valid.
+    test.assert_eq(bcs_packets(0, m, 23)[0], [0x00, 0x00, 0x23, 0x01])
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_an_unsuccessful_measurement_keeps_only_the_time_stamp_and_the_user_id()
+    let m = BcsMeasurement { imperial: false, present: F_SUPPORT_MASK, body_fat: UNSUCCESSFUL, time: wire.date_time(2026, 10, 27, 9, 5, 3), user_id: 7, basal_metabolism: 1, muscle_percentage: 1, muscle_mass: 1, fat_free_mass: 1, soft_lean_mass: 1, body_water_mass: 1, impedance: 1, weight: 1, height: 1 }
+    let p = bcs_packets(F_SUPPORT_MASK, m, 23)
+    test.assert_eq(list.len(p), 1)
+    test.assert_eq(p[0], [0x06, 0x00, 0xFF, 0xFF, 0xEA, 0x07, 10, 27, 9, 5, 3, 7])
+    test.assert_eq(bcs_packets(F_MUSCLE_MASS, m, 23)[0], [0x00, 0x00, 0xFF, 0xFF])
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_fields_that_do_not_fit_the_default_mtu_go_into_a_continuation_packet()
+    let p = bcs_packets(F_SUPPORT_MASK, full(), 23)
+    test.assert_eq(list.len(p), 2)
+    // First: Flags, Body Fat, Time Stamp, User ID, then as many 16-bit fields as fit in 20 octets.
+    test.assert_eq(list.len(p[0]), 20)
+    test.assert_eq(wire.get(p[0], 0, 2), 0x1000 | ((F_TIME_STAMP | F_MULTIPLE_USERS | F_BASAL_METABOLISM | F_MUSCLE_PERCENTAGE | F_MUSCLE_MASS | F_FAT_FREE_MASS) << 1))
+    test.assert_eq(p[0][4:12], [0xEA, 0x07, 10, 27, 9, 5, 3, 7])
+    test.assert_eq(wire.get(p[0], 18, 2), 0x4444)
+    // The continuation: Flags (Multiple Packet set), Body Fat, the rest, no Time Stamp or User ID.
+    test.assert_eq(list.len(p[1]), 4 + 10)
+    test.assert_eq(wire.get(p[1], 0, 2), 0x1000 | ((F_SOFT_LEAN_MASS | F_BODY_WATER_MASS | F_IMPEDANCE | F_WEIGHT | F_HEIGHT) << 1))
+    test.assert_eq(wire.get(p[1], 2, 2), 0x0123)
+    test.assert_eq(wire.get(p[1], 4, 2), 0x5555)
+    test.assert_eq(wire.get(p[1], 12, 2), 0x9999)
+    // A larger MTU holds the 30 octets in one packet with the bit clear.
+    let one = bcs_packets(F_SUPPORT_MASK, full(), 64)
+    test.assert_eq(list.len(one), 1)
+    test.assert_eq(list.len(one[0]), 30)
+    test.assert_eq(wire.get(one[0], 0, 2) & 0x1000, 0)
+    // A measurement that fits has no second packet and no bit.
+    test.assert_eq(list.len(bcs_packets(F_SUPPORT_MASK & (F_TIME_STAMP | F_MULTIPLE_USERS | F_IMPEDANCE), full(), 23)), 1)
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_a_measurement_the_service_cannot_hold_is_not_sent()
+    // A year, month or day of 0 ("not known") is refused when the device has a Time Stamp.
+    let m = BcsMeasurement { imperial: false, present: 0, body_fat: 1, time: wire.date_time(0, 10, 27, 9, 5, 3), user_id: 7, basal_metabolism: 0, muscle_percentage: 0, muscle_mass: 0, fat_free_mass: 0, soft_lean_mass: 0, body_water_mass: 0, impedance: 0, weight: 0, height: 0 }
+    test.assert_eq(list.len(bcs_packets(F_TIME_STAMP, m, 23)), 0)
+    test.assert_eq(list.len(bcs_packets(0, m, 23)), 1)
+    // An MTU under 23 is refused (a field wider than its octets cannot be built: the fields are sized).
+    test.assert_eq(list.len(bcs_packets(0, bcs_measurement(1), 22)), 0)
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_a_measurement_is_indicated_and_the_continuation_waits_for_the_confirmation()
+    let config = default_bcs_config()
+    let (s, h) = server(config)
+    var t = s
+    let first = bcs_indicate(var t.db, var t.link, h, config, full(), 0)
+    // The first packet goes now; the continuation is queued behind it.
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0][0] as Int, 0x1D)
+    test.assert_eq(gatt_server.read_le16(first[0], 1), h.measurement)
+    test.assert_eq(list.len(first[0]), 3 + 20)
+    let second = gatt_server.receive(var t.db, var t.link, [0x1E], 1)
+    test.assert_eq(list.len(second), 1)
+    test.assert_eq(list.len(second[0]), 3 + 14)
+    test.assert_eq(list.len(gatt_server.receive(var t.db, var t.link, [0x1E], 2)), 0)
+    // A measurement of one packet is one indication.
+    test.assert_eq(list.len(bcs_indicate(var t.db, var t.link, h, config, dated(0x0123), 3)), 1)
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_nothing_is_indicated_before_the_collector_enables_indications()
+    var s = gatt_server.new_server([], 65)
+    let config = default_bcs_config()
+    let h = add_bcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(list.len(bcs_indicate(var s.db, var s.link, h, config, bcs_measurement(5), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-BCS-001")
+fn test_the_feature_is_indicated_when_it_changed_and_the_link_security_is_the_access_of_the_service()
+    var changing = default_bcs_config()
+    changing.changes = true
+    let (c, ch) = server(changing)
+    var t = c
+    test.assert_eq(list.len(bcs_features_changed(var t.db, var t.link, ch, changing, 0)), 0)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, ch.feature_cccd, [2, 0]), 0)[0], [0x13])
+    let f = bcs_features_changed(var t.db, var t.link, ch, changing, 0)
+    test.assert_eq(f[0], [0x1D, 3, 0, 0xFF, 0x07, 0x00, 0x00])
+    // A device without the property never indicates it.
+    let (p, ph) = server(default_bcs_config())
+    var u = p
+    test.assert_eq(list.len(bcs_features_changed(var u.db, var u.link, ph, default_bcs_config(), 0)), 0)
+    // With an authenticated access an encrypted link cannot read the Feature.
+    var strict = default_bcs_config()
+    strict.access = gatt_server.Access.Authenticated
+    var s = gatt_server.new_server([], 65)
+    let h = add_bcs_service(var s.db, strict)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)

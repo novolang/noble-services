@@ -1,0 +1,301 @@
+// tests/cycling_speed_cadence_tests.nv — the unit tests of src/cycling_speed_cadence.nv.
+//
+//   novo test tests/cycling_speed_cadence_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+use cycling_speed_cadence.{ CscConfig, CscHandles, CscMeasurement, FEATURE_CRANK_REVOLUTION_DATA, FEATURE_MULTIPLE_SENSOR_LOCATIONS, FEATURE_WHEEL_REVOLUTION_DATA, add_csc_service, csc_control_point_response, csc_feature_value, csc_handle_control_point, csc_measurement_value, csc_notify, default_csc_config }
+
+fn added(var s: GattServer, config: CscConfig) -> CscHandles
+    match add_csc_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            CscHandles { feature_bits: 0, service: 0, measurement: 0, measurement_cccd: 0, feature: 0, location: 0, control_point: 0, control_point_cccd: 0 }
+
+fn request(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+fn both() -> Int
+    csc_feature_value(true, true, true)
+
+@test
+fn test_measurement_value()
+    let wheel = CscMeasurement {
+        wheel: true, wheel_revolutions: 0x01020304, last_wheel_event: 0x0506, crank: false, crank_revolutions: 0, last_crank_event: 0 }
+    test.assert_eq(csc_measurement_value(wheel), [0x01, 0x04, 0x03, 0x02, 0x01, 0x06, 0x05])
+    let crank = CscMeasurement {
+        wheel: false, wheel_revolutions: 0, last_wheel_event: 0, crank: true, crank_revolutions: 0x0708, last_crank_event: 0x090A }
+    test.assert_eq(csc_measurement_value(crank), [0x02, 0x08, 0x07, 0x0A, 0x09])
+    let all = CscMeasurement {
+        wheel: true, wheel_revolutions: 1, last_wheel_event: 2, crank: true, crank_revolutions: 3, last_crank_event: 4 }
+    test.assert_eq(csc_measurement_value(all), [0x03, 1, 0, 0, 0, 2, 0, 3, 0, 4, 0])
+    let nothing = CscMeasurement {
+        wheel: false, wheel_revolutions: 9, last_wheel_event: 9, crank: false, crank_revolutions: 9, last_crank_event: 9 }
+    test.assert_eq(csc_measurement_value(nothing), [0x00])
+
+@test
+fn test_feature_value()
+    test.assert_eq(csc_feature_value(true, false, false), 1)
+    test.assert_eq(csc_feature_value(false, true, false), 2)
+    test.assert_eq(csc_feature_value(true, true, true), 7)
+    test.assert_eq(csc_feature_value(false, false, false), 0)
+
+@test
+fn test_layout_and_reads()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(both(), sensor_control.SensorLocation.FrontWheel))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.feature, 6)
+    test.assert_eq(h.location, 8)
+    test.assert_eq(h.control_point, 10)
+    test.assert_eq(h.control_point_cccd, 11)
+    test.assert_eq(s.db.attributes[0].value, [0x16, 0x18])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x07, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 4])
+    // The control point declares Write and Indicate and is not readable.
+    test.assert_eq(s.db.attributes[8].value[0] as Int, 0x28)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.control_point, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    // Without the optional characteristics.
+    var bare = gatt_server.new_server([], 65)
+    let config = CscConfig {
+        feature: 2, location: sensor_control.SensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+    let b = added(var bare, config)
+    test.assert_eq(b.location, 0)
+    test.assert_eq(b.control_point, 0)
+    test.assert_eq(gatt_server.last_handle(bare.db), 6)
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.Absent, [], false, false)
+    test.assert_eq(list.len(csc_handle_control_point(var bare.db, var bare.link, b, var st, 0)), 0)
+
+@test
+fn test_notification_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(both(), sensor_control.SensorLocation.Other))
+    let m = CscMeasurement { wheel: true, wheel_revolutions: 10, last_wheel_event: 1024, crank: false, crank_revolutions: 0, last_crank_event: 0 }
+    test.assert_eq(list.len(csc_notify(var s.db, var s.link, h, m, 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    let ntf = csc_notify(var s.db, var s.link, h, m, 0)
+    test.assert_eq(ntf[0], [0x1B, 0x03, 0x00, 0x01, 10, 0, 0, 0, 0x00, 0x04])
+    // The measurement cannot be read.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.measurement, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+fn enable_indications(var s: GattServer, h: CscHandles)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+
+@test
+fn test_control_point_needs_indications_and_waits_for_confirmation()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(both(), sensor_control.SensorLocation.Other))
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.Other, [], true, true)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 1, 0, 0, 0]), 0)[0][4] as Int, sensor_control.ERR_CCCD_IMPROPERLY_CONFIGURED)
+    enable_indications(var s, h)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 0x10, 0, 0, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.take_changed(var s.link)[0], h.control_point)
+    let ind = csc_handle_control_point(var s.db, var s.link, h, var st, 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(ind[0], [0x1D, 0x0A, 0x00, 0x10, 0x01, 0x01])
+    test.assert_eq(st.cumulative_value, 0x10)
+    // Another write before the client confirms is refused.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0][4] as Int, sensor_control.ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0], [0x13])
+    let cal = csc_handle_control_point(var s.db, var s.link, h, var st, 2)
+    test.assert_eq(cal[0], [0x1D, 0x0A, 0x00, 0x10, 0x02, 0x02])
+    test.assert_eq(st.calibration_requested, false)
+
+@test
+fn test_every_procedure_and_result()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(both(), sensor_control.SensorLocation.LeftCrank))
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.LeftCrank, [5, 6], true, false)
+    enable_indications(var s, h)
+    // Set Cumulative Value with a short parameter: Invalid Parameter.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 1, 2]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x01, 0x03])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Start Sensor Calibration on a sensor that has none: Op Code Not Supported.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x02, 0x02])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Request Supported Sensor Locations.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [4]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x04, 0x01, 5, 6])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    // Update Sensor Location moves the characteristic with it.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3, 6]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x03, 0x01])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 6])
+    // A location outside the list: Invalid Parameter, the location stays.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [3, 9]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x03, 0x03])
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 6])
+    // An opcode the service does not define.
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0x77]), 0)
+    test.assert_eq(csc_handle_control_point(var s.db, var s.link, h, var st, 0)[0], [0x1D, 0x0A, 0x00, 0x10, 0x77, 0x02])
+
+@test
+fn test_response_to_an_empty_request()
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.Other, [], false, false)
+    test.assert_eq(csc_control_point_response(var st, both(), []), [0x10, 0x00, 0x02])
+
+@test
+fn test_permissions_are_enforced_per_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let config = CscConfig {
+        feature: both(), location: sensor_control.SensorLocation.Hip, control_point: true, read: gatt_server.Access.Encrypted,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authenticated },
+        control_point_write: gatt_server.Access.Authenticated,
+        control_point_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted } }
+    let h = added(var s, config)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x07, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0], [0x13])
+    // Authorization.
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, CscConfig {
+        feature: 1, location: sensor_control.SensorLocation.Hip, control_point: true, read: gatt_server.Access.Authorized,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authorized },
+        control_point_write: gatt_server.Access.Authorized, control_point_cccd: gatt_server.open_permissions() })
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+
+fn is_refused(config: CscConfig) -> Bool
+    var s = gatt_server.new_server([], 65)
+    match add_csc_service(var s.db, config)
+        Ok(_) => false
+        Err(e) => e == profile_builder.ProfileError.NotPermitted
+
+fn config_for(feature: Int, location: sensor_control.SensorLocation, control_point: Bool) -> CscConfig
+    CscConfig {
+        feature: feature, location: location, control_point: control_point, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+
+@test
+fn test_the_feature_drops_its_reserved_bits()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(0xFFFF, sensor_control.SensorLocation.Other))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x07, 0x00])
+    test.assert_eq(h.feature_bits, 7)
+
+@test
+fn test_the_parts_follow_from_the_feature()
+    let hip = sensor_control.SensorLocation.Hip
+    let absent = sensor_control.SensorLocation.Absent
+    // The sensor measures at least one of wheel and crank revolutions.
+    test.assert(is_refused(config_for(0, hip, false)))
+    test.assert(is_refused(config_for(4, hip, true)))
+    // The control point is present exactly with wheel data or several locations.
+    test.assert(is_refused(config_for(1, absent, false)))
+    test.assert(is_refused(config_for(2, absent, true)))
+    test.assert(is_refused(config_for(6, hip, false)))
+    test.assert(not is_refused(config_for(1, absent, true)))
+    test.assert(not is_refused(config_for(2, absent, false)))
+    test.assert(not is_refused(config_for(2, hip, false)))
+    // Several locations need the Sensor Location.
+    test.assert(is_refused(config_for(6, absent, true)))
+    test.assert(not is_refused(config_for(6, hip, true)))
+    // The default configuration follows the Feature.
+    test.assert_eq(default_csc_config(2, absent).control_point, false)
+    test.assert_eq(default_csc_config(3, absent).control_point, true)
+    test.assert_eq(default_csc_config(6, hip).control_point, true)
+
+@test
+fn test_a_denied_access_is_refused()
+    let denied = gatt_server.Access.Denied
+    let open = gatt_server.open_permissions()
+    let hip = sensor_control.SensorLocation.Hip
+    let base = config_for(7, hip, true)
+    test.assert(not is_refused(base))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: denied,
+        measurement_cccd: open, control_point_write: gatt_server.Access.Open, control_point_cccd: open }))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: denied, write: gatt_server.Access.Open },
+        control_point_write: gatt_server.Access.Open, control_point_cccd: open }))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: open, control_point_write: denied, control_point_cccd: open }))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: open, control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: denied } }))
+    // Without a control point its accesses do not matter.
+    test.assert(not is_refused(CscConfig { feature: 2, location: hip, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: open, control_point_write: denied, control_point_cccd: gatt_server.Permissions { read: denied, write: denied } }))
+
+@test
+fn test_a_measurement_carries_only_what_the_feature_names()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_csc_config(2, sensor_control.SensorLocation.Other))
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)
+    let all = CscMeasurement {
+        wheel: true, wheel_revolutions: 1, last_wheel_event: 2, crank: true, crank_revolutions: 3, last_crank_event: 4 }
+    // A crank-only sensor leaves the wheel data and its flag out.
+    test.assert_eq(csc_notify(var s.db, var s.link, h, all, 0)[0], [0x1B, 0x03, 0x00, 0x02, 3, 0, 4, 0])
+    // A measurement with only wheel data has nothing to send.
+    let wheel = CscMeasurement {
+        wheel: true, wheel_revolutions: 1, last_wheel_event: 2, crank: false, crank_revolutions: 0, last_crank_event: 0 }
+    test.assert_eq(list.len(csc_notify(var s.db, var s.link, h, wheel, 0)), 0)
+    let nothing = CscMeasurement {
+        wheel: false, wheel_revolutions: 0, last_wheel_event: 0, crank: false, crank_revolutions: 0, last_crank_event: 0 }
+    test.assert_eq(list.len(csc_notify(var s.db, var s.link, h, nothing, 0)), 0)
+
+@test
+fn test_wheel_revolutions_neither_go_below_zero_nor_wrap()
+    let m = CscMeasurement {
+        wheel: true, wheel_revolutions: -3, last_wheel_event: 0x10001, crank: true, crank_revolutions: 0x10002, last_crank_event: 0 }
+    // The event time and the crank count wrap at 16 bits.
+    test.assert_eq(csc_measurement_value(m), [0x03, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0])
+    let top = CscMeasurement {
+        wheel: true, wheel_revolutions: 0x1FFFFFFFF, last_wheel_event: 0, crank: false, crank_revolutions: 0, last_crank_event: 0 }
+    test.assert_eq(csc_measurement_value(top), [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0])
+
+@test
+fn test_the_opcodes_follow_from_the_feature()
+    var st = sensor_control.new_sc_state(sensor_control.SensorLocation.LeftCrank, [5, 6], true, true)
+    let wheel = FEATURE_WHEEL_REVOLUTION_DATA
+    let crank_locations = FEATURE_CRANK_REVOLUTION_DATA | FEATURE_MULTIPLE_SENSOR_LOCATIONS
+    // Set Cumulative Value needs wheel data.
+    test.assert_eq(csc_control_point_response(var st, wheel, [1, 5, 0, 0, 0]), [0x10, 0x01, 0x01])
+    test.assert_eq(csc_control_point_response(var st, crank_locations, [1, 5, 0, 0, 0]), [0x10, 0x01, 0x02])
+    // The location procedures need several locations.
+    test.assert_eq(csc_control_point_response(var st, wheel, [3, 6]), [0x10, 0x03, 0x02])
+    test.assert_eq(csc_control_point_response(var st, wheel, [4]), [0x10, 0x04, 0x02])
+    test.assert_eq(csc_control_point_response(var st, crank_locations, [4]), [0x10, 0x04, 0x01, 5, 6])
+    // Start Sensor Calibration is not part of the service, and neither is 0x00.
+    test.assert_eq(csc_control_point_response(var st, both(), [2]), [0x10, 0x02, 0x02])
+    test.assert_eq(csc_control_point_response(var st, both(), [0]), [0x10, 0x00, 0x02])
+    test.assert_eq(st.calibration_requested, false)
+
+@test
+fn test_security_above_level_3_is_refused()
+    let hip = sensor_control.SensorLocation.Hip
+    let open = gatt_server.open_permissions()
+    let sc = gatt_server.Access.SecureConnections
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: sc,
+        measurement_cccd: open, control_point_write: gatt_server.Access.Open, control_point_cccd: open }))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: sc },
+        control_point_write: gatt_server.Access.Open, control_point_cccd: open }))
+    test.assert(is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: open, control_point_write: sc, control_point_cccd: open }))
+    test.assert(not is_refused(CscConfig { feature: 7, location: hip, control_point: true, read: gatt_server.Access.Authenticated,
+        measurement_cccd: open, control_point_write: gatt_server.Access.Authenticated, control_point_cccd: open }))

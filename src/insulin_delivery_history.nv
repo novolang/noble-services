@@ -1,0 +1,825 @@
+// src/insulin_delivery_history.nv — the second family of the Insulin
+// Delivery Service (0x183A): the history database, the IDD Record Access Control Point
+// and the IDD History Data characteristic.
+//
+//   IDD Record Access Control Point  0x2B27  Write, Indicate; Report Stored Records,
+//                                            Delete Stored Records, Abort Operation and
+//                                            Report Number of Stored Records
+//   IDD History Data                 0x2B28  Notify; Event Type, Sequence Number, Relative
+//                                            Offset, Event Data and, with E2E-Protection,
+//                                            the E2E-CRC
+//
+// The service of `insulin_delivery.nv` is the first family; this file adds the two
+// characteristics after it (`add_ids_history`) and answers the writes to the control point
+// (`ids_history_receive`, which hands every other PDU on to `insulin_delivery.ids_receive`).
+// NOT IMPLEMENTED yet: the IDD Command Control Point and IDD Command Data.
+//
+// The control point is the Record Access Control Point of the Glucose and CGM services
+// ([GLS] 3.4) with other values: the Op Codes, Operators and Success are Hamming-code
+// values, the count is a uint32, the Operand starts with one of three Filter Types and the
+// control point carries the E2E-Counter and E2E-CRC ([IDS] 3.9).  `racp.racp_decode` and its
+// responses do not fit; the selection of the records by Operator and the run state
+// (`racp.racp_select`, `racp.RacpRun`) are the generic ones.  The Filter Types are Sequence
+// Number (0x0F), Sequence Number filtered by Reference Time Event (0x33: the Reference Time
+// and Reference Time Base Offset events) and Sequence Number filtered by Non-Reference Time
+// Event (0x3C: every other event) ([IDS] Table 3.24).
+//
+// The history.  A record is an Event Type, a Sequence Number, a Relative Offset and the
+// Event Data of that type ([IDS] 4.9).  The Sequence Number starts at 0, steps by 1 for
+// each record, is not reset by Delete Stored Records and does not roll over; a Data
+// Corruption event has the Sequence Number 0xFFFFFFFF ([IDS] 3.10.2, 3.10.4.2).  The
+// events of a compound group ([IDS] Table 3.28) are recorded together with consecutive
+// Sequence Numbers and the same Relative Offset, `ids_record_group`; the full profile of a
+// template is recorded, so its time blocks number 1 to n and last 24 hours together
+// ([IDS] 3.10.3).  A Delete Stored Records that selects part of a group is answered
+// Procedure not applicable ([IDS] 3.9.4.3).  A store at its capacity drops its oldest record
+// ([IDS] 3.13).  The records are sent oldest first, a burst at a time by `ids_history_pump`,
+// followed by the Success response.
+//
+// What the product decides: which events it records and when (`ids_record_event`,
+// `ids_record_group`), the capacity, whether Delete and the optional Operators and Filter
+// Types are offered, and the storage across a power cycle.  The checks of the Event Data
+// against the Event Type and the Features are the stack's.
+//
+// Specification checked against: Insulin Delivery Service 1.0.2 and the test suite
+// IDS.TS.p3 (IDS/SEN/RAN, RAD, RAR, RAA, RAE, HDE).
+//
+// Satisfies: REQ-BLE-IDS-002.
+
+use std.test
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use insulin_delivery
+use profile_builder
+use racp
+use reconnection_configuration
+use wire
+
+const UUID_IDD_RECORD_ACCESS_CONTROL_POINT = 0x2B27
+const UUID_IDD_HISTORY_DATA = 0x2B28
+
+// The Op Codes of the IDD Record Access Control Point ([IDS] Table 3.25).
+const RACP_RESPONSE_CODE = 0x0F
+const RACP_REPORT_STORED_RECORDS = 0x33
+const RACP_DELETE_STORED_RECORDS = 0x3C
+const RACP_ABORT_OPERATION = 0x55
+const RACP_REPORT_NUMBER_OF_STORED_RECORDS = 0x5A
+const RACP_NUMBER_OF_STORED_RECORDS_RESPONSE = 0x66
+
+// The Operators ([IDS] Table 3.26).
+const RACP_OPERATOR_NULL = 0x0F
+const RACP_OPERATOR_ALL_RECORDS = 0x33
+const RACP_OPERATOR_LESS_THAN_OR_EQUAL_TO = 0x3C
+const RACP_OPERATOR_GREATER_THAN_OR_EQUAL_TO = 0x55
+const RACP_OPERATOR_WITHIN_RANGE_OF = 0x5A
+const RACP_OPERATOR_FIRST_RECORD = 0x66
+const RACP_OPERATOR_LAST_RECORD = 0x69
+
+// The Response Code Values ([IDS] Table 3.27).
+const RACP_OP_CODE_NOT_SUPPORTED = 0x02
+const RACP_INVALID_OPERATOR = 0x03
+const RACP_OPERATOR_NOT_SUPPORTED = 0x04
+const RACP_INVALID_OPERAND = 0x05
+const RACP_NO_RECORDS_FOUND = 0x06
+const RACP_ABORT_UNSUCCESSFUL = 0x07
+const RACP_PROCEDURE_NOT_COMPLETED = 0x08
+const RACP_OPERAND_NOT_SUPPORTED = 0x09
+const RACP_PROCEDURE_NOT_APPLICABLE = 0x0A
+const RACP_SUCCESS = 0xF0
+
+// The Filter Types ([IDS] Table 3.24).
+const FILTER_SEQUENCE_NUMBER = 0x0F
+const FILTER_REFERENCE_TIME = 0x33
+const FILTER_NON_REFERENCE_TIME = 0x3C
+
+// The Event Types ([IDS] Table 4.95).
+const EVENT_REFERENCE_TIME = 0x000F
+const EVENT_REFERENCE_TIME_BASE_OFFSET = 0x0033
+const EVENT_BOLUS_CALCULATED_1 = 0x003C
+const EVENT_BOLUS_CALCULATED_2 = 0x0055
+const EVENT_BOLUS_PROGRAMMED_1 = 0x005A
+const EVENT_BOLUS_PROGRAMMED_2 = 0x0066
+const EVENT_BOLUS_DELIVERED_1 = 0x0069
+const EVENT_BOLUS_DELIVERED_2 = 0x0096
+const EVENT_DELIVERED_BASAL_RATE_CHANGED = 0x0099
+const EVENT_TBR_ADJUSTMENT_STARTED = 0x00A5
+const EVENT_TBR_ADJUSTMENT_ENDED = 0x00AA
+const EVENT_TBR_ADJUSTMENT_CHANGED = 0x00C3
+const EVENT_PROFILE_TEMPLATE_ACTIVATED = 0x00CC
+const EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED = 0x00F0
+const EVENT_TOTAL_DAILY_INSULIN_DELIVERY = 0x00FF
+const EVENT_THERAPY_CONTROL_STATE_CHANGED = 0x0303
+const EVENT_OPERATIONAL_STATE_CHANGED = 0x030C
+const EVENT_RESERVOIR_REMAINING_AMOUNT_CHANGED = 0x0330
+const EVENT_ANNUNCIATION_STATUS_CHANGED_1 = 0x033F
+const EVENT_ANNUNCIATION_STATUS_CHANGED_2 = 0x0356
+const EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED = 0x0359
+const EVENT_I2CHO_RATIO_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED = 0x0365
+const EVENT_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED = 0x036A
+const EVENT_PRIMING_STARTED = 0x0395
+const EVENT_PRIMING_DONE = 0x039A
+const EVENT_DATA_CORRUPTION = 0x03A6
+const EVENT_POINTER = 0x03A9
+const EVENT_BOLUS_TEMPLATE_CHANGED_1 = 0x03C0
+const EVENT_BOLUS_TEMPLATE_CHANGED_2 = 0x03CF
+const EVENT_TBR_TEMPLATE_CHANGED = 0x03F3
+const EVENT_MAX_BOLUS_AMOUNT_CHANGED = 0x03FC
+const EVENT_MANUFACTURER_FIRST = 0xF000
+const EVENT_MANUFACTURER_LAST = 0xFFF0
+
+// The Sequence Number of a Data Corruption event ([IDS] 3.10.2).
+const SEQUENCE_DATA_CORRUPTION = 0xFFFFFFFF
+
+// The minutes of the 24 hours the time blocks of a profile add up to ([IDS] 3.10.3).
+const PROFILE_MINUTES = 1440
+
+// ── The history ─────────────────────────────────────────────────────
+
+// One history record.  `group` is the Sequence Number of the first event of its compound
+// group, -1 for an event that stands alone.
+struct IdsHistoryRecord
+    event_type: Int
+    sequence: Int
+    offset: Int
+    data: [u8]
+    group: Int
+
+// What the control point offers beyond the mandatory part: Delete Stored Records, the
+// Operators Less than or equal to, Within range of and First/Last record (`racp.RacpSupport`),
+// and the two Filter Types by Reference Time Event (`ref_filters`).  Report Stored Records
+// and Report Number of Stored Records with All records and Greater than or equal to, and
+// Abort Operation, are mandatory ([IDS] Table 3.22).
+struct IdsHistory
+    var records: [IdsHistoryRecord]
+    var next_sequence: Int
+    var run: racp.RacpRun
+    capacity: Int
+    support: racp.RacpSupport
+    ref_filters: Bool
+
+// An empty history of `capacity` records.
+@tier(app)
+fn new_ids_history(capacity: Int, support: racp.RacpSupport, ref_filters: Bool) -> IdsHistory
+    IdsHistory { records: [], next_sequence: 0, run: racp.racp_run_new(), capacity: capacity, support: support, ref_filters: ref_filters }
+
+// Whether the byte `v` is a codeword of the Hamming code the enumerations of the service use
+// (distance 4 over eight bits, [IDS] 5): the sixteen values 0x00, 0x0F, 0x33, 0x3C, 0x55,
+// 0x5A, 0x66, 0x69, 0x96, 0x99, 0xA5, 0xAA, 0xC3, 0xCC, 0xF0 and 0xFF.
+@tier(embedded)
+@no_alloc
+fn ids_codeword8(v: Int) -> Bool
+    if v < 0 or v > 255
+        return false
+    ev_even(v & 0x0F) and ev_even(v & 0x33) and ev_even(v & 0x55) and ev_even(v)
+
+// Whether the byte `v` has an even number of bits set.
+@tier(embedded)
+@no_alloc
+fn ev_even(v: Int) -> Bool
+    var ones = 0
+    for k in 0..8
+        if (v >> k) & 1 == 1
+            ones = ones + 1
+    ones % 2 == 0
+
+// Whether `t` is an Event Type the service defines or one of the manufacturer range.
+@tier(embedded)
+@no_alloc
+fn ids_event_type_known(t: Int) -> Bool
+    if t >= EVENT_MANUFACTURER_FIRST and t <= EVENT_MANUFACTURER_LAST
+        return true
+    t == 0x000F or t == 0x0033 or t == 0x003C or t == 0x0055 or t == 0x005A or t == 0x0066 or t == 0x0069 or t == 0x0096
+        or t == 0x0099 or t == 0x00A5 or t == 0x00AA or t == 0x00C3 or t == 0x00CC or t == 0x00F0 or t == 0x00FF
+        or t == 0x0303 or t == 0x030C or t == 0x0330 or t == 0x033F or t == 0x0356 or t == 0x0359 or t == 0x0365
+        or t == 0x036A or t == 0x0395 or t == 0x039A or t == 0x03A6 or t == 0x03A9 or t == 0x03C0 or t == 0x03CF
+        or t == 0x03F3 or t == 0x03FC
+
+// Whether `t` is one of the two events the Reference Time Event filter selects.
+@tier(embedded)
+@no_alloc
+fn ids_event_is_reference_time(t: Int) -> Bool
+    t == EVENT_REFERENCE_TIME or t == EVENT_REFERENCE_TIME_BASE_OFFSET
+
+// Whether `t` is an event that is recorded only as a member of a compound group.
+@tier(embedded)
+@no_alloc
+fn ids_event_is_grouped(t: Int) -> Bool
+    t == 0x003C or t == 0x0055 or t == 0x005A or t == 0x0066 or t == 0x0069 or t == 0x0096 or t == 0x00A5 or t == 0x00AA
+        or t == 0x00C3 or t == 0x00F0 or t == 0x033F or t == 0x0356 or t == 0x0359 or t == 0x0365 or t == 0x036A
+        or t == 0x03C0 or t == 0x03CF
+
+@tier(embedded)
+@no_alloc
+fn ev_bit(flags: Int, k: Int) -> Int
+    (flags >> k) & 1
+
+@tier(embedded)
+@no_alloc
+fn ev_reason_ok(v: Int) -> Bool
+    v == 0x0F or v == 0x33 or v == 0x3C or v == 0x55
+
+@tier(embedded)
+@no_alloc
+fn ev_bolus_type_ok(features: Int, t: Int) -> Bool
+    (t == insulin_delivery.BOLUS_TYPE_FAST and (features & insulin_delivery.FEATURE_FAST_BOLUS) != 0)
+        or (t == insulin_delivery.BOLUS_TYPE_EXTENDED and (features & insulin_delivery.FEATURE_EXTENDED_BOLUS) != 0)
+        or (t == insulin_delivery.BOLUS_TYPE_MULTIWAVE and (features & insulin_delivery.FEATURE_MULTIWAVE_BOLUS) != 0)
+        or t == insulin_delivery.BOLUS_TYPE_UNDETERMINED
+
+// The amounts of a bolus event (type at `at + 2`, fast, extended, duration after it): valid
+// SFLOATs, and 0 for the part the type does not have ([IDS] 4.9.4.5).
+@tier(embedded)
+@no_alloc
+fn ev_bolus_amounts_ok(features: Int, d: [u8], at: Int) -> Bool
+    let t = d[at] as Int
+    let fast = wire.get(d, at + 1, 2)
+    let extended = wire.get(d, at + 3, 2)
+    let duration = wire.get(d, at + 5, 2)
+    if not ev_bolus_type_ok(features, t) or not insulin_delivery.ids_sfloat_valid(fast) or not insulin_delivery.ids_sfloat_valid(extended)
+        return false
+    if t == insulin_delivery.BOLUS_TYPE_FAST and (extended != 0 or duration != 0)
+        return false
+    if t == insulin_delivery.BOLUS_TYPE_EXTENDED and fast != 0
+        return false
+    true
+
+@tier(embedded)
+@no_alloc
+fn ev_tbr_type_ok(features: Int, t: Int) -> Bool
+    (t == insulin_delivery.TBR_ABSOLUTE and (features & insulin_delivery.FEATURE_TBR_ABSOLUTE) != 0)
+        or (t == insulin_delivery.TBR_RELATIVE and (features & insulin_delivery.FEATURE_TBR_RELATIVE) != 0)
+        or t == insulin_delivery.TBR_UNDETERMINED
+
+@tier(embedded)
+@no_alloc
+fn ev_activation_ok(features: Int, a: Int) -> Bool
+    (features & insulin_delivery.FEATURE_BOLUS_ACTIVATION_TYPE) != 0
+        and (a == 0x0F or a == 0x33 or a == 0x3C or a == 0x55 or a == 0x5A)
+
+@tier(embedded)
+@no_alloc
+fn ev_context_ok(c: Int) -> Bool
+    c == 0x0F or c == 0x33 or c == 0x3C or c == 0x55
+
+@tier(embedded)
+@no_alloc
+fn ev_zone_ok(zone: Int, dst: Int) -> Bool
+    ((zone >= -48 and zone <= 56) or zone == -128) and (dst == 0 or dst == 2 or dst == 4 or dst == 8 or dst == 255)
+
+@tier(embedded)
+@no_alloc
+fn ev_sfloats_ok(d: [u8], at: Int, count: Int) -> Bool
+    for i in 0..count
+        if not insulin_delivery.ids_sfloat_valid(wire.get(d, at + 2 * i, 2))
+            return false
+    true
+
+// Whether `data` is the Event Data of an event of type `t` on a pump with the Features
+// `features` ([IDS] 4.9.4): its size, the Flags that name the optional fields, the
+// enumerations, the SFLOATs, the fields a bolus type does not have set to 0, and the
+// Features the event needs.  The manufacturer range takes up to ten octets.
+@tier(embedded)
+@no_alloc
+fn ids_event_valid(features: Int, t: Int, d: [u8]) -> Bool
+    let n = list.len(d)
+    let bolus = (features & insulin_delivery.FEATURE_BOLUS_ANY) != 0
+    let basal = (features & insulin_delivery.FEATURE_BASAL_RATE) != 0
+    let tbr = basal and (features & (insulin_delivery.FEATURE_TBR_ABSOLUTE | insulin_delivery.FEATURE_TBR_RELATIVE)) != 0
+    if t >= EVENT_MANUFACTURER_FIRST and t <= EVENT_MANUFACTURER_LAST
+        return n <= 10
+    if t == EVENT_REFERENCE_TIME
+        return n == 10 and ev_reason_ok(d[0] as Int) and wire.date_time_valid(wire.get_date_time(d, 1)) and ev_zone_ok(wire.get_signed(d, 8, 1), d[9] as Int)
+    if t == EVENT_REFERENCE_TIME_BASE_OFFSET
+        return n == 10 and ev_reason_ok(d[0] as Int) and wire.date_time_valid(wire.get_date_time(d, 1))
+    if t == EVENT_BOLUS_CALCULATED_1 or t == EVENT_BOLUS_CALCULATED_2
+        return bolus and n == 8 and ev_sfloats_ok(d, 0, 4)
+    if t == EVENT_BOLUS_PROGRAMMED_1 or t == EVENT_BOLUS_DELIVERED_1
+        return bolus and n == 9 and ev_bolus_amounts_ok(features, d, 2)
+    if t == EVENT_BOLUS_PROGRAMMED_2
+        if not bolus or n < 1
+            return false
+        let f = d[0] as Int
+        if (f & 0xE0) != 0 or n != 1 + 2 * ev_bit(f, 0) + ev_bit(f, 1) + ev_bit(f, 2)
+            return false
+        if ev_bit(f, 0) == 1 and (features & insulin_delivery.FEATURE_BOLUS_DELAY_TIME) == 0
+            return false
+        if ev_bit(f, 1) == 1 and (features & insulin_delivery.FEATURE_BOLUS_TEMPLATE) == 0
+            return false
+        if ev_bit(f, 2) == 1 and not ev_activation_ok(features, d[n - 1] as Int)
+            return false
+        return true
+    if t == EVENT_BOLUS_DELIVERED_2
+        if not bolus or n < 5
+            return false
+        let f = d[0] as Int
+        if (f & 0xF8) != 0 or n != 5 + ev_bit(f, 0) + ev_bit(f, 1) + 2 * ev_bit(f, 2)
+            return false
+        var at = 5
+        if ev_bit(f, 0) == 1
+            if not ev_activation_ok(features, d[at] as Int)
+                return false
+            at = at + 1
+        if ev_bit(f, 1) == 1 and not (d[at] == 0x0F or d[at] == 0x33 or d[at] == 0x3C or d[at] == 0x55)
+            return false
+        return true
+    if t == EVENT_DELIVERED_BASAL_RATE_CHANGED
+        if not basal or n < 5
+            return false
+        let f = d[0] as Int
+        if (f & 0xFE) != 0 or n != 5 + ev_bit(f, 0) or not ev_sfloats_ok(d, 1, 2)
+            return false
+        return ev_bit(f, 0) == 0 or ev_context_ok(d[5] as Int)
+    if t == EVENT_TBR_ADJUSTMENT_STARTED or t == EVENT_TBR_ADJUSTMENT_CHANGED
+        let base = if t == EVENT_TBR_ADJUSTMENT_STARTED then 6 else 8
+        if not tbr or n < base
+            return false
+        let f = d[0] as Int
+        if (f & 0xFE) != 0 or n != base + ev_bit(f, 0) or not ev_tbr_type_ok(features, d[1] as Int) or not insulin_delivery.ids_sfloat_valid(wire.get(d, 2, 2))
+            return false
+        return ev_bit(f, 0) == 0 or (features & insulin_delivery.FEATURE_TBR_TEMPLATE) != 0
+    if t == EVENT_TBR_ADJUSTMENT_ENDED
+        if not tbr or n < 5
+            return false
+        let f = d[0] as Int
+        if (f & 0xFC) != 0 or n != 5 + ev_bit(f, 0) + 2 * ev_bit(f, 1) or not ev_tbr_type_ok(features, d[1] as Int) or not ev_reason_ok(d[4] as Int)
+            return false
+        return ev_bit(f, 0) == 0 or (features & insulin_delivery.FEATURE_TBR_TEMPLATE) != 0
+    if t == EVENT_PROFILE_TEMPLATE_ACTIVATED
+        if n != 3
+            return false
+        let k = d[0] as Int
+        if k == 0x33
+            return basal
+        if k == 0x3C
+            return (features & insulin_delivery.FEATURE_ISF_PROFILE_TEMPLATE) != 0
+        if k == 0x55
+            return (features & insulin_delivery.FEATURE_I2CHO_RATIO_PROFILE_TEMPLATE) != 0
+        if k == 0x5A
+            return (features & insulin_delivery.FEATURE_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE) != 0
+        return k == 0x0F
+    if t == EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        return basal and n == 6 and (d[1] as Int) >= 1 and insulin_delivery.ids_sfloat_valid(wire.get(d, 4, 2))
+    if t == EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        return (features & insulin_delivery.FEATURE_ISF_PROFILE_TEMPLATE) != 0 and n == 6 and (d[1] as Int) >= 1 and insulin_delivery.ids_sfloat_valid(wire.get(d, 4, 2))
+    if t == EVENT_I2CHO_RATIO_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        return (features & insulin_delivery.FEATURE_I2CHO_RATIO_PROFILE_TEMPLATE) != 0 and n == 6 and (d[1] as Int) >= 1 and insulin_delivery.ids_sfloat_valid(wire.get(d, 4, 2))
+    if t == EVENT_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        return (features & insulin_delivery.FEATURE_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE) != 0 and n == 8 and (d[1] as Int) >= 1 and ev_sfloats_ok(d, 4, 2)
+    if t == EVENT_TOTAL_DAILY_INSULIN_DELIVERY
+        if n != 9 or (d[0] as Int & 0xFE) != 0 or not ev_sfloats_ok(d, 1, 2)
+            return false
+        // The part the pump does not deliver is 0 ([IDS] 4.9.4.15: the footnotes name the wrong
+        // feature for the bolus part; the Status Reader record has the pair the other way round).
+        if not bolus and wire.get(d, 1, 2) != 0
+            return false
+        if not basal and wire.get(d, 3, 2) != 0
+            return false
+        let year = wire.get(d, 5, 2)
+        return (year == 0 or (year >= 1582 and year <= 9999)) and d[7] <= 12 and d[8] <= 31
+    if t == EVENT_THERAPY_CONTROL_STATE_CHANGED
+        return n == 2 and insulin_delivery.ids_therapy_valid(d[0] as Int) and insulin_delivery.ids_therapy_valid(d[1] as Int)
+    if t == EVENT_OPERATIONAL_STATE_CHANGED
+        return n == 2 and insulin_delivery.ids_operational_valid(d[0] as Int) and insulin_delivery.ids_operational_valid(d[1] as Int)
+    if t == EVENT_RESERVOIR_REMAINING_AMOUNT_CHANGED or t == EVENT_PRIMING_STARTED
+        return n == 2 and ev_sfloats_ok(d, 0, 1)
+    if t == EVENT_ANNUNCIATION_STATUS_CHANGED_1
+        if n < 6
+            return false
+        let f = d[0] as Int
+        if (f & 0xFC) != 0 or n != 6 + 2 * ev_bit(f, 0) + 2 * ev_bit(f, 1)
+            return false
+        let s = d[5] as Int
+        return insulin_delivery.ids_annunciation_type_valid(wire.get(d, 3, 2)) and (s == 0x0F or s == 0x33 or s == 0x3C or s == 0x55)
+    if t == EVENT_ANNUNCIATION_STATUS_CHANGED_2
+        if n < 1
+            return false
+        let f = d[0] as Int
+        return (f & 0xF8) == 0 and n == 1 + 2 * (ev_bit(f, 0) + ev_bit(f, 1) + ev_bit(f, 2))
+    if t == EVENT_PRIMING_DONE
+        if n < 4
+            return false
+        let f = d[0] as Int
+        return (f & 0xFE) == 0 and n == 4 + 2 * ev_bit(f, 0) and insulin_delivery.ids_sfloat_valid(wire.get(d, 1, 2)) and ev_reason_ok(d[3] as Int)
+    if t == EVENT_DATA_CORRUPTION or t == EVENT_POINTER
+        return n == 0
+    if t == EVENT_BOLUS_TEMPLATE_CHANGED_1
+        return (features & insulin_delivery.FEATURE_BOLUS_TEMPLATE) != 0 and n == 8 and ev_bolus_amounts_ok(features, d, 1)
+    if t == EVENT_BOLUS_TEMPLATE_CHANGED_2
+        if (features & insulin_delivery.FEATURE_BOLUS_TEMPLATE) == 0 or n < 1
+            return false
+        let f = d[0] as Int
+        if (f & 0xF8) != 0 or n != 1 + 2 * ev_bit(f, 0)
+            return false
+        return ev_bit(f, 0) == 0 or (features & insulin_delivery.FEATURE_BOLUS_DELAY_TIME) != 0
+    if t == EVENT_TBR_TEMPLATE_CHANGED
+        return (features & insulin_delivery.FEATURE_TBR_TEMPLATE) != 0 and tbr and n == 6 and ev_tbr_type_ok(features, d[1] as Int)
+            and insulin_delivery.ids_sfloat_valid(wire.get(d, 2, 2))
+    if t == EVENT_MAX_BOLUS_AMOUNT_CHANGED
+        return bolus and n == 4 and ev_sfloats_ok(d, 0, 2)
+    false
+
+// The compound groups of [IDS] Table 3.28 that have a fixed order of events: whether `types`
+// is one of them.
+@tier(app)
+fn ids_group_fixed(types: [Int]) -> Bool
+    if list.len(types) != 2
+        return false
+    let a = types[0]
+    let b = types[1]
+    (a == EVENT_BOLUS_CALCULATED_1 and b == EVENT_BOLUS_CALCULATED_2) or (a == EVENT_BOLUS_PROGRAMMED_1 and b == EVENT_BOLUS_PROGRAMMED_2)
+        or (a == EVENT_BOLUS_DELIVERED_1 and b == EVENT_BOLUS_DELIVERED_2)
+        or ((a == EVENT_TBR_ADJUSTMENT_STARTED or a == EVENT_TBR_ADJUSTMENT_ENDED or a == EVENT_TBR_ADJUSTMENT_CHANGED) and b == EVENT_DELIVERED_BASAL_RATE_CHANGED)
+        or (a == EVENT_ANNUNCIATION_STATUS_CHANGED_1 and b == EVENT_ANNUNCIATION_STATUS_CHANGED_2)
+        or (a == EVENT_BOLUS_TEMPLATE_CHANGED_1 and b == EVENT_BOLUS_TEMPLATE_CHANGED_2)
+
+// Whether `types` and `datas` are the time blocks of one profile template: the same type of
+// a profile, one template number, the blocks numbered 1 to n in order and lasting 1440
+// minutes together ([IDS] 3.10.3).
+@tier(app)
+fn ids_group_profile(types: [Int], datas: [[u8]]) -> Bool
+    let n = list.len(types)
+    if n < 1
+        return false
+    let t = types[0]
+    if t != EVENT_BASAL_RATE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED and t != EVENT_ISF_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        and t != EVENT_I2CHO_RATIO_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED and t != EVENT_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE_TIME_BLOCK_CHANGED
+        return false
+    var minutes = 0
+    for i in 0..n
+        if types[i] != t or list.len(datas[i]) < 4 or datas[i][0] != datas[0][0] or (datas[i][1] as Int) != i + 1
+            return false
+        minutes = minutes + wire.get(datas[i], 2, 2)
+    minutes == PROFILE_MINUTES
+
+// Keep one event of the type `t` at the Relative Offset `offset`, with the next Sequence
+// Number.  False when the history has no room for the Sequence Number (it does not roll over),
+// `t` is a type that is recorded in a group, or the Event Data does not fit the type.  Raises
+// History Event Recorded.
+@tier(app)
+fn ids_record_event(var dev: insulin_delivery.IdsDevice, var h: IdsHistory, t: Int, offset: Int, data: [u8]) -> Bool
+    if h.capacity < 1 or ids_event_is_grouped(t) or t == EVENT_DATA_CORRUPTION or not ids_event_valid(dev.features, t, data)
+        return false
+    ids_push(var dev, var h, t, offset, data, -1)
+
+@tier(app)
+fn ids_push(var dev: insulin_delivery.IdsDevice, var h: IdsHistory, t: Int, offset: Int, data: [u8], group: Int) -> Bool
+    if offset < 0 or offset > 0xFFFF or h.next_sequence >= SEQUENCE_DATA_CORRUPTION
+        return false
+    if list.len(h.records) >= h.capacity
+        h.records = h.records[1:]
+    list.push(h.records, IdsHistoryRecord { event_type: t, sequence: h.next_sequence, offset: offset, data: data[:], group: group })
+    h.next_sequence = h.next_sequence + 1
+    insulin_delivery.ids_raise(var dev, insulin_delivery.CHANGED_HISTORY_EVENT_RECORDED)
+    true
+
+// Keep the events of one compound group together, with consecutive Sequence Numbers and
+// one Relative Offset.  False, and nothing kept, unless `types` is a group of Table 3.28 or
+// the full time blocks of a profile template, every Event Data fits its type, and the history
+// has room for all the Sequence Numbers.
+@tier(app)
+fn ids_record_group(var dev: insulin_delivery.IdsDevice, var h: IdsHistory, offset: Int, types: [Int], datas: [[u8]]) -> Bool
+    if h.capacity < list.len(types) or list.len(types) != list.len(datas) or list.len(types) < 1
+        return false
+    if not ids_group_fixed(types) and not ids_group_profile(types, datas)
+        return false
+    for i in 0..list.len(types)
+        if not ids_event_valid(dev.features, types[i], datas[i])
+            return false
+    if h.next_sequence + list.len(types) > SEQUENCE_DATA_CORRUPTION
+        return false
+    let first = h.next_sequence
+    for i in 0..list.len(types)
+        if not ids_push(var dev, var h, types[i], offset, datas[i], first)
+            return false
+    true
+
+// Keep a Data Corruption event; its Sequence Number is 0xFFFFFFFF and the next one is
+// not used up ([IDS] 3.10.2).
+@tier(app)
+fn ids_record_data_corruption(var dev: insulin_delivery.IdsDevice, var h: IdsHistory, offset: Int) -> Bool
+    if h.capacity < 1 or offset < 0 or offset > 0xFFFF
+        return false
+    if list.len(h.records) >= h.capacity
+        h.records = h.records[1:]
+    list.push(h.records, IdsHistoryRecord { event_type: EVENT_DATA_CORRUPTION, sequence: SEQUENCE_DATA_CORRUPTION, offset: offset, data: [], group: -1 })
+    insulin_delivery.ids_raise(var dev, insulin_delivery.CHANGED_HISTORY_EVENT_RECORDED)
+    true
+
+// The IDD History Data value of `r`: Event Type, Sequence Number, Relative Offset, Event Data
+// and, with E2E-Protection, the CRC over them; there is no E2E-Counter ([IDS] 3.10.4.5).
+@tier(app)
+fn ids_history_value(features: Int, r: IdsHistoryRecord) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, r.event_type, 2)
+    wire.put(var out, r.sequence, 4)
+    wire.put(var out, r.offset, 2)
+    list.append(out, r.data)
+    if insulin_delivery.ids_e2e(features)
+        wire.put(var out, reconnection_configuration.crc16(out), 2)
+    out
+
+// ── The Record Access Control Point ─────────────────────────────────
+
+// A decoded write.  `error` is 0 for a request the service can carry out and otherwise the
+// Response Code Value to answer with; `filter` is the Filter Type (0 for none), `lo` and
+// `hi` the Sequence Numbers of the filter, `hi` equal to `lo` when the Operator names one.
+@value
+struct IdsRacpRequest
+    op: Int
+    operator: Int
+    filter: Int
+    lo: Int
+    hi: Int
+    error: Int
+
+@tier(embedded)
+@no_alloc
+fn racp_rejected(op: Int, operator: Int, code: Int) -> IdsRacpRequest
+    IdsRacpRequest { op: op, operator: operator, filter: 0, lo: 0, hi: 0, error: code }
+
+// Decode the value written to the control point without its E2E fields.  The order of the
+// checks is that of [IDS] 3.9.4.6 and 3.11.4: the Op Code, then the Operator (Invalid
+// Operator for Null where an Operator is needed and for a value outside the code, Operator
+// not supported for a codeword the service does not define or offer), then the Operand (the
+// Filter Type first, Operand not supported for one not offered; Invalid Operand for an
+// Operand where none is used, a short or long one, or a range whose minimum is above its
+// maximum).
+@tier(app)
+fn ids_racp_decode(h: IdsHistory, b: [u8]) -> IdsRacpRequest
+    if list.len(b) < 1
+        return racp_rejected(0, 0, RACP_OP_CODE_NOT_SUPPORTED)
+    let op = b[0] as Int
+    let operator = if list.len(b) > 1 then b[1] as Int else 0
+    let operand = list.len(b) - 2
+    if op != RACP_REPORT_STORED_RECORDS and op != RACP_DELETE_STORED_RECORDS and op != RACP_ABORT_OPERATION and op != RACP_REPORT_NUMBER_OF_STORED_RECORDS
+        return racp_rejected(op, operator, RACP_OP_CODE_NOT_SUPPORTED)
+    if op == RACP_DELETE_STORED_RECORDS and not h.support.delete
+        return racp_rejected(op, operator, RACP_OP_CODE_NOT_SUPPORTED)
+    if list.len(b) < 2
+        return racp_rejected(op, 0, RACP_INVALID_OPERATOR)
+    if op == RACP_ABORT_OPERATION
+        if operator != RACP_OPERATOR_NULL
+            return racp_rejected(op, operator, RACP_INVALID_OPERATOR)
+        if operand != 0
+            return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+        return IdsRacpRequest { op: op, operator: operator, filter: 0, lo: 0, hi: 0, error: 0 }
+    if operator == RACP_OPERATOR_NULL
+        return racp_rejected(op, operator, RACP_INVALID_OPERATOR)
+    let defined = operator == RACP_OPERATOR_ALL_RECORDS or operator == RACP_OPERATOR_LESS_THAN_OR_EQUAL_TO
+        or operator == RACP_OPERATOR_GREATER_THAN_OR_EQUAL_TO or operator == RACP_OPERATOR_WITHIN_RANGE_OF
+        or operator == RACP_OPERATOR_FIRST_RECORD or operator == RACP_OPERATOR_LAST_RECORD
+    if not defined
+        return racp_rejected(op, operator, if ids_codeword8(operator) then RACP_OPERATOR_NOT_SUPPORTED else RACP_INVALID_OPERATOR)
+    if (operator == RACP_OPERATOR_LESS_THAN_OR_EQUAL_TO and not h.support.less_or_equal)
+        or (operator == RACP_OPERATOR_WITHIN_RANGE_OF and not h.support.within_range)
+        or ((operator == RACP_OPERATOR_FIRST_RECORD or operator == RACP_OPERATOR_LAST_RECORD) and not h.support.first_last)
+        return racp_rejected(op, operator, RACP_OPERATOR_NOT_SUPPORTED)
+    if operator == RACP_OPERATOR_ALL_RECORDS or operator == RACP_OPERATOR_FIRST_RECORD or operator == RACP_OPERATOR_LAST_RECORD
+        if operand != 0
+            return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+        return IdsRacpRequest { op: op, operator: operator, filter: 0, lo: 0, hi: 0, error: 0 }
+    if operand < 1
+        return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+    let filter = b[2] as Int
+    if filter != FILTER_SEQUENCE_NUMBER and not (h.ref_filters and (filter == FILTER_REFERENCE_TIME or filter == FILTER_NON_REFERENCE_TIME))
+        return racp_rejected(op, operator, RACP_OPERAND_NOT_SUPPORTED)
+    if operator == RACP_OPERATOR_WITHIN_RANGE_OF
+        if operand != 9
+            return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+        let lo = wire.get(b, 3, 4)
+        let hi = wire.get(b, 7, 4)
+        if lo > hi
+            return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+        return IdsRacpRequest { op: op, operator: operator, filter: filter, lo: lo, hi: hi, error: 0 }
+    if operand != 5
+        return racp_rejected(op, operator, RACP_INVALID_OPERAND)
+    let v = wire.get(b, 3, 4)
+    IdsRacpRequest { op: op, operator: operator, filter: filter, lo: v, hi: v, error: 0 }
+
+// Whether the request reports records, the only one that needs History Data subscribed.
+@tier(embedded)
+@no_alloc
+fn ids_racp_reports(r: IdsRacpRequest) -> Bool
+    r.error == 0 and r.op == RACP_REPORT_STORED_RECORDS
+
+// The generic Operator number `racp.racp_select` uses for an Operator of the service.
+@tier(embedded)
+@no_alloc
+fn racp_generic_operator(operator: Int) -> Int
+    if operator == RACP_OPERATOR_ALL_RECORDS
+        return racp.OPERATOR_ALL_RECORDS
+    if operator == RACP_OPERATOR_LESS_THAN_OR_EQUAL_TO
+        return racp.OPERATOR_LESS_THAN_OR_EQUAL_TO
+    if operator == RACP_OPERATOR_GREATER_THAN_OR_EQUAL_TO
+        return racp.OPERATOR_GREATER_THAN_OR_EQUAL_TO
+    if operator == RACP_OPERATOR_WITHIN_RANGE_OF
+        return racp.OPERATOR_WITHIN_RANGE_OF
+    if operator == RACP_OPERATOR_FIRST_RECORD
+        return racp.OPERATOR_FIRST_RECORD
+    racp.OPERATOR_LAST_RECORD
+
+// The Sequence Numbers the request's filter ranges over, oldest first: every record for
+// Sequence Number, the Reference Time events for the first Reference Time filter, the others
+// for the second.
+@tier(app)
+fn ids_racp_keys(h: IdsHistory, r: IdsRacpRequest) -> [Int]
+    var keys: [Int] = []
+    for rec in h.records
+        let reference = ids_event_is_reference_time(rec.event_type)
+        if r.filter == FILTER_REFERENCE_TIME and not reference
+            continue
+        if r.filter == FILTER_NON_REFERENCE_TIME and reference
+            continue
+        list.push(keys, rec.sequence)
+    keys
+
+@tier(app)
+fn ids_racp_response(features: Int, counter: Int, request_op: Int, code: Int) -> [u8]
+    insulin_delivery.ids_protect(features, [RACP_RESPONSE_CODE as u8, RACP_OPERATOR_NULL as u8, request_op as u8, code as u8], counter)
+
+// The Number of Stored Records Response value, a uint32 count ([IDS] 3.9.4.2).
+@tier(app)
+fn ids_racp_count_response(features: Int, counter: Int, count: Int) -> [u8]
+    var body: [u8] = [RACP_NUMBER_OF_STORED_RECORDS_RESPONSE as u8, RACP_OPERATOR_NULL as u8]
+    wire.put(var body, count, 4)
+    insulin_delivery.ids_protect(features, body, counter)
+
+// Whether every event of every compound group the selected records belong to is selected too.
+@tier(app)
+fn ids_group_complete(h: IdsHistory, selected: [Int]) -> Bool
+    for rec in h.records
+        if rec.group < 0
+            continue
+        var chosen = false
+        for k in selected
+            if k == rec.sequence
+                chosen = true
+        if not chosen
+            continue
+        for other in h.records
+            if other.group == rec.group
+                var in_set = false
+                for k in selected
+                    if k == other.sequence
+                        in_set = true
+                if not in_set
+                    return false
+    true
+
+// Carry out the request: the reply to indicate now (empty when records go first).  Report
+// Stored Records starts a run when a record matches, Delete Stored Records removes the
+// selected records (all of a group or none), Report Number of Stored Records counts, and
+// Abort Operation stops the run and answers Success.
+@tier(app)
+fn ids_racp_execute(var dev: insulin_delivery.IdsDevice, var h: IdsHistory, r: IdsRacpRequest) -> [u8]
+    let f = dev.features
+    if r.error != 0
+        return ids_racp_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), r.op, r.error)
+    if r.op == RACP_ABORT_OPERATION
+        racp.racp_abandon(var h.run)
+        dev.busy = false
+        return ids_racp_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), r.op, RACP_SUCCESS)
+    let generic = racp.RacpRequest { op: 0, operator: racp_generic_operator(r.operator), lo: r.lo, hi: r.hi, error: 0 }
+    let found = racp.racp_select(generic, ids_racp_keys(h, r))
+    if r.op == RACP_REPORT_NUMBER_OF_STORED_RECORDS
+        return ids_racp_count_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), list.len(found))
+    if list.len(found) == 0
+        return ids_racp_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), r.op, RACP_NO_RECORDS_FOUND)
+    if r.op == RACP_DELETE_STORED_RECORDS
+        if not ids_group_complete(h, found)
+            return ids_racp_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), r.op, RACP_PROCEDURE_NOT_APPLICABLE)
+        var kept: [IdsHistoryRecord] = []
+        for rec in h.records
+            var gone = false
+            for k in found
+                if k == rec.sequence
+                    gone = true
+            if not gone
+                list.push(kept, rec)
+        h.records = kept
+        return ids_racp_response(f, insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP), r.op, RACP_SUCCESS)
+    h.run.active = true
+    h.run.pending = found[:]
+    h.run.fresh = true
+    dev.busy = true
+    []
+
+// ── The characteristics ─────────────────────────────────────────────
+
+@value
+struct IdsHistoryHandles
+    racp: u16
+    racp_cccd: u16
+    history: u16
+    history_cccd: u16
+
+// Add the Record Access Control Point and the History Data after the last characteristic of
+// the service built by `insulin_delivery.add_ids_service` ([IDS] Table 3.1), with the
+// access of `config`.
+@tier(app)
+fn add_ids_history(var db: GattDb, config: insulin_delivery.IdsConfig, h: IdsHistory) -> Result<IdsHistoryHandles, profile_builder.ProfileError>
+    if not insulin_delivery.ids_access_authenticated(config.access)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if h.capacity < 1
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let control = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.access },
+        gatt_server.le16(UUID_IDD_RECORD_ACCESS_CONTROL_POINT), [])!
+    let control_cccd = profile_builder.add_cccd(var db, both)!
+    let history = profile_builder.add_value(
+        var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_IDD_HISTORY_DATA), [])!
+    let history_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(IdsHistoryHandles { racp: control as u16, racp_cccd: control_cccd as u16, history: history as u16, history_cccd: history_cccd as u16 })
+
+// Send up to `burst` records of the requested transfer, oldest first, and, when the last is
+// out, the Success response ([IDS] 3.9.4.4).  The run ends and the control point is free again.
+@tier(app)
+fn ids_history_pump(var db: GattDb, var link: AttLink, hh: IdsHistoryHandles, var dev: insulin_delivery.IdsDevice, var h: IdsHistory, burst: Int, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if not h.run.active
+        return out
+    var taken = 0
+    while taken < burst and list.len(h.run.pending) > 0
+        let key = racp.racp_next(var h.run)
+        taken = taken + 1
+        for rec in h.records
+            if rec.sequence == key
+                if gatt_server.set_value(var db, hh.history as Int, ids_history_value(dev.features, rec))
+                    list.append(out, gatt_server.send_value(var db, var link, hh.history as Int, now_ms))
+    if list.len(h.run.pending) == 0
+        h.run.active = false
+        h.run.fresh = true
+        dev.busy = false
+        let c = insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_RACP)
+        if gatt_server.set_value(var db, hh.racp as Int, ids_racp_response(dev.features, c, RACP_REPORT_STORED_RECORDS, RACP_SUCCESS))
+            list.append(out, gatt_server.send_value(var db, var link, hh.racp as Int, now_ms))
+    out
+
+// The run cannot be completed: the link ended or the response was not confirmed in the ATT
+// transaction timeout ([IDS] 3.11.3).
+@tier(app)
+fn ids_history_abandon(var dev: insulin_delivery.IdsDevice, var h: IdsHistory)
+    racp.racp_abandon(var h.run)
+    dev.busy = false
+
+// Answer one ATT PDU.  A write to the Record Access Control Point is checked first (the
+// descriptors, the procedure in progress, the E2E-CRC and E2E-Counter) and carried out when
+// the Write Response is out; every other PDU is `insulin_delivery.ids_receive`'s.  While a
+// run is in progress the Status Reader Control Point is answered Procedure Already in
+// Progress through `dev.busy`, and only Abort Operation is taken here ([IDS] 3.11.1).
+@tier(app)
+fn ids_history_receive(var db: GattDb, var link: AttLink, handles: insulin_delivery.IdsHandles, hh: IdsHistoryHandles, config: insulin_delivery.IdsConfig, var dev: insulin_delivery.IdsDevice, var h: IdsHistory, pdu: [u8], now_ms: Int) -> [[u8]]
+    if list.len(pdu) < 3 or (pdu[0] as Int) != att.ATT_OP_WRITE_REQ or gatt_server.read_le16(pdu, 1) != hh.racp as Int
+        return insulin_delivery.ids_receive(var db, var link, handles, config, var dev, pdu, now_ms)
+    let handle = hh.racp as Int
+    let value = pdu[3:]
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+    if access == 0
+        var refused = 0
+        let request = ids_racp_decode(h, insulin_delivery.ids_body(dev.features, value))
+        let abort = request.op == RACP_ABORT_OPERATION
+        if not insulin_delivery.ids_subscribed(link, hh.racp_cccd as Int, gatt_server.CCC_INDICATION)
+            refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+        else if ids_racp_reports(request) and not insulin_delivery.ids_subscribed(link, hh.history_cccd as Int, gatt_server.CCC_NOTIFICATION)
+            refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+        else if not abort and (h.run.active or insulin_delivery.ids_busy(link, handles, dev) or gatt_server.indication_pending(link, handle))
+            refused = att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+        else
+            refused = insulin_delivery.ids_e2e_error(dev, insulin_delivery.COUNTER_RACP, value, 2)
+        if refused != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handle, refused)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if access != 0 or list.len(out) == 0 or (out[0][0] as Int) != att.ATT_OP_WRITE_RSP
+        return out
+    if insulin_delivery.ids_e2e(dev.features)
+        dev.rx[insulin_delivery.COUNTER_RACP] = value[list.len(value) - 3] as Int
+    let reply = ids_racp_execute(var dev, var h, ids_racp_decode(h, insulin_delivery.ids_body(dev.features, value)))
+    if list.len(reply) > 0 and gatt_server.set_value(var db, hh.racp as Int, reply)
+        list.append(out, gatt_server.send_value(var db, var link, hh.racp as Int, now_ms))
+    out
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn history_of(capacity: Int) -> IdsHistory
+    new_ids_history(capacity, racp.racp_support_all(), true)
+
+// A Therapy Control State Changed event (Run to Stop), a Reference Time event and a
+// Reservoir Remaining Amount Changed event: events that stand alone.
+@tier(app)
+fn reference_time() -> [u8]
+    wire.octets([0x33, 0xEA, 0x07, 10, 27, 9, 5, 3, 4, 0])
+
+@tier(app)
+fn filled(var dev: insulin_delivery.IdsDevice, var h: IdsHistory)
+    test.assert(ids_record_event(var dev, var h, EVENT_REFERENCE_TIME, 0, reference_time()))
+    test.assert(ids_record_event(var dev, var h, EVENT_THERAPY_CONTROL_STATE_CHANGED, 5, wire.octets([0x33, 0x55])))
+    test.assert(ids_record_event(var dev, var h, EVENT_OPERATIONAL_STATE_CHANGED, 6, wire.octets([0x3C, 0x96])))
+    test.assert(ids_record_event(var dev, var h, EVENT_REFERENCE_TIME, 0, reference_time()))
+    test.assert(ids_record_event(var dev, var h, EVENT_RESERVOIR_REMAINING_AMOUNT_CHANGED, 7, wire.octets([0x2C, 0x01])))

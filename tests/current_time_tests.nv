@@ -1,0 +1,241 @@
+// tests/current_time_tests.nv — the unit tests of src/current_time.nv.
+//
+//   novo test tests/current_time_tests.nv
+
+use std.test
+use att
+use links
+use gatt_server
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+use current_time.{ CURRENT_TIME_OCTETS, CtsConfig, CtsPolicy, CurrentTime, DST_UNKNOWN, ERR_DATA_FIELD_IGNORED, LocalTime, REASON_DEFINED_BITS, REASON_EXTERNAL_REFERENCE, REASON_TIME_ZONE, REFERENCE_NOTIFY_SPACING_MS, ReferenceTime, TIME_ZONE_UNKNOWN, add_cts_service, added, cts_serve_writes, cts_set_local_time, cts_set_reference_time, cts_set_time, current_time_valid, current_time_value, default_cts_config, default_cts_policy, local_time_valid, local_time_value, new_cts_state, parse_current_time, parse_local_time, reference_time_value, sample, unknown_time }
+
+struct Clock
+    var times: [CurrentTime]
+    var zones: [LocalTime]
+
+impl CtsPolicy[] for Clock
+    @tier(app)
+    fn set_time(var self, peer: links.LinkId, t: CurrentTime)
+        list.push(self.times, t)
+    @tier(app)
+    fn set_local_time(var self, peer: links.LinkId, l: LocalTime)
+        list.push(self.zones, l)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_current_time_value_is_ten_octets_in_the_order_of_the_supplement()
+    test.assert_eq(current_time_value(sample()), [0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128, 0x01])
+    test.assert_eq(list.len(current_time_value(unknown_time())), CURRENT_TIME_OCTETS)
+    test.assert_eq(parse_current_time(current_time_value(sample())), sample())
+
+// `sample()` with the fields named replaced.
+@tier(app)
+fn tm(year: Int, month: Int, hours: Int, minutes: Int, seconds: Int, day_of_week: Int, reason: Int) -> CurrentTime
+    CurrentTime { time: wire.date_time(year, month, 27, hours, minutes, seconds), day_of_week: day_of_week, fractions: 128, reason: reason }
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_fields_of_the_current_time_have_their_ranges()
+    test.assert(current_time_valid(sample()) and current_time_valid(unknown_time()))
+    test.assert(not current_time_valid(tm(2026, 13, 13, 45, 30, 2, 1)))
+    test.assert(not current_time_valid(tm(1581, 10, 13, 45, 30, 2, 1)))
+    test.assert(not current_time_valid(tm(10000, 10, 13, 45, 30, 2, 1)))
+    test.assert(not current_time_valid(tm(2026, 10, 24, 45, 30, 2, 1)))
+    test.assert(not current_time_valid(tm(2026, 10, 13, 60, 30, 2, 1)))
+    test.assert(not current_time_valid(tm(2026, 10, 13, 45, 60, 2, 1)))
+    test.assert(not current_time_valid(tm(2026, 10, 13, 45, 30, 8, 1)))
+    test.assert(not current_time_valid(tm(2026, 10, 13, 45, 30, 2, 0x10)))
+    test.assert(current_time_valid(tm(1582, 10, 13, 45, 30, 7, REASON_DEFINED_BITS)))
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_local_time_information_is_a_zone_and_a_dst_offset()
+    test.assert_eq(local_time_value(LocalTime { zone: 4, dst: 4 }), [4, 4])
+    test.assert_eq(local_time_value(LocalTime { zone: -48, dst: 0 }), [0xD0, 0])
+    test.assert_eq(parse_local_time([0x80, 255]), LocalTime { zone: TIME_ZONE_UNKNOWN, dst: DST_UNKNOWN })
+    test.assert(local_time_valid(LocalTime { zone: 56, dst: 8 }) and local_time_valid(LocalTime { zone: -128, dst: 255 }))
+    test.assert(not local_time_valid(LocalTime { zone: 57, dst: 0 }))
+    test.assert(not local_time_valid(LocalTime { zone: -49, dst: 0 }))
+    test.assert(not local_time_valid(LocalTime { zone: 0, dst: 1 }))
+    test.assert(not local_time_valid(LocalTime { zone: 0, dst: 6 }))
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_reference_time_information_clamps_and_saturates()
+    test.assert_eq(reference_time_value(ReferenceTime { source: 2, accuracy: 12, days: 3, hours: 5 }), [2, 12, 3, 5])
+    // More than 254 days and 23 hours: both 255.
+    test.assert_eq(reference_time_value(ReferenceTime { source: 1, accuracy: 254, days: 254, hours: 23 }), [1, 254, 254, 23])
+    test.assert_eq(reference_time_value(ReferenceTime { source: 1, accuracy: 254, days: 255, hours: 0 }), [1, 254, 255, 255])
+    test.assert_eq(reference_time_value(ReferenceTime { source: 9, accuracy: 255, days: 0, hours: 99 }), [0, 255, 0, 23])
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_service_layout_and_the_properties()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    test.assert_eq(h.time, 3)
+    test.assert_eq(h.cccd, 4)
+    test.assert_eq(h.local, 6)
+    test.assert_eq(h.reference, 8)
+    test.assert_eq(s.db.attributes[0].value, [0x05, 0x18])
+    // Read, Write and Notify of Current Time; Read and Write of Local Time; Read of Reference Time.
+    test.assert_eq(s.db.attributes[1].value, [0x1A, 0x03, 0x00, 0x2B, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x0A, 0x06, 0x00, 0x0F, 0x2A])
+    test.assert_eq(s.db.attributes[6].value, [0x02, 0x08, 0x00, 0x14, 0x2A])
+    var r = gatt_server.new_server([], 65)
+    let read_only = added(var r, CtsConfig {
+        read: gatt_server.Access.Open, cccd: gatt_server.open_permissions(), write: gatt_server.Access.Open,
+        writable_time: false, local: false, writable_local: false, reference: false })
+    test.assert_eq(r.db.attributes[1].value, [0x12, 0x03, 0x00, 0x2B, 0x2A])
+    test.assert_eq(read_only.local, 0)
+    test.assert_eq(read_only.reference, 0)
+    test.assert_eq(att_error(gatt_server.receive(var r.db, var r.link, req(0x12, read_only.time, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+fn att_error(pdus: [[u8]]) -> Int
+    pdus[0][4] as Int
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_a_local_time_cannot_be_written_when_it_is_not_there()
+    var s = gatt_server.new_server([], 65)
+    let config = CtsConfig {
+        read: gatt_server.Access.Open, cccd: gatt_server.open_permissions(), write: gatt_server.Access.Open,
+        writable_time: true, local: false, writable_local: true, reference: false }
+    match add_cts_service(var s.db, config)
+        Ok(_) => test.fail("a writable Local Time Information needs the characteristic")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_a_client_sets_the_time_and_a_wrong_length_is_answered_0x80()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    var clock = Clock { times: [], zones: [] }
+    let value = current_time_value(sample())
+    var pdu = wire.octets([0x12, h.time, 0])
+    list.append(pdu, value)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, pdu, 0)[0], [0x13])
+    test.assert_eq(cts_serve_writes(var s.db, h, var clock, peer(), gatt_server.take_changed(var s.link), unknown_time(), LocalTime { zone: 0, dst: 0 }), 1)
+    test.assert_eq(clock.times[0], sample())
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, req(0x12, h.time, [1, 2, 3]), 0)), ERR_DATA_FIELD_IGNORED)
+    var long = pdu[:]
+    list.push(long, 0)
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, long, 0)), ERR_DATA_FIELD_IGNORED)
+    test.assert_eq(list.len(gatt_server.take_changed(var s.link)), 0)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_a_field_out_of_range_is_put_back_and_does_not_reach_the_policy()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    var clock = Clock { times: [], zones: [] }
+    let bad = tm(2026, 13, 13, 45, 30, 2, 1)
+    var pdu = wire.octets([0x12, h.time, 0])
+    list.append(pdu, current_time_value(bad))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, pdu, 0)[0], [0x13])
+    test.assert_eq(cts_serve_writes(var s.db, h, var clock, peer(), gatt_server.take_changed(var s.link), sample(), LocalTime { zone: 0, dst: 0 }), 0)
+    test.assert_eq(list.len(clock.times), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.time, []), 0)[0][1:], current_time_value(sample()))
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_a_client_sets_the_local_time_and_a_bad_zone_is_put_back()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    var clock = Clock { times: [], zones: [] }
+    let zero = LocalTime { zone: 0, dst: 0 }
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.local, [8, 4]), 0)[0], [0x13])
+    test.assert_eq(cts_serve_writes(var s.db, h, var clock, peer(), gatt_server.take_changed(var s.link), unknown_time(), zero), 1)
+    test.assert_eq(clock.zones[0], LocalTime { zone: 8, dst: 4 })
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, req(0x12, h.local, [8]), 0)), ERR_DATA_FIELD_IGNORED)
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.local, [100, 4]), 0)
+    test.assert_eq(cts_serve_writes(var s.db, h, var clock, peer(), gatt_server.take_changed(var s.link), unknown_time(), zero), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.local, []), 0)[0], [0x0B, 0, 0])
+    // The reference time cannot be written.
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, req(0x12, h.reference, [0, 0, 0, 0]), 0)), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_default_policy_takes_a_time_and_does_nothing()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    var p = default_cts_policy()
+    var pdu = wire.octets([0x12, h.time, 0])
+    list.append(pdu, current_time_value(sample()))
+    let _ = gatt_server.receive(var s.db, var s.link, pdu, 0)
+    test.assert_eq(cts_serve_writes(var s.db, h, var p, peer(), gatt_server.take_changed(var s.link), unknown_time(), LocalTime { zone: 0, dst: 0 }), 1)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_time_is_notified_when_it_changes_and_a_reference_update_waits()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    var st = new_cts_state()
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, sample(), false, 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.cccd, [1, 0]), 0)[0], [0x13])
+    // A manual change goes out at once, with the Adjust Reason.
+    let manual = cts_set_time(var s.db, var s.link, h, var st, sample(), false, 1000)
+    test.assert_eq(list.len(manual), 1)
+    test.assert_eq(manual[0], [0x1B, 0x03, 0x00, 0xEA, 0x07, 10, 27, 13, 45, 30, 2, 128, 0x01])
+    // A reference update within 15 minutes and under a minute away waits.
+    var next = tm(2026, 10, 13, 45, 40, 2, REASON_EXTERNAL_REFERENCE)
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, false, 2000)), 0)
+    // The same update moving the time by more than a minute goes out.
+    next = tm(2026, 10, 13, 48, 40, 2, REASON_EXTERNAL_REFERENCE)
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, false, 3000)), 1)
+    // A reference update a client caused goes out.
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, true, 4000)), 1)
+    // After 15 minutes it goes out.
+    next = tm(2026, 10, 13, 48, 41, 2, REASON_EXTERNAL_REFERENCE)
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, false, 4000 + REFERENCE_NOTIFY_SPACING_MS - 1)), 0)
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, false, 4000 + REFERENCE_NOTIFY_SPACING_MS)), 1)
+    // A time zone change goes out at once.
+    next = tm(2026, 10, 13, 48, 41, 2, REASON_TIME_ZONE)
+    test.assert_eq(list.len(cts_set_time(var s.db, var s.link, h, var st, next, false, 4000 + REFERENCE_NOTIFY_SPACING_MS + 1)), 1)
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_stored_local_and_reference_time_read_back()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_cts_config())
+    test.assert(cts_set_local_time(var s.db, h, LocalTime { zone: 4, dst: 0 }))
+    test.assert(cts_set_reference_time(var s.db, h, ReferenceTime { source: 1, accuracy: 8, days: 0, hours: 1 }))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.local, []), 0)[0], [0x0B, 4, 0])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.reference, []), 0)[0], [0x0B, 1, 8, 0, 1])
+    var r = gatt_server.new_server([], 65)
+    let none = added(var r, CtsConfig {
+        read: gatt_server.Access.Open, cccd: gatt_server.open_permissions(), write: gatt_server.Access.Open,
+        writable_time: false, local: false, writable_local: false, reference: false })
+    test.assert(not cts_set_local_time(var r.db, none, LocalTime { zone: 4, dst: 0 }))
+    test.assert(not cts_set_reference_time(var r.db, none, ReferenceTime { source: 1, accuracy: 8, days: 0, hours: 1 }))
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_access_of_the_service_is_the_configured_one()
+    var s = gatt_server.new_server([], 65)
+    let config = CtsConfig {
+        read: gatt_server.Access.Encrypted, cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted },
+        write: gatt_server.Access.Authenticated, writable_time: true, local: false, writable_local: false, reference: false }
+    let h = added(var s, config)
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, req(0x0A, h.time, []), 0)), att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.time, []), 0)[0][0] as Int, 0x0B)
+    var pdu = wire.octets([0x12, h.time, 0])
+    list.append(pdu, current_time_value(sample()))
+    test.assert_eq(att_error(gatt_server.receive(var s.db, var s.link, pdu, 0)), att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, pdu, 0)[0], [0x13])
+
+@test
+@satisfies("REQ-BLE-CTS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_cts_service(var s.db, default_cts_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

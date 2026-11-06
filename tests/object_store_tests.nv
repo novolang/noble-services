@@ -1,0 +1,280 @@
+// tests/object_store_tests.nv — the unit tests of src/object_store.nv.
+//
+//   novo test tests/object_store_tests.nv
+
+use std.test
+use gatt_server
+use wire
+use object_store.{ CREATE_NO_ROOM, EXECUTE_FAILED, EXECUTE_SUCCESS, ID_FIRST, MemoryStore, ObjectMeta, PROP_DELETE, PROP_READ, PROP_STORED, PROP_WRITE, TYPE_UNSPECIFIED, bytes_compare, contains, copy_meta, crc32, crc32_update, date_time_key, date_time_known, date_time_ok, date_time_zero, ends_with, memory_add, name_ok, new_memory_store, new_meta, starts_with, utf8_valid, uuid_compare, uuid_expand, uuid_ok }
+
+@tier(app)
+fn uuid16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+// The metadata of `id`, or an object with the id -1 for none.
+@tier(app)
+fn meta_of(var repo: MemoryStore, id: Int) -> ObjectMeta
+    match repo.meta(id)
+        Some(m) => m
+        None => new_meta(-1, [], 0, 0, 0)
+
+@tier(app)
+fn seeded() -> MemoryStore
+    var repo = new_memory_store(1000, 4)
+    let _ = memory_add(var repo, wire.text("alpha"), uuid16(TYPE_UNSPECIFIED), wire.text("0123456789"), PROP_DELETE | PROP_READ | PROP_WRITE)
+    let _ = memory_add(var repo, wire.text("beta"), uuid16(0x2BAB), wire.text("abc"), PROP_READ)
+    repo
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_crc32_is_the_one_of_iso_3309()
+    // The check value of the CRC-32 of the nine digits.
+    test.assert_eq(crc32(wire.text("123456789")), 0xCBF43926)
+    test.assert_eq(crc32([]), 0)
+    test.assert_eq(crc32([0]), 0xD202EF8D)
+    test.assert_eq(crc32(wire.text("a")), 0xE8B7BE43)
+    // Fed in two parts, the register carries over.
+    let part = crc32_update(0xFFFFFFFF, wire.text("1234"))
+    test.assert_eq(crc32_update(part, wire.text("56789")) ^ 0xFFFFFFFF, 0xCBF43926)
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_date_time_keys_order_in_time()
+    let a: [u8] = [0xE8, 0x07, 1, 2, 3, 4, 5]
+    let b: [u8] = [0xE8, 0x07, 1, 2, 3, 4, 6]
+    let c: [u8] = [0xE9, 0x07, 1, 1, 0, 0, 0]
+    test.assert(date_time_key(a) < date_time_key(b))
+    test.assert(date_time_key(b) < date_time_key(c))
+    test.assert_eq(date_time_key(a), date_time_key([0xE8, 0x07, 1, 2, 3, 4, 5]))
+    test.assert_eq(date_time_key([]), 0)
+    test.assert(date_time_ok(a))
+    test.assert(date_time_ok(date_time_zero()))
+    test.assert(not date_time_ok([0xE8, 0x07, 13, 2, 3, 4, 5]))
+    test.assert(not date_time_ok([0xE8, 0x07, 1, 2, 24, 4, 5]))
+    test.assert(not date_time_ok([0x2D, 0x06, 1, 2, 3, 4, 5]))
+    test.assert(not date_time_ok([1, 2, 3]))
+    // A value that names no day is not known.
+    test.assert(date_time_known(a))
+    test.assert(not date_time_known(date_time_zero()))
+    test.assert(not date_time_known([0xE8, 0x07, 0, 2, 3, 4, 5]))
+    test.assert(not date_time_known([0xE8, 0x07, 1, 0, 3, 4, 5]))
+    test.assert(not date_time_known([]))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_uuids_are_expanded_and_compared_as_numbers()
+    test.assert_eq(list.len(uuid_expand(uuid16(0x2ACB))), 16)
+    test.assert_eq(uuid_expand(uuid16(0x2ACB))[12] as Int, 0xCB)
+    test.assert_eq(uuid_expand(uuid16(0x2ACB))[13] as Int, 0x2A)
+    test.assert_eq(list.len(uuid_expand([1, 2, 3])), 0)
+    let long = uuid_expand(uuid16(0x2ACB))
+    test.assert_eq(uuid_compare(uuid16(0x2ACB), long), 0)
+    test.assert_eq(uuid_compare(uuid16(0x2ACA), uuid16(0x2ACB)), -1)
+    test.assert_eq(uuid_compare(uuid16(0x2ACB), uuid16(0x2ACA)), 1)
+    // The most significant octet decides.
+    var other = long[:]
+    other[15] = 0x01
+    test.assert_eq(uuid_compare(other, uuid16(0xFFFF)), 1)
+    test.assert_eq(uuid_compare([1, 2, 3], uuid16(1)), -1)
+    test.assert_eq(uuid_compare(uuid16(1), [1, 2, 3]), 1)
+    test.assert_eq(uuid_compare([1, 2, 3], []), 0)
+    test.assert(uuid_ok(uuid16(5)))
+    test.assert(uuid_ok(long))
+    test.assert(not uuid_ok([1, 2, 3]))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_names_are_utf8_without_control_characters()
+    test.assert(name_ok(wire.text("firmware.bin")))
+    test.assert(name_ok([0xC3, 0xA6]))
+    test.assert(name_ok([0xE2, 0x82, 0xAC]))
+    test.assert(name_ok([0xF0, 0x9F, 0x98, 0x80]))
+    // Empty is not a name; neither is more than 120 octets.
+    test.assert(not name_ok([]))
+    var long: [u8] = []
+    for _ in 0..120
+        list.push(long, 0x61)
+    test.assert(name_ok(long))
+    list.push(long, 0x61)
+    test.assert(not name_ok(long))
+    // Control characters: C0, DEL and C1.
+    test.assert(not name_ok([0x61, 0x0A]))
+    test.assert(not name_ok([0x00]))
+    test.assert(not name_ok([0x7F]))
+    test.assert(not name_ok([0xC2, 0x85]))
+    test.assert(name_ok([0xC2, 0xA0]))
+    // Malformed UTF-8: a lone continuation, an overlong form, a surrogate, a
+    // truncated sequence, a code point past U+10FFFF.
+    test.assert(not utf8_valid([0x80]))
+    test.assert(not utf8_valid([0xC0, 0x80]))
+    test.assert(not utf8_valid([0xC1, 0xBF]))
+    test.assert(not utf8_valid([0xE0, 0x80, 0x80]))
+    test.assert(not utf8_valid([0xED, 0xA0, 0x80]))
+    test.assert(not utf8_valid([0xF0, 0x80, 0x80, 0x80]))
+    test.assert(not utf8_valid([0xF4, 0x90, 0x80, 0x80]))
+    test.assert(not utf8_valid([0xF5, 0x80, 0x80, 0x80]))
+    test.assert(not utf8_valid([0xE2, 0x82]))
+    test.assert(not utf8_valid([0xC3]))
+    test.assert(not utf8_valid([0xFF]))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_name_matches_are_byte_for_byte()
+    let h = wire.text("Firmware.bin")
+    test.assert(starts_with(h, wire.text("Firm")))
+    test.assert(not starts_with(h, wire.text("firm")))
+    test.assert(not starts_with(h, wire.text("Firmware.bin2")))
+    test.assert(ends_with(h, wire.text(".bin")))
+    test.assert(not ends_with(h, wire.text(".BIN")))
+    test.assert(not ends_with(h, wire.text("xFirmware.bin")))
+    test.assert(contains(h, wire.text("mwa")))
+    test.assert(contains(h, h))
+    test.assert(not contains(h, wire.text("mwb")))
+    test.assert(not contains(wire.text("ab"), wire.text("abc")))
+    test.assert_eq(bytes_compare(wire.text("abc"), wire.text("abd")), -1)
+    test.assert_eq(bytes_compare(wire.text("abd"), wire.text("abc")), 1)
+    test.assert_eq(bytes_compare(wire.text("abc"), wire.text("abc")), 0)
+    test.assert_eq(bytes_compare(wire.text("ab"), wire.text("abc")), -1)
+    test.assert_eq(bytes_compare(wire.text("abc"), wire.text("ab")), 1)
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_lists_objects_and_answers_copies_of_their_metadata()
+    var repo = seeded()
+    test.assert_eq(repo.ids(), [0x100, 0x101])
+    let m = meta_of(var repo, 0x100)
+    test.assert_eq(m.name, wire.text("alpha"))
+    test.assert_eq(m.size, 10)
+    test.assert_eq(m.allocated, 10)
+    test.assert_eq(m.properties, PROP_DELETE | PROP_READ | PROP_WRITE)
+    test.assert_eq(m.created, date_time_zero())
+    test.assert_eq(meta_of(var repo, 0x105).id, -1)
+    // A copy: changing it changes nothing until `set_meta`.
+    var copy = meta_of(var repo, 0x100)
+    copy.name = wire.text("gamma")
+    test.assert_eq(meta_of(var repo, 0x100).name, wire.text("alpha"))
+    test.assert(repo.set_meta(copy))
+    test.assert_eq(meta_of(var repo, 0x100).name, wire.text("gamma"))
+    // `set_meta` keeps the id, the type and the sizes, and the Mark bit is not stored.
+    copy.size = 3
+    copy.kind = uuid16(1)
+    copy.properties = 0xFF
+    test.assert(repo.set_meta(copy))
+    let kept = meta_of(var repo, 0x100)
+    test.assert_eq(kept.size, 10)
+    test.assert_eq(kept.kind, uuid16(TYPE_UNSPECIFIED))
+    test.assert_eq(kept.properties, PROP_STORED)
+    var ghost = copy_meta(copy)
+    ghost.id = 0x7FF
+    test.assert(not repo.set_meta(ghost))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_creates_empty_objects_within_its_capacity_and_count()
+    var repo = new_memory_store(100, 2)
+    test.assert_eq(repo.available(), 100)
+    test.assert(repo.accepts(uuid16(5)))
+    let a = repo.create(uuid16(TYPE_UNSPECIFIED), 40)
+    test.assert_eq(a, ID_FIRST)
+    let m = meta_of(var repo, a)
+    test.assert_eq(m.size, 0)
+    test.assert_eq(m.allocated, 40)
+    test.assert_eq(list.len(m.name), 0)
+    test.assert_eq(m.properties & PROP_WRITE, PROP_WRITE)
+    test.assert_eq(m.created, date_time_zero())
+    test.assert_eq(m.modified, date_time_zero())
+    test.assert_eq(repo.available(), 60)
+    // More than is left, and more objects than the store holds.
+    test.assert_eq(repo.create(uuid16(TYPE_UNSPECIFIED), 61), CREATE_NO_ROOM)
+    test.assert_eq(repo.create(uuid16(TYPE_UNSPECIFIED), 60), ID_FIRST + 1)
+    test.assert_eq(repo.create(uuid16(TYPE_UNSPECIFIED), 0), CREATE_NO_ROOM)
+    test.assert_eq(repo.available(), 0)
+    // A deleted object frees its room; its Object ID is not reused at once.
+    test.assert(repo.delete(a))
+    test.assert(not repo.delete(a))
+    test.assert_eq(repo.available(), 40)
+    test.assert_eq(repo.create(uuid16(TYPE_UNSPECIFIED), 40), ID_FIRST + 2)
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_accepts_only_the_types_it_lists()
+    var repo = new_memory_store(100, 2)
+    list.push(repo.kinds, uuid16(0x2ACA))
+    list.push(repo.kinds, uuid_expand(uuid16(0x2BAB)))
+    test.assert(repo.accepts(uuid16(0x2ACA)))
+    // A 128-bit form of a listed 16-bit UUID is the same type.
+    test.assert(repo.accepts(uuid_expand(uuid16(0x2ACA))))
+    test.assert(repo.accepts(uuid16(0x2BAB)))
+    test.assert(not repo.accepts(uuid16(0x2BAC)))
+    test.assert(not repo.accepts([]))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_reads_and_writes_ranges_of_the_contents()
+    var repo = seeded()
+    test.assert_eq(repo.read(0x100, 0, 4), wire.text("0123"))
+    test.assert_eq(repo.read(0x100, 6, 100), wire.text("6789"))
+    test.assert_eq(repo.read(0x100, 10, 4), [])
+    test.assert_eq(repo.read(0x100, 0, 0), [])
+    test.assert_eq(repo.read(0x999, 0, 4), [])
+    // A patch inside the object leaves the tail.
+    test.assert(repo.write(0x100, 2, wire.text("XY")))
+    test.assert_eq(repo.read(0x100, 0, 10), wire.text("01XY456789"))
+    test.assert_eq(meta_of(var repo, 0x100).size, 10)
+    // A write past the allocated size, or past the current size, fails.
+    test.assert(not repo.write(0x100, 9, wire.text("ab")))
+    test.assert(not repo.write(0x101, 5, wire.text("a")))
+    test.assert(not repo.write(0x999, 0, wire.text("a")))
+    test.assert(not repo.write(0x100, -1, wire.text("a")))
+    test.assert_eq(repo.read(0x100, 0, 10), wire.text("01XY456789"))
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_resizes_and_a_write_extends_the_current_size()
+    var repo = new_memory_store(100, 2)
+    let id = repo.create(uuid16(TYPE_UNSPECIFIED), 8)
+    test.assert(repo.write(id, 0, wire.text("abcd")))
+    test.assert_eq(meta_of(var repo, id).size, 4)
+    test.assert(repo.write(id, 4, wire.text("efgh")))
+    test.assert_eq(meta_of(var repo, id).size, 8)
+    // Truncation drops the contents past the new size and keeps the room.
+    test.assert(repo.resize(id, 3, 8))
+    test.assert_eq(repo.read(id, 0, 8), wire.text("abc"))
+    test.assert_eq(meta_of(var repo, id).allocated, 8)
+    // Growth is limited by the capacity.
+    test.assert(repo.resize(id, 3, 100))
+    test.assert_eq(repo.available(), 0)
+    test.assert(not repo.resize(id, 3, 101))
+    test.assert(not repo.resize(id, 4, 3))
+    test.assert(not repo.resize(id, -1, 3))
+    test.assert(not repo.resize(0x999, 0, 3))
+    // A larger current size is zero-filled.
+    test.assert(repo.resize(id, 5, 100))
+    test.assert_eq(repo.read(id, 0, 8), [0x61, 0x62, 0x63, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_the_store_records_what_it_executes_and_has_a_clock()
+    var repo = seeded()
+    let r = repo.execute(0x100, [1, 2])
+    test.assert_eq(r.0, EXECUTE_SUCCESS)
+    test.assert_eq(r.1, [])
+    repo.execute_result = EXECUTE_FAILED
+    repo.execute_response = [7]
+    let f = repo.execute(0x101, [])
+    test.assert_eq(f.0, EXECUTE_FAILED)
+    test.assert_eq(f.1, [7])
+    test.assert_eq(repo.executed, [0x100, 0x101])
+    test.assert_eq(repo.now(), date_time_zero())
+    repo.clock = [0xE8, 0x07, 6, 1, 12, 0, 0]
+    test.assert_eq(repo.now(), [0xE8, 0x07, 6, 1, 12, 0, 0])
+
+@test
+@satisfies("REQ-BLE-OTS-003")
+fn test_a_store_is_full_at_its_object_count_and_capacity()
+    var repo = new_memory_store(10, 1)
+    test.assert_eq(memory_add(var repo, wire.text("a"), uuid16(1), wire.text("0123456789"), PROP_READ), ID_FIRST)
+    test.assert_eq(memory_add(var repo, wire.text("b"), uuid16(1), [], PROP_READ), -1)
+    var small = new_memory_store(5, 4)
+    test.assert_eq(memory_add(var small, wire.text("a"), uuid16(1), wire.text("0123456789"), PROP_READ), -1)
+    test.assert_eq(small.available(), 5)

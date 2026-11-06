@@ -1,0 +1,638 @@
+// src/fitness_machine_client.nv — the Collector side of the Fitness
+// Machine Service (0x1826): the decoders of its characteristics, the Fitness Machine
+// Control Point requests and responses, and the client session a head unit or an app uses
+// to drive a smart trainer.
+//
+//   Fitness Machine Feature   0x2ACC   `ftm_decode_feature`
+//   Treadmill Data            0x2ACD   `ftm_decode_treadmill`
+//   Indoor Bike Data          0x2AD2   `ftm_decode_bike`
+//   Training Status           0x2AD3   `ftm_decode_training_status`
+//   Supported Speed / Inclination / Resistance Level / Power / Heart Rate Range
+//                             0x2AD4 to 0x2AD8   `ftm_decode_*_range`
+//   Fitness Machine Control Point 0x2AD9   `ftm_req_*` build, `ftm_decode_response` reads
+//   Fitness Machine Status    0x2ADA   `ftm_decode_status`
+//
+// Data records.  In Treadmill Data and Indoor Bike Data bit 0 of the flags is More Data: it
+// is clear in the notification that carries the Instantaneous Speed and set in the others of
+// a record that did not fit one notification ([FTMS] 4.19).  The decoders report it in
+// `more_data` and put the speed in the value only when it is present (`FTM_SPEED` in
+// `present`); a record is complete when a notification with More Data clear arrives.  The
+// other fields follow the flag bits in the order of the tables ([FTMS] 4.4, 4.9, [GSS] 3.233 and
+// 3.124).  A field whose flag is not set is 0.  Data Not Available is kept as the raw value
+// (0xFFFF for the expended energy, 0xFF for the energy per minute, 0x7FFF for a signed field)
+// and `ftm_na` tells it.
+//
+// Units, from [GSS]: speeds 0.01 km/h, cadence 0.5 per minute, distance metres (24 bits),
+// inclination and ramp angle 0.1 percent and 0.1 degree, power watts, energy kilocalories,
+// metabolic equivalent 0.1, times seconds.  Two widths follow the [GSS] text on disk and
+// were not confirmed by a device: the Resistance Level of Indoor Bike Data is one octet and
+// the Instantaneous and Average Pace of Treadmill Data are two octets each.
+//
+// The decoders allocate nothing.  The session runs on `sensor_client.nv`.
+
+use gatt_client
+use links
+use fitness_machine
+use sensor_client
+use sensor_control
+use wire
+
+// The bits of `FtmBike.present` and `FtmTreadmill.present`: the flag bits of the characteristic,
+// with bit 0 set when the Instantaneous Speed is in the value.
+const FTM_SPEED = 0x0001
+
+// Indoor Bike Data flag bits ([GSS] 3.124.1).
+const BIKE_AVERAGE_SPEED = 0x0002
+const BIKE_CADENCE = 0x0004
+const BIKE_AVERAGE_CADENCE = 0x0008
+const BIKE_DISTANCE = 0x0010
+const BIKE_RESISTANCE = 0x0020
+const BIKE_POWER = 0x0040
+const BIKE_AVERAGE_POWER = 0x0080
+const BIKE_ENERGY = 0x0100
+const BIKE_HEART_RATE = 0x0200
+const BIKE_METABOLIC = 0x0400
+const BIKE_ELAPSED = 0x0800
+const BIKE_REMAINING = 0x1000
+
+// Treadmill Data flag bits ([FTMS] Table 4.5).
+const TM_AVERAGE_SPEED = 0x0002
+const TM_DISTANCE = 0x0004
+const TM_INCLINATION = 0x0008
+const TM_ELEVATION = 0x0010
+const TM_PACE = 0x0020
+const TM_AVERAGE_PACE = 0x0040
+const TM_ENERGY = 0x0080
+const TM_HEART_RATE = 0x0100
+const TM_METABOLIC = 0x0200
+const TM_ELAPSED = 0x0400
+const TM_REMAINING = 0x0800
+const TM_FORCE_POWER = 0x1000
+
+// The raw values that mean Data Not Available.
+const NA_U16 = 0xFFFF
+const NA_U8 = 0xFF
+const NA_S16 = 0x7FFF
+
+// Whether `present` holds the field `bit`.
+@tier(embedded)
+@no_alloc
+fn ftm_has(present: Int, bit: Int) -> Bool
+    (present & bit) == bit
+
+// One decoded Indoor Bike Data notification.
+@value
+struct FtmBike
+    more_data: Bool
+    present: Int
+    speed: Int
+    average_speed: Int
+    cadence: Int
+    average_cadence: Int
+    distance: Int
+    resistance: Int
+    power: Int
+    average_power: Int
+    energy_total: Int
+    energy_per_hour: Int
+    energy_per_minute: Int
+    heart_rate: Int
+    metabolic: Int
+    elapsed: Int
+    remaining: Int
+
+// The Indoor Bike Data notification in `b`, `None` when `b` is shorter than its flags require.
+@tier(embedded)
+@no_alloc
+fn ftm_decode_bike(b: [u8]) -> ?FtmBike
+    let n = list.len(b)
+    if n < 2
+        return None
+    let flags = wire.get(b, 0, 2)
+    let more = (flags & 1) != 0
+    var at = 2
+    var speed = 0
+    var average_speed = 0
+    var cadence = 0
+    var average_cadence = 0
+    var distance = 0
+    var resistance = 0
+    var power = 0
+    var average_power = 0
+    var energy_total = 0
+    var energy_hour = 0
+    var energy_minute = 0
+    var heart_rate = 0
+    var metabolic = 0
+    var elapsed = 0
+    var remaining = 0
+    if not more
+        if n < at + 2
+            return None
+        speed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_AVERAGE_SPEED) != 0
+        if n < at + 2
+            return None
+        average_speed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_CADENCE) != 0
+        if n < at + 2
+            return None
+        cadence = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_AVERAGE_CADENCE) != 0
+        if n < at + 2
+            return None
+        average_cadence = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_DISTANCE) != 0
+        if n < at + 3
+            return None
+        distance = wire.get(b, at, 3)
+        at = at + 3
+    if (flags & BIKE_RESISTANCE) != 0
+        if n < at + 1
+            return None
+        resistance = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & BIKE_POWER) != 0
+        if n < at + 2
+            return None
+        power = wire.get_signed(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_AVERAGE_POWER) != 0
+        if n < at + 2
+            return None
+        average_power = wire.get_signed(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_ENERGY) != 0
+        if n < at + 5
+            return None
+        energy_total = wire.get(b, at, 2)
+        energy_hour = wire.get(b, at + 2, 2)
+        energy_minute = wire.get(b, at + 4, 1)
+        at = at + 5
+    if (flags & BIKE_HEART_RATE) != 0
+        if n < at + 1
+            return None
+        heart_rate = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & BIKE_METABOLIC) != 0
+        if n < at + 1
+            return None
+        metabolic = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & BIKE_ELAPSED) != 0
+        if n < at + 2
+            return None
+        elapsed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & BIKE_REMAINING) != 0
+        if n < at + 2
+            return None
+        remaining = wire.get(b, at, 2)
+    Some(FtmBike {
+        more_data: more, present: (flags & 0x1FFE) | (if more then 0 else FTM_SPEED), speed: speed, average_speed: average_speed,
+        cadence: cadence, average_cadence: average_cadence, distance: distance, resistance: resistance, power: power,
+        average_power: average_power, energy_total: energy_total, energy_per_hour: energy_hour, energy_per_minute: energy_minute,
+        heart_rate: heart_rate, metabolic: metabolic, elapsed: elapsed, remaining: remaining })
+
+// One decoded Treadmill Data notification.
+@value
+struct FtmTreadmill
+    more_data: Bool
+    present: Int
+    speed: Int
+    average_speed: Int
+    distance: Int
+    inclination: Int
+    ramp_angle: Int
+    elevation_gain: Int
+    elevation_loss: Int
+    pace: Int
+    average_pace: Int
+    energy_total: Int
+    energy_per_hour: Int
+    energy_per_minute: Int
+    heart_rate: Int
+    metabolic: Int
+    elapsed: Int
+    remaining: Int
+    force_on_belt: Int
+    power_output: Int
+
+// The Treadmill Data notification in `b`, `None` when `b` is shorter than its flags require.
+@tier(embedded)
+@no_alloc
+fn ftm_decode_treadmill(b: [u8]) -> ?FtmTreadmill
+    let n = list.len(b)
+    if n < 2
+        return None
+    let flags = wire.get(b, 0, 2)
+    let more = (flags & 1) != 0
+    var at = 2
+    var speed = 0
+    var average_speed = 0
+    var distance = 0
+    var inclination = 0
+    var ramp = 0
+    var gain = 0
+    var loss = 0
+    var pace = 0
+    var average_pace = 0
+    var energy_total = 0
+    var energy_hour = 0
+    var energy_minute = 0
+    var heart_rate = 0
+    var metabolic = 0
+    var elapsed = 0
+    var remaining = 0
+    var force = 0
+    var output = 0
+    if not more
+        if n < at + 2
+            return None
+        speed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_AVERAGE_SPEED) != 0
+        if n < at + 2
+            return None
+        average_speed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_DISTANCE) != 0
+        if n < at + 3
+            return None
+        distance = wire.get(b, at, 3)
+        at = at + 3
+    if (flags & TM_INCLINATION) != 0
+        if n < at + 4
+            return None
+        inclination = wire.get_signed(b, at, 2)
+        ramp = wire.get_signed(b, at + 2, 2)
+        at = at + 4
+    if (flags & TM_ELEVATION) != 0
+        if n < at + 4
+            return None
+        gain = wire.get(b, at, 2)
+        loss = wire.get(b, at + 2, 2)
+        at = at + 4
+    if (flags & TM_PACE) != 0
+        if n < at + 2
+            return None
+        pace = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_AVERAGE_PACE) != 0
+        if n < at + 2
+            return None
+        average_pace = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_ENERGY) != 0
+        if n < at + 5
+            return None
+        energy_total = wire.get(b, at, 2)
+        energy_hour = wire.get(b, at + 2, 2)
+        energy_minute = wire.get(b, at + 4, 1)
+        at = at + 5
+    if (flags & TM_HEART_RATE) != 0
+        if n < at + 1
+            return None
+        heart_rate = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & TM_METABOLIC) != 0
+        if n < at + 1
+            return None
+        metabolic = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & TM_ELAPSED) != 0
+        if n < at + 2
+            return None
+        elapsed = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_REMAINING) != 0
+        if n < at + 2
+            return None
+        remaining = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & TM_FORCE_POWER) != 0
+        if n < at + 4
+            return None
+        force = wire.get_signed(b, at, 2)
+        output = wire.get_signed(b, at + 2, 2)
+    Some(FtmTreadmill {
+        more_data: more, present: (flags & 0x1FFE) | (if more then 0 else FTM_SPEED), speed: speed, average_speed: average_speed,
+        distance: distance, inclination: inclination, ramp_angle: ramp, elevation_gain: gain, elevation_loss: loss, pace: pace,
+        average_pace: average_pace, energy_total: energy_total, energy_per_hour: energy_hour, energy_per_minute: energy_minute,
+        heart_rate: heart_rate, metabolic: metabolic, elapsed: elapsed, remaining: remaining, force_on_belt: force,
+        power_output: output })
+
+// Whether a field's raw value is Data Not Available for its width (`NA_U16`, `NA_U8`, `NA_S16`).
+@tier(embedded)
+@no_alloc
+fn ftm_na(raw: Int, marker: Int) -> Bool
+    raw == marker
+
+// ── Feature, ranges and status ──────────────────────────────────────
+
+// The bits of the machine features ([FTMS] Table 4.3).
+const MACHINE_AVERAGE_SPEED = 0x00000001
+const MACHINE_CADENCE = 0x00000002
+const MACHINE_TOTAL_DISTANCE = 0x00000004
+const MACHINE_INCLINATION = 0x00000008
+const MACHINE_ELEVATION_GAIN = 0x00000010
+const MACHINE_PACE = 0x00000020
+const MACHINE_STEP_COUNT = 0x00000040
+const MACHINE_RESISTANCE_LEVEL = 0x00000080
+const MACHINE_STRIDE_COUNT = 0x00000100
+const MACHINE_EXPENDED_ENERGY = 0x00000200
+const MACHINE_HEART_RATE = 0x00000400
+const MACHINE_METABOLIC_EQUIVALENT = 0x00000800
+const MACHINE_ELAPSED_TIME = 0x00001000
+const MACHINE_REMAINING_TIME = 0x00002000
+const MACHINE_POWER_MEASUREMENT = 0x00004000
+const MACHINE_FORCE_ON_BELT = 0x00008000
+const MACHINE_USER_DATA_RETENTION = 0x00010000
+
+// The bits of the target setting features ([FTMS] Table 4.4).
+const TARGET_SPEED = 0x00000001
+const TARGET_INCLINATION = 0x00000002
+const TARGET_RESISTANCE = 0x00000004
+const TARGET_POWER = 0x00000008
+const TARGET_HEART_RATE = 0x00000010
+const TARGET_ENERGY = 0x00000020
+const TARGET_STEPS = 0x00000040
+const TARGET_STRIDES = 0x00000080
+const TARGET_DISTANCE = 0x00000100
+const TARGET_TRAINING_TIME = 0x00000200
+const TARGET_TWO_ZONES = 0x00000400
+const TARGET_THREE_ZONES = 0x00000800
+const TARGET_FIVE_ZONES = 0x00001000
+const TARGET_BIKE_SIMULATION = 0x00002000
+const TARGET_WHEEL_CIRCUMFERENCE = 0x00004000
+const TARGET_SPIN_DOWN = 0x00008000
+const TARGET_CADENCE = 0x00010000
+
+// The Fitness Machine Feature: the machine features and the target setting features.
+@value
+struct FtmFeature
+    machine: Int
+    targets: Int
+
+// The Feature in `b`, `None` unless 8 octets.
+@tier(embedded)
+@no_alloc
+fn ftm_decode_feature(b: [u8]) -> ?FtmFeature
+    if list.len(b) != 8
+        return None
+    Some(FtmFeature { machine: wire.get(b, 0, 4), targets: wire.get(b, 4, 4) })
+
+// A supported range: the lowest and highest value the machine accepts and the smallest step.
+@value
+struct FtmRange
+    min: Int
+    max: Int
+    step: Int
+
+// Supported Speed Range (6 octets, three UINT16, 0.01 km/h).
+@tier(embedded)
+@no_alloc
+fn ftm_decode_speed_range(b: [u8]) -> ?FtmRange
+    if list.len(b) != 6
+        return None
+    Some(FtmRange { min: wire.get(b, 0, 2), max: wire.get(b, 2, 2), step: wire.get(b, 4, 2) })
+
+// Supported Inclination Range (6 octets: SINT16, SINT16, UINT16, 0.1 percent).
+@tier(embedded)
+@no_alloc
+fn ftm_decode_inclination_range(b: [u8]) -> ?FtmRange
+    if list.len(b) != 6
+        return None
+    Some(FtmRange { min: wire.get_signed(b, 0, 2), max: wire.get_signed(b, 2, 2), step: wire.get(b, 4, 2) })
+
+// Supported Resistance Level Range (3 octets, three UINT8, unit 0.1).
+@tier(embedded)
+@no_alloc
+fn ftm_decode_resistance_range(b: [u8]) -> ?FtmRange
+    if list.len(b) != 3
+        return None
+    Some(FtmRange { min: wire.get(b, 0, 1), max: wire.get(b, 1, 1), step: wire.get(b, 2, 1) })
+
+// Supported Power Range (6 octets: SINT16, SINT16, UINT16, watts).
+@tier(embedded)
+@no_alloc
+fn ftm_decode_power_range(b: [u8]) -> ?FtmRange
+    if list.len(b) != 6
+        return None
+    Some(FtmRange { min: wire.get_signed(b, 0, 2), max: wire.get_signed(b, 2, 2), step: wire.get(b, 4, 2) })
+
+// Supported Heart Rate Range (3 octets, three UINT8, beats per minute).
+@tier(embedded)
+@no_alloc
+fn ftm_decode_heart_rate_range(b: [u8]) -> ?FtmRange
+    if list.len(b) != 3
+        return None
+    Some(FtmRange { min: wire.get(b, 0, 1), max: wire.get(b, 1, 1), step: wire.get(b, 2, 1) })
+
+// Whether `v` lies in the range and is on its step from the minimum.
+@tier(embedded)
+@no_alloc
+fn ftm_in_range(r: FtmRange, v: Int) -> Bool
+    if v < r.min or v > r.max
+        return false
+    r.step == 0 or (v - r.min) % r.step == 0
+
+// The Training Status: the flags octet, the status value (`fitness_machine.TRAINING_*`), and the
+// string that follows (UTF-8; `extended` says more of it is read with Read Long).
+@value
+struct FtmTrainingStatus
+    status: Int
+    has_string: Bool
+    extended: Bool
+    string_at: Int
+    string_len: Int
+
+// The Training Status in `b`, `None` when shorter than 2 octets or when the string flag is clear and octets follow.
+@tier(embedded)
+@no_alloc
+fn ftm_decode_training_status(b: [u8]) -> ?FtmTrainingStatus
+    let n = list.len(b)
+    if n < 2
+        return None
+    let flags = b[0] as Int
+    let has_string = (flags & fitness_machine.TRAINING_STRING_PRESENT) != 0
+    if not has_string and n > 2
+        return None
+    Some(FtmTrainingStatus {
+        status: b[1] as Int, has_string: has_string, extended: (flags & fitness_machine.TRAINING_EXTENDED_STRING) != 0,
+        string_at: 2, string_len: n - 2 })
+
+// A Fitness Machine Status notification: the status opcode and where its parameter lies.
+@value
+struct FtmStatus
+    op: Int
+    param_at: Int
+    param_len: Int
+
+@tier(embedded)
+@no_alloc
+fn ftm_decode_status(b: [u8]) -> ?FtmStatus
+    if list.len(b) < 1
+        return None
+    Some(FtmStatus { op: b[0] as Int, param_at: 1, param_len: list.len(b) - 1 })
+
+// The new target value a status carries ([FTMS] Table 4.26): the target speed (UINT16), inclination (SINT16),
+// resistance level (SINT16), power (SINT16) or heart rate (UINT8), or the control information of Stopped or
+// Paused (1 stop, 2 pause); `None` for another opcode or a short parameter.
+@tier(embedded)
+@no_alloc
+fn ftm_status_value(b: [u8], s: FtmStatus) -> ?Int
+    let op = s.op
+    if op == fitness_machine.STATUS_TARGET_SPEED_CHANGED and s.param_len >= 2
+        return Some(wire.get(b, s.param_at, 2))
+    if (op == fitness_machine.STATUS_TARGET_INCLINATION_CHANGED or op == fitness_machine.STATUS_TARGET_RESISTANCE_CHANGED
+        or op == fitness_machine.STATUS_TARGET_POWER_CHANGED) and s.param_len >= 2
+        return Some(wire.get_signed(b, s.param_at, 2))
+    if (op == fitness_machine.STATUS_TARGET_HEART_RATE_CHANGED or op == fitness_machine.STATUS_STOPPED_OR_PAUSED) and s.param_len >= 1
+        return Some(wire.get(b, s.param_at, 1))
+    None
+
+// ── Control Point ───────────────────────────────────────────────────
+
+const OP_SET_WHEEL_CIRCUMFERENCE = 0x12
+const OP_SET_BIKE_SIMULATION = 0x11
+const OP_SPIN_DOWN = 0x13
+const OP_SET_TARGET_CADENCE = 0x14
+
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_PARAMETER = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+const RESULT_CONTROL_NOT_PERMITTED = 0x05
+
+@tier(app)
+fn ftm_request(op: Int, width: Int, v: Int) -> [u8]
+    var out: [u8] = [op as u8]
+    wire.put(var out, v, width)
+    out
+
+// Request Control and Reset.
+@tier(app)
+fn ftm_req_request_control() -> [u8]
+    [fitness_machine.OP_REQUEST_CONTROL]
+
+@tier(app)
+fn ftm_req_reset() -> [u8]
+    [fitness_machine.OP_RESET as u8]
+
+// Set Target Speed in 0.01 km/h.
+@tier(app)
+fn ftm_req_set_target_speed(speed_100: Int) -> [u8]
+    ftm_request(fitness_machine.OP_SET_TARGET_SPEED, 2, speed_100)
+
+// Set Target Inclination in 0.1 percent (signed).
+@tier(app)
+fn ftm_req_set_target_inclination(tenths: Int) -> [u8]
+    ftm_request(fitness_machine.OP_SET_TARGET_INCLINATION, 2, tenths)
+
+// Set Target Resistance Level, unit 0.1.
+@tier(app)
+fn ftm_req_set_target_resistance(level: Int) -> [u8]
+    ftm_request(fitness_machine.OP_SET_TARGET_RESISTANCE, 1, level)
+
+// Set Target Power in watts (signed).
+@tier(app)
+fn ftm_req_set_target_power(watts: Int) -> [u8]
+    ftm_request(fitness_machine.OP_SET_TARGET_POWER, 2, watts)
+
+// Set Target Heart Rate in beats per minute.
+@tier(app)
+fn ftm_req_set_target_heart_rate(bpm: Int) -> [u8]
+    ftm_request(fitness_machine.OP_SET_TARGET_HEART_RATE, 1, bpm)
+
+@tier(app)
+fn ftm_req_start_or_resume() -> [u8]
+    [fitness_machine.OP_START_OR_RESUME]
+
+@tier(app)
+fn ftm_req_stop() -> [u8]
+    [fitness_machine.OP_STOP_OR_PAUSE, fitness_machine.STOP]
+
+@tier(app)
+fn ftm_req_pause() -> [u8]
+    [fitness_machine.OP_STOP_OR_PAUSE, fitness_machine.PAUSE]
+
+// Set Indoor Bike Simulation Parameters: wind speed in 0.001 m/s, grade in 0.01 percent (both signed),
+// the coefficient of rolling resistance in 0.0001 and the wind resistance coefficient in 0.01 kg/m.
+@tier(app)
+fn ftm_req_set_bike_simulation(wind_mm_s: Int, grade_100: Int, crr_10000: Int, cw_100: Int) -> [u8]
+    var out: [u8] = [OP_SET_BIKE_SIMULATION]
+    wire.put(var out, wind_mm_s, 2)
+    wire.put(var out, grade_100, 2)
+    wire.put(var out, crr_10000, 1)
+    wire.put(var out, cw_100, 1)
+    out
+
+// Set Wheel Circumference in 0.1 millimetre.
+@tier(app)
+fn ftm_req_set_wheel_circumference(tenth_mm: Int) -> [u8]
+    ftm_request(OP_SET_WHEEL_CIRCUMFERENCE, 2, tenth_mm)
+
+// Set Targeted Cadence in 0.5 per minute.
+@tier(app)
+fn ftm_req_set_target_cadence(half_rpm: Int) -> [u8]
+    ftm_request(OP_SET_TARGET_CADENCE, 2, half_rpm)
+
+// A decoded response: the op code it answers, the result and where its parameter lies.
+@value
+struct FtmResponse
+    request_op: Int
+    result: Int
+    param_at: Int
+    param_len: Int
+
+// The response in `b` (0x80, the request's op code, the result, the parameter), `None` when `b` is no response.
+@tier(embedded)
+@no_alloc
+fn ftm_decode_response(b: [u8]) -> ?FtmResponse
+    if list.len(b) < 3 or b[0] as Int != fitness_machine.OP_RESPONSE_CODE
+        return None
+    Some(FtmResponse { request_op: b[1] as Int, result: b[2] as Int, param_at: 3, param_len: list.len(b) - 3 })
+
+// Whether the response says the request was carried out.
+@tier(embedded)
+@no_alloc
+fn ftm_succeeded(r: FtmResponse) -> Bool
+    r.result == RESULT_SUCCESS
+
+// ── Session ─────────────────────────────────────────────────────────
+
+@tier(app)
+fn ftm_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, fitness_machine.UUID_FITNESS_MACHINE_SERVICE)
+
+// Discover the service; read the Feature (required) and the five Supported Ranges the machine has; subscribe to
+// Indoor Bike Data, Treadmill Data, Training Status and Fitness Machine Status by notification and to the
+// Control Point by indication (each optional: a machine has the data characteristic of its kind).
+@tier(app)
+fn ftm_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_FITNESS_MACHINE_FEATURE, true)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_SUPPORTED_SPEED_RANGE, false)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_SUPPORTED_INCLINATION_RANGE, false)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_SUPPORTED_RESISTANCE_LEVEL_RANGE, false)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_SUPPORTED_POWER_RANGE, false)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_SUPPORTED_HEART_RATE_RANGE, false)
+    sensor_client.sc_queue_read(var c, fitness_machine.UUID_TRAINING_STATUS, false)
+    sensor_client.sc_queue_subscribe(var c, fitness_machine.UUID_INDOOR_BIKE_DATA, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, fitness_machine.UUID_TREADMILL_DATA, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, fitness_machine.UUID_TRAINING_STATUS, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, fitness_machine.UUID_FITNESS_MACHINE_STATUS, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, fitness_machine.UUID_FITNESS_MACHINE_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (a `ftm_req_*` value) to the Control Point; the response arrives as an indication on
+// `UUID_FITNESS_MACHINE_CONTROL_POINT` that `ftm_decode_response` reads.  The machine takes the write
+// only from a link that is encrypted, and a procedure other than Request Control needs control.
+@tier(app)
+fn ftm_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, fitness_machine.UUID_FITNESS_MACHINE_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

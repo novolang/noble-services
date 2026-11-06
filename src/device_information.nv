@@ -1,0 +1,115 @@
+// src/device_information.nv — the Device Information
+// Service (0x180A).
+//
+// The service describes the device to a client. Every characteristic of it
+// is optional and read-only; the caller supplies the values and the
+// service holds the ones that are not empty:
+//
+//   Manufacturer Name String   0x2A29   UTF-8 text
+//   Model Number String        0x2A24   UTF-8 text
+//   Serial Number String       0x2A25   UTF-8 text
+//   Hardware Revision String   0x2A27   UTF-8 text
+//   Firmware Revision String   0x2A26   UTF-8 text
+//   Software Revision String   0x2A28   UTF-8 text
+//   System ID                  0x2A23   8 octets, `system_id_value`
+//   PnP ID                     0x2A50   7 octets, `pnp_id_value`
+//
+// The characteristics follow in that order, each one a declaration and a
+// value, and none has a Client Characteristic Configuration descriptor.
+// A handle of 0 in `DeviceInformationHandles` means the characteristic is
+// not in the service.
+
+use gatt_server
+use profile_builder
+
+const UUID_DEVICE_INFORMATION_SERVICE = 0x180A
+const UUID_SYSTEM_ID = 0x2A23
+const UUID_MODEL_NUMBER_STRING = 0x2A24
+const UUID_SERIAL_NUMBER_STRING = 0x2A25
+const UUID_FIRMWARE_REVISION_STRING = 0x2A26
+const UUID_HARDWARE_REVISION_STRING = 0x2A27
+const UUID_SOFTWARE_REVISION_STRING = 0x2A28
+const UUID_MANUFACTURER_NAME_STRING = 0x2A29
+const UUID_PNP_ID = 0x2A50
+
+// The Vendor ID Source field of the PnP ID: who assigned the vendor ID
+// ([Bluetooth Assigned Numbers]).
+pub const PNP_SOURCE_BLUETOOTH_SIG = 0x01
+const PNP_SOURCE_USB_IF = 0x02
+
+// The values of the service, as the caller holds them.  A string is
+// UTF-8 text without a terminator; an empty value leaves the
+// characteristic out.  `read` is the access a client needs to read any of
+// them.
+struct DeviceInformation
+    read: gatt_server.Access
+    manufacturer: [u8]
+    model: [u8]
+    serial: [u8]
+    hardware: [u8]
+    firmware: [u8]
+    software: [u8]
+    system_id: [u8]
+    pnp_id: [u8]
+
+// The handles of the value attributes, 0 for a characteristic that is
+// not present.
+struct DeviceInformationHandles
+    service: Int
+    manufacturer: Int
+    model: Int
+    serial: Int
+    hardware: Int
+    firmware: Int
+    software: Int
+    system_id: Int
+    pnp_id: Int
+
+// A configuration with no characteristic.
+fn empty_device_information() -> DeviceInformation
+    DeviceInformation { read: gatt_server.Access.Open, manufacturer: [], model: [], serial: [], hardware: [], firmware: [], software: [], system_id: [], pnp_id: [] }
+
+// The System ID value: a 40-bit manufacturer-defined identifier, then the
+// 24-bit organizationally unique identifier, each least significant
+// octet first.
+pub fn system_id_value(manufacturer_id: Int, oui: Int) -> [u8]
+    [
+        (manufacturer_id & 0xFF) as u8,
+        ((manufacturer_id >>> 8) & 0xFF) as u8,
+        ((manufacturer_id >>> 16) & 0xFF) as u8,
+        ((manufacturer_id >>> 24) & 0xFF) as u8,
+        ((manufacturer_id >>> 32) & 0xFF) as u8,
+        (oui & 0xFF) as u8,
+        ((oui >>> 8) & 0xFF) as u8,
+        ((oui >>> 16) & 0xFF) as u8]
+
+// The PnP ID value: the Vendor ID Source, then the Vendor ID, the Product
+// ID and the Product Version, 16 bits each, least significant octet first.
+pub fn pnp_id_value(source: Int, vendor: Int, product: Int, version: Int) -> [u8]
+    [
+        source as u8,
+        (vendor & 0xFF) as u8, ((vendor >>> 8) & 0xFF) as u8,
+        (product & 0xFF) as u8, ((product >>> 8) & 0xFF) as u8,
+        (version & 0xFF) as u8, ((version >>> 8) & 0xFF) as u8]
+
+// The handle of a read-only characteristic with `value`, or 0 when `value`
+// is empty.
+fn add_optional(var db: GattDb, read: gatt_server.Access, uuid16: Int, value: [u8]) -> Result<Int, profile_builder.ProfileError>
+    if list.len(value) == 0
+        return Ok(0)
+    profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(read), gatt_server.le16(uuid16), value)
+
+// Add the Device Information Service after the last attribute of `server`.
+fn add_device_information_service(var db: GattDb, info: DeviceInformation) -> Result<DeviceInformationHandles, profile_builder.ProfileError>
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_DEVICE_INFORMATION_SERVICE))!
+    let manufacturer = add_optional(var db, info.read, UUID_MANUFACTURER_NAME_STRING, info.manufacturer)!
+    let model = add_optional(var db, info.read, UUID_MODEL_NUMBER_STRING, info.model)!
+    let serial = add_optional(var db, info.read, UUID_SERIAL_NUMBER_STRING, info.serial)!
+    let hardware = add_optional(var db, info.read, UUID_HARDWARE_REVISION_STRING, info.hardware)!
+    let firmware = add_optional(var db, info.read, UUID_FIRMWARE_REVISION_STRING, info.firmware)!
+    let software = add_optional(var db, info.read, UUID_SOFTWARE_REVISION_STRING, info.software)!
+    let system_id = add_optional(var db, info.read, UUID_SYSTEM_ID, info.system_id)!
+    let pnp_id = add_optional(var db, info.read, UUID_PNP_ID, info.pnp_id)!
+    Ok(DeviceInformationHandles {
+        service: service, manufacturer: manufacturer, model: model, serial: serial, hardware: hardware,
+        firmware: firmware, software: software, system_id: system_id, pnp_id: pnp_id })

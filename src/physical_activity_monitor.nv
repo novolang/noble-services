@@ -1,0 +1,1273 @@
+// src/physical_activity_monitor.nv — the Physical Activity
+// Monitor Service (0x183E), with which an activity monitor (a wrist band, a
+// step counter, a sleep tracker) sends the data of physical activity sessions
+// to a collector and lets it manage the sessions.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Physical Activity Monitor Features    0x2B3B  Read; 64 bits
+//   General Activity Instantaneous Data   0x2B3C  Notify
+//   General Activity Summary Data         0x2B3D  Indicate
+//   CardioRespiratory Instantaneous Data  0x2B3E  Notify; optional
+//   CardioRespiratory Summary Data        0x2B3F  Indicate; optional
+//   Step Counter Summary Data             0x2B40  Indicate; optional
+//   Sleep Activity Instantaneous Data     0x2B41  Notify; optional
+//   Sleep Activity Summary Data           0x2B42  Indicate; optional
+//   Physical Activity Monitor Control Point 0x2B43  Write, Indicate
+//   Physical Activity Current Session     0x2B44  Read, Indicate
+//   Physical Activity Session Descriptor  0x2B45  Indicate
+//
+// The characteristics come in the order of the specification's table; the
+// seven data characteristics are numbered 0 to 6 in that order, the number the
+// Get Ended Session Data procedure names them by ("kind" below), and each one
+// that notifies or indicates has a Client Characteristic Configuration
+// descriptor.
+//
+// Features.  `PamsConfig.features` is the 64-bit Features value: the bits 0 to 2
+// (Multiple Users, User Data Service, Device Worn) and one bit for each
+// optional field of the data characteristics (bits 3 to 54); bits 55 to 63 are
+// reserved and `add_pams_service` refuses a value that sets one, and a value of
+// 0, because a monitor supports at least one feature.  `PamsConfig.kinds` lists
+// the data characteristics the monitor has (bit k for kind k): the two General
+// Activity ones are mandatory, an optional one has to carry at least one
+// supported field, and every supported field has to have a characteristic that
+// carries it; the service refuses a configuration that breaks either rule.
+//
+// Data Records.  A Data Record is the Flags field (1 to 4 octets, by kind), the
+// Session ID, the Sub-session ID, the Relative Timestamp and the Sequence
+// Number, then the optional fields in the order of the specification's table.
+// A field is in a record exactly when its Features bit is set and the record
+// has it (`PamsRecord.present`); the Device Worn flag is set only for a monitor
+// that supports it.  `pams_record_valid` refuses a record with a field outside
+// its format: the Session ID 0xFFFF (reserved), a sub-session ID of 0xFFFF is
+// the whole session, an Activity Type with a reserved sub-field value, a Sleep
+// Stage with a reserved bit, an Elevation outside 24 bits signed.  The Sequence
+// Number is the service's: it goes up by one for each record of a kind and
+// wraps at 32 bits.  A record is sent in segments of at most ATT_MTU - 4 octets
+// after a Header field (First Segment, Last Segment and the 6-bit Rolling
+// Segment Counter, which runs on across records, one counter for each
+// characteristic) and only the first segment holds the Flags field and the
+// identifiers ([PAMS] 2.4); `pams_segments` is the procedure.
+//
+// Sessions.  `PamsState` holds the sessions and sub-sessions (ID, start and end
+// as a base time in seconds since 2000-01-01 and a time offset in minutes, and
+// whether it runs), the records kept for Get Ended Session Data, the sequence
+// numbers and segment counters, and the clock the application sets with
+// `pams_set_time`.  A session does not overlap another: starting one ends the
+// running one; a session has one or more sub-sessions that fill it.  The
+// session IDs are 0, 1, 2, ... up to 0xFFFE and are not reused while the session
+// exists; the sub-session IDs run from 0 in each session.  `pams_send_record`
+// validates a record, gives it its Sequence Number, keeps it (a summary record
+// replaces the one before it of the same session and sub-session; at
+// `max_records` the oldest goes) and sends it to a client that enabled the
+// characteristic.  The Current Session value names the running session and
+// sub-session, or the ones that ran last while none runs.  `pams_start`,
+// `pams_stop`, `pams_set_monitor_type` and `pams_describe_current` are for a
+// session the monitor itself starts or stops.
+// A monitor that supports Multiple Users sends no data record before the
+// application calls `pams_set_consent` with true, which is the consent through
+// the User Data Service ([PAMP] 3.2, 4.8).
+//
+// The control point.  `pams_receive` evaluates a write after the checks of the
+// ATT server and answers the request:
+//
+//   0x01  Enquire Sessions        indicates the Session Descriptor of each
+//                                 session, then 0xFC with the number of sessions
+//   0x02  Enquire Sub-sessions    uint16 Session ID; the descriptors, then 0xFB
+//                                 with the number
+//   0x03  Get Ended Session Data  uint16 Session ID, uint16 Sub-session ID (0xFFFF
+//                                 for all), uint8 data characteristic 0 to 6; the
+//                                 kept records of the characteristic, then 0xFA
+//                                 with the number of records (uint24)
+//   0x04  Start Session/Sub-session  uint8 type, 0 session, 1 sub-session
+//   0x05  Stop Session
+//   0x06  Delete Ended Session    uint16 Session ID; indicates its descriptor
+//                                 with the Deleted Session bit
+//   0x07  Set Average Activity Type  uint8 scope (0 the current sub-session, 1
+//                                 all of the current session), uint8 user-defined
+//                                 activity type; needs the Activity Type feature
+//
+// A request is refused with the Application Error Code of [PAMS] 1.7, in the
+// order of the specification's table when several apply: 0x80 for an opcode the
+// service does not define (also 0x00, 0x08 to 0xFF, and 0x07 without the
+// Activity Type feature), 0x81 for a Session ID that does not exist (0xFFFF
+// included), 0x82 for a Sub-session ID the session does not have, 0x83 for a
+// session that still runs (Get Ended Session Data, Delete Ended Session), 0x84
+// when no kept record matches, 0x85 when there is no session, 0x86 for a type
+// or a scope above 1, 0x87 with no session running (Start Sub-session, Set
+// Average Activity Type), 0x88 for Stop Session with none running, 0x89 for a
+// user-defined activity type in the reserved range 0x0F to 0xFE, and 0x8A for
+// a data characteristic parameter above 6, for a record request before the
+// consent of a Multiple Users monitor, and for a table that has no room for the
+// session or the sub-session.  A request of the wrong length is refused with
+// Invalid Attribute Value Length.  A request is refused with 0xFD while the
+// indication of the control point is not enabled, and while the indication of
+// the Session Descriptor (Enquire Sessions, Enquire Sub-sessions, Delete Ended
+// Session) or the notification or indication of the requested data
+// characteristic (Get Ended Session Data) is not; with 0xFE while a procedure's
+// indications are unconfirmed.  The checks of the request's parameters come
+// before the checks of the descriptors, which come before the answers that need
+// the data ("no data", "no sessions"), so a client that has not enabled a
+// characteristic still hears that its Session ID is wrong.  A long write to the
+// control point is refused.  The service has no step that fails after the Write
+// Response; the application that has one (a storage that cannot be read) reports
+// it with `pams_report_failure`, which indicates the Enquire Sessions, Enquire
+// Sub-sessions or Get Ended Session Data Error Response (0xFF, 0xFE, 0xFD) with
+// the Undetermined Error parameter.  The 30-second limits between the PDUs of
+// Get Ended Session Data are the application's clock (`gatt_server.tick`).
+//
+// Security.  The service imposes none ([PAMS] Table 3.1); the Physical Activity
+// Monitor Profile 1.0 raises it ([PAMP] 6.1): every characteristic of the
+// service is at LE security mode 1, level 2 or 3.  So `add_pams_service` takes
+// `PamsConfig.access` as Encrypted or Authenticated and refuses the others with
+// `NotPermitted`; it is the access of every value and descriptor and of the
+// control point.
+//
+// NOT IMPLEMENTED: the measuring (the application fills the records and starts
+// the sessions itself), the storage that survives a power cycle (the kept
+// records are in the state), the separation of the data of several users (the
+// application keeps a state for each user and gives the consent for the one who
+// consented), the Device Time Service, the Service UUID, Local Name and
+// Appearance items of the advertising data ([PAMP] 3.1.1), and the BR/EDR SDP
+// record.
+//
+// Specification checked against: Physical Activity Monitor Service 1.0 (PAMS)
+// and Physical Activity Monitor Profile 1.0 (PAMP 3.2, 4.4, 4.8, 6.1).
+//
+// Satisfies: REQ-BLE-PAMS-001.
+
+use att
+use gatt_server
+use links
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer, subscribe, read }
+use wire
+
+const UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE = 0x183E
+const UUID_PAM_FEATURES = 0x2B3B
+const UUID_PAM_CONTROL_POINT = 0x2B43
+const UUID_PAM_CURRENT_SESSION = 0x2B44
+const UUID_PAM_SESSION_DESCRIPTOR = 0x2B45
+
+// The data characteristics, numbered as the Get Ended Session Data procedure
+// numbers them.
+const KIND_GENERAL_INSTANTANEOUS = 0
+const KIND_GENERAL_SUMMARY = 1
+const KIND_CARDIORESPIRATORY_INSTANTANEOUS = 2
+const KIND_CARDIORESPIRATORY_SUMMARY = 3
+const KIND_STEP_COUNTER_SUMMARY = 4
+const KIND_SLEEP_INSTANTANEOUS = 5
+const KIND_SLEEP_SUMMARY = 6
+const KIND_COUNT = 7
+
+// The bits of the Features value that are not the support of a field, and the
+// reserved range.
+const FEATURE_MULTIPLE_USERS = 0x1
+const FEATURE_USER_DATA_SERVICE = 0x2
+const FEATURE_DEVICE_WORN = 0x4
+const FEATURE_ACTIVITY_TYPE = 0x1000000
+const FEATURE_BITS = 55
+
+// The opcodes of the control point, and the opcodes of its indications.
+const OP_ENQUIRE_SESSIONS = 0x01
+const OP_ENQUIRE_SUB_SESSIONS = 0x02
+const OP_GET_ENDED_SESSION_DATA = 0x03
+const OP_START_SESSION = 0x04
+const OP_STOP_SESSION = 0x05
+const OP_DELETE_ENDED_SESSION = 0x06
+const OP_SET_AVERAGE_ACTIVITY_TYPE = 0x07
+const OP_GET_ENDED_SESSION_DATA_SUCCESS = 0xFA
+const OP_ENQUIRE_SUB_SESSIONS_SUCCESS = 0xFB
+const OP_ENQUIRE_SESSIONS_SUCCESS = 0xFC
+const OP_GET_ENDED_SESSION_DATA_ERROR = 0xFD
+const OP_ENQUIRE_SUB_SESSIONS_ERROR = 0xFE
+const OP_ENQUIRE_SESSIONS_ERROR = 0xFF
+const UNDETERMINED_ERROR = 0xFF
+
+// The Application Error Codes of [PAMS] 1.7.
+const ERR_OP_CODE_NOT_SUPPORTED = 0x80
+const ERR_INVALID_SESSION_ID = 0x81
+const ERR_INVALID_SUB_SESSION_ID = 0x82
+const ERR_SESSION_STILL_RUNNING = 0x83
+const ERR_NO_DATA_AVAILABLE = 0x84
+const ERR_NO_SESSIONS_AVAILABLE = 0x85
+const ERR_INVALID_TYPE = 0x86
+const ERR_NO_SESSION_RUNNING = 0x87
+const ERR_NOTHING_TO_STOP = 0x88
+const ERR_ACTIVITY_TYPE_OUT_OF_RANGE = 0x89
+const ERR_OPERATION_FAILED = 0x8A
+
+// The sub-session ID that names the whole session.
+const WHOLE_SESSION = 0xFFFF
+
+// The Header field of a segment, the Flags bits of the Session Descriptor and of
+// the Current Session.
+const HEADER_FIRST_SEGMENT = 0x01
+const HEADER_LAST_SEGMENT = 0x02
+const DESCRIBES_SESSION = 0x01
+const SESSION_RUNNING = 0x02
+const DELETED_SESSION = 0x04
+
+// The octets of the Current Session value.
+const CURRENT_SESSION_SIZE = 17
+
+// ── Configuration, handles and state ────────────────────────────────
+
+// What the service has.  `features` is the Features value, `kinds` the data
+// characteristics (bit k for kind k; bits 0 and 1 are set), `access` the access
+// of every value and descriptor (Encrypted or Authenticated).  `max_sessions` and
+// `max_sub_sessions` (for each session) limit the table of sessions, and
+// `max_records` the records kept for Get Ended Session Data (0 keeps none).
+struct PamsConfig
+    var features: Int
+    var kinds: Int
+    var access: gatt_server.Access
+    var max_sessions: Int
+    var max_sub_sessions: Int
+    var max_records: Int
+
+// The handles of the service; `data[k]` and `data_cccd[k]` are those of the data
+// characteristic of kind k and its descriptor, 0 for a kind the service lacks.
+struct PamsHandles
+    service: Int
+    features: Int
+    data: [Int]
+    data_cccd: [Int]
+    control_point: Int
+    control_point_cccd: Int
+    current: Int
+    current_cccd: Int
+    descriptor: Int
+    descriptor_cccd: Int
+
+// A session: its ID, when it started and, once it ended, when it ended (a base
+// time in seconds since 2000-01-01 and a time offset in minutes).
+@value
+struct PamsSession
+    id: u16
+    start_base: Int
+    start_offset: Int
+    end_base: Int
+    end_offset: Int
+    running: Bool
+
+// A sub-session of a session, with its average activity type: the sub-field the
+// monitor detects and the one the user sets.
+@value
+struct PamsSub
+    session: u16
+    id: u16
+    start_base: Int
+    start_offset: Int
+    end_base: Int
+    end_offset: Int
+    running: Bool
+    monitor_type: u8
+    user_type: u8
+
+// A Data Record kept for Get Ended Session Data: its kind, session, sub-session
+// and the octets after the Header field.
+struct PamsStored
+    kind: Int
+    session: Int
+    sub: Int
+    data: [u8]
+
+// What the service knows between connections' requests.  `base_time` and
+// `time_offset` are the clock; `current` and `current_sub` the running session
+// and sub-session (-1 for none), `next_session` the ID the next session tries
+// first and `next_sub` the ID of the next sub-session of the running session; `last` and `last_sub` the session and sub-session that
+// ran last, which the Current Session characteristic names while none runs;
+// `sequence` and `counters` the Sequence Number and Rolling Segment Counter of
+// each kind; `consent` whether a Multiple Users monitor may send data.
+struct PamsState
+    var base_time: Int
+    var time_offset: Int
+    var sessions: [PamsSession]
+    var subs: [PamsSub]
+    var records: [PamsStored]
+    var next_session: Int
+    var current: Int
+    var current_sub: Int
+    var next_sub: Int
+    var last: Int
+    var last_sub: Int
+    var sequence: [Int]
+    var counters: [Int]
+    var consent: Bool
+
+// The state of a monitor with no session; a Multiple Users monitor has no
+// consent yet.
+@tier(app)
+fn new_pams_state(config: PamsConfig) -> PamsState
+    PamsState {
+        base_time: 0, time_offset: 0, sessions: [], subs: [], records: [], next_session: 0, current: -1, current_sub: -1, next_sub: 0,
+        last: -1, last_sub: -1, sequence: [0, 0, 0, 0, 0, 0, 0], counters: [0, 0, 0, 0, 0, 0, 0],
+        consent: (config.features & FEATURE_MULTIPLE_USERS) == 0 }
+
+// The clock: seconds since 2000-01-01 and the offset of the local time in minutes.
+@tier(embedded)
+@no_alloc
+fn pams_set_time(var state: PamsState, base_time: Int, time_offset: Int)
+    state.base_time = base_time
+    state.time_offset = time_offset
+
+// The user of a Multiple Users monitor gave, or withdrew, the consent through the
+// User Data Service.
+@tier(embedded)
+@no_alloc
+fn pams_set_consent(var state: PamsState, consent: Bool)
+    state.consent = consent
+
+// ── The tables of the data characteristics ──────────────────────────
+
+// The octets of each optional field of kind `kind`, in the order of the
+// specification's table; the position is the bit of the Flags field.
+@tier(app)
+fn pams_sizes(kind: Int) -> [Int]
+    if kind == KIND_GENERAL_INSTANTANEOUS
+        return [2, 2, 2, 2, 1, 2, 2, 3, 2, 2, 2]
+    if kind == KIND_GENERAL_SUMMARY
+        return [4, 4, 4, 2, 1, 1, 1, 3, 2, 2, 2, 3, 3, 2, 2, 2, 1, 3, 3, 4, 2, 2, 2, 2, 3]
+    if kind == KIND_CARDIORESPIRATORY_INSTANTANEOUS
+        return [1, 1, 2, 1, 2, 1, 1]
+    if kind == KIND_CARDIORESPIRATORY_SUMMARY
+        return [3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 3]
+    if kind == KIND_STEP_COUNTER_SUMMARY
+        return [3, 3, 3, 3, 3]
+    if kind == KIND_SLEEP_INSTANTANEOUS
+        return [3, 3, 3, 3, 1]
+    if kind == KIND_SLEEP_SUMMARY
+        return [3, 3, 3, 2, 2, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 3]
+    []
+
+// The Features bit that lets each optional field of kind `kind` into a record.
+@tier(app)
+fn pams_field_features(kind: Int) -> [Int]
+    if kind == KIND_GENERAL_INSTANTANEOUS
+        return [4, 6, 8, 10, 11, 13, 16, 20, 22, 23, 24]
+    if kind == KIND_GENERAL_SUMMARY
+        return [3, 5, 7, 9, 11, 11, 11, 12, 13, 13, 13, 14, 15, 16, 16, 16, 17, 18, 19, 21, 23, 23, 23, 24, 25]
+    if kind == KIND_CARDIORESPIRATORY_INSTANTANEOUS
+        return [31, 32, 33, 34, 35, 36, 37]
+    if kind == KIND_CARDIORESPIRATORY_SUMMARY
+        return [26, 27, 28, 29, 30, 31, 31, 31, 32, 32, 32, 33, 33, 33, 34, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 25]
+    if kind == KIND_STEP_COUNTER_SUMMARY
+        return [38, 39, 40, 12, 25]
+    if kind == KIND_SLEEP_INSTANTANEOUS
+        return [50, 51, 52, 53, 54]
+    if kind == KIND_SLEEP_SUMMARY
+        return [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50, 50, 51, 51, 51, 52, 52, 52, 54, 25]
+    []
+
+// The octets of the Flags field of kind `kind`.
+@tier(embedded)
+@no_alloc
+fn pams_flags_size(kind: Int) -> Int
+    if kind == KIND_GENERAL_INSTANTANEOUS or kind == KIND_SLEEP_SUMMARY
+        return 3
+    if kind == KIND_GENERAL_SUMMARY or kind == KIND_CARDIORESPIRATORY_SUMMARY
+        return 4
+    if kind == KIND_STEP_COUNTER_SUMMARY
+        return 1
+    2
+
+// The bit of the Device Worn flag of kind `kind`, -1 for a kind that has none.
+@tier(embedded)
+@no_alloc
+fn pams_worn_bit(kind: Int) -> Int
+    if kind == KIND_GENERAL_INSTANTANEOUS
+        return 23
+    if kind == KIND_CARDIORESPIRATORY_INSTANTANEOUS or kind == KIND_SLEEP_INSTANTANEOUS
+        return 15
+    -1
+
+// Whether kind `kind` is a summary characteristic (indicated) and not an
+// instantaneous one (notified).
+@tier(embedded)
+@no_alloc
+fn pams_is_summary(kind: Int) -> Bool
+    kind == KIND_GENERAL_SUMMARY or kind == KIND_CARDIORESPIRATORY_SUMMARY or kind == KIND_STEP_COUNTER_SUMMARY or kind == KIND_SLEEP_SUMMARY
+
+// The UUID of the data characteristic of kind `kind`.
+@tier(embedded)
+@no_alloc
+fn pams_kind_uuid(kind: Int) -> Int
+    0x2B3C + kind
+
+// The octets of the fixed part of a record after the Header: the Flags field, the
+// Session ID, the Sub-session ID, the Relative Timestamp and the Sequence Number.
+@tier(embedded)
+@no_alloc
+fn pams_fixed_size(kind: Int) -> Int
+    pams_flags_size(kind) + 12
+
+// The octets of the longest value of kind `kind`: the Header field, the fixed
+// part and every field.
+@tier(app)
+fn pams_longest(kind: Int) -> Int
+    var n = 1 + pams_fixed_size(kind)
+    for s in pams_sizes(kind)
+        n = n + s
+    n
+
+// Whether `v` is a value of the Activity Type sub-field: 0 to 0x0E or 0xFF.
+@tier(embedded)
+@no_alloc
+fn pams_activity_octet_valid(v: Int) -> Bool
+    (v >= 0 and v <= 0x0E) or v == 0xFF
+
+// Whether `features` is a Features value: at least one bit and none of the
+// reserved bits 55 to 63.
+@tier(embedded)
+@no_alloc
+fn pams_features_valid(features: Int) -> Bool
+    features > 0 and (features >>> FEATURE_BITS) == 0
+
+// ── Configuration rules ─────────────────────────────────────────────
+
+// Whether the access is a level of the profile: LE security mode 1, level 2 or 3.
+@tier(embedded)
+@no_alloc
+fn pams_access_conforms(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        _ => false
+
+// Whether kind `kind` has a field whose Features bit `features` sets.
+@tier(app)
+fn pams_kind_supported(features: Int, kind: Int) -> Bool
+    for f in pams_field_features(kind)
+        if ((features >>> f) & 1) != 0
+            return true
+    false
+
+// Whether some data characteristic of `kinds` carries a field for Features bit `bit`.
+@tier(app)
+fn pams_bit_carried(kinds: Int, bit: Int) -> Bool
+    for k in 0..KIND_COUNT
+        if ((kinds >>> k) & 1) != 0
+            for f in pams_field_features(k)
+                if f == bit
+                    return true
+    false
+
+// What is wrong with `config`, the first thing: CONFIG_OK, CONFIG_NOT_PERMITTED
+// for an access outside the profile's levels and CONFIG_INVALID for a value or
+// a set of characteristics that breaks a rule of the service.
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+@tier(app)
+fn pams_config_error(config: PamsConfig) -> Int
+    if not pams_access_conforms(config.access)
+        return CONFIG_NOT_PERMITTED
+    if not pams_features_valid(config.features)
+        return CONFIG_INVALID
+    if config.kinds < 0 or (config.kinds >>> KIND_COUNT) != 0 or (config.kinds & 3) != 3
+        return CONFIG_INVALID
+    for k in 2..KIND_COUNT
+        if ((config.kinds >>> k) & 1) != 0 and not pams_kind_supported(config.features, k)
+            return CONFIG_INVALID
+    for bit in 3..FEATURE_BITS
+        if ((config.features >>> bit) & 1) != 0 and not pams_bit_carried(config.kinds, bit)
+            return CONFIG_INVALID
+    if config.max_sessions < 1 or config.max_sessions > 0xFFFE
+        return CONFIG_INVALID
+    if config.max_sub_sessions < 1 or config.max_sub_sessions > 0xFFFE
+        return CONFIG_INVALID
+    if config.max_records < 0 or config.max_records > 0xFFFF
+        return CONFIG_INVALID
+    CONFIG_OK
+
+// The data characteristics a monitor with `features` has when it takes every one
+// that can carry a supported field.
+@tier(app)
+fn pams_default_kinds(features: Int) -> Int
+    var kinds = 3
+    for k in 2..KIND_COUNT
+        if pams_kind_supported(features, k)
+            kinds = kinds | (1 << k)
+    kinds
+
+// A monitor of `features` with the characteristics that carry them, on an
+// encrypted link, room for 8 sessions of 8 sub-sessions and 64 kept records.
+@tier(app)
+fn default_pams_config(features: Int) -> PamsConfig
+    PamsConfig {
+        features: features, kinds: pams_default_kinds(features), access: gatt_server.Access.Encrypted, max_sessions: 8,
+        max_sub_sessions: 8, max_records: 64 }
+
+// ── Data Records ────────────────────────────────────────────────────
+
+// One Data Record of kind `kind` for the session `session` and the sub-session
+// `sub_session` (0xFFFF for the whole session), `relative_time` seconds after the
+// session began.  `values[i]` is the value of optional field i, and `present`
+// holds the fields the monitor has now (bit i for field i).  `worn` says the
+// device is worn.  An Activity Type value is the monitor-defined sub-field in the
+// low octet and the user-defined in the high one; the units are the specification's.
+struct PamsRecord
+    var kind: Int
+    var session: Int
+    var sub_session: Int
+    var relative_time: Int
+    var present: Int
+    var worn: Bool
+    var values: [Int]
+
+// A record of `kind` with no field.
+@tier(app)
+fn pams_record(kind: Int, session: Int, sub_session: Int, relative_time: Int) -> PamsRecord
+    var values: [Int] = []
+    for _ in pams_sizes(kind)
+        list.push(values, 0)
+    PamsRecord { kind: kind, session: session, sub_session: sub_session, relative_time: relative_time, present: 0, worn: false, values: values }
+
+// Give optional field `field` of `rec` the value `value` and mark it present.
+@tier(embedded)
+@no_alloc
+fn pams_set_field(var rec: PamsRecord, field: Int, value: Int)
+    rec.values[field] = value
+    rec.present = rec.present | (1 << field)
+
+// The fields of `rec` that reach the record: the ones present whose Features bit
+// is set.
+@tier(app)
+fn pams_taken(features: Int, rec: PamsRecord) -> Int
+    var take = 0
+    var i = 0
+    for f in pams_field_features(rec.kind)
+        if ((features >>> f) & 1) != 0 and ((rec.present >>> i) & 1) != 0
+            take = take | (1 << i)
+        i = i + 1
+    take
+
+// Whether `v` fits field `i` of kind `kind` in the octets the table gives it.
+@tier(embedded)
+@no_alloc
+fn pams_value_valid(kind: Int, i: Int, size: Int, v: Int) -> Bool
+    if kind == KIND_GENERAL_INSTANTANEOUS and i == 7
+        return v >= -8388608 and v <= 8388607
+    if v < 0 or v >= (1 << (8 * size))
+        return false
+    if (kind == KIND_GENERAL_INSTANTANEOUS and i == 10) or (kind == KIND_GENERAL_SUMMARY and i == 23)
+        return pams_activity_octet_valid(v & 0xFF) and pams_activity_octet_valid(v >>> 8)
+    if kind == KIND_SLEEP_INSTANTANEOUS and i == 3
+        return (v & 0x7FC000) == 0
+    true
+
+// Whether the service can send `rec`: a kind, a Session ID below 0xFFFF, a
+// Sub-session ID of 16 bits, a Relative Timestamp of 32 bits, one value for each
+// field and every field it would send inside its format.
+@tier(app)
+fn pams_record_valid(features: Int, rec: PamsRecord) -> Bool
+    if rec.kind < 0 or rec.kind >= KIND_COUNT
+        return false
+    if rec.session < 0 or rec.session >= WHOLE_SESSION or rec.sub_session < 0 or rec.sub_session > WHOLE_SESSION
+        return false
+    if rec.relative_time < 0 or rec.relative_time > 0xFFFFFFFF
+        return false
+    let sizes = pams_sizes(rec.kind)
+    if list.len(rec.values) != list.len(sizes)
+        return false
+    let take = pams_taken(features, rec)
+    for i in 0..list.len(sizes)
+        if ((take >>> i) & 1) != 0 and not pams_value_valid(rec.kind, i, sizes[i], rec.values[i])
+            return false
+    true
+
+// The Data Record after the Header field for `rec` with the Sequence Number
+// `sequence`; empty when `rec` cannot be sent.
+@tier(app)
+fn pams_encode(features: Int, rec: PamsRecord, sequence: Int) -> [u8]
+    var out: [u8] = []
+    if not pams_record_valid(features, rec)
+        return out
+    let take = pams_taken(features, rec)
+    var flags = take
+    let worn = pams_worn_bit(rec.kind)
+    if worn >= 0 and rec.worn and (features & FEATURE_DEVICE_WORN) != 0
+        flags = flags | (1 << worn)
+    wire.put(var out, flags, pams_flags_size(rec.kind))
+    wire.put(var out, rec.session, 2)
+    wire.put(var out, rec.sub_session, 2)
+    wire.put(var out, rec.relative_time, 4)
+    wire.put(var out, sequence, 4)
+    let sizes = pams_sizes(rec.kind)
+    for i in 0..list.len(sizes)
+        if ((take >>> i) & 1) != 0
+            wire.put(var out, rec.values[i], sizes[i])
+    out
+
+// The values to send for the Data Record `data` (the octets after the Header
+// field) at an ATT_MTU of `mtu` (at least 23), the first Rolling Segment Counter
+// being `counter` ([PAMS] 2.4): each value is a Header field and at most
+// `mtu` - 4 octets of the record, the first has First Segment, the last Last
+// Segment, and the counter goes up by one for each segment and wraps from 63 to 0.
+@tier(app)
+fn pams_segments(counter: Int, data: [u8], mtu: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if mtu < 23 or list.len(data) == 0
+        return out
+    let room = mtu - 4
+    var at = 0
+    var c = counter & 63
+    while at < list.len(data)
+        let left = list.len(data) - at
+        let take = if left > room then room else left
+        var header = c << 2
+        if at == 0
+            header = header | HEADER_FIRST_SEGMENT
+        if take == left
+            header = header | HEADER_LAST_SEGMENT
+        var v: [u8] = [header as u8]
+        list.append(v, data[at:at + take])
+        list.push(out, v)
+        at = at + take
+        c = (c + 1) & 63
+    out
+
+// ── Sessions ────────────────────────────────────────────────────────
+
+// The index of session `id` in `state.sessions`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn pams_find_session(state: PamsState, id: Int) -> Int
+    for i in 0..list.len(state.sessions)
+        if state.sessions[i].id == id
+            return i
+    -1
+
+// The index of sub-session `id` of session `session` in `state.subs`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn pams_find_sub(state: PamsState, session: Int, id: Int) -> Int
+    for i in 0..list.len(state.subs)
+        if state.subs[i].session == session and state.subs[i].id == id
+            return i
+    -1
+
+@tier(embedded)
+@no_alloc
+fn pams_sub_count(state: PamsState, session: Int) -> Int
+    var n = 0
+    for s in state.subs
+        if s.session == session
+            n = n + 1
+    n
+
+// The ID of the next session: the first number from `next_session` on (after
+// 0xFFFE it is 0 again) that no session has.
+@tier(embedded)
+@no_alloc
+fn pams_new_session_id(state: PamsState) -> Int
+    var id = state.next_session
+    for _ in 0..WHOLE_SESSION
+        if id >= WHOLE_SESSION
+            id = 0
+        if pams_find_session(state, id) < 0
+            return id
+        id = id + 1
+    id
+
+// The session `s` ended at the clock of `state`.
+@tier(embedded)
+@no_alloc
+fn pams_session_ended(s: PamsSession, base_time: Int, time_offset: Int) -> PamsSession
+    PamsSession { id: s.id, start_base: s.start_base, start_offset: s.start_offset, end_base: base_time, end_offset: time_offset, running: false }
+
+@tier(embedded)
+@no_alloc
+fn pams_sub_ended(s: PamsSub, base_time: Int, time_offset: Int) -> PamsSub
+    PamsSub {
+        session: s.session, id: s.id, start_base: s.start_base, start_offset: s.start_offset, end_base: base_time,
+        end_offset: time_offset, running: false, monitor_type: s.monitor_type, user_type: s.user_type }
+
+// End the running sub-session, and the session with it when `whole`.
+@tier(embedded)
+@no_alloc
+fn pams_end_running(var state: PamsState, whole: Bool)
+    if state.current < 0
+        return
+    let k = pams_find_sub(state, state.current, state.current_sub)
+    if k >= 0
+        state.subs[k] = pams_sub_ended(state.subs[k], state.base_time, state.time_offset)
+    state.last = state.current
+    state.last_sub = state.current_sub
+    state.current_sub = -1
+    if whole
+        let i = pams_find_session(state, state.current)
+        if i >= 0
+            state.sessions[i] = pams_session_ended(state.sessions[i], state.base_time, state.time_offset)
+        state.current = -1
+
+// Whether a session can start: the table has room for it.
+@tier(embedded)
+@no_alloc
+fn pams_can_start(config: PamsConfig, state: PamsState) -> Bool
+    list.len(state.sessions) < config.max_sessions
+
+// Whether a sub-session can start: a session runs and has room for another.
+@tier(embedded)
+@no_alloc
+fn pams_can_start_sub(config: PamsConfig, state: PamsState) -> Bool
+    state.current >= 0 and pams_sub_count(state, state.current) < config.max_sub_sessions
+
+// Start a session and its first sub-session at the clock; the running session,
+// if there is one, ends.  False when the table has no room.
+@tier(app)
+fn pams_begin_session(config: PamsConfig, var state: PamsState) -> Bool
+    if not pams_can_start(config, state)
+        return false
+    pams_end_running(var state, true)
+    let id = pams_new_session_id(state)
+    state.next_session = id + 1
+    list.push(state.sessions, PamsSession {
+        id: id as u16, start_base: state.base_time, start_offset: state.time_offset, end_base: 0, end_offset: 0, running: true })
+    list.push(state.subs, PamsSub {
+        session: id as u16, id: 0, start_base: state.base_time, start_offset: state.time_offset, end_base: 0, end_offset: 0,
+        running: true, monitor_type: 0, user_type: 0 })
+    state.current = id
+    state.current_sub = 0
+    state.next_sub = 1
+    true
+
+// Start a sub-session of the running session at the clock; the running
+// sub-session ends.  False when none runs or the session has no room.
+@tier(app)
+fn pams_begin_sub(config: PamsConfig, var state: PamsState) -> Bool
+    if not pams_can_start_sub(config, state)
+        return false
+    let session = state.current
+    pams_end_running(var state, false)
+    state.current = session
+    let id = state.next_sub
+    state.next_sub = id + 1
+    list.push(state.subs, PamsSub {
+        session: session as u16, id: id as u16, start_base: state.base_time, start_offset: state.time_offset, end_base: 0, end_offset: 0,
+        running: true, monitor_type: 0, user_type: 0 })
+    state.current_sub = id
+    true
+
+// Delete session `id` with its sub-sessions and the records kept for it.
+@tier(app)
+fn pams_delete_session(var state: PamsState, id: Int)
+    var sessions: [PamsSession] = []
+    for s in state.sessions
+        if s.id != id
+            list.push(sessions, s)
+    state.sessions = sessions
+    var subs: [PamsSub] = []
+    for s in state.subs
+        if s.session != id
+            list.push(subs, s)
+    state.subs = subs
+    var records: [PamsStored] = []
+    for r in state.records
+        if r.session != id
+            list.push(records, r)
+    state.records = records
+    if state.last == id
+        state.last = -1
+        state.last_sub = -1
+
+// The average activity type of a sub-session, as the General Activity Summary
+// Data holds it: the monitor-defined sub-field in the low octet and the
+// user-defined one in the high octet, 0 for a sub-session that does not exist.
+@tier(embedded)
+@no_alloc
+fn pams_average_activity_type(state: PamsState, session: Int, sub: Int) -> Int
+    let k = pams_find_sub(state, session, sub)
+    if k < 0
+        return 0
+    (state.subs[k].monitor_type as Int) | ((state.subs[k].user_type as Int) << 8)
+
+// Set the monitor-defined sub-field of the average activity type of a
+// sub-session; false for one that does not exist or a reserved value.
+@tier(embedded)
+@no_alloc
+fn pams_set_monitor_type(var state: PamsState, session: Int, sub: Int, monitor_type: Int) -> Bool
+    let k = pams_find_sub(state, session, sub)
+    if k < 0 or not pams_activity_octet_valid(monitor_type)
+        return false
+    let s = state.subs[k]
+    state.subs[k] = PamsSub {
+        session: s.session, id: s.id, start_base: s.start_base, start_offset: s.start_offset, end_base: s.end_base,
+        end_offset: s.end_offset, running: s.running, monitor_type: monitor_type as u8, user_type: s.user_type }
+    true
+
+// ── The values of the session characteristics ───────────────────────
+
+// The Physical Activity Current Session value: the running session and
+// sub-session, or while none runs the one that ran last, or zeros before the
+// first.
+@tier(app)
+fn pams_current_value(state: PamsState) -> [u8]
+    var out: [u8] = []
+    let running = state.current >= 0
+    let session = if running then state.current else state.last
+    let sub = if running then state.current_sub else state.last_sub
+    let i = pams_find_session(state, session)
+    let k = pams_find_sub(state, session, sub)
+    wire.put(var out, if running then 1 else 0, 1)
+    if i < 0 or k < 0
+        for _ in 1..CURRENT_SESSION_SIZE
+            list.push(out, 0)
+        return out
+    wire.put(var out, state.sessions[i].id, 2)
+    wire.put(var out, state.sessions[i].start_base, 4)
+    wire.put(var out, state.sessions[i].start_offset, 2)
+    wire.put(var out, state.subs[k].id, 2)
+    wire.put(var out, state.subs[k].start_base, 4)
+    wire.put(var out, state.subs[k].start_offset, 2)
+    out
+
+// The Session Descriptor value of session `s`; `deleted` sets the Deleted
+// Session bit.  The end of a session that runs is left out.
+@tier(app)
+fn pams_session_descriptor(s: PamsSession, deleted: Bool) -> [u8]
+    var out: [u8] = []
+    var flags = DESCRIBES_SESSION
+    if s.running
+        flags = flags | SESSION_RUNNING
+    if deleted
+        flags = flags | DELETED_SESSION
+    wire.put(var out, flags, 1)
+    wire.put(var out, s.id, 2)
+    wire.put(var out, s.start_base, 4)
+    wire.put(var out, s.start_offset, 2)
+    if not s.running
+        wire.put(var out, s.end_base, 4)
+        wire.put(var out, s.end_offset, 2)
+    out
+
+// The Session Descriptor value of sub-session `s`.
+@tier(app)
+fn pams_sub_descriptor(s: PamsSub) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, if s.running then SESSION_RUNNING else 0, 1)
+    wire.put(var out, s.session, 2)
+    wire.put(var out, s.id, 2)
+    wire.put(var out, s.start_base, 4)
+    wire.put(var out, s.start_offset, 2)
+    if not s.running
+        wire.put(var out, s.end_base, 4)
+        wire.put(var out, s.end_offset, 2)
+    out
+
+// The Features value: 8 octets.
+@tier(app)
+fn pams_features_value(features: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, features, 8)
+    out
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_pams_service(var db: GattDb, config: PamsConfig) -> Result<PamsHandles, profile_builder.ProfileError>
+    let problem = pams_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_PHYSICAL_ACTIVITY_MONITOR_SERVICE))!
+    let features = profile_builder.add_value(
+        var db, gatt_server.PROP_READ, profile_builder.read_only(config.access), gatt_server.le16(UUID_PAM_FEATURES),
+        pams_features_value(config.features))!
+    var data: [Int] = []
+    var data_cccd: [Int] = []
+    for k in 0..KIND_COUNT
+        if ((config.kinds >>> k) & 1) != 0
+            let props = if pams_is_summary(k) then gatt_server.PROP_INDICATE else gatt_server.PROP_NOTIFY
+            let value = profile_builder.add_value(
+                var db, props, profile_builder.notify_only(), gatt_server.le16(pams_kind_uuid(k)), [])!
+            let cccd = profile_builder.add_cccd(var db, both)!
+            list.push(data, value)
+            list.push(data_cccd, cccd)
+        else
+            list.push(data, 0)
+            list.push(data_cccd, 0)
+    let added = sensor_control.add_control_point_with_errors(
+        var db, UUID_PAM_CONTROL_POINT, config.access, both, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED,
+        att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)!
+    var none: [u8] = []
+    for _ in 0..CURRENT_SESSION_SIZE
+        list.push(none, 0)
+    let current = profile_builder.add_value(
+        var db, gatt_server.PROP_READ | gatt_server.PROP_INDICATE, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_PAM_CURRENT_SESSION), none)!
+    let current_cccd = profile_builder.add_cccd(var db, both)!
+    let descriptor = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_PAM_SESSION_DESCRIPTOR), [])!
+    let descriptor_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(PamsHandles {
+        service: service, features: features, data: data, data_cccd: data_cccd, control_point: added.0,
+        control_point_cccd: added.1, current: current, current_cccd: current_cccd, descriptor: descriptor,
+        descriptor_cccd: descriptor_cccd })
+
+// Store `value` as the value of `handle` and send it as the client asked.
+@tier(app)
+fn pams_push(var db: GattDb, var link: AttLink, handle: Int, value: [u8], now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handle, value)
+    gatt_server.send_value(var db, var link, handle, now_ms)
+
+// Whether the client enabled what kind `kind` sends: the notification of an
+// instantaneous characteristic, the indication of a summary one.
+@tier(embedded)
+@no_alloc
+fn pams_data_enabled(link: AttLink, handles: PamsHandles, kind: Int) -> Bool
+    let cccd = handles.data_cccd[kind]
+    if cccd == 0
+        return false
+    let bit = if pams_is_summary(kind) then gatt_server.CCC_INDICATION else gatt_server.CCC_NOTIFICATION
+    (gatt_server.configuration(link, cccd) & bit) != 0
+
+@tier(embedded)
+@no_alloc
+fn pams_indication_enabled(link: AttLink, cccd: Int) -> Bool
+    (gatt_server.configuration(link, cccd) & gatt_server.CCC_INDICATION) != 0
+
+// Send the Data Record `data` of kind `kind` in segments to a client that enabled
+// the characteristic; the Rolling Segment Counter goes on only for a record that
+// is sent.
+@tier(app)
+fn pams_transmit(var db: GattDb, var link: AttLink, handles: PamsHandles, var state: PamsState, kind: Int, data: [u8], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if handles.data[kind] == 0 or not pams_data_enabled(link, handles, kind)
+        return out
+    let segments = pams_segments(state.counters[kind], data, gatt_server.mtu_of(link, 0))
+    state.counters[kind] = (state.counters[kind] + list.len(segments)) & 63
+    for v in segments
+        list.append(out, pams_push(var db, var link, handles.data[kind], v, now_ms))
+    out
+
+// Keep the Data Record `data` of kind `kind` for Get Ended Session Data.  A
+// summary replaces the one of the same session and sub-session; at `max_records`
+// the oldest record goes.  Nothing is kept with `max_records` of 0.
+@tier(app)
+fn pams_keep(config: PamsConfig, var state: PamsState, kind: Int, session: Int, sub: Int, data: [u8])
+    if config.max_records == 0
+        return
+    var records: [PamsStored] = []
+    for r in state.records
+        if not (pams_is_summary(kind) and r.kind == kind and r.session == session and r.sub == sub)
+            list.push(records, r)
+    list.push(records, PamsStored { kind: kind, session: session, sub: sub, data: data })
+    if list.len(records) > config.max_records
+        records = records[list.len(records) - config.max_records:]
+    state.records = records
+
+// Send the record `rec`: validate it, give it the next Sequence Number of its
+// kind, keep it and send it to a client that enabled the characteristic.  A
+// Multiple Users monitor sends only after `pams_set_consent`.  Nothing for a
+// kind the service lacks or a record it cannot hold.
+@tier(app)
+fn pams_send_record(var db: GattDb, var link: AttLink, handles: PamsHandles, config: PamsConfig, var state: PamsState, rec: PamsRecord, now_ms: Int) -> [[u8]]
+    if rec.kind < 0 or rec.kind >= KIND_COUNT or handles.data[rec.kind] == 0
+        return []
+    let sequence = state.sequence[rec.kind]
+    let data = pams_encode(config.features, rec, sequence)
+    if list.len(data) == 0
+        return []
+    state.sequence[rec.kind] = (sequence + 1) & 0xFFFFFFFF
+    pams_keep(config, var state, rec.kind, rec.session, rec.sub_session, data)
+    if not state.consent
+        return []
+    pams_transmit(var db, var link, handles, var state, rec.kind, data, now_ms)
+
+// Update the Current Session value and indicate it to a client that enabled the
+// indication.
+@tier(app)
+fn pams_describe_current(var db: GattDb, var link: AttLink, handles: PamsHandles, state: PamsState, now_ms: Int) -> [[u8]]
+    pams_push(var db, var link, handles.current, pams_current_value(state), now_ms)
+
+// The monitor starts a session (`sub_only` false) or a sub-session itself: the
+// Current Session indications that follow, two when a session ends for the new
+// one; empty (and nothing started) when the table has no room or, for a
+// sub-session, no session runs.
+@tier(app)
+fn pams_start(var db: GattDb, var link: AttLink, handles: PamsHandles, config: PamsConfig, var state: PamsState, sub_only: Bool, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if sub_only
+        if not pams_begin_sub(config, var state)
+            return out
+        list.append(out, pams_describe_current(var db, var link, handles, state, now_ms))
+        return out
+    if not pams_can_start(config, state)
+        return out
+    if state.current >= 0
+        pams_end_running(var state, true)
+        list.append(out, pams_describe_current(var db, var link, handles, state, now_ms))
+    let _ = pams_begin_session(config, var state)
+    list.append(out, pams_describe_current(var db, var link, handles, state, now_ms))
+    out
+
+// The monitor stops the running session itself: the Current Session indication,
+// none when no session runs.
+@tier(app)
+fn pams_stop(var db: GattDb, var link: AttLink, handles: PamsHandles, var state: PamsState, now_ms: Int) -> [[u8]]
+    if state.current < 0
+        return []
+    pams_end_running(var state, true)
+    pams_describe_current(var db, var link, handles, state, now_ms)
+
+// ── The control point ───────────────────────────────────────────────
+
+// The octets of a request with opcode `op`, the opcode included.
+@tier(embedded)
+@no_alloc
+fn pams_request_length(op: Int) -> Int
+    if op == OP_ENQUIRE_SESSIONS or op == OP_STOP_SESSION
+        return 1
+    if op == OP_ENQUIRE_SUB_SESSIONS or op == OP_DELETE_ENDED_SESSION or op == OP_SET_AVERAGE_ACTIVITY_TYPE
+        return 3
+    if op == OP_START_SESSION
+        return 2
+    6
+
+// The kept records of kind `kind` for session `session`, of sub-session `sub`
+// (0xFFFF for all of them).
+@tier(app)
+fn pams_matching(state: PamsState, kind: Int, session: Int, sub: Int) -> [PamsStored]
+    var out: [PamsStored] = []
+    for r in state.records
+        if r.kind == kind and r.session == session and (sub == WHOLE_SESSION or r.sub == sub)
+            list.push(out, r)
+    out
+
+// The error that refuses the request written to the control point, 0 when it is
+// accepted: the Application Error Codes of [PAMS] 1.7 and the ATT errors of the
+// descriptors, in the order the specification's text gives (see the header).
+@tier(app)
+fn pams_request_error(link: AttLink, handles: PamsHandles, config: PamsConfig, state: PamsState, request: [u8]) -> Int
+    let n = list.len(request)
+    let op = if n == 0 then 0 else request[0] as Int
+    if op < OP_ENQUIRE_SESSIONS or op > OP_SET_AVERAGE_ACTIVITY_TYPE
+        return ERR_OP_CODE_NOT_SUPPORTED
+    if op == OP_SET_AVERAGE_ACTIVITY_TYPE and (config.features & FEATURE_ACTIVITY_TYPE) == 0
+        return ERR_OP_CODE_NOT_SUPPORTED
+    if n != pams_request_length(op)
+        return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    let improperly = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+    if op == OP_ENQUIRE_SESSIONS
+        if not pams_indication_enabled(link, handles.descriptor_cccd)
+            return improperly
+        if list.len(state.sessions) == 0
+            return ERR_NO_SESSIONS_AVAILABLE
+        return 0
+    if op == OP_ENQUIRE_SUB_SESSIONS
+        if pams_find_session(state, wire.get(request, 1, 2)) < 0
+            return ERR_INVALID_SESSION_ID
+        if not pams_indication_enabled(link, handles.descriptor_cccd)
+            return improperly
+        return 0
+    if op == OP_GET_ENDED_SESSION_DATA
+        let session = wire.get(request, 1, 2)
+        let sub = wire.get(request, 3, 2)
+        let kind = request[5] as Int
+        let i = pams_find_session(state, session)
+        if i < 0
+            return ERR_INVALID_SESSION_ID
+        if sub != WHOLE_SESSION and pams_find_sub(state, session, sub) < 0
+            return ERR_INVALID_SUB_SESSION_ID
+        if state.sessions[i].running
+            return ERR_SESSION_STILL_RUNNING
+        if kind >= KIND_COUNT
+            return ERR_OPERATION_FAILED
+        if not state.consent
+            return ERR_OPERATION_FAILED
+        if handles.data[kind] != 0 and not pams_data_enabled(link, handles, kind)
+            return improperly
+        if list.len(pams_matching(state, kind, session, sub)) == 0
+            return ERR_NO_DATA_AVAILABLE
+        return 0
+    if op == OP_START_SESSION
+        let what = request[1] as Int
+        if what > 1
+            return ERR_INVALID_TYPE
+        if what == 1 and state.current < 0
+            return ERR_NO_SESSION_RUNNING
+        if what == 0 and not pams_can_start(config, state)
+            return ERR_OPERATION_FAILED
+        if what == 1 and not pams_can_start_sub(config, state)
+            return ERR_OPERATION_FAILED
+        return 0
+    if op == OP_STOP_SESSION
+        if state.current < 0
+            return ERR_NOTHING_TO_STOP
+        return 0
+    if op == OP_DELETE_ENDED_SESSION
+        let i = pams_find_session(state, wire.get(request, 1, 2))
+        if i < 0
+            return ERR_INVALID_SESSION_ID
+        if state.sessions[i].running
+            return ERR_SESSION_STILL_RUNNING
+        if not pams_indication_enabled(link, handles.descriptor_cccd)
+            return improperly
+        return 0
+    if (request[1] as Int) > 1
+        return ERR_INVALID_TYPE
+    if state.current < 0
+        return ERR_NO_SESSION_RUNNING
+    if not pams_activity_octet_valid(request[2] as Int)
+        return ERR_ACTIVITY_TYPE_OUT_OF_RANGE
+    0
+
+// Set the user-defined sub-field of the average activity type to `user` for the
+// current sub-session (`scope` 0) or all the sub-sessions of the running session
+// (`scope` 1): the sub-sessions, and the General Activity Summary records kept
+// for them.
+@tier(app)
+fn pams_set_average_type(var state: PamsState, scope: Int, user: Int)
+    for k in 0..list.len(state.subs)
+        let s = state.subs[k]
+        if s.session == state.current and (scope == 1 or s.id == state.current_sub)
+            state.subs[k] = PamsSub {
+                session: s.session, id: s.id, start_base: s.start_base, start_offset: s.start_offset, end_base: s.end_base,
+                end_offset: s.end_offset, running: s.running, monitor_type: s.monitor_type, user_type: user as u8 }
+            for r in 0..list.len(state.records)
+                let kept = state.records[r]
+                if kept.kind == KIND_GENERAL_SUMMARY and kept.session == s.session and kept.sub == s.id
+                    state.records[r] = PamsStored {
+                        kind: kept.kind, session: kept.session, sub: kept.sub, data: pams_with_user_type(kept.data, user) }
+
+// The octets of the General Activity Summary record `data` with the user-defined
+// sub-field of its Average Activity Type (field 23) set to `user`; the record
+// itself when it has no such field.
+@tier(app)
+fn pams_with_user_type(data: [u8], user: Int) -> [u8]
+    let flags = wire.get(data, 0, 4)
+    if ((flags >>> 23) & 1) == 0
+        return data[:]
+    let sizes = pams_sizes(KIND_GENERAL_SUMMARY)
+    var at = pams_fixed_size(KIND_GENERAL_SUMMARY)
+    for i in 0..23
+        if ((flags >>> i) & 1) != 0
+            at = at + sizes[i]
+    if at + 2 > list.len(data)
+        return data[:]
+    var out = data[:]
+    out[at + 1] = user as u8
+    out
+
+// The indication of the control point: `value`.
+@tier(app)
+fn pams_respond(var db: GattDb, var link: AttLink, handles: PamsHandles, value: [u8], now_ms: Int) -> [[u8]]
+    pams_push(var db, var link, handles.control_point, value, now_ms)
+
+// The control point's answer to a request that was accepted: carry it out and
+// answer the PDUs of the procedure.
+@tier(app)
+fn pams_execute(var db: GattDb, var link: AttLink, handles: PamsHandles, config: PamsConfig, var state: PamsState, request: [u8], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let op = request[0] as Int
+    if op == OP_ENQUIRE_SESSIONS
+        for s in state.sessions
+            list.append(out, pams_push(var db, var link, handles.descriptor, pams_session_descriptor(s, false), now_ms))
+        var response: [u8] = [OP_ENQUIRE_SESSIONS_SUCCESS]
+        wire.put(var response, list.len(state.sessions), 2)
+        list.append(out, pams_respond(var db, var link, handles, response, now_ms))
+    else if op == OP_ENQUIRE_SUB_SESSIONS
+        let session = wire.get(request, 1, 2)
+        var count = 0
+        for s in state.subs
+            if s.session == session
+                list.append(out, pams_push(var db, var link, handles.descriptor, pams_sub_descriptor(s), now_ms))
+                count = count + 1
+        var response: [u8] = [OP_ENQUIRE_SUB_SESSIONS_SUCCESS]
+        wire.put(var response, count, 2)
+        list.append(out, pams_respond(var db, var link, handles, response, now_ms))
+    else if op == OP_GET_ENDED_SESSION_DATA
+        let kept = pams_matching(state, request[5] as Int, wire.get(request, 1, 2), wire.get(request, 3, 2))
+        for r in kept
+            list.append(out, pams_transmit(var db, var link, handles, var state, r.kind, r.data, now_ms))
+        var response: [u8] = [OP_GET_ENDED_SESSION_DATA_SUCCESS]
+        wire.put(var response, list.len(kept), 3)
+        list.append(out, pams_respond(var db, var link, handles, response, now_ms))
+    else if op == OP_START_SESSION
+        list.append(out, pams_start(var db, var link, handles, config, var state, (request[1] as Int) == 1, now_ms))
+    else if op == OP_STOP_SESSION
+        list.append(out, pams_stop(var db, var link, handles, var state, now_ms))
+    else if op == OP_DELETE_ENDED_SESSION
+        let k = pams_find_session(state, wire.get(request, 1, 2))
+        let gone = state.sessions[k]
+        pams_delete_session(var state, gone.id)
+        list.append(out, pams_push(var db, var link, handles.descriptor, pams_session_descriptor(gone, true), now_ms))
+    else
+        pams_set_average_type(var state, request[1] as Int, request[2] as Int)
+    out
+
+// Report that the procedure with opcode `procedure` (Enquire Sessions, Enquire
+// Sub-sessions or Get Ended Session Data) failed after its Write Response: the
+// error response of the control point with the Undetermined Error parameter
+// (0xFF).  Nothing for another opcode.
+@tier(app)
+fn pams_report_failure(var db: GattDb, var link: AttLink, handles: PamsHandles, procedure: Int, now_ms: Int) -> [[u8]]
+    var code = 0
+    if procedure == OP_ENQUIRE_SESSIONS
+        code = OP_ENQUIRE_SESSIONS_ERROR
+    else if procedure == OP_ENQUIRE_SUB_SESSIONS
+        code = OP_ENQUIRE_SUB_SESSIONS_ERROR
+    else if procedure == OP_GET_ENDED_SESSION_DATA
+        code = OP_GET_ENDED_SESSION_DATA_ERROR
+    else
+        return []
+    pams_respond(var db, var link, handles, [code as u8, UNDETERMINED_ERROR], now_ms)
+
+trait PamsPolicy[e]
+    // Whether the monitor starts a session (`what` 0) or a sub-session of the
+    // running session (`what` 1) for `peer`, who wrote Start Session; false is
+    // answered Operation Failed (0x8A), as for a monitor that cannot start one.
+    // It is asked for a request the service accepts, before the session starts.
+    fn start_session(var self, peer: links.LinkId, what: Int) -> Bool [e]
+
+// The policy of a monitor that starts every session its configuration allows
+// (`accept`) or none.
+@value
+struct DefaultPamsPolicy
+    accept: Bool
+
+@tier(embedded)
+fn default_pams_policy() -> DefaultPamsPolicy
+    DefaultPamsPolicy { accept: true }
+
+impl PamsPolicy[] for DefaultPamsPolicy
+    fn start_session(var self, _peer: links.LinkId, _what: Int) -> Bool
+        self.accept
+
+// Answer one ATT PDU of `peer`, the client.  A Write Request to the control point is
+// refused when the ATT server refuses it, when a procedure is unconfirmed (0xFE)
+// or by `pams_request_error`; otherwise the ATT server answers it and the
+// procedure follows the Write Response.  A long write to the control point is
+// refused.  Every other PDU is the ATT server's.
+@tier(app)
+fn pams_receive<P: PamsPolicy[e]>(var db: GattDb, var link: AttLink, handles: PamsHandles, config: PamsConfig, var state: PamsState, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) < 3 or gatt_server.read_le16(pdu, 1) != handles.control_point
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let op = pdu[0] as Int
+    if op == att.ATT_OP_PREPARE_WRITE_REQ
+        return gatt_server.error(op, handles.control_point, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    if op != att.ATT_OP_WRITE_REQ
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let request = pdu[3:list.len(pdu)]
+    let denied = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.control_point), true)
+    if denied != 0
+        return gatt_server.error(op, handles.control_point, denied)
+    if gatt_server.indication_pending(link, handles.control_point)
+        return gatt_server.error(op, handles.control_point, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    let refused = pams_request_error(link, handles, config, state, request)
+    if refused != 0
+        return gatt_server.error(op, handles.control_point, refused)
+    if (request[0] as Int) == OP_START_SESSION and not policy.start_session(peer, request[1] as Int)
+        return gatt_server.error(op, handles.control_point, ERR_OPERATION_FAILED)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if list.len(out) > 0 and (out[0][0] as Int) == att.ATT_OP_WRITE_RSP
+        list.append(out, pams_execute(var db, var link, handles, config, var state, request, now_ms))
+    out

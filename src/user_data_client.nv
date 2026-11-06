@@ -1,0 +1,266 @@
+// src/user_data_client.nv — the Collector side of the User Data Service
+// (0x181C): the decoders of its characteristics, the User Control Point requests and
+// responses, the reassembly of the Registered User indications, and the client session.
+//
+//   Database Change Increment  0x2A99   `uds_decode_increment`; read, written, notified
+//   User Index                 0x2A9A   `uds_decode_index`; read
+//   User Control Point         0x2A9F   `uds_req_*` build, `uds_decode_response` reads the indication
+//   Registered User            0x2B37   `uds_segment_push` joins the segments, `uds_decode_registered`
+//                                       reads the whole value; indicated
+//   UDS Characteristics        the peer's own list (First Name, Weight, Height, ...), read and
+//                                       written by UUID with `uds_client_read_data` and
+//                                       `uds_client_write_data`; their formats are the
+//                                       GATT Specification Supplement's, not decoded here
+//
+// The Database Change Increment is a uint32 and the User Index one octet, 0xFF for the unknown
+// user.  The User Control Point ([UDS] 3.4) takes Register New User (0x01, a Consent Code of
+// 0 to 9999), Consent (0x02, a User Index and the code), Delete User Data (0x03), List All
+// Users (0x04) and Delete User(s) (0x05, a User Index, 0xFF for all) and answers with an
+// indication: the Response Code opcode 0x20, the opcode it answers, the result (1 success, 2
+// Op Code Not Supported, 3 Invalid Parameter, 4 Operation Failed, 5 User Not Authorized) and
+// the parameter: the new User Index after a Register New User, the number of users after a
+// List All Users, the User Index after a Delete User(s).  A UDS Characteristic of a user who
+// has not consented is refused with the Application Error 0x80 (User Data Access Not
+// Permitted).
+//
+// A Registered User value ([UDS] 3.5) is cut into segments by the peer: each starts with a
+// Segmentation Header (bit 0 first segment, bit 1 last segment, bits 2 to 7 the Rolling
+// Segment Number, which counts up modulo 64 over the segments of the whole procedure).  The
+// whole value is a flags octet (bit 0 a name follows, bit 1 the name was truncated), the User
+// Index and the name in UTF-8.  `UdsAssembly` joins the segments of one value; a segment out
+// of sequence ends the value with an error.
+//
+// A decoder answers `None` for a value of the wrong length.  It allocates nothing and keeps no
+// state; the assembly keeps the octets it has been given.
+//
+// The session (`uds_client_*`) runs on `sensor_client.nv`: discover the service, read the User
+// Index and the Database Change Increment, enable the notification of the increment and the
+// indication of the control point and of the Registered User characteristic.
+// `uds_client_command` writes a request.
+//
+// Satisfies: REQ-BLE-PRFC-015.
+
+use gatt_client
+use links
+use sensor_client
+use user_data
+use wire
+
+// The User Index of the unknown user (and of "all users" in Delete User(s)).
+const UDS_UNKNOWN_USER = 0xFF
+
+// The largest Consent Code.
+const UDS_CODE_MAX = 9999
+
+// The results of a procedure.
+const UDS_RESULT_SUCCESS = 0x01
+const UDS_RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const UDS_RESULT_INVALID_PARAMETER = 0x03
+const UDS_RESULT_OPERATION_FAILED = 0x04
+const UDS_RESULT_USER_NOT_AUTHORIZED = 0x05
+
+// The bits of the Segmentation Header and of the Registered User flags.
+const UDS_SEGMENT_FIRST = 0x01
+const UDS_SEGMENT_LAST = 0x02
+const UDS_NAME_PRESENT = 0x01
+const UDS_NAME_TRUNCATED = 0x02
+
+// What `uds_segment_push` answers.
+const UDS_MORE = 0
+const UDS_COMPLETE = 1
+const UDS_SEQUENCE_ERROR = -1
+
+// The decoded Registered User value.  `name_at` is the offset of the name in the value.
+@value
+struct UdsRegistered
+    has_name: Bool
+    truncated: Bool
+    index: Int
+    name_at: Int
+
+// A decoded response: the opcode it answers, the result and where its parameter lies.
+@value
+struct UdsResponse
+    request_op: Int
+    result: Int
+    param_at: Int
+    param_len: Int
+
+// The segments of one Registered User value, joined.  `next` is the Rolling Segment Number the next
+// segment is to have, -1 before the first segment of a procedure; `open` says a value is being joined.
+struct UdsAssembly
+    var data: [u8]
+    var next: Int
+    var open: Bool
+
+@tier(app)
+fn uds_assembly_new() -> UdsAssembly
+    UdsAssembly { data: [], next: -1, open: false }
+
+// Forget a value half joined and the sequence, as at a new procedure.
+@tier(app)
+fn uds_assembly_reset(var a: UdsAssembly)
+    a.data = []
+    a.next = -1
+    a.open = false
+
+// Take one Registered User indication (the octets of the notification value, the Segmentation Header
+// first).  UDS_MORE when the value goes on, UDS_COMPLETE when it ended (then `uds_assembly_value` holds
+// it), UDS_SEQUENCE_ERROR for an empty segment, a first segment inside a value, a middle segment without
+// a first one, or a Rolling Segment Number out of sequence; the assembly is then reset.
+@tier(app)
+fn uds_segment_push(var a: UdsAssembly, segment: [u8]) -> Int
+    if list.len(segment) < 1
+        uds_assembly_reset(var a)
+        return UDS_SEQUENCE_ERROR
+    let header = segment[0] as Int
+    let first = (header & UDS_SEGMENT_FIRST) != 0
+    let last = (header & UDS_SEGMENT_LAST) != 0
+    let number = header >>> 2
+    if first == a.open or (a.next >= 0 and number != a.next)
+        uds_assembly_reset(var a)
+        return UDS_SEQUENCE_ERROR
+    if first
+        a.data = []
+        a.open = true
+    for k in 1..list.len(segment)
+        list.push(a.data, segment[k])
+    a.next = (number + 1) % 64
+    if last
+        a.open = false
+        return UDS_COMPLETE
+    UDS_MORE
+
+// The joined value after UDS_COMPLETE.
+@tier(app)
+fn uds_assembly_value(a: UdsAssembly) -> [u8]
+    a.data[:]
+
+// The Registered User value in `b`, `None` when it has no room for the flags and the index, or has flag
+// bit 0 clear and octets after the index, or flag bit 0 set and no name octet.
+@tier(embedded)
+@no_alloc
+fn uds_decode_registered(b: [u8]) -> ?UdsRegistered
+    if list.len(b) < 2
+        return None
+    let flags = b[0] as Int
+    let has_name = (flags & UDS_NAME_PRESENT) != 0
+    if has_name and list.len(b) < 3
+        return None
+    if not has_name and list.len(b) != 2
+        return None
+    Some(UdsRegistered { has_name: has_name, truncated: (flags & UDS_NAME_TRUNCATED) != 0, index: b[1] as Int, name_at: 2 })
+
+// The name of a decoded Registered User value, the UTF-8 octets.
+@tier(app)
+fn uds_registered_name(b: [u8], r: UdsRegistered) -> [u8]
+    if not r.has_name
+        return []
+    b[r.name_at:list.len(b)]
+
+// The Database Change Increment in `b`, `None` unless it is four octets.
+@tier(embedded)
+@no_alloc
+fn uds_decode_increment(b: [u8]) -> ?Int
+    if list.len(b) != 4
+        return None
+    Some(wire.get(b, 0, 4))
+
+// The value to write to the Database Change Increment.
+@tier(app)
+fn uds_increment_value(v: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, wire.clamp(v, 0, 0xFFFFFFFF), 4)
+    out
+
+// The User Index in `b`, `None` unless it is one octet.  0xFF is the unknown user.
+@tier(embedded)
+@no_alloc
+fn uds_decode_index(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    Some(b[0] as Int)
+
+// ── The control point ───────────────────────────────────────────────
+
+// The request Register New User with the Consent Code `code`, limited to 0 to 9999.
+@tier(app)
+fn uds_req_register(code: Int) -> [u8]
+    var out: [u8] = [user_data.OP_REGISTER_NEW_USER as u8]
+    wire.put(var out, wire.clamp(code, 0, UDS_CODE_MAX), 2)
+    out
+
+// The request Consent for the user `index` with `code`.
+@tier(app)
+fn uds_req_consent(index: Int, code: Int) -> [u8]
+    var out: [u8] = [user_data.OP_CONSENT as u8, wire.clamp(index, 0, 255) as u8]
+    wire.put(var out, wire.clamp(code, 0, UDS_CODE_MAX), 2)
+    out
+
+@tier(app)
+fn uds_req_delete_data() -> [u8]
+    [user_data.OP_DELETE_USER_DATA as u8]
+
+@tier(app)
+fn uds_req_list_all() -> [u8]
+    [user_data.OP_LIST_ALL_USERS as u8]
+
+// The request Delete User(s) for the user `index`; `UDS_UNKNOWN_USER` deletes all.
+@tier(app)
+fn uds_req_delete_users(index: Int) -> [u8]
+    [user_data.OP_DELETE_USERS as u8, wire.clamp(index, 0, 255) as u8]
+
+// The response in `b`, `None` when `b` is not one (the Response Code opcode, the opcode it answers and the result).
+@tier(embedded)
+@no_alloc
+fn uds_decode_response(b: [u8]) -> ?UdsResponse
+    if list.len(b) < 3 or (b[0] as Int) != user_data.OP_RESPONSE_CODE
+        return None
+    Some(UdsResponse { request_op: b[1] as Int, result: b[2] as Int, param_at: 3, param_len: list.len(b) - 3 })
+
+// The one-octet parameter of a successful response (the new User Index, the number of users or the
+// deleted User Index), -1 for another result or a parameter of another length.
+@tier(embedded)
+@no_alloc
+fn uds_response_value(b: [u8], r: UdsResponse) -> Int
+    if r.result != UDS_RESULT_SUCCESS or r.param_len != 1
+        return -1
+    b[r.param_at] as Int
+
+// ── The session ─────────────────────────────────────────────────────
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn uds_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, user_data.UUID_USER_DATA_SERVICE)
+
+// Discover the service, read the User Index (required) and the Database Change Increment (optional), enable the
+// notification of the increment (optional) and the indication of the control point (required) and of the
+// Registered User characteristic (optional).
+@tier(app)
+fn uds_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, user_data.UUID_USER_INDEX, true)
+    sensor_client.sc_queue_read(var c, user_data.UUID_DATABASE_CHANGE_INCREMENT, false)
+    sensor_client.sc_queue_subscribe(var c, user_data.UUID_DATABASE_CHANGE_INCREMENT, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, user_data.UUID_USER_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, user_data.UUID_REGISTERED_USER, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (a `uds_req_*` value) to the User Control Point; the response arrives as an indication.
+// The session must have finished its plan.
+@tier(app)
+fn uds_client_command(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, user_data.UUID_USER_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Read the UDS Characteristic `uuid` of the user who consented (Read Long, as the values may exceed the ATT_MTU).
+@tier(app)
+fn uds_client_read_data(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, uuid: Int, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read_long(var c, uuid, true)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write `value` to the UDS Characteristic `uuid` of the user who consented.
+@tier(app)
+fn uds_client_write_data(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, uuid: Int, value: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, uuid, value)
+    sensor_client.sc_kick(var t, var c, now_ms)

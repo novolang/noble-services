@@ -1,0 +1,213 @@
+// src/object_channel.nv — the Object Transfer Channel of the
+// Object Transfer Service: the data that moves through an L2CAP LE Credit Based
+// channel on the PSM 0x0025 after a client wrote Read or Write to the OACP.
+//
+// Its builders run at start-up and allocate, and the module keeps every `@tier(app)`
+// mark: with the mark removed, a helper generic over the store is refused with
+// E2016.
+//
+// The client opens the channel, whichever way the object goes (OTS 1.6, OTP
+// 4.5.10).  The device listens with `object_transfer.ots_listen`, the channel
+// table of the connection (`l2cap_coc`) accepts the request and the channel is
+// then at the service's disposal.  A Read or Write started by the OACP records a
+// transfer (`object_transfer.Transfer`) that this module moves:
+//
+//   Read     The octets of the range go through the channel as SDUs of at most
+//            512 octets or the client's MTU, two SDUs queued in the channel at a
+//            time, so a client that gives few credits holds back a few octets
+//            only.  The transfer is over when the last octet has left the
+//            channel.  The Directory Listing Object is sent as it was when the
+//            Read started.
+//   Write    The SDUs the client sends are written into the object from the
+//            offset of the request, so Current Size grows with the data and a
+//            transfer that stops can be resumed from it (OTS 3.2.4.1.1).  A
+//            patch of existing octets is kept until all of it arrived and is then
+//            written at once (OTS 3.3.2.6.2).  When the expected octets have come,
+//            the modification time is set (the store's clock, or not known without
+//            one) and Object Changed reports the change.
+//   Abort    A Read that was aborted stops sending new SDUs; the SDU whose
+//            K-frames began to leave is sent to its end, so the next SDU on the
+//            channel is not read as part of it.
+//
+// A transfer that makes no progress for 30 s is given up (OTS 3.8): a Read whose
+// client gives no credit, a Write whose client sends nothing.  The channel is
+// closed, the lock on the object is released, and what was written stays.  A
+// transfer ends the same way when the client closes the channel or the link is
+// lost.  A client that sends more octets than it announced (OTS 3.3.2.6.3), or
+// data when no Write is under way, has its channel closed.
+//
+// The module performs no I/O and holds no clock.  `ots_poll` takes the channel
+// table of one connection and the caller's time in milliseconds and answers the
+// packets to send: K-frames and L2CAP signaling, each with the CID it goes to,
+// as `l2cap_coc` produces them (`le_link.send_coc` puts them on the link).  A
+// program calls it after every K-frame and every credit it passes to the channel
+// table, after `object_transfer.ots_receive`, and at least once a second while a
+// transfer is under way, so the 30 s timer is observed.
+//
+// NOT IMPLEMENTED: the Object Transfer Channel over BR/EDR with the Enhanced
+// Retransmission Mode (OTS 3.8.2 b, OTP 8.1); a channel of the Enhanced Credit
+// Based Flow Control mode (the Object Transfer Channel of OTP 3.1.2 is a channel
+// of the LE Credit Based Flow Control mode).
+//
+// Specification checked against: Object Transfer Service 1.0 (Sections 1.6,
+// 3.3.2.5 to 3.3.2.7, 3.7 and 3.8) and Object Transfer Profile 1.0 (Sections
+// 3.1.2, 4.5.4.2, 4.5.5.2, 4.5.10 and 7).
+//
+// Satisfies: REQ-BLE-OTS-002.
+
+use gatt_server
+use l2cap_coc
+use object_store
+use object_transfer
+
+// The most octets of one SDU a Read sends, and the number of SDUs it keeps queued
+// in the channel.
+const SDU_MAX = 512
+const SDU_WINDOW = 2
+
+// The octets queued in the channel `c` that have not left it yet.
+@tier(app)
+fn channel_queued(c: l2cap_coc.CocChannel) -> Int
+    var n = 0
+    for sdu in c.tx
+        n = n + list.len(sdu)
+    n - c.tx_at
+
+// Ask the client to close the channel `channel`; the packets to send.
+@tier(app)
+fn ots_close(var coc: l2cap_coc.CocState, channel: Int) -> [l2cap_coc.CocOut]
+    match l2cap_coc.disconnect(var coc, channel)
+        Some(out) => out
+        None => []
+
+// Whether a Write of the client `identity` under way takes the data of `channel`.
+@tier(app)
+fn ots_writing(shared: OtsShared, identity: Int, channel: Int) -> Bool
+    for t in shared.transfers
+        if t.state == object_transfer.T_ACTIVE and t.owner == identity and t.channel == channel and not t.reading
+            return true
+    false
+
+@tier(embedded)
+@no_alloc
+fn smaller(a: Int, b: Int) -> Int
+    if a < b then a else b
+
+// Queue more of the Read `k` in the channel, as far as the window allows: the
+// packets to send.  The progress of the transfer is the octets that left the
+// channel since the last call.
+@tier(app)
+fn pump_read<S: object_store.ObjectStore[e]>(var coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, k: Int, now_ms: Int) -> [l2cap_coc.CocOut] [e, mutate]
+    var out: [l2cap_coc.CocOut] = []
+    var t = shared.transfers[k]
+    match l2cap_coc.channel_of(coc, t.channel)
+        None =>
+            t.state = object_transfer.T_ABORTED
+        Some(c) =>
+            while t.state == object_transfer.T_ACTIVE and t.done < t.length and list.len(c.tx) < SDU_WINDOW
+                let room = smaller(smaller(c.peer_mtu, SDU_MAX), t.length - t.done)
+                let at = t.offset + t.done
+                var data: [u8] = []
+                if t.object == object_store.ID_DIRECTORY
+                    if at + room <= list.len(t.data)
+                        data = t.data[at:at + room]
+                else
+                    data = repo.read(t.object, at, room)
+                if room <= 0 or list.len(data) != room
+                    t.state = object_transfer.T_FAILED
+                else
+                    match l2cap_coc.send_sdu(var coc, t.channel, data)
+                        None =>
+                            t.state = object_transfer.T_FAILED
+                        Some(frames) =>
+                            list.append(out, frames)
+                            t.done = t.done + room
+            let on_air = t.done - channel_queued(c)
+            if on_air > t.on_air
+                t.on_air = on_air
+                t.last_ms = now_ms
+            if t.state == object_transfer.T_ACTIVE and t.done >= t.length and channel_queued(c) == 0
+                t.state = object_transfer.T_DONE
+    out
+
+// Take the SDUs the client sent on the channel of the Write `k` and put their
+// octets into the object, or keep them for a patch.  Octets beyond the announced
+// length are not written and close the channel.
+@tier(app)
+fn pump_write<S: object_store.ObjectStore[e]>(var coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, k: Int, now_ms: Int) [e, mutate]
+    var t = shared.transfers[k]
+    var more = true
+    while more and t.state == object_transfer.T_ACTIVE
+        match l2cap_coc.take_data(var coc, t.channel)
+            None =>
+                more = false
+            Some(sdu) =>
+                t.last_ms = now_ms
+                let remaining = t.length - t.done
+                let take = smaller(list.len(sdu), remaining)
+                if take > 0
+                    let piece = sdu[0:take]
+                    if t.patching
+                        list.append(t.data, piece)
+                    elif repo.write(t.object, t.offset + t.done, piece)
+                        t.touched = true
+                    else
+                        t.state = object_transfer.T_FAILED
+                t.done = t.done + take
+                if list.len(sdu) > take
+                    t.excess = true
+                if t.state == object_transfer.T_ACTIVE and t.done >= t.length
+                    t.state = object_transfer.T_DONE
+
+// The transfer `k` is no longer active: apply the patch that arrived whole, set
+// the modification time of an object that changed, report the change, and close
+// the channel of a transfer that expired, failed or got more than it announced.
+// The packets to send.
+@tier(app)
+fn settle<S: object_store.ObjectStore[e]>(config: OtsConfig, var coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, k: Int) -> [l2cap_coc.CocOut] [e, mutate]
+    var t = shared.transfers[k]
+    var out: [l2cap_coc.CocOut] = []
+    if not t.reading
+        if t.state == object_transfer.T_DONE and t.patching and list.len(t.data) > 0
+            if repo.write(t.object, t.offset, t.data)
+                t.touched = true
+            else
+                t.state = object_transfer.T_FAILED
+        if t.touched
+            object_transfer.ots_touch(config, var shared, var repo, t.object, t.owner)
+    if t.state == object_transfer.T_EXPIRED or t.state == object_transfer.T_FAILED or t.excess
+        list.append(out, ots_close(var coc, t.channel))
+    t.settled = true
+    out
+
+// Move the data of the transfers of the client `identity`: queue the octets of the
+// Reads, take the octets of the Writes, give up the transfers that made no
+// progress for 30 s, settle the ones that ended, and close a channel that got data
+// nobody asked for.  The packets to send.
+@tier(app)
+fn ots_poll<S: object_store.ObjectStore[e]>(config: OtsConfig, var coc: l2cap_coc.CocState, var shared: OtsShared, var repo: S, identity: Int, now_ms: Int) -> [l2cap_coc.CocOut] [e, mutate]
+    var out: [l2cap_coc.CocOut] = []
+    // Progress is seen before the timer is read, so a client that answered at
+    // the last moment is not given up.
+    for k in 0..list.len(shared.transfers)
+        let t = shared.transfers[k]
+        if t.owner == identity and t.state == object_transfer.T_ACTIVE
+            if not l2cap_coc.is_connected(coc, t.channel)
+                shared.transfers[k].state = object_transfer.T_ABORTED
+            elif t.reading
+                list.append(out, pump_read(var coc, var shared, var repo, k, now_ms))
+            else
+                pump_write(var coc, var shared, var repo, k, now_ms)
+    object_transfer.ots_expire(var shared, now_ms)
+    for k in 0..list.len(shared.transfers)
+        let t = shared.transfers[k]
+        if t.owner == identity and t.state != object_transfer.T_ACTIVE and not t.settled
+            list.append(out, settle(config, var coc, var shared, var repo, k))
+    for c in l2cap_coc.channels_of_psm(coc, object_transfer.OTS_PSM)
+        if not ots_writing(shared, identity, c.id)
+            match l2cap_coc.take_data(var coc, c.id)
+                Some(_) =>
+                    list.append(out, ots_close(var coc, c.id))
+                None => ()
+    object_transfer.ots_prune(var shared)
+    out

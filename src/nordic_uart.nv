@@ -1,0 +1,86 @@
+// src/nordic_uart.nv — the Nordic UART Service.
+//
+// A vendor service that carries a byte stream in both directions. Its
+// UUIDs are 128-bit, 6E40xxxx-B5A3-F393-E0A9-E50E24DCCA9E:
+//
+//   service  6E400001   primary service
+//   RX       6E400002   the client writes (Write, Write Without Response)
+//   TX       6E400003   the server notifies (Notify) with a Client
+//                       Characteristic Configuration descriptor
+//
+// The names are the client's: RX is what the device receives. A write to RX
+// replaces the value, so the application takes it with
+// `nus_received` before the next write arrives, which it learns of from
+// `gatt_server.take_changed`. A notification carries at most ATT_MTU - 3
+// octets, so a longer stream is sent in pieces; `nus_chunk` cuts the piece.
+
+use gatt_server
+use profile_builder
+
+// The 128-bit UUIDs, least significant octet first, with the 16 bits that
+// tell the service, RX and TX apart.
+const NUS_UUID_SERVICE = 0x0001
+const NUS_UUID_RX = 0x0002
+const NUS_UUID_TX = 0x0003
+
+// 6E40xxxx-B5A3-F393-E0A9-E50E24DCCA9E with `short` as the xxxx.
+fn nus_uuid(short: Int) -> [u8]
+    [
+        0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+        0x93, 0xF3, 0xA3, 0xB5,
+        (short & 0xFF) as u8, ((short >>> 8) & 0xFF) as u8, 0x40, 0x6E]
+
+// The configuration of the service. `rx` is the access a client needs to
+// write RX; RX cannot be read. `tx_read` is the access to read TX, Denied
+// for a value that is only notified. `tx_cccd` is the access to read and to
+// write TX's Client Characteristic Configuration descriptor, and TX is
+// notified only while the link grants the write of that descriptor, so a
+// descriptor whose write needs encryption makes TX a notify-only value that
+// needs an encrypted link.
+struct NordicUartConfig
+    rx: gatt_server.Access
+    tx_read: gatt_server.Access
+    tx_cccd: gatt_server.Permissions
+
+// RX written and TX notified on any link; TX cannot be read.
+fn default_nordic_uart_config() -> NordicUartConfig
+    NordicUartConfig { rx: gatt_server.Access.Open, tx_read: gatt_server.Access.Denied, tx_cccd: gatt_server.open_permissions() }
+
+// RX written and TX notified only at `access`; TX cannot be read and its
+// descriptor stays readable on any link.
+fn secured_nordic_uart_config(access: gatt_server.Access) -> NordicUartConfig
+    NordicUartConfig {
+        rx: access, tx_read: gatt_server.Access.Denied,
+        tx_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: access } }
+
+// The handles of the service: `rx` and `tx` are the value attributes,
+// `tx_cccd` the client's configuration descriptor for TX.
+struct NordicUartHandles
+    service: Int
+    rx: Int
+    tx: Int
+    tx_cccd: Int
+
+// Add the service after the last attribute of `server`.
+fn add_nordic_uart_service(var db: GattDb, config: NordicUartConfig) -> Result<NordicUartHandles, profile_builder.ProfileError>
+    let service = profile_builder.start_service(var db, nus_uuid(NUS_UUID_SERVICE))!
+    let rx = profile_builder.add_value(var db, gatt_server.PROP_WRITE | gatt_server.PROP_WRITE_WO_RESP, profile_builder.write_only(config.rx), nus_uuid(NUS_UUID_RX), [])!
+    let tx = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.read_only(config.tx_read), nus_uuid(NUS_UUID_TX), [])!
+    let tx_cccd = profile_builder.add_cccd(var db, config.tx_cccd)!
+    Ok(NordicUartHandles { service: service, rx: rx, tx: tx, tx_cccd: tx_cccd })
+
+// What the client last wrote to RX.
+fn nus_received(db: GattDb, handles: NordicUartHandles) -> [u8]
+    let i = gatt_server.index_of(db, handles.rx)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// The largest piece of the stream one notification carries on the bearer
+// at `index`.
+fn nus_chunk_size(link: AttLink, index: Int) -> Int
+    gatt_server.mtu_of(link, index) - 3
+
+// Send `data` (at most `nus_chunk_size` octets; a longer one is cut) over TX:
+// the notification PDUs, none while the client has not enabled them.
+fn nus_send(var db: GattDb, var link: AttLink, handles: NordicUartHandles, data: [u8], now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handles.tx, data)
+    gatt_server.send_value(var db, var link, handles.tx, now_ms)

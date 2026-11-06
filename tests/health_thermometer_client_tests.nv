@@ -1,0 +1,267 @@
+// tests/health_thermometer_client_tests.nv — the unit tests of src/health_thermometer_client.nv.
+//
+//   novo test tests/health_thermometer_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use health_thermometer
+use sensor_client
+use wire
+use health_thermometer_client.{ HtMeasurement, ht_client_new, ht_client_set_interval, ht_client_start, ht_decode, ht_decode_interval, ht_decode_type, ht_decode_valid_range, ht_has_reading, ht_interval_value, ht_milli_celsius, ht_temperature_kind }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> HtMeasurement
+    match ht_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            HtMeasurement {
+                temperature: 0, fahrenheit: false, has_time: false, time: wire.date_time_unknown(),
+                has_type: false, temperature_type: 0 }
+
+// The octets of a measurement: the flags, the FLOAT of `mantissa` and `exponent`, then `rest`.
+@tier(app)
+fn value_of(flags: Int, mantissa: Int, exponent: Int, rest: [Int]) -> [u8]
+    var out: [u8] = [flags as u8]
+    wire.put(var out, wire.float(mantissa, exponent), 4)
+    for x in rest
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_the_unit_flag_and_the_temperature()
+    let c = must(value_of(0x00, 364, -1, []))
+    test.assert_eq(c.fahrenheit, false)
+    test.assert_eq(c.has_time, false)
+    test.assert_eq(c.has_type, false)
+    test.assert_eq(wire.float_scaled(c.temperature, 1), 364)
+    test.assert_eq(ht_milli_celsius(c), 36400)
+    test.assert(ht_has_reading(c))
+    // 98.6 degrees Fahrenheit is 37 degrees Celsius.
+    let f = must(value_of(0x01, 986, -1, []))
+    test.assert_eq(f.fahrenheit, true)
+    test.assert_eq(ht_milli_celsius(f), 37000)
+    // 32 degrees Fahrenheit is the freezing point; below it the result is negative and rounds away from zero.
+    test.assert_eq(ht_milli_celsius(must(value_of(0x01, 32, 0, []))), 0)
+    test.assert_eq(ht_milli_celsius(must(value_of(0x01, 0, 0, []))), -17778)
+    test.assert_eq(ht_milli_celsius(must(value_of(0x00, -125, -1, []))), -12500)
+    // Reserved flag bits 3 to 7 are ignored.
+    test.assert_eq(ht_milli_celsius(must(value_of(0xF8, 364, -1, []))), 36400)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_every_combination_of_the_optional_fields()
+    let stamp = [0xE9, 0x07, 3, 14, 15, 9, 26]
+    for flags in 0..8
+        var rest: [Int] = []
+        if (flags & 2) != 0
+            for x in stamp
+                list.push(rest, x)
+        if (flags & 4) != 0
+            list.push(rest, 6)
+        let m = must(value_of(flags, 370, -1, rest))
+        test.assert_eq(m.fahrenheit, (flags & 1) != 0)
+        test.assert_eq(m.has_time, (flags & 2) != 0)
+        test.assert_eq(m.has_type, (flags & 4) != 0)
+        test.assert_eq(m.temperature_type, if (flags & 4) != 0 then 6 else 0)
+        if m.has_time
+            test.assert_eq(m.time.year as Int, 2025)
+            test.assert_eq(m.time.month as Int, 3)
+            test.assert_eq(m.time.day as Int, 14)
+            test.assert_eq(m.time.hours as Int, 15)
+            test.assert_eq(m.time.minutes as Int, 9)
+            test.assert_eq(m.time.seconds as Int, 26)
+    // Octets past the fields are not read.
+    test.assert_eq(must(value_of(0x00, 364, -1, [9, 9, 9])).has_time, false)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_special_float_values_are_not_readings()
+    var nan: [u8] = [0]
+    wire.put(var nan, wire.FLOAT_NAN, 4)
+    let a = must(nan)
+    test.assert_eq(ht_temperature_kind(a), wire.KIND_NAN)
+    test.assert(not ht_has_reading(a))
+    test.assert_eq(ht_milli_celsius(a), 0)
+    var inf: [u8] = [0]
+    wire.put(var inf, wire.FLOAT_POSITIVE_INFINITY, 4)
+    test.assert_eq(ht_temperature_kind(must(inf)), wire.KIND_POSITIVE_INFINITY)
+    var ninf: [u8] = [0]
+    wire.put(var ninf, wire.FLOAT_NEGATIVE_INFINITY, 4)
+    test.assert_eq(ht_temperature_kind(must(ninf)), wire.KIND_NEGATIVE_INFINITY)
+    var nres: [u8] = [0]
+    wire.put(var nres, wire.FLOAT_NRES, 4)
+    test.assert_eq(ht_temperature_kind(must(nres)), wire.KIND_NRES)
+    // The largest and the smallest mantissa are numbers.
+    test.assert_eq(ht_temperature_kind(must(value_of(0, wire.FLOAT_MANTISSA_MAX, 0, []))), wire.KIND_NUMBER)
+    test.assert_eq(ht_temperature_kind(must(value_of(0, -wire.FLOAT_MANTISSA_MAX, 0, []))), wire.KIND_NUMBER)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_truncated_values_and_bad_time_stamps_answer_none()
+    test.assert_eq(ht_decode([]), None)
+    test.assert_eq(ht_decode(octets([0, 1, 2, 3])), None)
+    // The time stamp flagged: every prefix is none, the whole value decodes.
+    let stamp = [0xE9, 0x07, 3, 14, 15, 9, 26]
+    let whole = value_of(0x02, 364, -1, stamp)
+    for k in 0..list.len(whole)
+        test.assert_eq(ht_decode(whole[:k]), None)
+    test.assert(ht_decode(whole) != None)
+    // The type flagged and missing.
+    test.assert_eq(ht_decode(value_of(0x04, 364, -1, [])), None)
+    test.assert_eq(ht_decode(value_of(0x06, 364, -1, stamp)), None)
+    // A month or a day of 0, a month above 12, an hour above 23.
+    test.assert_eq(ht_decode(value_of(0x02, 364, -1, [0xE9, 0x07, 0, 14, 15, 9, 26])), None)
+    test.assert_eq(ht_decode(value_of(0x02, 364, -1, [0xE9, 0x07, 3, 0, 15, 9, 26])), None)
+    test.assert_eq(ht_decode(value_of(0x02, 364, -1, [0xE9, 0x07, 13, 14, 15, 9, 26])), None)
+    test.assert_eq(ht_decode(value_of(0x02, 364, -1, [0xE9, 0x07, 3, 14, 24, 9, 26])), None)
+    // A year of 0 (not known) with a month and a day is a time stamp.
+    test.assert(ht_decode(value_of(0x02, 364, -1, [0, 0, 3, 14, 15, 9, 26])) != None)
+
+// Whether `b` decodes to the Valid Range `lo` to `hi`.
+@tier(app)
+fn range_is(b: [u8], lo: Int, hi: Int) -> Bool
+    match ht_decode_valid_range(b)
+        Some(r) => r.0 == lo and r.1 == hi
+        None => false
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_type_interval_and_valid_range()
+    for t in 1..10
+        test.assert_eq(ht_decode_type(octets([t])), Some(t))
+    test.assert_eq(ht_decode_type(octets([0])), None)
+    test.assert_eq(ht_decode_type(octets([10])), None)
+    test.assert_eq(ht_decode_type([]), None)
+    test.assert_eq(ht_decode_type(octets([1, 1])), None)
+    test.assert_eq(ht_decode_interval(octets([0, 0])), Some(0))
+    test.assert_eq(ht_decode_interval(octets([0x10, 0x0E])), Some(3600))
+    test.assert_eq(ht_decode_interval(octets([0xFF, 0xFF])), Some(65535))
+    test.assert_eq(ht_decode_interval(octets([1])), None)
+    test.assert_eq(ht_decode_interval(octets([1, 2, 3])), None)
+    test.assert(range_is(octets([10, 0, 0x10, 0x0E]), 10, 3600))
+    test.assert(range_is(octets([5, 0, 5, 0]), 5, 5))
+    test.assert_eq(ht_decode_valid_range(octets([6, 0, 5, 0])), None)
+    test.assert_eq(ht_decode_valid_range(octets([1, 0, 2])), None)
+    test.assert_eq(ht_interval_value(60), octets([60, 0]))
+    test.assert_eq(ht_interval_value(-5), octets([0, 0]))
+    test.assert_eq(ht_interval_value(70000), octets([0xFF, 0xFF]))
+
+@tier(app)
+fn test_server(config: health_thermometer.HtsConfig) -> (gatt_server.GattServer, health_thermometer.HtsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = health_thermometer.add_hts_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(health_thermometer.full_config())
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(health_thermometer.UUID_HEALTH_THERMOMETER_SERVICE)
+    var t = both.0
+    var c = ht_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ht_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_handle(var t, c, health_thermometer.UUID_TEMPERATURE_MEASUREMENT), h.measurement as Int)
+    test.assert_eq(sensor_client.sc_handle(var t, c, health_thermometer.UUID_MEASUREMENT_INTERVAL), h.interval as Int)
+    // The last read of the plan is the interval.
+    test.assert_eq(sensor_client.sc_uuid(c), health_thermometer.UUID_MEASUREMENT_INTERVAL)
+    test.assert_eq(ht_decode_interval(sensor_client.sc_value(c)), Some(60))
+    // An indicated measurement with a time stamp reaches the decoder; the service holds the type itself.
+    let m = health_thermometer.HtsMeasurement {
+        temperature: wire.float(371, -1), fahrenheit: false, has_time: true,
+        time: wire.date_time(2026, 10, 29, 8, 30, 0), temperature_type: 0 }
+    let ind = health_thermometer.hts_indicate(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(ind), 1)
+    let ev = sensor_client.test_deliver(var t, var c, ind)
+    test.assert_eq(ev, sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), health_thermometer.UUID_TEMPERATURE_MEASUREMENT)
+    let d = must(sensor_client.sc_value(c))
+    test.assert_eq(ht_milli_celsius(d), 37100)
+    test.assert_eq(d.time.year as Int, 2026)
+    test.assert_eq(d.has_type, false)
+    // An intermediate temperature is notified.
+    let ntf = health_thermometer.hts_intermediate_notify(
+        var s.db, var s.link, h, health_thermometer.hts_measurement(wire.float(365, -1), true), 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), health_thermometer.UUID_INTERMEDIATE_TEMPERATURE)
+    test.assert_eq(must(sensor_client.sc_value(c)).fahrenheit, true)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_session_reads_the_type_and_writes_the_interval()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(health_thermometer.full_config())
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(health_thermometer.UUID_HEALTH_THERMOMETER_SERVICE)
+    var t = both.0
+    var c = ht_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let _ = sensor_client.test_pump(var t, var c, var s, ht_client_start(var t, var c, 0), var seen)
+    // The type was read as a value of the plan.
+    var type_seen = false
+    for i in 0..(list.len(seen) / 2)
+        if seen[2 * i + 1] == health_thermometer.UUID_TEMPERATURE_TYPE
+            type_seen = true
+    test.assert(type_seen)
+    let w = sensor_client.test_pump(var t, var c, var s, ht_client_set_interval(var t, var c, 120, 0), var seen)
+    test.assert((w & sensor_client.SE_DONE) != 0)
+    test.assert_eq(health_thermometer.hts_interval(s.db, h), 120)
+    test.assert(health_thermometer.hts_interval_written(h, gatt_server.take_changed(var s.link)))
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_session_with_the_minimal_server_skips_the_optional_characteristics()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(health_thermometer.default_hts_config())
+    var s = built.0
+    let both = sensor_client.test_open(health_thermometer.UUID_HEALTH_THERMOMETER_SERVICE)
+    var t = both.0
+    var c = ht_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ht_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_VALUE), 0)
+    // No interval characteristic: the write ends with Not Found.
+    let w = ht_client_set_interval(var t, var c, 30, 0)
+    test.assert((w.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-009")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(health_thermometer.UUID_HEALTH_THERMOMETER_SERVICE)
+    var t = both.0
+    var c = ht_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, ht_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

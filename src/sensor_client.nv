@@ -1,0 +1,393 @@
+// src/sensor_client.nv — the GATT client session the sensor
+// service clients share (Heart Rate, Cycling Power, Cycling Speed and Cadence,
+// Running Speed and Cadence, Fitness Machine, Battery, Device Information).
+//
+// A session serves one service on one link.  It runs a short plan over the
+// GATT client engine (`orbit/noble/src/gatt_client.nv`) in this order: Discover Primary
+// Service by UUID, Discover All Characteristics of the service, Discover All
+// Characteristic Descriptors of each characteristic that notifies or
+// indicates, then the steps the service client queued (read, subscribe,
+// write).  The module is sans I/O: the program owns the `ClientTable`, moves
+// the PDUs that `sc_start`, `sc_kick` and `sc_on_pdu` answer, and calls
+// `sc_tick` with its clock.
+//
+// A step is required or optional.  A required step whose characteristic the
+// service lacks ends the plan with `SC_NOT_FOUND`; an optional one is
+// skipped.  The result of a step is an event mask in the `ScStep`:
+//
+//   SE_VALUE        a read completed or a notification or an indication
+//                   arrived; `sc_uuid` names the characteristic and `sc_value`
+//                   holds the octets
+//   SE_INDICATION   with SE_VALUE, the value arrived in an indication (the
+//                   engine confirms it)
+//   SE_DONE         the plan has no step left
+//   SE_FAILED       a step failed; `sc_status` holds the engine status or an
+//                   `SC_` code
+//
+// The session decides nothing about the peer: which characteristics to
+// subscribe to and what to write are the service client's.  The decoders of
+// the values are in the service client modules and need no session.
+//
+// Satisfies: REQ-BLE-PRFC-001.
+
+use std.test
+use gatt_client
+use gatt_server
+use links
+
+// The events of a step.
+const SE_NONE = 0
+const SE_VALUE = 1
+const SE_DONE = 2
+const SE_FAILED = 4
+const SE_INDICATION = 8
+
+// The codes the session adds to the engine's statuses.
+const SC_NOT_FOUND = 0x300
+const SC_NO_ROOM = 0x301
+const SC_BUSY = 0x302
+
+// The steps of a plan.
+const STEP_READ = 1
+const STEP_SUBSCRIBE = 2
+const STEP_WRITE = 3
+const STEP_READ_LONG = 4
+
+// The phases of a session.
+const PH_IDLE = 0
+const PH_SERVICE = 1
+const PH_CHARS = 2
+const PH_DESCS = 3
+const PH_PLAN = 4
+
+const PLAN_FIELDS = 4
+
+// A session: the service, its handle range, the plan and the last value.
+struct SensorClient
+    link: links.LinkId
+    service: Int
+    var phase: Int
+    var first: Int
+    var last: Int
+    var cursor: Int
+    var plan: [Int]
+    var staged: [[u8]]
+    var plan_at: Int
+    var running: Bool
+    var current: Int
+    var status: Int
+    var uuid: Int
+    var step_uuid: Int
+    var value: [u8]
+
+// What a call answers: the event mask and the ATT PDUs to send.
+struct ScStep
+    var event: Int
+    var pdus: [[u8]]
+
+@tier(app)
+fn sc_new(link: links.LinkId, service: Int) -> SensorClient
+    SensorClient {
+        link: link, service: service, phase: PH_IDLE, first: 0, last: 0, cursor: 0, plan: [], staged: [],
+        plan_at: 0, running: false, current: 0, status: 0, uuid: 0, step_uuid: 0, value: [] }
+
+// Queue a read of the characteristic `uuid`; `required` ends the plan when it is missing.
+@tier(app)
+fn sc_queue_read(var c: SensorClient, uuid: Int, required: Bool)
+    list.append(c.plan, [STEP_READ, uuid, if required then 1 else 0, 0])
+
+// Queue a Read Long of the characteristic `uuid` (a string that may exceed the ATT_MTU).
+@tier(app)
+fn sc_queue_read_long(var c: SensorClient, uuid: Int, required: Bool)
+    list.append(c.plan, [STEP_READ_LONG, uuid, if required then 1 else 0, 0])
+
+// Queue a subscription: `mode` is `gatt_client.CCCD_NOTIFY` or `CCCD_INDICATE`.
+@tier(app)
+fn sc_queue_subscribe(var c: SensorClient, uuid: Int, mode: Int, required: Bool)
+    list.append(c.plan, [STEP_SUBSCRIBE, uuid, if required then 1 else 0, mode])
+
+// Queue a Write Characteristic Value of `data` to the characteristic `uuid`.
+@tier(app)
+fn sc_queue_write(var c: SensorClient, uuid: Int, data: [u8])
+    list.push(c.staged, data[:])
+    list.append(c.plan, [STEP_WRITE, uuid, 1, list.len(c.staged) - 1])
+
+// Whether the plan has no step left and no request is out.
+@tier(app)
+fn sc_idle(c: SensorClient) -> Bool
+    not c.running
+
+// The status of the step that failed.
+@tier(app)
+fn sc_status(c: SensorClient) -> Int
+    c.status
+
+// The characteristic of the last value, and its octets.
+@tier(app)
+fn sc_uuid(c: SensorClient) -> Int
+    c.uuid
+
+@tier(app)
+fn sc_value(c: SensorClient) -> [u8]
+    c.value[:]
+
+@tier(app)
+fn sc_service_range(c: SensorClient) -> (Int, Int)
+    (c.first, c.last)
+
+@tier(app)
+fn payload_of(data: [u8]) -> gatt_client.ClientPayload
+    var p: gatt_client.ClientPayload = Vec.new()
+    for x in data
+        let _ = p.push(x)
+    p
+
+@tier(app)
+fn pdu_of(data: [u8]) -> gatt_client.ClientPdu
+    var v: gatt_client.ClientPdu = Vec.new()
+    for x in data
+        let _ = v.push(x)
+    v
+
+// The cache index of the characteristic `uuid` inside the service, -1 for none.
+@tier(app)
+fn find_char(var t: gatt_client.ClientTable, c: SensorClient, uuid: Int) -> Int
+    var from = 0
+    for _ in 0..gatt_client.cache()
+        let i = gatt_client.cache_find(var t, c.link, gatt_client.KIND_CHAR, gatt_client.uuid16(uuid), from)
+        if i < 0
+            return -1
+        let h = gatt_client.cache_handle_at(var t, c.link, i)
+        if h >= c.first and h <= c.last
+            return i
+        from = i + 1
+    -1
+
+// The value handle of the characteristic `uuid` of the service, 0 for none.
+@tier(app)
+fn sc_handle(var t: gatt_client.ClientTable, c: SensorClient, uuid: Int) -> Int
+    let i = find_char(var t, c, uuid)
+    if i < 0 then 0 else gatt_client.cache_a_at(var t, c.link, i)
+
+@tier(app)
+fn queued(ticket: Int) -> Int
+    if ticket > 0 then ticket else -SC_NO_ROOM
+
+// The next descriptor discovery, from the cursor; 0 when none is left.
+@tier(app)
+fn begin_descriptors(var t: gatt_client.ClientTable, var c: SensorClient) -> Int
+    for n in c.cursor..gatt_client.cache_count(var t, c.link)
+        let h = gatt_client.cache_handle_at(var t, c.link, n)
+        if gatt_client.cache_kind_at(var t, c.link, n) == gatt_client.KIND_CHAR and h >= c.first and h <= c.last and (gatt_client.cache_b_at(var t, c.link, n) & 0x30) != 0
+            let value = gatt_client.cache_a_at(var t, c.link, n)
+            let bound = gatt_client.boundary_after(var t, c.link.slot, value)
+            let end = if bound > c.last + 1 then c.last else bound - 1
+            c.cursor = n + 1
+            if value < end
+                return queued(gatt_client.begin_discover_descriptors(var t, c.link, 0, value + 1, end))
+    0
+
+// The request of the next step: a ticket, 0 when the plan is done, minus a status on failure.
+@tier(app)
+fn begin_next(var t: gatt_client.ClientTable, var c: SensorClient) -> Int
+    if c.phase == PH_DESCS
+        let r = begin_descriptors(var t, var c)
+        if r != 0
+            return r
+        c.phase = PH_PLAN
+    for _ in 0..(list.len(c.plan) / PLAN_FIELDS + 1)
+        if c.plan_at * PLAN_FIELDS >= list.len(c.plan)
+            return 0
+        let at = c.plan_at * PLAN_FIELDS
+        c.plan_at = c.plan_at + 1
+        let op = c.plan[at]
+        let uuid = c.plan[at + 1]
+        let required = c.plan[at + 2] != 0
+        let arg = c.plan[at + 3]
+        let ci = find_char(var t, c, uuid)
+        if ci < 0
+            if required
+                return -SC_NOT_FOUND
+            continue
+        c.current = op
+        c.step_uuid = uuid
+        let handle = gatt_client.cache_a_at(var t, c.link, ci)
+        if op == STEP_READ
+            return queued(gatt_client.begin_read(var t, c.link, 0, handle))
+        if op == STEP_READ_LONG
+            return queued(gatt_client.begin_read_long(var t, c.link, 0, handle))
+        if op == STEP_SUBSCRIBE
+            let cccd = gatt_client.cccd_of(var t, c.link, ci)
+            if cccd == 0
+                if required
+                    return -SC_NOT_FOUND
+                continue
+            return queued(gatt_client.begin_subscribe(var t, c.link, 0, cccd, arg))
+        let data = c.staged[arg][:]
+        return queued(gatt_client.begin_write(var t, c.link, 0, handle, payload_of(data), list.len(data)))
+    0
+
+@tier(app)
+fn fail(var c: SensorClient, status: Int) -> Int
+    c.status = status
+    c.running = false
+    SE_FAILED
+
+// Issue the next step, or end the plan.
+@tier(app)
+fn issue(var t: gatt_client.ClientTable, var c: SensorClient) -> Int
+    let r = begin_next(var t, var c)
+    if r < 0
+        return fail(c, -r)
+    if r == 0
+        c.running = false
+        return SE_DONE
+    SE_NONE
+
+@tier(app)
+fn pump(var t: gatt_client.ClientTable, c: SensorClient, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for _ in 0..8
+        var buf: gatt_client.ClientPdu = Vec.new()
+        let kind = gatt_client.take_tx(var t, c.link, 0, now_ms, var buf)
+        if kind == gatt_client.TX_NONE
+            break
+        var pdu: [u8] = []
+        for k in 0..buf.len()
+            list.push(pdu, buf[k])
+        list.push(out, pdu)
+    out
+
+// Start the session: discover the service, its characteristics and descriptors, and run the plan.
+@tier(app)
+fn sc_start(var t: gatt_client.ClientTable, var c: SensorClient, now_ms: Int) -> ScStep
+    if c.running
+        return ScStep { event: SE_FAILED, pdus: [] }
+    c.running = true
+    c.phase = PH_SERVICE
+    c.plan_at = 0
+    c.cursor = 0
+    let r = gatt_client.begin_discover_services_by_uuid(var t, c.link, 0, 1, 0xFFFF, gatt_client.uuid16(c.service))
+    if r <= 0
+        return ScStep { event: fail(c, SC_NO_ROOM), pdus: [] }
+    ScStep { event: SE_NONE, pdus: pump(var t, c, now_ms) }
+
+// Run the steps queued after a finished plan (the discovery is kept).
+@tier(app)
+fn sc_kick(var t: gatt_client.ClientTable, var c: SensorClient, now_ms: Int) -> ScStep
+    if c.running
+        return ScStep { event: SE_FAILED, pdus: [] }
+    if c.phase != PH_PLAN
+        return sc_start(var t, var c, now_ms)
+    c.running = true
+    let event = issue(var t, var c)
+    ScStep { event: event, pdus: pump(var t, c, now_ms) }
+
+@tier(app)
+fn value_octets(var t: gatt_client.ClientTable, link: links.LinkId) -> [u8]
+    var out: [u8] = []
+    for k in 0..gatt_client.value_len(var t, link, 0)
+        list.push(out, gatt_client.value_at(var t, link, 0, k) as u8)
+    out
+
+// A request of the plan ended with `status`.
+@tier(app)
+fn finished(var t: gatt_client.ClientTable, var c: SensorClient, status: Int) -> Int
+    if status != gatt_client.STATUS_OK
+        return fail(c, status)
+    var event = SE_NONE
+    if c.phase == PH_SERVICE
+        let s = gatt_client.cache_find(var t, c.link, gatt_client.KIND_SERVICE, gatt_client.uuid16(c.service), 0)
+        if s < 0
+            return fail(c, SC_NOT_FOUND)
+        c.first = gatt_client.cache_handle_at(var t, c.link, s)
+        c.last = gatt_client.cache_a_at(var t, c.link, s)
+        c.phase = PH_CHARS
+        if queued(gatt_client.begin_discover_characteristics(var t, c.link, 0, c.first, c.last)) < 0
+            return fail(c, SC_NO_ROOM)
+        return SE_NONE
+    if c.phase == PH_CHARS
+        c.phase = PH_DESCS
+        c.cursor = 0
+    else if c.phase == PH_PLAN and (c.current == STEP_READ or c.current == STEP_READ_LONG)
+        c.value = value_octets(var t, c.link)
+        c.uuid = c.step_uuid
+        event = SE_VALUE
+    event | issue(var t, var c)
+
+// Take a PDU received on the link.  A response moves the plan on; a notification or an indication
+// of a characteristic of the service sets `sc_uuid` and `sc_value`.
+@tier(app)
+fn sc_on_pdu(var t: gatt_client.ClientTable, var c: SensorClient, pdu: [u8], now_ms: Int) -> ScStep
+    var event = SE_NONE
+    var buf = pdu_of(pdu)
+    let ev = gatt_client.on_pdu(var t, c.link, 0, var buf, list.len(pdu))
+    if ev == gatt_client.EV_DONE and c.running
+        event = finished(var t, var c, gatt_client.result_status(var t, c.link, 0))
+    else if ev == gatt_client.EV_NOTIFICATION or ev == gatt_client.EV_INDICATION
+        let handle = gatt_client.event_handle(var t, c.link, 0)
+        for n in 0..gatt_client.cache_count(var t, c.link)
+            if gatt_client.cache_kind_at(var t, c.link, n) == gatt_client.KIND_CHAR and gatt_client.cache_a_at(var t, c.link, n) == handle and handle >= c.first and handle <= c.last
+                let u = gatt_client.cache_uuid_at(var t, c.link, n)
+                if not u.wide
+                    c.uuid = u.lo
+                    c.value = pdu[3:]
+                    event = SE_VALUE
+                    if ev == gatt_client.EV_INDICATION
+                        event = event | SE_INDICATION
+    ScStep { event: event, pdus: pump(var t, c, now_ms) }
+
+// The clock reaches `now_ms`: a request that waited 30 s ends the plan.
+@tier(app)
+fn sc_tick(var t: gatt_client.ClientTable, var c: SensorClient, now_ms: Int) -> ScStep
+    var event = SE_NONE
+    if gatt_client.tick(var t, c.link, 0, now_ms) == gatt_client.EV_DONE and c.running
+        event = fail(c, gatt_client.result_status(var t, c.link, 0))
+    ScStep { event: event, pdus: [] }
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn test_link() -> links.LinkId
+    links.link_id(0, 1)
+
+// A table with the link of `test_link` open, and a session for `service` on it.
+@tier(app)
+fn test_open(service: Int) -> (gatt_client.ClientTable, SensorClient)
+    var t = gatt_client.new_table()
+    test.assert(gatt_client.open(var t, test_link()))
+    (t, sc_new(test_link(), service))
+
+// Carry `first` between the session and the server `s` until neither has more to send.  The values of the
+// events the client saw are appended to `seen` as (event, uuid) pairs.
+@tier(app)
+fn test_pump(var t: gatt_client.ClientTable, var c: SensorClient, var s: gatt_server.GattServer, first: ScStep, var seen: [Int]) -> Int [mutate]
+    var all = first.event
+    var pending = first.pdus[:]
+    if first.event != SE_NONE
+        list.append(seen, [first.event, c.uuid])
+    for _ in 0..60
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            let answers = gatt_server.receive_on(var s.db, var s.link, 0, item[:], 0)
+            for a in answers
+                let step = sc_on_pdu(var t, var c, a, 0)
+                list.append(next, step.pdus[:])
+                if step.event != SE_NONE
+                    all = all | step.event
+                    list.append(seen, [step.event, c.uuid])
+        pending = next
+    all
+
+// Deliver `pdus` (a server's notifications) to the session; the event mask seen.
+@tier(app)
+fn test_deliver(var t: gatt_client.ClientTable, var c: SensorClient, pdus: [[u8]]) -> Int [mutate]
+    var all = SE_NONE
+    for p in pdus
+        all = all | sc_on_pdu(var t, var c, p[:], 0).event
+    all

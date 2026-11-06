@@ -1,0 +1,835 @@
+// src/environmental_sensing.nv — the Environmental Sensing
+// Service (0x181A), with which an environmental sensor exposes its readings.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+// The service is a family of characteristics, one for each kind of
+// measurement, that all behave alike: Read, optionally Notify.  This module
+// carries three of them, the ones the formats below fix:
+//
+//   Temperature   0x2A6E   sint16, 0.01 degrees Celsius, -273.15 to 327.67;
+//                          0x8000 is "value is not known"
+//   Pressure      0x2A6D   uint32, 0.1 pascal
+//   Humidity      0x2A6F   uint16, 0.01 percent, 0.00 to 100.00;
+//                          0xFFFF is "value is not known"
+//
+// Each characteristic may carry these descriptors (ESS Table 3.2):
+//
+//   ES Measurement             0x290C  Read; 11 octets: Flags (uint16, all
+//                                      Reserved for Future Use), Sampling
+//                                      Function, Measurement Period (uint24
+//                                      seconds), Internal Update Interval
+//                                      (uint24 seconds), Application,
+//                                      Measurement Uncertainty
+//   ES Trigger Setting         0x290D  Read, Write; a Condition octet and an
+//                                      Operand; one to three, exactly when the
+//                                      characteristic notifies
+//   ES Configuration           0x290B  Read, Write; the Trigger Logic octet,
+//                                      present exactly when there is more than
+//                                      one Trigger Setting
+//   Characteristic User Description 0x2901
+//                                      Read; Write at an authenticated link
+//   Valid Range                0x2906  Read; the lower and the upper bound, in
+//                                      the format of the characteristic
+//
+// and the service carries one Descriptor Value Changed characteristic
+// (0x2A7D, Indicate only) when the server can change a descriptor or the
+// User Description is writable.  Two instances of one characteristic UUID
+// need an ES Measurement descriptor each, and the descriptors differ.
+//
+// Trigger conditions (Table 3.11).  0x00 inactive, 0x01 a fixed time between
+// transmissions, 0x02 no less than the time between transmissions (both with
+// a uint24 operand in seconds), 0x03 when the value changes, 0x04 to 0x09
+// while the value is less than, less than or equal to, greater than, greater
+// than or equal to, equal to, or not equal to the operand (the operand has the
+// format of the characteristic).  A set of Trigger Settings is combined with
+// the Trigger Logic, 0x00 AND or 0x01 OR; an inactive one counts as absent;
+// with all inactive the value is never notified.
+//
+// Writes to the Trigger Setting and Configuration descriptors.  The server
+// supports every condition and both logics.  The descriptors belong to the
+// bonded client that wrote them (`make_per_link`): a client that has not
+// written one reads the value the server set.  A write from a client that is
+// not bonded is answered Insufficient Authorization, a Condition that is
+// Reserved for Future Use 0x81 (Condition not supported), a Trigger Logic that
+// is 0x02 or more 0x80 (Write Request Rejected), a fixed time of zero seconds
+// 0x80, and an operand that is outside the Valid Range, outside the format or
+// has the wrong length 0xFF (Out of Range); the descriptor keeps its value in
+// every case.  A fixed time shorter than the Internal Update Interval is
+// accepted, and the product sends as often as it can.  `ess_receive` makes
+// these checks before the Write Response, so the writes of a client go
+// through it; it also refuses a Prepare Write to either descriptor
+// (Attribute Not Long) and ignores a signed write.
+//
+// A client of the profile writes the descriptors only when bonded (ESP
+// 6.1); when `trigger_write` is false both descriptors are read only and the
+// product sets their values.  The User Description is global (one value for
+// all clients), writable only when `description_writable` is set, which also
+// gives the characteristic the Extended Properties property and descriptor
+// (Writable Auxiliaries); the write needs an authenticated link.
+//
+// Descriptor Value Changed.  The value is the Flags (uint16: bit 0 Source of
+// Change, 1 Trigger Setting, 2 Configuration, 3 ES Measurement, 4 User
+// Description) and the 16-bit UUID of the characteristic.  `ess_indicate_change`
+// indicates it to one client, `ess_dvc_recipient` says which clients a change
+// reaches (Table 3.15), and `ess_written_flags` gives the flags of a client's
+// write.  The TS (Table 4.11) prints the flags of a change at the server as
+// 0x02 ES Measurement, 0x04 Trigger Setting, 0x08 Configuration; the
+// specification (Table 3.16) has them as bits 1, 2 and 3 in the order above,
+// and this module follows the specification.
+//
+// Time-sensitive data (ESS 3.3).  The server holds the latest value only:
+// `ess_set_value` replaces it, and `ess_notify` sends the value as it stands
+// and only when the client's triggers hold, so a value that no longer meets
+// the trigger is never sent late.  The caller supplies the time since the
+// last transmission to that client and the value last sent, and calls
+// `ess_notify` when a new value is available (for the fixed time of
+// condition 0x01 also when the time is due).
+//
+// Security.  The service imposes none (Table 3.1); the Environmental Sensing
+// Profile asks for LE security mode 1 level 1 or higher (ESP 6.1), so reads
+// are open by default (`EssConfig.read` raises them).  The profile also asks
+// for bonding when a descriptor is writable, which `ess_receive` enforces
+// by asking `EssPolicy.bonded`.
+//
+// NOT IMPLEMENTED: the Descriptor Value Changed indication a bonded client
+// that is away hears at its next connection (the caller indicates it then
+// with `ess_indicate_change`); characteristics other than the three above and
+// the conditions' rules for enumerations and multi-value ones; a 128-bit UUID
+// in the Descriptor Value Changed value; the BR/EDR SDP record; the
+// advertising items of the profile except the Service Data payload
+// (`ess_service_data`); the schedule of the fixed-time notifications.
+//
+// Specification checked against: Environmental Sensing Service 1.0.1,
+// Environmental Sensing Profile 1.0.1 and the GATT Specification Supplement
+// v9, Sections 3.121 (Humidity), 3.175 (Pressure) and 3.211 (Temperature).
+//
+// Satisfies: REQ-BLE-ESS-001.
+
+use att
+use gatt_server
+use links
+use profile_builder
+use fixtures.{ req, peer }
+use wire
+
+const UUID_ENVIRONMENTAL_SENSING_SERVICE = 0x181A
+const UUID_PRESSURE = 0x2A6D
+const UUID_TEMPERATURE = 0x2A6E
+const UUID_HUMIDITY = 0x2A6F
+const UUID_DESCRIPTOR_VALUE_CHANGED = 0x2A7D
+const UUID_VALID_RANGE = 0x2906
+const UUID_ES_CONFIGURATION = 0x290B
+const UUID_ES_MEASUREMENT = 0x290C
+const UUID_ES_TRIGGER_SETTING = 0x290D
+
+// Trigger conditions (Table 3.11).
+const TRIGGER_INACTIVE = 0x00
+const TRIGGER_FIXED_INTERVAL = 0x01
+const TRIGGER_MIN_INTERVAL = 0x02
+const TRIGGER_ON_CHANGE = 0x03
+const TRIGGER_LESS = 0x04
+const TRIGGER_LESS_OR_EQUAL = 0x05
+const TRIGGER_GREATER = 0x06
+const TRIGGER_GREATER_OR_EQUAL = 0x07
+const TRIGGER_EQUAL = 0x08
+const TRIGGER_NOT_EQUAL = 0x09
+
+// Trigger Logic (Table 3.13).
+const LOGIC_AND = 0x00
+const LOGIC_OR = 0x01
+
+// The Flags of the Descriptor Value Changed value (Table 3.16).
+const DVC_SOURCE_CLIENT = 0x01
+const DVC_TRIGGER_SETTING = 0x02
+const DVC_CONFIGURATION = 0x04
+const DVC_MEASUREMENT = 0x08
+const DVC_USER_DESCRIPTION = 0x10
+const DVC_FLAGS_MASK = 0x1F
+
+// The Application Error Codes of Table 1.2; Out of Range (0xFF) is the Common
+// Profile and Service Error Code `att.ATT_ERR_OUT_OF_RANGE`.
+const ERR_WRITE_REQUEST_REJECTED = 0x80
+const ERR_CONDITION_NOT_SUPPORTED = 0x81
+
+// The ATT opcodes ess_receive tells apart.
+const OP_PREPARE_WRITE_REQ = 0x16
+const OP_WRITE_CMD = 0x52
+const OP_SIGNED_WRITE_CMD = 0xD2
+
+// What ess_locate finds at a handle.
+const KIND_NONE = 0
+const KIND_TRIGGER = 1
+const KIND_CONFIGURATION = 2
+const KIND_DESCRIPTION = 3
+
+// The longest value of the uint24 fields of ES Measurement and of a time
+// operand.
+const UINT24_MAX = 0xFFFFFF
+
+// The ES Measurement descriptor (Table 3.3), without its Flags field.  The
+// Sampling Function is 0 to 7, the Application 0 to 0x21; a period or an
+// interval of 0 is "not in use"; the uncertainty is in steps of 0.5 percent,
+// 0xFF "not available".
+@value
+struct EssMeasurement
+    sampling: u8
+    period_s: u32
+    interval_s: u32
+    application: u8
+    uncertainty: u8
+
+// One ES Trigger Setting: the Condition and its operand (seconds for the
+// conditions 0x01 and 0x02, a value in the format of the characteristic for
+// 0x04 to 0x09, unused otherwise).
+@value
+struct EssTrigger
+    condition: u8
+    operand: Int
+
+// One ESS characteristic.  `value` is the raw value of the format of `uuid`.
+// `notify` needs one to three `triggers` and no triggers excludes it; `logic`
+// is the Trigger Logic of the Configuration descriptor, which exists when
+// there is more than one trigger.  `has_range` adds the Valid Range
+// descriptor.  `has_description` adds the User Description with
+// `description`; `description_writable` lets an authenticated client write it.
+struct EssCharConfig
+    var uuid: Int
+    var value: Int
+    var has_measurement: Bool
+    var measurement: EssMeasurement
+    var notify: Bool
+    var triggers: [EssTrigger]
+    var logic: Int
+    var has_range: Bool
+    var range_low: Int
+    var range_high: Int
+    var has_description: Bool
+    var description: [u8]
+    var description_writable: Bool
+
+// The service: its characteristics (at least one), the access to read them
+// and their descriptors, whether a bonded client may write the Trigger
+// Setting and Configuration descriptors, and whether the server changes
+// descriptors itself, which adds the Descriptor Value Changed characteristic.
+struct EssConfig
+    characteristics: [EssCharConfig]
+    read: gatt_server.Access
+    trigger_write: Bool
+    descriptors_change: Bool
+
+// A reading of `value` without descriptors or notification.
+@tier(app)
+fn ess_characteristic(uuid: Int, value: Int) -> EssCharConfig
+    EssCharConfig {
+        uuid: uuid, value: value,
+        has_measurement: false, measurement: EssMeasurement { sampling: 0, period_s: 0, interval_s: 0, application: 0, uncertainty: 0xFF },
+        notify: false, triggers: [], logic: LOGIC_AND, has_range: false, range_low: 0, range_high: 0,
+        has_description: false, description: [], description_writable: false }
+
+// The service of `characteristics` with open reads, read-only triggers and no
+// Descriptor Value Changed characteristic.
+@tier(app)
+fn default_ess_config(characteristics: [EssCharConfig]) -> EssConfig
+    EssConfig { characteristics: characteristics, read: gatt_server.Access.Open, trigger_write: false, descriptors_change: false }
+
+// The handles of one characteristic; 0 for a descriptor it does not have.
+struct EssCharHandles
+    uuid: Int
+    value: Int
+    cccd: Int
+    measurement: Int
+    triggers: [Int]
+    configuration: Int
+    valid_range: Int
+    extended: Int
+    description: Int
+
+struct EssHandles
+    service: Int
+    characteristics: [EssCharHandles]
+    dvc: Int
+    dvc_cccd: Int
+
+// ── Formats ─────────────────────────────────────────────────────────
+
+// The octets of the value of `uuid`, 0 for a characteristic this module does
+// not carry.
+@tier(embedded)
+@no_alloc
+fn ess_octets(uuid: Int) -> Int
+    if uuid == UUID_PRESSURE
+        return 4
+    if uuid == UUID_TEMPERATURE or uuid == UUID_HUMIDITY
+        return 2
+    0
+
+// The smallest and the largest raw value of `uuid`, "not known" excluded.
+@tier(embedded)
+@no_alloc
+fn ess_min(uuid: Int) -> Int
+    if uuid == UUID_TEMPERATURE
+        return -27315
+    0
+
+@tier(embedded)
+@no_alloc
+fn ess_max(uuid: Int) -> Int
+    if uuid == UUID_TEMPERATURE
+        return 32767
+    if uuid == UUID_PRESSURE
+        return 4294967295
+    if uuid == UUID_HUMIDITY
+        return 10000
+    0
+
+// Whether `v` is a value the characteristic may hold: in range, or the value
+// "not known" of the temperature (0x8000) and the humidity (0xFFFF).
+@tier(embedded)
+@no_alloc
+fn ess_value_valid(uuid: Int, v: Int) -> Bool
+    if ess_octets(uuid) == 0
+        return false
+    if v >= ess_min(uuid) and v <= ess_max(uuid)
+        return true
+    (uuid == UUID_TEMPERATURE and v == -32768) or (uuid == UUID_HUMIDITY and v == 65535)
+
+// Whether `v` can be the operand of a comparison or a bound of the Valid
+// Range: in range, "not known" excluded.
+@tier(embedded)
+@no_alloc
+fn ess_operand_valid(uuid: Int, v: Int) -> Bool
+    ess_octets(uuid) != 0 and v >= ess_min(uuid) and v <= ess_max(uuid)
+
+// The value octets of the raw value `v`.
+@tier(app)
+fn ess_value(uuid: Int, v: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, v, ess_octets(uuid))
+    out
+
+// The raw value at `at` in `b`; the temperature is signed.
+@tier(embedded)
+@no_alloc
+fn ess_decode(uuid: Int, b: [u8], at: Int) -> Int
+    if uuid == UUID_TEMPERATURE
+        return wire.get_signed(b, at, 2)
+    wire.get(b, at, ess_octets(uuid))
+
+// Whether `m` has only values the descriptor defines.
+@tier(embedded)
+@no_alloc
+fn ess_measurement_valid(m: EssMeasurement) -> Bool
+    m.sampling >= 0 and m.sampling <= 7 and m.period_s >= 0 and m.period_s <= UINT24_MAX
+        and m.interval_s >= 0 and m.interval_s <= UINT24_MAX and m.application >= 0 and m.application <= 0x21
+        and m.uncertainty >= 0 and m.uncertainty <= 0xFF
+
+// The ES Measurement value: Flags 0, then the fields of `m`.
+@tier(app)
+fn ess_measurement_value(m: EssMeasurement) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, 0, 2)
+    wire.put(var out, m.sampling, 1)
+    wire.put(var out, m.period_s, 3)
+    wire.put(var out, m.interval_s, 3)
+    wire.put(var out, m.application, 1)
+    wire.put(var out, m.uncertainty, 1)
+    out
+
+// The ES Trigger Setting value of `t` for the characteristic `uuid`.
+@tier(app)
+fn ess_trigger_value(uuid: Int, t: EssTrigger) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, t.condition, 1)
+    if t.condition == TRIGGER_FIXED_INTERVAL or t.condition == TRIGGER_MIN_INTERVAL
+        wire.put(var out, t.operand, 3)
+    if t.condition >= TRIGGER_LESS and t.condition <= TRIGGER_NOT_EQUAL
+        wire.put(var out, t.operand, ess_octets(uuid))
+    out
+
+// The trigger of an ES Trigger Setting value; an inactive one for an empty
+// value or an operand that is too short.
+@tier(embedded)
+@no_alloc
+fn ess_trigger_of(uuid: Int, b: [u8]) -> EssTrigger
+    if list.len(b) == 0
+        return EssTrigger { condition: TRIGGER_INACTIVE, operand: 0 }
+    let c = b[0] as Int
+    if c == TRIGGER_FIXED_INTERVAL or c == TRIGGER_MIN_INTERVAL
+        return EssTrigger { condition: c as u8, operand: wire.get(b, 1, 3) }
+    if c >= TRIGGER_LESS and c <= TRIGGER_NOT_EQUAL
+        return EssTrigger { condition: c as u8, operand: ess_decode(uuid, b, 1) }
+    EssTrigger { condition: c as u8, operand: 0 }
+
+// The Error Code of a write of `value` to an ES Trigger Setting descriptor of
+// the characteristic `uuid`, 0 when it may be written.  `has_range`, `low`
+// and `high` are the Valid Range descriptor, when there is one.
+@tier(embedded)
+@no_alloc
+fn ess_trigger_error(uuid: Int, has_range: Bool, low: Int, high: Int, value: [u8]) -> Int
+    if list.len(value) == 0
+        return att.ATT_ERR_OUT_OF_RANGE
+    let c = value[0] as Int
+    if c > TRIGGER_NOT_EQUAL
+        return ERR_CONDITION_NOT_SUPPORTED
+    let n = list.len(value) - 1
+    if c == TRIGGER_INACTIVE or c == TRIGGER_ON_CHANGE
+        return if n == 0 then 0 else att.ATT_ERR_OUT_OF_RANGE
+    if c == TRIGGER_FIXED_INTERVAL or c == TRIGGER_MIN_INTERVAL
+        if n != 3
+            return att.ATT_ERR_OUT_OF_RANGE
+        return if c == TRIGGER_FIXED_INTERVAL and wire.get(value, 1, 3) == 0 then ERR_WRITE_REQUEST_REJECTED else 0
+    if n != ess_octets(uuid)
+        return att.ATT_ERR_OUT_OF_RANGE
+    let v = ess_decode(uuid, value, 1)
+    if not ess_operand_valid(uuid, v)
+        return att.ATT_ERR_OUT_OF_RANGE
+    if has_range and (v < low or v > high)
+        return att.ATT_ERR_OUT_OF_RANGE
+    0
+
+// The Error Code of a write of `value` to an ES Configuration descriptor: one
+// octet, 0 (AND) or 1 (OR).
+@tier(embedded)
+@no_alloc
+fn ess_configuration_error(value: [u8]) -> Int
+    if list.len(value) != 1
+        return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    if (value[0] as Int) > LOGIC_OR
+        return ERR_WRITE_REQUEST_REJECTED
+    0
+
+// The Descriptor Value Changed value: the Flags and the 16-bit UUID.
+@tier(app)
+fn ess_dvc_value(flags: Int, uuid: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, flags, 2)
+    wire.put(var out, uuid, 2)
+    out
+
+// The Service Data AD structure of the profile (ESP Table 3.2): length, AD
+// type 0x16, the service UUID and the two-octet pseudo-random Change Index a
+// collector reads to see whether notifications are pending.
+@tier(app)
+fn ess_service_data(change_index: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, 5, 1)
+    wire.put(var out, 0x16, 1)
+    wire.put(var out, UUID_ENVIRONMENTAL_SENSING_SERVICE, 2)
+    wire.put(var out, change_index, 2)
+    out
+
+// ── Triggers ────────────────────────────────────────────────────────
+
+// Whether one trigger holds.  `previous` is the value last sent, `current` the
+// value now, `elapsed_s` the seconds since the last transmission.  The two
+// time conditions hold from `operand` seconds on; the fixed time (0x01) is
+// kept by the caller's clock, which offers the value on it whether or not it
+// changed.  An inactive or Reserved condition never holds.
+@tier(embedded)
+@no_alloc
+fn ess_trigger_fires(condition: Int, operand: Int, previous: Int, current: Int, elapsed_s: Int) -> Bool
+    if condition == TRIGGER_FIXED_INTERVAL or condition == TRIGGER_MIN_INTERVAL
+        return elapsed_s >= operand
+    if condition == TRIGGER_ON_CHANGE
+        return current != previous
+    if condition == TRIGGER_LESS
+        return current < operand
+    if condition == TRIGGER_LESS_OR_EQUAL
+        return current <= operand
+    if condition == TRIGGER_GREATER
+        return current > operand
+    if condition == TRIGGER_GREATER_OR_EQUAL
+        return current >= operand
+    if condition == TRIGGER_EQUAL
+        return current == operand
+    if condition == TRIGGER_NOT_EQUAL
+        return current != operand
+    false
+
+// Whether a notification is due under `triggers` combined with `logic`.  An
+// inactive trigger counts as absent; with none active nothing is due.
+@tier(embedded)
+@no_alloc
+fn ess_should_notify(triggers: [EssTrigger], logic: Int, previous: Int, current: Int, elapsed_s: Int) -> Bool
+    var active = 0
+    var fired = 0
+    for t in triggers
+        if t.condition != TRIGGER_INACTIVE and t.condition <= TRIGGER_NOT_EQUAL
+            active = active + 1
+            if ess_trigger_fires(t.condition, t.operand, previous, current, elapsed_s)
+                fired = fired + 1
+    if active == 0
+        return false
+    if logic == LOGIC_OR
+        return fired > 0
+    fired == active
+
+// Whether a change of the descriptor `descriptor` (one DVC flag) reaches a
+// client (Table 3.15).  `by_client` is the Source of Change, `is_writer` that
+// the client made the change, `is_affected` that the descriptor is the one of
+// this client.  A change a client makes to its Trigger Setting or
+// Configuration is announced to nobody; the User Description reaches every
+// client but the writer; at the server a Trigger Setting or Configuration
+// reaches the affected client and an ES Measurement or User Description all.
+@tier(embedded)
+@no_alloc
+fn ess_dvc_recipient(descriptor: Int, by_client: Bool, is_writer: Bool, is_affected: Bool) -> Bool
+    if by_client
+        return descriptor == DVC_USER_DESCRIPTION and not is_writer
+    if descriptor == DVC_TRIGGER_SETTING or descriptor == DVC_CONFIGURATION
+        return is_affected
+    descriptor == DVC_MEASUREMENT or descriptor == DVC_USER_DESCRIPTION
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Whether two ES Measurement descriptors differ.
+@tier(app)
+fn ess_measurements_differ(a: EssCharConfig, b: EssCharConfig) -> Bool
+    a.has_measurement and b.has_measurement and ess_measurement_value(a.measurement) != ess_measurement_value(b.measurement)
+
+// Whether the characteristics are acceptable together: at least one, and two
+// of one UUID each with an ES Measurement descriptor that differs.
+@tier(app)
+fn ess_characteristics_ok(cs: [EssCharConfig]) -> Bool
+    if list.len(cs) == 0
+        return false
+    for i in 0..list.len(cs)
+        for j in i + 1..list.len(cs)
+            if cs[i].uuid == cs[j].uuid and not ess_measurements_differ(cs[i], cs[j])
+                return false
+    true
+
+// Whether `c` is a characteristic the service can add.
+@tier(app)
+fn ess_char_ok(c: EssCharConfig) -> Bool
+    let n = list.len(c.triggers)
+    if not ess_value_valid(c.uuid, c.value) or n > 3 or c.notify != (n > 0)
+        return false
+    if c.has_measurement and not ess_measurement_valid(c.measurement)
+        return false
+    if n > 1 and (c.logic < LOGIC_AND or c.logic > LOGIC_OR)
+        return false
+    if c.has_range and not (ess_operand_valid(c.uuid, c.range_low) and ess_operand_valid(c.uuid, c.range_high) and c.range_low <= c.range_high)
+        return false
+    if c.description_writable and not c.has_description
+        return false
+    for t in c.triggers
+        if ess_trigger_error(c.uuid, c.has_range, c.range_low, c.range_high, ess_trigger_value(c.uuid, t)) != 0
+            return false
+    true
+
+@tier(app)
+fn ess_add_characteristic(var db: GattDb, config: EssConfig, c: EssCharConfig) -> Result<EssCharHandles, profile_builder.ProfileError>
+    var properties = gatt_server.PROP_READ
+    if c.notify
+        properties = properties | gatt_server.PROP_NOTIFY
+    if c.description_writable
+        properties = properties | gatt_server.PROP_EXTENDED_PROPERTIES
+    let value = profile_builder.add_value(
+        var db, properties, profile_builder.read_only(config.read), gatt_server.le16(c.uuid), ess_value(c.uuid, c.value))!
+    var cccd = 0
+    if c.notify
+        cccd = profile_builder.add_cccd(var db, gatt_server.open_permissions())!
+    var measurement = 0
+    if c.has_measurement
+        measurement = profile_builder.add_descriptor(
+            var db, profile_builder.read_only(config.read), UUID_ES_MEASUREMENT, ess_measurement_value(c.measurement))!
+    let descriptor_permissions = if config.trigger_write then gatt_server.Permissions { read: config.read, write: gatt_server.Access.Open } else profile_builder.read_only(config.read)
+    var triggers: [Int] = []
+    for t in c.triggers
+        let h = profile_builder.add_descriptor(var db, descriptor_permissions, UUID_ES_TRIGGER_SETTING, ess_trigger_value(c.uuid, t))!
+        if config.trigger_write and not gatt_server.make_per_link(var db, h)
+            return Err(profile_builder.ProfileError.NotPermitted)
+        list.push(triggers, h)
+    var configuration = 0
+    if list.len(c.triggers) > 1
+        var logic: [u8] = []
+        wire.put(var logic, c.logic, 1)
+        configuration = profile_builder.add_descriptor(var db, descriptor_permissions, UUID_ES_CONFIGURATION, logic)!
+        if config.trigger_write and not gatt_server.make_per_link(var db, configuration)
+            return Err(profile_builder.ProfileError.NotPermitted)
+    var valid_range = 0
+    if c.has_range
+        var bounds: [u8] = []
+        wire.put(var bounds, c.range_low, ess_octets(c.uuid))
+        wire.put(var bounds, c.range_high, ess_octets(c.uuid))
+        valid_range = profile_builder.add_descriptor(var db, profile_builder.read_only(config.read), UUID_VALID_RANGE, bounds)!
+    var extended = 0
+    if c.description_writable
+        extended = profile_builder.add_descriptor(
+            var db, profile_builder.read_only(config.read), gatt_server.UUID_CHARACTERISTIC_EXTENDED_PROPERTIES, [0x02, 0x00])!
+    var description = 0
+    if c.has_description
+        let write = if c.description_writable then gatt_server.Access.Authenticated else gatt_server.Access.Denied
+        description = profile_builder.add_descriptor(
+            var db, gatt_server.Permissions { read: config.read, write: write }, gatt_server.UUID_CHARACTERISTIC_USER_DESCRIPTION, c.description)!
+        if c.description_writable and not gatt_server.set_max_length(var db, description, gatt_server.ATT_VALUE_MAX)
+            return Err(profile_builder.ProfileError.NoRoom)
+    Ok(EssCharHandles {
+        uuid: c.uuid, value: value, cccd: cccd, measurement: measurement, triggers: triggers, configuration: configuration,
+        valid_range: valid_range, extended: extended, description: description })
+
+// Add the service to `db` after its last attribute.  InvalidValue: no
+// characteristic, a characteristic that is not one of the three or holds a
+// value outside its format, notification without one to three triggers or
+// triggers without notification, a trigger the server would refuse to be
+// written, a Trigger Logic above 1, a Valid Range with a bound outside the
+// format or the lower bound above the upper, an ES Measurement with a value
+// the descriptor does not define, a writable User Description with no
+// description, or two characteristics of one UUID whose ES Measurement
+// descriptors are missing or equal.
+@tier(app)
+fn add_ess_service(var db: GattDb, config: EssConfig) -> Result<EssHandles, profile_builder.ProfileError>
+    if not ess_characteristics_ok(config.characteristics)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    for c in config.characteristics
+        if not ess_char_ok(c)
+            return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_ENVIRONMENTAL_SENSING_SERVICE))!
+    var handles: [EssCharHandles] = []
+    var changes = config.descriptors_change
+    for c in config.characteristics
+        list.push(handles, ess_add_characteristic(var db, config, c)!)
+        if c.description_writable
+            changes = true
+    var dvc = 0
+    var dvc_cccd = 0
+    if changes
+        dvc = profile_builder.add_value(
+            var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_DESCRIPTOR_VALUE_CHANGED), [])!
+        dvc_cccd = profile_builder.add_cccd(var db, gatt_server.open_permissions())!
+    Ok(EssHandles { service: service, characteristics: handles, dvc: dvc, dvc_cccd: dvc_cccd })
+
+// ── Values ──────────────────────────────────────────────────────────
+
+// Store a new raw value; false (and the old value kept) outside the format.
+@tier(app)
+fn ess_set_value(var db: GattDb, ch: EssCharHandles, v: Int) -> Bool
+    ess_value_valid(ch.uuid, v) and gatt_server.set_value(var db, ch.value, ess_value(ch.uuid, v))
+
+// The temperature in hundredths of a degree Celsius, -27315 to 32767, or
+// -32768 for "not known".
+@tier(app)
+fn set_temperature(var db: GattDb, ch: EssCharHandles, centi_celsius: Int) -> Bool
+    ch.uuid == UUID_TEMPERATURE and ess_set_value(var db, ch, centi_celsius)
+
+// The pressure in tenths of a pascal.
+@tier(app)
+fn set_pressure(var db: GattDb, ch: EssCharHandles, deci_pascal: Int) -> Bool
+    ch.uuid == UUID_PRESSURE and ess_set_value(var db, ch, deci_pascal)
+
+// The relative humidity in hundredths of a percent, 0 to 10000, or 65535 for
+// "not known".
+@tier(app)
+fn set_humidity(var db: GattDb, ch: EssCharHandles, centi_percent: Int) -> Bool
+    ch.uuid == UUID_HUMIDITY and ess_set_value(var db, ch, centi_percent)
+
+// The raw value the characteristic holds.
+@tier(embedded)
+@no_alloc
+fn ess_current(db: GattDb, ch: EssCharHandles) -> Int
+    ess_decode(ch.uuid, db.attributes[gatt_server.index_of(db, ch.value)].value, 0)
+
+// Change the ES Measurement descriptor of the server; false for a value the
+// descriptor does not define or a characteristic without the descriptor.  The
+// caller indicates the change (`ess_indicate_change`, flag `DVC_MEASUREMENT`).
+@tier(app)
+fn ess_set_measurement(var db: GattDb, ch: EssCharHandles, m: EssMeasurement) -> Bool
+    ch.measurement != 0 and ess_measurement_valid(m) and gatt_server.set_value(var db, ch.measurement, ess_measurement_value(m))
+
+// Change the value the server sets for the Trigger Setting descriptor number
+// `index` (0 to 2), which a client that has not written it reads; false for
+// a trigger the server would refuse.
+@tier(app)
+fn ess_set_trigger(var db: GattDb, ch: EssCharHandles, index: Int, t: EssTrigger) -> Bool
+    if index < 0 or index >= list.len(ch.triggers)
+        return false
+    let (has_range, low, high) = ess_range(db, ch)
+    let value = ess_trigger_value(ch.uuid, t)
+    ess_trigger_error(ch.uuid, has_range, low, high, value) == 0 and gatt_server.set_value(var db, ch.triggers[index], value)
+
+// The Valid Range descriptor of the characteristic: whether there is one, the
+// lower and the upper bound.
+@tier(app)
+fn ess_range(db: GattDb, ch: EssCharHandles) -> (Bool, Int, Int)
+    if ch.valid_range == 0
+        return (false, 0, 0)
+    let b = db.attributes[gatt_server.index_of(db, ch.valid_range)].value
+    let n = ess_octets(ch.uuid)
+    (true, ess_decode(ch.uuid, b, 0), ess_decode(ch.uuid, b, n))
+
+// The triggers a client reads: the values it wrote, or the ones the server set.
+@tier(app)
+fn ess_triggers(db: GattDb, link: AttLink, ch: EssCharHandles) -> [EssTrigger]
+    var out: [EssTrigger] = []
+    for h in ch.triggers
+        list.push(out, ess_trigger_of(ch.uuid, gatt_server.value_at(db, link, gatt_server.index_of(db, h))))
+    out
+
+// The Trigger Logic a client reads; AND when the characteristic has no
+// Configuration descriptor.
+@tier(app)
+fn ess_logic(db: GattDb, link: AttLink, ch: EssCharHandles) -> Int
+    if ch.configuration == 0
+        return LOGIC_AND
+    let b = gatt_server.value_at(db, link, gatt_server.index_of(db, ch.configuration))
+    if list.len(b) == 0 then LOGIC_AND else b[0] as Int
+
+// Notify the value of `ch` to the client of `link` when its triggers hold:
+// `previous` is the value last sent to that client, `elapsed_s` the seconds
+// since then.  The PDUs to send; none for a client that has not enabled
+// notification, a trigger that does not hold or a characteristic that does not
+// notify.
+@tier(app)
+fn ess_notify(var db: GattDb, var link: AttLink, ch: EssCharHandles, previous: Int, elapsed_s: Int, now_ms: Int) -> [[u8]]
+    if ch.cccd == 0
+        return []
+    if not ess_should_notify(ess_triggers(db, link, ch), ess_logic(db, link, ch), previous, ess_current(db, ch), elapsed_s)
+        return []
+    gatt_server.send_value(var db, var link, ch.value, now_ms)
+
+// ── What the product decides ────────────────────────────────────────
+
+trait EssPolicy[e]
+    // Whether `peer` is a bonded client, which alone may write the Trigger
+    // Setting and Configuration descriptors (ESP 6.1); the product knows its
+    // bonds.
+    fn bonded(var self, peer: links.LinkId) -> Bool [e]
+
+// The policy of a device that treats every client as bonded (`bonded`) or none.
+@value
+struct DefaultEssPolicy
+    bonded: Bool
+
+@tier(embedded)
+fn default_ess_policy(bonded: Bool) -> DefaultEssPolicy
+    DefaultEssPolicy { bonded: bonded }
+
+impl EssPolicy[] for DefaultEssPolicy
+    fn bonded(var self, _peer: links.LinkId) -> Bool
+        self.bonded
+
+// ── Descriptor writes ───────────────────────────────────────────────
+
+// The characteristic and the kind of descriptor at `handle`: its position in
+// `handles.characteristics` and KIND_TRIGGER, KIND_CONFIGURATION or
+// KIND_DESCRIPTION; (-1, KIND_NONE) for any other attribute.
+@tier(app)
+fn ess_locate(handles: EssHandles, handle: Int) -> (Int, Int)
+    for i in 0..list.len(handles.characteristics)
+        let ch = handles.characteristics[i]
+        for t in ch.triggers
+            if t == handle
+                return (i, KIND_TRIGGER)
+        if ch.configuration == handle and handle != 0
+            return (i, KIND_CONFIGURATION)
+        if ch.description == handle and handle != 0
+            return (i, KIND_DESCRIPTION)
+    (-1, KIND_NONE)
+
+// The Error Code a write of `value` to the Trigger Setting or Configuration
+// descriptor at `handle` of the characteristic `ch` gets, 0 for none.
+@tier(app)
+fn ess_descriptor_error(db: GattDb, ch: EssCharHandles, kind: Int, value: [u8]) -> Int
+    if kind == KIND_CONFIGURATION
+        return ess_configuration_error(value)
+    let (has_range, low, high) = ess_range(db, ch)
+    ess_trigger_error(ch.uuid, has_range, low, high, value)
+
+// Answer one ATT PDU of `peer`, the client of `link`.  A write to a Trigger
+// Setting or Configuration descriptor is evaluated before its Write Response,
+// in this order: the access of the descriptor, the client being bonded
+// (`EssPolicy.bonded`, else Insufficient Authorization), the value.  A write command
+// that fails is dropped, a Prepare Write to either descriptor is answered
+// Attribute Not Long and a signed write is dropped.  Any other PDU is the
+// GATT server's.
+@tier(app)
+fn ess_receive<P: EssPolicy[e]>(var db: GattDb, var link: AttLink, handles: EssHandles, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if list.len(pdu) >= 3
+        let op = pdu[0] as Int
+        let handle = gatt_server.read_le16(pdu, 1)
+        let (at, kind) = ess_locate(handles, handle)
+        if at >= 0 and (kind == KIND_TRIGGER or kind == KIND_CONFIGURATION)
+            if op == OP_PREPARE_WRITE_REQ
+                return gatt_server.error(OP_PREPARE_WRITE_REQ, handle, att.ATT_ERR_ATTRIBUTE_NOT_LONG)
+            if op == OP_SIGNED_WRITE_CMD
+                return []
+            if op == att.ATT_OP_WRITE_REQ or op == OP_WRITE_CMD
+                let respond = op == att.ATT_OP_WRITE_REQ
+                var code = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+                if code == 0 and not policy.bonded(peer)
+                    code = att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+                if code == 0
+                    code = ess_descriptor_error(db, handles.characteristics[at], kind, pdu[3:list.len(pdu)])
+                if code != 0
+                    return if respond then gatt_server.error(att.ATT_OP_WRITE_REQ, handle, code) else []
+    gatt_server.receive(var db, var link, pdu, now_ms)
+
+// ── Descriptor Value Changed ────────────────────────────────────────
+
+// Indicate to the client of `link` that the descriptors of the flags `flags`
+// of the characteristic `uuid` changed.  The flags are the DVC_ bits; the PDUs
+// to send, none for a service without the characteristic, a flag outside the
+// five bits, an unknown characteristic or a client that has not enabled
+// indications.
+@tier(app)
+fn ess_indicate_change(var db: GattDb, var link: AttLink, handles: EssHandles, flags: Int, uuid: Int, now_ms: Int) -> [[u8]]
+    if handles.dvc == 0 or flags < 0 or (flags & DVC_FLAGS_MASK) != flags or (flags & 0x1E) == 0 or ess_octets(uuid) == 0
+        return []
+    if not gatt_server.set_value(var db, handles.dvc, ess_dvc_value(flags, uuid))
+        return []
+    gatt_server.send_value(var db, var link, handles.dvc, now_ms)
+
+// The Descriptor Value Changed flags of the write PDU `pdu` of a client: the
+// User Description is announced to the other clients, the others are not
+// (Table 3.15).  0 for a PDU that writes neither.
+@tier(app)
+fn ess_written_flags(handles: EssHandles, pdu: [u8]) -> Int
+    if list.len(pdu) < 3
+        return 0
+    let op = pdu[0] as Int
+    if op != att.ATT_OP_WRITE_REQ and op != OP_WRITE_CMD
+        return 0
+    let (at, kind) = ess_locate(handles, gatt_server.read_le16(pdu, 1))
+    if at >= 0 and kind == KIND_DESCRIPTION
+        return DVC_SOURCE_CLIENT | DVC_USER_DESCRIPTION
+    0
+
+// ── Values per bond ─────────────────────────────────────────────────
+
+// The Trigger Setting and Configuration values the client of `link` wrote,
+// for the product to keep with the bond: the descriptors are persistent for
+// a bonded client (ESS 3.1.2), and the GATT server's saved configuration holds
+// the Client Characteristic Configuration values only.
+@tier(app)
+fn ess_save_values(link: AttLink, handles: EssHandles) -> [gatt_server.LinkValue]
+    var out: [gatt_server.LinkValue] = []
+    for lv in link.link_values
+        let (at, kind) = ess_locate(handles, lv.handle)
+        if at >= 0 and (kind == KIND_TRIGGER or kind == KIND_CONFIGURATION)
+            list.push(out, lv)
+    out
+
+// Give the client of `link` the values `ess_save_values` returned when it
+// reconnects.
+@tier(app)
+fn ess_restore_values(db: GattDb, var link: AttLink, handles: EssHandles, saved: [gatt_server.LinkValue])
+    for lv in saved
+        let (at, kind) = ess_locate(handles, lv.handle)
+        if at >= 0 and (kind == KIND_TRIGGER or kind == KIND_CONFIGURATION)
+            let _ = gatt_server.set_link_value(db, var link, lv.handle, lv.value)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// A server on an authenticated link.
+@tier(app)
+fn server(config: EssConfig) -> (GattServer, EssHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_ess_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)

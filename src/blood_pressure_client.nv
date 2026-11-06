@@ -1,0 +1,195 @@
+// src/blood_pressure_client.nv — the Collector side of the Blood Pressure
+// Service (0x1810): the decoders of its characteristics and the client session.
+//
+//   Blood Pressure Measurement          0x2A35   decoded by `bp_decode`; indicated
+//   Intermediate Cuff Pressure          0x2A36   decoded by `bp_decode_cuff`; notified
+//   Blood Pressure Feature              0x2A49   decoded by `bp_decode_features`
+//   Enhanced Blood Pressure Measurement 0x2B34   decoded by `bp_decode_enhanced`
+//   Enhanced Intermediate Cuff Pressure 0x2B35   decoded by `bp_decode_enhanced_cuff`
+//
+// Layout ([GSS] 3.31, 3.86, 3.87 and 3.125): the Flags octet (bit 0 the unit, mmHg
+// when clear and kPa when set; bit 1 a time stamp; bit 2 a pulse rate; bit 3 a user
+// id; bit 4 a Measurement Status; in the Enhanced values bit 5 a User Facing Time and
+// bit 6 the epoch start 2000; the other bits reserved and ignored), the pressures as
+// SFLOATs, then the optional fields in that order.  The classic time stamp is a
+// seven-octet Date Time with a month and a day ([BLS] 3.1.1.3), the Enhanced one a
+// uint32 of seconds.
+//
+// A decoder answers `None` for a value too short for the fields its flags name and
+// for a time stamp that is not a Date Time with a month and a day.  It allocates
+// nothing and keeps no state.  Pressures stay raw SFLOATs; `bp_milli_mmhg` converts a
+// number to thousandths of a millimetre of mercury whatever unit the flag names (1 kPa
+// is 7.50062 mmHg).  Octets after the fields are not read.
+//
+// The session (`bp_client_*`) runs on `sensor_client.nv`: discover the service, read
+// the Feature, enable the indication of the measurement (the Enhanced one when
+// `enhanced` is set, because a collector should enable one only, [BLS] 3.1.1) and the
+// notification of the matching cuff pressure.
+//
+// Satisfies: REQ-BLE-PRFC-016.
+
+use gatt_client
+use blood_pressure
+use sensor_client
+use wire
+use links
+
+// One decoded measurement of any of the four characteristics.  `systolic` is the cuff
+// pressure of a cuff value; the other pressures are NaN there in the classic format
+// and absent in the Enhanced one.
+@value
+struct BpMeasurement
+    kpa: Bool
+    systolic: Int
+    diastolic: Int
+    map: Int
+    has_time: Bool
+    time: wire.DateTime
+    has_stamp: Bool
+    stamp: Int
+    has_user_facing: Bool
+    user_facing: Int
+    epoch_2000: Bool
+    has_pulse_rate: Bool
+    pulse_rate: Int
+    has_user_id: Bool
+    user_id: Int
+    has_status: Bool
+    status: Int
+
+// Decode the fields after the pressures, starting at `at`.
+@tier(embedded)
+@no_alloc
+fn bp_decode_tail(b: [u8], flags: Int, at: Int, enhanced: Bool, kpa: Bool, systolic: Int, diastolic: Int, map: Int) -> ?BpMeasurement
+    var i = at
+    let has_stamp_field = (flags & blood_pressure.FLAG_TIME_STAMP) != 0
+    var stamp = 0
+    var stamp_time = wire.date_time_unknown()
+    if has_stamp_field
+        if enhanced
+            if list.len(b) < i + 4
+                return None
+            stamp = wire.get(b, i, 4)
+            i = i + 4
+        else
+            if list.len(b) < i + 7
+                return None
+            stamp_time = wire.get_date_time(b, i)
+            if not wire.date_time_valid(stamp_time) or stamp_time.month == 0 or stamp_time.day == 0
+                return None
+            i = i + 7
+    let has_pulse = (flags & blood_pressure.FLAG_PULSE_RATE) != 0
+    var pulse = 0
+    if has_pulse
+        if list.len(b) < i + 2
+            return None
+        pulse = wire.get(b, i, 2)
+        i = i + 2
+    let has_user = (flags & blood_pressure.FLAG_USER_ID) != 0
+    var user = 0
+    if has_user
+        if list.len(b) < i + 1
+            return None
+        user = b[i] as Int
+        i = i + 1
+    let has_status = (flags & blood_pressure.FLAG_MEASUREMENT_STATUS) != 0
+    var status = 0
+    if has_status
+        if list.len(b) < i + 2
+            return None
+        status = wire.get(b, i, 2)
+        i = i + 2
+    let has_facing = enhanced and (flags & blood_pressure.FLAG_USER_FACING_TIME) != 0
+    var facing = 0
+    if has_facing
+        if list.len(b) < i + 4
+            return None
+        facing = wire.get(b, i, 4)
+    Some(BpMeasurement {
+        kpa: kpa, systolic: systolic, diastolic: diastolic, map: map,
+        has_time: has_stamp_field and not enhanced, time: stamp_time,
+        has_stamp: has_stamp_field and enhanced, stamp: stamp,
+        has_user_facing: has_facing, user_facing: facing,
+        epoch_2000: enhanced and (flags & blood_pressure.FLAG_EPOCH_START_2000) != 0,
+        has_pulse_rate: has_pulse, pulse_rate: pulse, has_user_id: has_user, user_id: user,
+        has_status: has_status, status: status })
+
+// The Blood Pressure Measurement in `b`, `None` when it is not a whole one.
+@tier(embedded)
+@no_alloc
+fn bp_decode(b: [u8]) -> ?BpMeasurement
+    if list.len(b) < 7
+        return None
+    let flags = b[0] as Int
+    bp_decode_tail(b, flags, 7, false, (flags & blood_pressure.FLAG_KPA) != 0, wire.get(b, 1, 2), wire.get(b, 3, 2), wire.get(b, 5, 2))
+
+// The Intermediate Cuff Pressure in `b`: the cuff pressure is `systolic`, the other
+// two SFLOATs are read as they are (NaN, [BLS] 3.2.1.2).
+@tier(embedded)
+@no_alloc
+fn bp_decode_cuff(b: [u8]) -> ?BpMeasurement
+    bp_decode(b)
+
+// The Enhanced Blood Pressure Measurement in `b`.
+@tier(embedded)
+@no_alloc
+fn bp_decode_enhanced(b: [u8]) -> ?BpMeasurement
+    if list.len(b) < 7
+        return None
+    let flags = b[0] as Int
+    bp_decode_tail(b, flags, 7, true, (flags & blood_pressure.FLAG_KPA) != 0, wire.get(b, 1, 2), wire.get(b, 3, 2), wire.get(b, 5, 2))
+
+// The Enhanced Intermediate Cuff Pressure in `b`: one SFLOAT, the cuff pressure in
+// `systolic`; the other two read as NaN.
+@tier(embedded)
+@no_alloc
+fn bp_decode_enhanced_cuff(b: [u8]) -> ?BpMeasurement
+    if list.len(b) < 3
+        return None
+    let flags = b[0] as Int
+    bp_decode_tail(b, flags, 3, true, (flags & blood_pressure.FLAG_KPA) != 0, wire.get(b, 1, 2), wire.SFLOAT_NAN, wire.SFLOAT_NAN)
+
+// The Feature in `b`: two octets, `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn bp_decode_features(b: [u8]) -> ?Int
+    if list.len(b) != 2
+        return None
+    Some(wire.get(b, 0, 2))
+
+// `n / d` rounded once, halves away from zero.
+@tier(embedded)
+@no_alloc
+fn bp_div_round(n: Int, d: Int) -> Int
+    if n < 0
+        return -((-n + d / 2) / d)
+    (n + d / 2) / d
+
+// The pressure `raw` of `m` in thousandths of a millimetre of mercury; 0 for a special
+// value, which `wire.sfloat_kind` tells apart.
+@tier(embedded)
+@no_alloc
+fn bp_milli_mmhg(m: BpMeasurement, raw: Int) -> Int
+    let milli = wire.sfloat_scaled(raw, 3)
+    if not m.kpa
+        return milli
+    bp_div_round(milli * 750062, 100000)
+
+// A session on `link`.
+@tier(app)
+fn bp_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, blood_pressure.UUID_BLOOD_PRESSURE_SERVICE)
+
+// Discover the service, read the Feature, enable the indication of the measurement
+// (required) and the notification of the cuff pressure (optional); the Enhanced pair
+// when `enhanced` is set.
+@tier(app)
+fn bp_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, enhanced: Bool, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, blood_pressure.UUID_BLOOD_PRESSURE_FEATURE, true)
+    if enhanced
+        sensor_client.sc_queue_subscribe(var c, blood_pressure.UUID_ENHANCED_BLOOD_PRESSURE_MEASUREMENT, gatt_client.CCCD_INDICATE, true)
+        sensor_client.sc_queue_subscribe(var c, blood_pressure.UUID_ENHANCED_INTERMEDIATE_CUFF_PRESSURE, gatt_client.CCCD_NOTIFY, false)
+    else
+        sensor_client.sc_queue_subscribe(var c, blood_pressure.UUID_BLOOD_PRESSURE_MEASUREMENT, gatt_client.CCCD_INDICATE, true)
+        sensor_client.sc_queue_subscribe(var c, blood_pressure.UUID_INTERMEDIATE_CUFF_PRESSURE, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_start(var t, var c, now_ms)

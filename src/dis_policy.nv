@@ -1,0 +1,259 @@
+// src/dis_policy.nv — the Device Information Service with the
+// product's values and the rules the stack keeps.
+//
+// Mechanism and policy.  What the Device Information Service fixes belongs to
+// the stack and a product cannot change it: a string characteristic holds UTF-8
+// text, the System ID is eight octets, the PnP ID is seven octets whose Vendor
+// ID Source is 1 (Bluetooth SIG) or 2 (USB Implementer's Forum), every value is
+// read-only and none has a Client Characteristic Configuration descriptor.
+// `check_information` refuses a value that breaks one of those rules, and one
+// longer than `noble_services_config.MAX_DIS_OCTETS`.  What the service leaves to the product
+// is asked of a `DisPolicy`: which characteristics the service holds (a value
+// that is empty leaves its characteristic out), what each one says, and the
+// access a client needs to read it, so a serial number can wait for an
+// encrypted link while the model number is open.
+//
+// `add_device_information_policy` builds the service in the order of
+// `device_information.nv`, so a handle is the same whichever builder made it.
+// `dis_update` replaces a value that changed after the service was built, a
+// firmware revision after an update, and answers the Error Code of the rule it
+// broke; a client reads the new value at its next read, since the service has
+// no notification.
+//
+// Satisfies: REQ-BLE-PRF-001.
+
+use gatt_server
+use noble_services_config
+use device_information
+use profile_builder
+
+// The characteristics of the service, in the order the builder adds them.
+enum DisKind
+    Manufacturer
+    Model
+    Serial
+    Hardware
+    Firmware
+    Software
+    SystemId
+    PnpId
+
+// Why a value or the service was refused.  Empty: the policy holds no value at
+// all.  TooLong: a value above `noble_services_config.MAX_DIS_OCTETS`.  NotUtf8: a string that
+// is not well-formed UTF-8.  BadSystemId: a System ID that is not eight octets.
+// BadPnpId: a PnP ID that is not seven octets or whose Vendor ID Source is not
+// 1 or 2.  Absent: an update of a characteristic the service does not hold.
+// NoRoom: the attribute table has no handle left.
+enum DisError
+    Empty
+    TooLong
+    NotUtf8
+    BadSystemId
+    BadPnpId
+    Absent
+    NoRoom
+
+impl Error for DisError
+    fn message(self) -> Str
+        match self
+            Empty => "the policy holds no Device Information value"
+            TooLong => "a Device Information value is longer than the profile allows"
+            NotUtf8 => "a Device Information string is not UTF-8"
+            BadSystemId => "the System ID is not eight octets"
+            BadPnpId => "the PnP ID is not seven octets with a Vendor ID Source of 1 or 2"
+            Absent => "the service holds no such characteristic"
+            NoRoom => "the attribute table has no handle left"
+
+// The questions a product answers for the service.
+trait DisPolicy[e]
+    // The value of `kind`: UTF-8 text for a string, the eight octets of
+    // `device_information.system_id_value` or the seven of `pnp_id_value`;
+    // empty to leave the characteristic out.
+    fn value(var self, kind: DisKind) -> [u8] [e]
+    // The access a client needs to read the characteristic.
+    fn access(var self, kind: DisKind) -> gatt_server.Access [e]
+
+// The kinds in the order the service holds them.
+pub fn all_kinds() -> [DisKind]
+    [DisKind.Manufacturer, DisKind.Model, DisKind.Serial, DisKind.Hardware, DisKind.Firmware,
+     DisKind.Software, DisKind.SystemId, DisKind.PnpId]
+
+// Whether `b` is well-formed UTF-8 ([RFC 3629]): the shortest form of each
+// scalar value, none of the surrogates U+D800 to U+DFFF and none above
+// U+10FFFF.
+fn valid_utf8(b: [u8]) -> Bool
+    var i = 0
+    let n = list.len(b)
+    while i < n
+        let c = b[i] as Int
+        if c < 0x80
+            i = i + 1
+        else if c >= 0xC2 and c <= 0xDF
+            if i + 1 >= n or not continuation(b[i + 1])
+                return false
+            i = i + 2
+        else if c >= 0xE0 and c <= 0xEF
+            if i + 2 >= n or not continuation(b[i + 1]) or not continuation(b[i + 2])
+                return false
+            let second = b[i + 1] as Int
+            if (c == 0xE0 and second < 0xA0) or (c == 0xED and second > 0x9F)
+                return false
+            i = i + 3
+        else if c >= 0xF0 and c <= 0xF4
+            if i + 3 >= n or not continuation(b[i + 1]) or not continuation(b[i + 2]) or not continuation(b[i + 3])
+                return false
+            let second = b[i + 1] as Int
+            if (c == 0xF0 and second < 0x90) or (c == 0xF4 and second > 0x8F)
+                return false
+            i = i + 4
+        else
+            return false
+    true
+
+fn continuation(b: u8) -> Bool
+    ((b as Int) & 0xC0) == 0x80
+
+// The UUID of the characteristic of `kind`.
+fn uuid_of(kind: DisKind) -> Int
+    match kind
+        Manufacturer => device_information.UUID_MANUFACTURER_NAME_STRING
+        Model => device_information.UUID_MODEL_NUMBER_STRING
+        Serial => device_information.UUID_SERIAL_NUMBER_STRING
+        Hardware => device_information.UUID_HARDWARE_REVISION_STRING
+        Firmware => device_information.UUID_FIRMWARE_REVISION_STRING
+        Software => device_information.UUID_SOFTWARE_REVISION_STRING
+        SystemId => device_information.UUID_SYSTEM_ID
+        PnpId => device_information.UUID_PNP_ID
+
+// The rule `value` must meet to be the value of `kind`, as the error it
+// breaks.  An empty value meets every rule: it leaves the characteristic out.
+fn check_value(kind: DisKind, value: [u8]) -> ?DisError
+    if list.len(value) == 0
+        return None
+    if list.len(value) > noble_services_config.MAX_DIS_OCTETS
+        return Some(DisError.TooLong)
+    match kind
+        SystemId =>
+            if list.len(value) != 8
+                return Some(DisError.BadSystemId)
+            None
+        PnpId =>
+            let source = value[0] as Int
+            if list.len(value) != 7 or (source != device_information.PNP_SOURCE_BLUETOOTH_SIG and source != device_information.PNP_SOURCE_USB_IF)
+                return Some(DisError.BadPnpId)
+            None
+        _ =>
+            if not valid_utf8(value)
+                return Some(DisError.NotUtf8)
+            None
+
+// The values of `info` checked as the policy of the service.
+struct InformationPolicy
+    info: DeviceInformation
+
+impl DisPolicy[] for InformationPolicy
+    fn value(var self, kind: DisKind) -> [u8]
+        match kind
+            Manufacturer => self.info.manufacturer[:]
+            Model => self.info.model[:]
+            Serial => self.info.serial[:]
+            Hardware => self.info.hardware[:]
+            Firmware => self.info.firmware[:]
+            Software => self.info.software[:]
+            SystemId => self.info.system_id[:]
+            PnpId => self.info.pnp_id[:]
+
+    fn access(var self, kind: DisKind) -> gatt_server.Access
+        let _ = kind
+        self.info.read
+
+// A policy that serves the values of `info`, every one at the access
+// `info.read`.
+pub fn information_policy(info: DeviceInformation) -> InformationPolicy
+    InformationPolicy { info: info }
+
+// Check the values of `info`: the first rule it breaks, or None.
+fn check_information(info: DeviceInformation) -> ?DisError
+    var policy = information_policy(info)
+    check_policy(var policy)
+
+// The first rule the values of `policy` break, or None.  A service that holds no
+// characteristic is refused as `Empty`.
+fn check_policy<P: DisPolicy[e]>(var policy: P) -> ?DisError [e]
+    var held = 0
+    for kind in all_kinds()
+        let value = policy.value(kind)
+        match check_value(kind, value)
+            Some(e) => return Some(e)
+            None => ()
+        if list.len(value) > 0
+            held = held + 1
+    if held == 0
+        return Some(DisError.Empty)
+    None
+
+// Add the service after the last attribute of `db`, with the values and the
+// access the policy gives.  The handles are those of `device_information.nv`.
+pub fn add_device_information_policy<P: DisPolicy[e]>(var db: GattDb, var policy: P) -> Result<DeviceInformationHandles, DisError> [e]
+    match check_policy(var policy)
+        Some(e) => return Err(e)
+        None => ()
+    var handles = no_handles()
+    match profile_builder.start_service(var db, gatt_server.le16(device_information.UUID_DEVICE_INFORMATION_SERVICE))
+        Err(_) => return Err(DisError.NoRoom)
+        Ok(h) => handles = with_service(handles, h)
+    for kind in all_kinds()
+        let added = device_information.add_optional(var db, policy.access(kind), uuid_of(kind), policy.value(kind))
+        match added
+            Err(_) => return Err(DisError.NoRoom)
+            Ok(h) => handles = with_handle(handles, kind, h)
+    Ok(handles)
+
+// The handles of a service that holds nothing.
+pub fn no_handles() -> DeviceInformationHandles
+    DeviceInformationHandles { service: 0, manufacturer: 0, model: 0, serial: 0, hardware: 0, firmware: 0, software: 0, system_id: 0, pnp_id: 0 }
+
+fn with_service(h: DeviceInformationHandles, service: Int) -> DeviceInformationHandles
+    DeviceInformationHandles {
+        service: service, manufacturer: h.manufacturer, model: h.model, serial: h.serial, hardware: h.hardware,
+        firmware: h.firmware, software: h.software, system_id: h.system_id, pnp_id: h.pnp_id }
+
+// `handles` with the handle of `kind` set.
+fn with_handle(h: DeviceInformationHandles, kind: DisKind, handle: Int) -> DeviceInformationHandles
+    DeviceInformationHandles {
+        service: h.service,
+        manufacturer: if kind == DisKind.Manufacturer then handle else h.manufacturer,
+        model: if kind == DisKind.Model then handle else h.model,
+        serial: if kind == DisKind.Serial then handle else h.serial,
+        hardware: if kind == DisKind.Hardware then handle else h.hardware,
+        firmware: if kind == DisKind.Firmware then handle else h.firmware,
+        software: if kind == DisKind.Software then handle else h.software,
+        system_id: if kind == DisKind.SystemId then handle else h.system_id,
+        pnp_id: if kind == DisKind.PnpId then handle else h.pnp_id }
+
+// The handle of the characteristic of `kind`, 0 when the service has none.
+fn handle_of(h: DeviceInformationHandles, kind: DisKind) -> Int
+    match kind
+        Manufacturer => h.manufacturer
+        Model => h.model
+        Serial => h.serial
+        Hardware => h.hardware
+        Firmware => h.firmware
+        Software => h.software
+        SystemId => h.system_id
+        PnpId => h.pnp_id
+
+// Replace the value of `kind` after the service was built.  The characteristic
+// must exist in `db` (`Absent`) and the value meet its rule and
+// `noble_services_config.MAX_DIS_OCTETS`; an empty value is refused as `Absent`, since a
+// characteristic is not taken out of a built service.
+pub fn dis_update(var db: GattDb, handles: DeviceInformationHandles, kind: DisKind, value: [u8]) -> ?DisError
+    let handle = handle_of(handles, kind)
+    if handle == 0 or list.len(value) == 0
+        return Some(DisError.Absent)
+    match check_value(kind, value)
+        Some(e) => return Some(e)
+        None => ()
+    if not gatt_server.set_value(var db, handle, value)
+        return Some(DisError.Absent)
+    None

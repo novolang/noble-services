@@ -1,0 +1,291 @@
+// tests/hid_tests.nv — the unit tests of src/hid.nv.
+//
+//   novo test tests/hid_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use battery
+use device_information
+use hid.{ CONSUMER_REPORT_ID, CONTROL_POINT_EXIT_SUSPEND, HidConfig, HidHandles, HidReport, KEYBOARD_REPORT_ID, PROTOCOL_MODE_BOOT, PROTOCOL_MODE_REPORT, ReportKind, add_hid_device, add_hid_service, hid_protocol_mode, hid_send_boot_input, hid_send_report, keyboard_consumer_config, keyboard_consumer_report_map }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn zero_handles() -> HidHandles
+    HidHandles { service: 0, protocol_mode: 0, report_map: 0, information: 0, control_point: 0, reports: [], boot_input: 0, boot_input_cccd: 0, boot_output: 0 }
+
+fn added(var s: GattServer, config: HidConfig) -> HidHandles
+    match add_hid_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            zero_handles()
+
+fn read(var s: GattServer, handle: Int) -> [u8]
+    let out = gatt_server.receive(var s.db, var s.link, octets([0x0A, handle & 0xFF, handle >>> 8]), 0)
+    test.assert_eq(list.len(out), 1)
+    out[0][:]
+
+fn read_value(var s: GattServer, handle: Int) -> [u8]
+    let out = read(s, handle)
+    test.assert_eq(out[0] as Int, 0x0B)
+    out[1:]
+
+fn write_request(var s: GattServer, handle: Int, value: [Int]) -> [[u8]]
+    var pdu = octets([0x12, handle & 0xFF, handle >>> 8])
+    list.append(pdu, octets(value))
+    gatt_server.receive(var s.db, var s.link, pdu, 0)
+
+fn write_command(var s: GattServer, handle: Int, value: [Int]) -> [[u8]]
+    var pdu = octets([0x52, handle & 0xFF, handle >>> 8])
+    list.append(pdu, octets(value))
+    gatt_server.receive(var s.db, var s.link, pdu, 0)
+
+fn props(s: GattServer, decl: Int) -> Int
+    s.db.attributes[gatt_server.index_of(s.db, decl)].value[0] as Int
+
+fn permissions_of(s: GattServer, handle: Int) -> Int
+    s.db.attributes[gatt_server.index_of(s.db, handle)].permissions
+
+@test
+fn test_layout_of_the_example()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Open))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.protocol_mode, 3)
+    test.assert_eq(h.report_map, 5)
+    test.assert_eq(h.information, 7)
+    test.assert_eq(h.control_point, 9)
+    test.assert_eq(list.len(h.reports), 3)
+    // Keyboard input: value, reference, configuration.
+    test.assert_eq(h.reports[0].value, 11)
+    test.assert_eq(h.reports[0].reference, 12)
+    test.assert_eq(h.reports[0].cccd, 13)
+    // Keyboard output: value and reference.
+    test.assert_eq(h.reports[1].value, 15)
+    test.assert_eq(h.reports[1].reference, 16)
+    test.assert_eq(h.reports[1].cccd, 0)
+    // Consumer input.
+    test.assert_eq(h.reports[2].value, 18)
+    test.assert_eq(h.reports[2].reference, 19)
+    test.assert_eq(h.reports[2].cccd, 20)
+    test.assert_eq(h.boot_input, 22)
+    test.assert_eq(h.boot_input_cccd, 23)
+    test.assert_eq(h.boot_output, 25)
+    test.assert_eq(gatt_server.last_handle(s.db), 25)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 25)
+    test.assert(gatt_server.same_bytes(s.db.attributes[0].value, octets([0x12, 0x18])))
+
+@test
+fn test_values_properties_and_permissions()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Open))
+    // Declarations carry the properties.
+    test.assert_eq(props(s, 2), 0x06)     // Protocol Mode: Read, Write Without Response
+    test.assert_eq(props(s, 4), 0x02)     // Report Map: Read
+    test.assert_eq(props(s, 6), 0x02)     // HID Information: Read
+    test.assert_eq(props(s, 8), 0x04)     // Control Point: Write Without Response
+    test.assert_eq(props(s, 10), 0x12)    // Input report: Read, Notify
+    test.assert_eq(props(s, 14), 0x0E)    // Output report: Read, Write, Write Without Response
+    test.assert_eq(props(s, 21), 0x12)    // Boot Keyboard Input: Read, Notify
+    test.assert_eq(props(s, 24), 0x0E)    // Boot Keyboard Output: Read, Write, Write Without Response
+    // Initial values.
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.protocol_mode)].value, octets([1])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.information)].value, octets([0x11, 0x01, 0x00, 0x02])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.report_map)].value, keyboard_consumer_report_map()))
+    test.assert_eq(list.len(s.db.attributes[gatt_server.index_of(s.db, h.reports[0].value)].value), 8)
+    // Report references: report ID and type (1 input, 2 output).
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.reports[0].reference)].value, octets([1, 1])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.reports[1].reference)].value, octets([1, 2])))
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.reports[2].reference)].value, octets([2, 1])))
+    // Permissions.
+    test.assert_eq(permissions_of(s, h.report_map), gatt_server.PERM_READ)
+    test.assert_eq(permissions_of(s, h.information), gatt_server.PERM_READ)
+    test.assert_eq(permissions_of(s, h.control_point), gatt_server.PERM_WRITE)
+    test.assert_eq(permissions_of(s, h.reports[0].value), gatt_server.PERM_READ)
+    test.assert_eq(permissions_of(s, h.reports[1].value), gatt_server.PERM_READ | gatt_server.PERM_WRITE)
+    test.assert_eq(permissions_of(s, h.reports[0].reference), gatt_server.PERM_READ)
+    test.assert_eq(permissions_of(s, h.reports[0].cccd), gatt_server.PERM_READ | gatt_server.PERM_WRITE)
+
+@test
+fn test_reads_and_writes_through_the_server()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Open))
+    test.assert(gatt_server.same_bytes(read_value(s, h.information), octets([0x11, 0x01, 0x00, 0x02])))
+    test.assert(gatt_server.same_bytes(read_value(s, h.reports[0].reference), octets([1, 1])))
+    // The Report Map is longer than a default ATT_MTU: a long read follows with Read Blob.
+    let map = keyboard_consumer_report_map()
+    let blob = gatt_server.receive(var s.db, var s.link, octets([0x0C, h.report_map & 0xFF, h.report_map >>> 8, 22, 0]), 0)
+    test.assert_eq(blob[0][0] as Int, 0x0D)
+    test.assert(gatt_server.same_bytes(blob[0][1:], map[22:44]))
+    // The Control Point and the Protocol Mode take a command.
+    test.assert_eq(list.len(write_command(var s, h.control_point, [CONTROL_POINT_EXIT_SUSPEND])), 0)
+    test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, h.control_point)].value, octets([1])))
+    test.assert_eq(hid_protocol_mode(s.db, h), PROTOCOL_MODE_REPORT)
+    test.assert_eq(list.len(write_command(var s, h.protocol_mode, [PROTOCOL_MODE_BOOT])), 0)
+    test.assert_eq(hid_protocol_mode(s.db, h), PROTOCOL_MODE_BOOT)
+    // The Control Point is not readable; the Report Map and Information are not writable;
+    // an Input report is not writable.
+    test.assert_eq(read(s, h.control_point)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(write_request(var s, h.report_map, [0])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(write_request(var s, h.information, [0])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(write_request(var s, h.reports[0].value, [0])[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The LED output report takes a request and keeps one octet.
+    test.assert(gatt_server.same_bytes(write_request(var s, h.reports[1].value, [0x02])[0], octets([0x13])))
+    test.assert(gatt_server.same_bytes(read_value(s, h.reports[1].value), octets([0x02])))
+    test.assert_eq(write_request(var s, h.reports[1].value, [1, 2])[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(gatt_server.take_changed(var s.link)[0], h.control_point)
+
+@test
+fn test_input_report_notification_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Open))
+    let key_a = [0, 0, 4, 0, 0, 0, 0, 0]
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, KEYBOARD_REPORT_ID, octets(key_a), 0)), 0)
+    // The host subscribes to the keyboard report and to the consumer report.
+    let kb = h.reports[0].cccd
+    test.assert(gatt_server.same_bytes(write_request(var s, kb, [1, 0])[0], octets([0x13])))
+    test.assert(gatt_server.same_bytes(read_value(s, kb), octets([1, 0])))
+    let ntf = hid_send_report(var s.db, var s.link, h, KEYBOARD_REPORT_ID, octets(key_a), 0)
+    test.assert_eq(list.len(ntf), 1)
+    var want = octets([0x1B, h.reports[0].value & 0xFF, h.reports[0].value >>> 8])
+    list.append(want, octets(key_a))
+    test.assert(gatt_server.same_bytes(ntf[0], want))
+    // The consumer report has its own subscription.
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, CONSUMER_REPORT_ID, octets([0xE9, 0x00]), 0)), 0)
+    let cc = h.reports[2].cccd
+    let _ = write_request(var s, cc, [1, 0])
+    let volume_up = hid_send_report(var s.db, var s.link, h, CONSUMER_REPORT_ID, octets([0xE9, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(volume_up[0], octets([0x1B, h.reports[2].value & 0xFF, h.reports[2].value >>> 8, 0xE9, 0x00])))
+    // An output report and an unknown ID send nothing.
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, 9, octets([1]), 0)), 0)
+    // The reader can read the last report back.
+    test.assert(gatt_server.same_bytes(read_value(s, h.reports[0].value), octets(key_a)))
+
+@test
+fn test_boot_keyboard_reports()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Open))
+    test.assert_eq(list.len(hid_send_boot_input(var s.db, var s.link, h, octets([0, 0, 5, 0, 0, 0, 0, 0]), 0)), 0)
+    let _ = write_request(var s, h.boot_input_cccd, [1, 0])
+    let ntf = hid_send_boot_input(var s.db, var s.link, h, octets([0, 0, 5, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(list.len(ntf[0]), 3 + 8)
+    test.assert(gatt_server.same_bytes(write_request(var s, h.boot_output, [3])[0], octets([0x13])))
+    test.assert(gatt_server.same_bytes(read_value(s, h.boot_output), octets([3])))
+    // Without the boot keyboard the characteristics are left out.
+    var plain = gatt_server.new_server([], 65)
+    let config = HidConfig {
+        bcd_hid: 0x0111, country_code: 0, flags: 0, report_map: keyboard_consumer_report_map(),
+        reports: [HidReport { id: 2, kind: ReportKind.Input, size: 2 }], boot_keyboard: false, values: gatt_server.open_permissions(), cccd: gatt_server.open_permissions() }
+    let p = added(var plain, config)
+    test.assert_eq(p.boot_input, 0)
+    test.assert_eq(p.boot_output, 0)
+    test.assert_eq(gatt_server.last_handle(plain.db), 13)
+    test.assert_eq(list.len(hid_send_boot_input(var plain.db, var plain.link, p, octets([1]), 0)), 0)
+
+@test
+fn test_encrypted_reports_wait_for_the_link()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, keyboard_consumer_config(gatt_server.Access.Encrypted))
+    test.assert_eq(permissions_of(s, h.reports[0].value), gatt_server.PERM_READ_ENCRYPT)
+    test.assert_eq(permissions_of(s, h.reports[1].value), gatt_server.PERM_READ_ENCRYPT | gatt_server.PERM_WRITE_ENCRYPT)
+    test.assert_eq(permissions_of(s, h.control_point), gatt_server.PERM_WRITE_ENCRYPT)
+    // The Report Map and HID Information stay readable.
+    test.assert_eq(permissions_of(s, h.report_map), gatt_server.PERM_READ)
+    test.assert_eq(permissions_of(s, h.information), gatt_server.PERM_READ)
+    // The configuration descriptors read on any link and are written once encrypted.
+    test.assert_eq(permissions_of(s, h.reports[0].cccd), gatt_server.PERM_READ | gatt_server.PERM_WRITE_ENCRYPT)
+    test.assert_eq(permissions_of(s, h.boot_input_cccd), gatt_server.PERM_READ | gatt_server.PERM_WRITE_ENCRYPT)
+    test.assert(gatt_server.same_bytes(read_value(s, h.reports[0].cccd), octets([0, 0])))
+    // On a link with no key the host hears Insufficient Authentication; with a
+    // key for the peer, Insufficient Encryption.
+    test.assert_eq(read(s, h.reports[0].value)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(write_request(var s, h.reports[0].cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(read(s, h.reports[0].value)[4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    test.assert_eq(write_request(var s, h.reports[1].value, [1])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    test.assert_eq(write_request(var s, h.reports[0].cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    test.assert_eq(write_request(var s, h.boot_input_cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    test.assert_eq(gatt_server.configuration(s.link, h.reports[0].cccd), 0)
+    // A subscription kept from an earlier link is held back until the link is encrypted.
+    gatt_server.set_configuration(var s.link, h.reports[0].cccd, gatt_server.CCC_NOTIFICATION)
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, KEYBOARD_REPORT_ID, octets([0, 0, 4, 0, 0, 0, 0, 0]), 0)), 0)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, KEYBOARD_REPORT_ID, octets([0, 0, 4, 0, 0, 0, 0, 0]), 0)), 1)
+    test.assert(gatt_server.same_bytes(read_value(s, h.reports[0].value), octets([0, 0, 4, 0, 0, 0, 0, 0])))
+    test.assert(gatt_server.same_bytes(write_request(var s, h.reports[2].cccd, [1, 0])[0], octets([0x13])))
+
+@test
+fn test_authenticated_and_secure_connections_reports()
+    var a = gatt_server.new_server([], 65)
+    let ha = added(var a, keyboard_consumer_config(gatt_server.Access.Authenticated))
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(read(a, ha.reports[0].value)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(write_request(var a, ha.reports[0].cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read(a, ha.reports[0].value)[0] as Int, 0x0B)
+    test.assert(gatt_server.same_bytes(write_request(var a, ha.reports[0].cccd, [1, 0])[0], octets([0x13])))
+    var c = gatt_server.new_server([], 65)
+    let hc = added(var c, keyboard_consumer_config(gatt_server.Access.SecureConnections))
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(read(c, hc.reports[0].value)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(write_request(var c, hc.reports[0].cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(read(c, hc.reports[0].value)[0] as Int, 0x0B)
+    test.assert(gatt_server.same_bytes(write_request(var c, hc.reports[0].cccd, [1, 0])[0], octets([0x13])))
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, keyboard_consumer_config(gatt_server.Access.Authorized))
+    test.assert_eq(read(z, hz.reports[0].value)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(write_request(var z, hz.reports[0].cccd, [1, 0])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+
+@test
+fn test_the_descriptors_can_ask_for_less_than_the_values()
+    var s = gatt_server.new_server([], 65)
+    let base = keyboard_consumer_config(gatt_server.Access.Encrypted)
+    let config = HidConfig {
+        bcd_hid: base.bcd_hid, country_code: base.country_code, flags: base.flags, report_map: base.report_map,
+        reports: base.reports, boot_keyboard: base.boot_keyboard, values: base.values, cccd: gatt_server.open_permissions() }
+    let h = added(var s, config)
+    test.assert(gatt_server.same_bytes(write_request(var s, h.reports[0].cccd, [1, 0])[0], octets([0x13])))
+    // The value still waits for the link.
+    test.assert_eq(list.len(hid_send_report(var s.db, var s.link, h, KEYBOARD_REPORT_ID, octets([0, 0, 4, 0, 0, 0, 0, 0]), 0)), 0)
+
+@test
+fn test_a_report_needs_a_length()
+    var s = gatt_server.new_server([], 65)
+    let config = HidConfig {
+        bcd_hid: 0x0111, country_code: 0, flags: 0, report_map: keyboard_consumer_report_map(),
+        reports: [HidReport { id: 1, kind: ReportKind.Feature, size: 0 }], boot_keyboard: false, values: gatt_server.open_permissions(), cccd: gatt_server.open_permissions() }
+    match add_hid_service(var s.db, config)
+        Ok(_) => test.fail("a report of no octets is refused")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+fn test_keyboard_device_with_its_companions()
+    var s = gatt_server.new_server([], 65)
+    let info = DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: octets(['N' as Int, 'o' as Int, 'v' as Int, 'o' as Int]), model: [], serial: [], hardware: [], firmware: [],
+        software: [], system_id: [], pnp_id: device_information.pnp_id_value(device_information.PNP_SOURCE_USB_IF, 0x1915, 0x0001, 0x0100) }
+    match add_hid_device(var s.db, info, battery.default_battery_config(90), keyboard_consumer_config(gatt_server.Access.Open))
+        Err(_) => test.fail("the device is added")
+        Ok(d) =>
+            // Three services, in the order Device Information, Battery, HID.
+            let groups = gatt_server.receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0)
+            test.assert_eq(groups[0][0] as Int, 0x11)
+            test.assert_eq(d.information.service, 1)
+            test.assert_eq(d.battery.service, 6)
+            test.assert_eq(d.hid.service, 10)
+            test.assert_eq(d.battery.level, 8)
+            test.assert(gatt_server.same_bytes(read_value(s, d.battery.level), octets([90])))
+            test.assert(gatt_server.same_bytes(read_value(s, d.information.manufacturer), octets(['N' as Int, 'o' as Int, 'v' as Int, 'o' as Int])))
+            // A battery notification and a key notification, side by side.
+            let _ = write_request(var s, d.battery.cccd, [1, 0])
+            let _ = write_request(var s, d.hid.reports[0].cccd, [1, 0])
+            test.assert_eq(list.len(battery.set_battery_level(var s.db, var s.link, d.battery, 89, 0)), 1)
+            test.assert_eq(list.len(hid_send_report(var s.db, var s.link, d.hid, KEYBOARD_REPORT_ID, octets([0, 0, 4, 0, 0, 0, 0, 0]), 0)), 1)

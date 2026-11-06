@@ -1,0 +1,170 @@
+// tests/blood_pressure_client_tests.nv — the unit tests of src/blood_pressure_client.nv.
+//
+//   novo test tests/blood_pressure_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use blood_pressure
+use sensor_client
+use wire
+use blood_pressure_client.{ BpMeasurement, bp_client_new, bp_client_start, bp_decode, bp_decode_cuff, bp_decode_enhanced, bp_decode_enhanced_cuff, bp_decode_features, bp_milli_mmhg }
+
+@tier(app)
+fn must(m: ?BpMeasurement) -> BpMeasurement
+    match m
+        Some(v) => v
+        None =>
+            test.fail("a measurement")
+            BpMeasurement {
+                kpa: false, systolic: 0, diastolic: 0, map: 0, has_time: false, time: wire.date_time_unknown(),
+                has_stamp: false, stamp: 0, has_user_facing: false, user_facing: 0, epoch_2000: false,
+                has_pulse_rate: false, pulse_rate: 0, has_user_id: false, user_id: 0, has_status: false, status: 0 }
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_classic_measurement_is_decoded_field_by_field()
+    let sent = blood_pressure.bps_with_status(blood_pressure.bps_with_user_id(blood_pressure.bps_with_pulse_rate(
+        blood_pressure.bps_with_time(blood_pressure.bps_measurement(wire.sfloat(120, 0), wire.sfloat(80, 0), wire.sfloat(93, 0), false),
+            wire.date_time(2026, 11, 1, 8, 30, 15)), wire.sfloat(72, 0)), 2), blood_pressure.STATUS_IMPROPER_POSITION)
+    let m = must(bp_decode(blood_pressure.bps_measurement_value(sent)))
+    test.assert_eq(bp_milli_mmhg(m, m.systolic), 120000)
+    test.assert_eq(bp_milli_mmhg(m, m.diastolic), 80000)
+    test.assert_eq(bp_milli_mmhg(m, m.map), 93000)
+    test.assert(m.has_time)
+    test.assert_eq(m.time.day as Int, 1)
+    test.assert_eq(m.pulse_rate, wire.sfloat(72, 0))
+    test.assert_eq(m.user_id, 2)
+    test.assert_eq(m.status, blood_pressure.STATUS_IMPROPER_POSITION)
+    test.assert(not m.has_stamp)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_kpa_is_converted_to_millimetres_of_mercury()
+    let sent = blood_pressure.bps_measurement(wire.sfloat(160, -1), wire.sfloat(107, -1), wire.sfloat(124, -1), true)
+    let m = must(bp_decode(blood_pressure.bps_measurement_value(sent)))
+    test.assert(m.kpa)
+    test.assert_eq(bp_milli_mmhg(m, m.systolic), 120010)
+    test.assert_eq(bp_milli_mmhg(m, m.diastolic), 80257)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_short_value_and_a_bad_time_stamp_are_not_measurements()
+    let whole = blood_pressure.bps_measurement_value(blood_pressure.bps_with_time(
+        blood_pressure.bps_with_pulse_rate(blood_pressure.bps_measurement(1, 2, 3, false), 4), wire.date_time(2026, 1, 1, 0, 0, 0)))
+    test.assert(bp_decode(whole) != None)
+    for n in 0..list.len(whole)
+        test.assert_eq(bp_decode(whole[0:n]), None)
+    var bad = whole[:]
+    bad[9] = 0
+    test.assert_eq(bp_decode(bad), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_the_cuff_values_carry_the_pressure_in_the_first_sfloat()
+    let m = blood_pressure.bps_measurement(wire.sfloat(95, 0), 0, 0, false)
+    let c = must(bp_decode_cuff(blood_pressure.bps_cuff_value(m)))
+    test.assert_eq(c.systolic, wire.sfloat(95, 0))
+    test.assert_eq(c.diastolic, wire.SFLOAT_NAN)
+    let e = must(bp_decode_enhanced_cuff(blood_pressure.bps_enhanced_cuff_value(m)))
+    test.assert_eq(e.systolic, wire.sfloat(95, 0))
+    test.assert_eq(e.map, wire.SFLOAT_NAN)
+    test.assert_eq(bp_decode_enhanced_cuff(octets2([0, 1])), None)
+
+@tier(app)
+fn octets2(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_an_enhanced_measurement_has_a_uint32_stamp_and_a_user_facing_time()
+    let sent = blood_pressure.bps_with_user_facing(blood_pressure.bps_with_stamp(
+        blood_pressure.bps_measurement(wire.sfloat(120, 0), wire.sfloat(80, 0), wire.sfloat(93, 0), false), 0x01020304, true), 0x0A0B0C0D)
+    let m = must(bp_decode_enhanced(blood_pressure.bps_enhanced_value(sent)))
+    test.assert(m.has_stamp)
+    test.assert_eq(m.stamp, 0x01020304)
+    test.assert(m.has_user_facing)
+    test.assert_eq(m.user_facing, 0x0A0B0C0D)
+    test.assert(m.epoch_2000)
+    test.assert(not m.has_time)
+    test.assert_eq(bp_decode_enhanced(blood_pressure.bps_enhanced_value(sent)[0:12]), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_the_feature_is_two_octets()
+    test.assert_eq(bp_decode_features(octets2([0x3F, 0x01])), Some(0x013F))
+    test.assert_eq(bp_decode_features(octets2([1])), None)
+    test.assert_eq(bp_decode_features(octets2([1, 2, 3])), None)
+
+@tier(app)
+fn test_server(config: blood_pressure.BpsConfig) -> (gatt_server.GattServer, blood_pressure.BpsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = blood_pressure.add_bps_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_session_against_the_full_server()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(blood_pressure.full_config())
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(blood_pressure.UUID_BLOOD_PRESSURE_SERVICE)
+    var t = both.0
+    var c = bp_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, bp_client_start(var t, var c, false, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_handle(var t, c, blood_pressure.UUID_BLOOD_PRESSURE_MEASUREMENT), h.measurement as Int)
+    test.assert_eq(bp_decode_features(sensor_client.sc_value(c)), Some(0x013F))
+    let ind = blood_pressure.bps_indicate(var s.db, var s.link, h, blood_pressure.bps_measurement(wire.sfloat(118, 0), wire.sfloat(76, 0), wire.sfloat(90, 0), false), 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(bp_milli_mmhg(must(bp_decode(sensor_client.sc_value(c))), wire.sfloat(118, 0)), 118000)
+    let ntf = blood_pressure.bps_cuff_notify(var s.db, var s.link, h, blood_pressure.bps_measurement(wire.sfloat(60, 0), 0, 0, false), 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ntf), sensor_client.SE_VALUE)
+    test.assert_eq(sensor_client.sc_uuid(c), blood_pressure.UUID_INTERMEDIATE_CUFF_PRESSURE)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_session_with_the_enhanced_pair()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(blood_pressure.full_config())
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(blood_pressure.UUID_BLOOD_PRESSURE_SERVICE)
+    var t = both.0
+    var c = bp_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, bp_client_start(var t, var c, true, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    let m = blood_pressure.bps_with_stamp(blood_pressure.bps_measurement(wire.sfloat(120, 0), wire.sfloat(80, 0), wire.sfloat(93, 0), false), 99, false)
+    let ind = blood_pressure.bps_enhanced_indicate(var s.db, var s.link, h, m, 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(must(bp_decode_enhanced(sensor_client.sc_value(c))).stamp, 99)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_minimal_server_and_a_peer_without_the_service()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(blood_pressure.default_bps_config())
+    var s = built.0
+    let both = sensor_client.test_open(blood_pressure.UUID_BLOOD_PRESSURE_SERVICE)
+    var t = both.0
+    var c = bp_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, bp_client_start(var t, var c, false, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    var empty = gatt_server.new_server([], 65)
+    let both2 = sensor_client.test_open(blood_pressure.UUID_BLOOD_PRESSURE_SERVICE)
+    var t2 = both2.0
+    var c2 = bp_client_new(sensor_client.test_link())
+    var seen2: [Int] = []
+    let none = sensor_client.test_pump(var t2, var c2, var empty, bp_client_start(var t2, var c2, false, 0), var seen2)
+    test.assert((none & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c2), sensor_client.SC_NOT_FOUND)

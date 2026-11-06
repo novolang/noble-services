@@ -1,0 +1,338 @@
+// src/body_composition.nv — the Body Composition Service
+// (0x181B), with which a body composition analyzer indicates its measurements.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Body Composition Feature      0x2A9B  Read (Indicate when the value can
+//                                         change); 32 bits
+//   Body Composition Measurement  0x2A9C  Indicate; a Flags field, the Body Fat
+//                                         Percentage and the optional fields
+//
+// The Feature value says which optional fields the device has: bits 0 to 10
+// (Time Stamp, Multiple Users, Basal Metabolism, Muscle Percentage, Muscle
+// Mass, Fat Free Mass, Soft Lean Mass, Body Water Mass, Impedance, Weight,
+// Height), the Weight and Mass resolution in bits 11 to 14 and the Height
+// resolution in bits 15 to 17; the rest is reserved and sent as 0.  The
+// resolution of the Height is 0 when the Height is not supported.
+//
+// `bcs_packets` turns one measurement into the values to indicate.  The Flags
+// field follows the Feature bits (the field of Feature bit k is Flags bit k + 1);
+// a field the device does not support is left out; the Time Stamp and the User
+// ID are always in the packet when the device supports them; a Body Fat
+// Percentage of 0xFFFF (measurement unsuccessful) drops every other field but
+// those two.  Over the default ATT_MTU not every field fits: the fields that do
+// not go into a second packet, the continuation, which holds the Flags field
+// and the Body Fat Percentage again but neither the Time Stamp nor the User ID,
+// and both packets have the Multiple Packet Measurement bit set.  A Time Stamp
+// whose year, month or day is 0 is refused, as is a field beyond 16 bits.
+//
+// What a measurement is, when to send it and the storage of measurements the
+// Collector has not taken (at least 25 per user, oldest first, overwritten
+// oldest first) are the product's and NOT IMPLEMENTED here.  The service sets no
+// security level; `BcsConfig.access` does, and `secondary` makes the service a
+// Secondary Service, as the Weight Scale Profile asks.
+//
+// Specification checked against: Body Composition Service 1.0.1 and, for
+// the service inside a Weight Scale, Weight Scale Profile 1.0.1 (3.3).
+//
+// Satisfies: REQ-BLE-BCS-001.
+
+use std.test
+use gatt_server
+use profile_builder
+use fixtures.{ req }
+use wire
+
+const UUID_BODY_COMPOSITION_SERVICE = 0x181B
+const UUID_BODY_COMPOSITION_FEATURE = 0x2A9B
+const UUID_BODY_COMPOSITION_MEASUREMENT = 0x2A9C
+
+// The support bits of the Feature value, which are also the bits of
+// `BcsMeasurement.present`.
+const F_TIME_STAMP = 0x1
+const F_MULTIPLE_USERS = 0x2
+const F_BASAL_METABOLISM = 0x4
+const F_MUSCLE_PERCENTAGE = 0x8
+const F_MUSCLE_MASS = 0x10
+const F_FAT_FREE_MASS = 0x20
+const F_SOFT_LEAN_MASS = 0x40
+const F_BODY_WATER_MASS = 0x80
+const F_IMPEDANCE = 0x100
+const F_WEIGHT = 0x200
+const F_HEIGHT = 0x400
+const F_SUPPORT_MASK = 0x7FF
+
+// Where the two resolutions sit in the Feature value (Weight and Mass: 4 bits
+// with the values 0 to 7; Height: 3 bits with the values 0 to 3).
+const WEIGHT_RESOLUTION_SHIFT = 11
+const HEIGHT_RESOLUTION_SHIFT = 15
+
+// The bits of the Flags field that are not the presence of a field.
+const FLAG_IMPERIAL = 0x1
+const FLAG_MULTIPLE_PACKET = 0x1000
+
+// The Body Fat Percentage that says the measurement was unsuccessful.
+const UNSUCCESSFUL = 0xFFFF
+
+// The fields of the Measurement after the Body Fat Percentage: 11 of them, in
+// the order of the support bits.
+const FIELDS = 11
+
+// What the device supports (`features`: the support bits and the two
+// resolutions), whether RC Feature is indicated when the value changes, the
+// access to the characteristics and whether the service is secondary.
+struct BcsConfig
+    var features: Int
+    var changes: Bool
+    var access: gatt_server.Access
+    var secondary: Bool
+
+@tier(app)
+fn default_bcs_config() -> BcsConfig
+    BcsConfig { features: F_SUPPORT_MASK, changes: false, access: gatt_server.Access.Encrypted, secondary: false }
+
+@value
+struct BcsHandles
+    service: u16
+    feature: u16
+    feature_cccd: u16
+    measurement: u16
+    measurement_cccd: u16
+
+// One measurement.  `present` holds the optional fields the product has
+// (bit k as the support bit k); `imperial` selects pounds and inches.  The
+// units are the characteristic's: 0.1 percent, kilojoules, 0.1 ohm, 0.005 kg
+// or 0.01 lb for a weight or mass, 0.001 m or 0.1 in for the height.
+@value
+struct BcsMeasurement
+    imperial: Bool
+    present: u16
+    body_fat: u16
+    time: wire.DateTime
+    user_id: u8
+    basal_metabolism: u16
+    muscle_percentage: u16
+    muscle_mass: u16
+    fat_free_mass: u16
+    soft_lean_mass: u16
+    body_water_mass: u16
+    impedance: u16
+    weight: u16
+    height: u16
+
+// A measurement of `body_fat` with no optional field.
+@tier(embedded)
+fn bcs_measurement(body_fat: u16) -> BcsMeasurement
+    BcsMeasurement {
+        imperial: false, present: 0, body_fat: body_fat, time: wire.date_time_unknown(),
+        user_id: 0, basal_metabolism: 0, muscle_percentage: 0, muscle_mass: 0, fat_free_mass: 0, soft_lean_mass: 0,
+        body_water_mass: 0, impedance: 0, weight: 0, height: 0 }
+
+// ── Pure helpers ────────────────────────────────────────────────────
+
+// The octets of field `k` (the Time Stamp is 7, the User ID 1, the others 2).
+@tier(embedded)
+@no_alloc
+fn bcs_field_size(k: Int) -> Int
+    if k == 0
+        return 7
+    if k == 1
+        return 1
+    2
+
+// The 16-bit value of the field `k` from 2 to 10.
+@tier(embedded)
+@no_alloc
+fn bcs_field_value(m: BcsMeasurement, k: Int) -> Int
+    if k == 2
+        return m.basal_metabolism
+    if k == 3
+        return m.muscle_percentage
+    if k == 4
+        return m.muscle_mass
+    if k == 5
+        return m.fat_free_mass
+    if k == 6
+        return m.soft_lean_mass
+    if k == 7
+        return m.body_water_mass
+    if k == 8
+        return m.impedance
+    if k == 9
+        return m.weight
+    m.height
+
+// Whether a Feature value is one the service can hold: the reserved bits 18
+// to 31 are 0, the resolutions are defined, and the Height resolution is 0
+// without the Height.
+@tier(embedded)
+@no_alloc
+fn bcs_features_valid(features: Int) -> Bool
+    if (features >>> 18) != 0
+        return false
+    if ((features >>> WEIGHT_RESOLUTION_SHIFT) & 0xF) > 7
+        return false
+    let height = (features >>> HEIGHT_RESOLUTION_SHIFT) & 0x7
+    if height > 3
+        return false
+    (features & F_HEIGHT) != 0 or height == 0
+
+// Whether `m` can be sent by a device with `features`: the Time Stamp, when
+// the device has it, is a date and time with a known year, month and day, and
+// no field is beyond what its octets hold.
+@tier(embedded)
+@no_alloc
+fn bcs_measurement_valid(features: Int, m: BcsMeasurement) -> Bool
+    if m.body_fat < 0 or m.body_fat > 0xFFFF or m.user_id < 0 or m.user_id > 0xFF
+        return false
+    if (features & F_TIME_STAMP) != 0
+        if not wire.date_time_known(m.time)
+            return false
+    for k in 2..FIELDS
+        let v = bcs_field_value(m, k)
+        if v < 0 or v > 0xFFFF
+            return false
+    true
+
+// The fields of `m` that go into the packets: the ones the device supports and
+// the product has, the Time Stamp and the User ID always when supported, and
+// for an unsuccessful measurement nothing else.
+@tier(embedded)
+@no_alloc
+fn bcs_sent_fields(features: Int, m: BcsMeasurement) -> Int
+    let supported = features & F_SUPPORT_MASK
+    let always = supported & (F_TIME_STAMP | F_MULTIPLE_USERS)
+    if m.body_fat == UNSUCCESSFUL
+        return always
+    (supported & m.present) | always
+
+// ── Values ──────────────────────────────────────────────────────────
+
+// The Body Composition Feature value of `config`.
+@tier(app)
+fn bcs_feature_value(config: BcsConfig) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, config.features, 4)
+    out
+
+// One packet: the fields `take` of `m`, the Multiple Packet bit when `multiple`.
+@tier(app)
+fn bcs_pack(m: BcsMeasurement, take: Int, multiple: Bool) -> [u8]
+    var flags = take << 1
+    if m.imperial
+        flags = flags | FLAG_IMPERIAL
+    if multiple
+        flags = flags | FLAG_MULTIPLE_PACKET
+    var out: [u8] = []
+    wire.put(var out, flags, 2)
+    wire.put(var out, m.body_fat, 2)
+    for k in 0..FIELDS
+        if (take & (1 << k)) != 0
+            if k == 0
+                wire.put_date_time(var out, m.time)
+            else if k == 1
+                wire.put(var out, m.user_id, 1)
+            else
+                wire.put(var out, bcs_field_value(m, k), 2)
+    out
+
+// The values to indicate for `m` at an ATT_MTU of `mtu` (at least 23): one
+// packet, or when the fields do not fit the packet and its continuation.  Empty
+// when `m` cannot be sent.
+@tier(app)
+fn bcs_packets(features: Int, m: BcsMeasurement, mtu: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if mtu < 23 or not bcs_measurement_valid(features, m)
+        return out
+    let room = mtu - 3
+    var rest = bcs_sent_fields(features, m)
+    var first = true
+    var multiple = false
+    var take_all: [Int] = []
+    while first or rest != 0
+        var take = 0
+        var used = 4
+        if first
+            take = rest & (F_TIME_STAMP | F_MULTIPLE_USERS)
+            for k in 0..2
+                if (take & (1 << k)) != 0
+                    used = used + bcs_field_size(k)
+        var k = 2
+        while k < FIELDS and used + 2 <= room
+            if (rest & (1 << k)) != 0
+                take = take | (1 << k)
+                used = used + 2
+            k = k + 1
+        list.push(take_all, take)
+        rest = rest & (0xFFFF ^ take)
+        first = false
+    multiple = list.len(take_all) > 1
+    for take in take_all
+        list.push(out, bcs_pack(m, take, multiple))
+    out
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Add the service to `db` after its last attribute.
+@tier(app)
+fn add_bcs_service(var db: GattDb, config: BcsConfig) -> Result<BcsHandles, profile_builder.ProfileError>
+    if not bcs_features_valid(config.features)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = gatt_server.add_service(var db, config.secondary, gatt_server.le16(UUID_BODY_COMPOSITION_SERVICE))
+    if service < 0
+        return Err(profile_builder.ProfileError.NoRoom)
+    let props = if config.changes then gatt_server.PROP_READ | gatt_server.PROP_INDICATE else gatt_server.PROP_READ
+    let cccd = gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access }
+    let feature = profile_builder.add_value(
+        var db, props, profile_builder.read_only(config.access), gatt_server.le16(UUID_BODY_COMPOSITION_FEATURE), bcs_feature_value(config))!
+    var feature_cccd = 0
+    if config.changes
+        feature_cccd = profile_builder.add_cccd(var db, cccd)!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_BODY_COMPOSITION_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, cccd)!
+    Ok(BcsHandles {
+        service: service as u16, feature: feature as u16, feature_cccd: feature_cccd as u16, measurement: measurement as u16, measurement_cccd: measurement_cccd as u16 })
+
+// Indicate the measurement `m`: the first packet now, and the continuation
+// after the Collector confirms it (`gatt_server.confirmed` sends it).  Nothing
+// when the Collector has not enabled indications or `m` cannot be sent.
+@tier(app)
+fn bcs_indicate(var db: GattDb, var link: AttLink, handles: BcsHandles, config: BcsConfig, m: BcsMeasurement, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for packet in bcs_packets(config.features, m, gatt_server.mtu_of(link, 0))
+        let _ = gatt_server.set_value(var db, handles.measurement, packet)
+        list.append(out, gatt_server.send_value(var db, var link, handles.measurement, now_ms))
+    out
+
+// Indicate the Feature value after a reconnection when the features changed,
+// for a service built with `changes`.
+@tier(app)
+fn bcs_features_changed(var db: GattDb, var link: AttLink, handles: BcsHandles, config: BcsConfig, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    let _ = gatt_server.set_value(var db, handles.feature, bcs_feature_value(config))
+    gatt_server.send_value(var db, var link, handles.feature, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// A server with the indications of the measurement (and the feature) on.
+@tier(app)
+fn server(config: BcsConfig) -> (GattServer, BcsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_bcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement_cccd, [2, 0]), 0)[0], [0x13])
+    (s, h)
+
+// A measurement with the date 2026-10-27 09:05:03, user 7 and every field set.
+@tier(app)
+fn full() -> BcsMeasurement
+    BcsMeasurement {
+        imperial: false, present: F_SUPPORT_MASK, body_fat: 0x0123, time: wire.date_time(2026, 10, 27, 9, 5, 3),
+        user_id: 7, basal_metabolism: 0x1111, muscle_percentage: 0x2222, muscle_mass: 0x3333, fat_free_mass: 0x4444,
+        soft_lean_mass: 0x5555, body_water_mass: 0x6666, impedance: 0x7777, weight: 0x8888, height: 0x9999 }

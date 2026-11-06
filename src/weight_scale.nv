@@ -1,0 +1,421 @@
+// src/weight_scale.nv — the Weight Scale Service (0x181D), with
+// which a weight scale indicates its measurements to a collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Weight Scale Feature   0x2A9E  Read, optionally Indicate; 4 octets, the
+//                                   features the scale supports
+//   Weight Measurement     0x2A9D  Indicate; Flags, Weight, then the optional
+//                                   Time Stamp, User ID, BMI and Height
+//
+// The Weight Scale Feature value (GSS 3.251) is a uint32: bit 0 Time Stamp
+// Supported, 1 Multiple Users Supported, 2 BMI Supported, bits 3 to 6 the
+// Weight Measurement Resolution (0 not specified, 1 to 7 from 0.5 kg or 1 lb
+// down to 0.005 kg or 0.01 lb), bits 7 to 9 the Height Measurement Resolution
+// (0 not specified, 1 to 3 from 0.01 m or 1 in to 0.001 m or 0.1 in), the rest
+// Reserved for Future Use and zero.  A scale that does not support BMI has zero
+// Height Measurement Resolution bits (WSS 3.1.1).
+//
+// The Weight Measurement value (GSS 3.250, WSS 3.2.1) starts with a Flags
+// octet: bit 0 Measurement Units (0 SI: kilograms in 0.005 kg and meters in
+// 0.001 m, 1 imperial: pounds in 0.01 lb and inches in 0.1 in), bit 1 Time
+// Stamp present, 2 User ID present, 3 BMI and Height present, bits 4 to 7
+// zero.  The Weight is a uint16, and 0xFFFF is "Measurement Unsuccessful", in
+// which case no field but the Time Stamp and the User ID follows.  The Time
+// Stamp is the 7-octet Date Time (year 1582 to 9999, month, day, hours,
+// minutes, seconds) without the "not known" zero of the year, month and day,
+// which this service does not allow.  A field is present exactly when its
+// feature bit is set: the Time Stamp with bit 0, the User ID with bit 1
+// (0xFF is "unknown user").  The BMI (0.1 kg/m2) and Height pair is present
+// only when bit 2 is set, always as a pair, and always when the scale includes
+// a Body Composition Service (WSP 3.2, `WssConfig.included_service`).
+//
+// A measurement is validated against the features before it is indicated
+// (`wss_measurement_error`): a measurement that breaks a rule is neither
+// stored nor indicated.  `wss_indicate` indicates one; the stored measurements
+// of a scale with the Time Stamp feature go through `WssStore` (WSS 3.2.1,
+// 3.3): the oldest first, none retransmitted once confirmed, at most
+// `WSS_STORE_PER_USER` for each user with the oldest of that user purged for a
+// new one.  A scale without the Time Stamp feature stores nothing: a
+// measurement that could not be indicated is discarded.  Which collector the
+// indication goes to (the last bonded collector of the user) and the user's
+// consent through the User Data Service (WSP 3.5) are the product's.
+//
+// Security.  The service imposes none (Table 3.1); the Weight Scale Profile
+// asks for LE security mode 1 level 2 or higher on every characteristic (WSP
+// 6.1), so the access defaults to Encrypted: an encrypted link, not
+// necessarily an authenticated one.  The Client Characteristic Configuration
+// descriptors need the same.  The service defines no Application Error Code.
+//
+// NOT IMPLEMENTED: the indication of a changed Weight Scale Feature value to a
+// bonded collector after reconnection (the product indicates it with
+// `wss_indicate_feature` when it connects); the Body Composition Service
+// itself (a secondary service of another module, included by handle);
+// becoming connectable when a measurement is waiting for an absent collector;
+// the Current Time Service source of the Time Stamp; the advertising items of
+// the profile except the Service Data payload (`wss_service_data`).
+//
+// Specification checked against: Weight Scale Service 1.0.1, Weight Scale
+// Profile 1.0.1 and the GATT Specification Supplement v9, Sections 3.70
+// (Date Time), 3.250 (Weight Measurement) and 3.251 (Weight Scale Feature).
+//
+// Satisfies: REQ-BLE-WSS-001.
+
+use gatt_server
+use profile_builder
+use wire
+
+const UUID_WEIGHT_SCALE_SERVICE = 0x181D
+const UUID_WEIGHT_MEASUREMENT = 0x2A9D
+const UUID_WEIGHT_SCALE_FEATURE = 0x2A9E
+
+// The Weight field value of a measurement that did not succeed.
+const WEIGHT_UNSUCCESSFUL = 0xFFFF
+
+// The User ID of "unknown user".
+const USER_UNKNOWN = 0xFF
+
+// The measurements a scale with the Time Stamp feature should be able to
+// store for each user (WSS 3.3).
+const WSS_STORE_PER_USER = 25
+
+// The most User IDs the Service Data payload holds in a legacy advertisement
+// of 31 octets.
+const WSS_SERVICE_DATA_USERS = 27
+
+// What `wss_measurement_error` says is wrong with a measurement; 0 for none.
+const WSS_OK = 0
+const WSS_BAD_FIELD = 1
+const WSS_TIME_STAMP_MISMATCH = 2
+const WSS_TIME_STAMP_INVALID = 3
+const WSS_USER_MISMATCH = 4
+const WSS_BMI_NOT_SUPPORTED = 5
+const WSS_BMI_REQUIRED = 6
+const WSS_UNSUCCESSFUL_WITH_FIELDS = 7
+
+// The features of the scale (GSS 3.251).  `weight_resolution` is 0 to 7 and
+// `height_resolution` 0 to 3, and 0 when `bmi` is false.
+@value
+struct WssFeatures
+    time_stamp: Bool
+    multiple_users: Bool
+    bmi: Bool
+    weight_resolution: u8
+    height_resolution: u8
+
+// One Weight Measurement.  `weight` is in 0.005 kg, or 0.01 lb when
+// `imperial`; `height` in 0.001 m, or 0.1 in; `bmi` in 0.1 kg/m2.  A field is
+// used only when its `has_` flag is set.
+struct WssMeasurement
+    var imperial: Bool
+    var weight: Int
+    var has_time_stamp: Bool
+    var time: wire.DateTime
+    var has_user: Bool
+    var user_id: Int
+    var has_bmi: Bool
+    var bmi: Int
+    var height: Int
+
+// The service: the features, the access to every characteristic and
+// descriptor, whether the Weight Scale Feature is indicated when it changes
+// (Table 3.1, C.1: when the device bonds and the value can change over its
+// lifetime), and the handle of the Body Composition Service declaration to
+// include (0 for none).
+struct WssConfig
+    features: WssFeatures
+    access: gatt_server.Access
+    feature_indicate: Bool
+    included_service: Int
+
+// A scale with `features`, encrypted access, the feature value static and no
+// Body Composition Service.
+@tier(app)
+fn default_wss_config(features: WssFeatures) -> WssConfig
+    WssConfig { features: features, access: gatt_server.Access.Encrypted, feature_indicate: false, included_service: 0 }
+
+// A successful SI measurement of `weight` (0.005 kg) with no optional field.
+@tier(app)
+fn wss_measurement(weight: Int) -> WssMeasurement
+    WssMeasurement {
+        imperial: false, weight: weight, has_time_stamp: false, time: wire.date_time_unknown(),
+        has_user: false, user_id: 0, has_bmi: false, bmi: 0, height: 0 }
+
+@value
+struct WssHandles
+    service: u16
+    included: u16
+    feature: u16
+    feature_cccd: u16
+    measurement: u16
+    measurement_cccd: u16
+
+// ── Formats ─────────────────────────────────────────────────────────
+
+// Whether `f` sets only bits the Weight Scale Feature defines.
+@tier(embedded)
+@no_alloc
+fn wss_features_valid(f: WssFeatures) -> Bool
+    f.weight_resolution >= 0 and f.weight_resolution <= 7 and f.height_resolution >= 0 and f.height_resolution <= 3
+        and (f.bmi or f.height_resolution == 0)
+
+// The Weight Scale Feature value (a uint32, least significant octet first).
+@tier(app)
+fn wss_feature_value(f: WssFeatures) -> [u8]
+    var field = 0
+    if f.time_stamp
+        field = field | 0x01
+    if f.multiple_users
+        field = field | 0x02
+    if f.bmi
+        field = field | 0x04
+    field = field | ((f.weight_resolution as Int) << 3) | ((f.height_resolution as Int) << 7)
+    var out: [u8] = []
+    wire.put(var out, field, 4)
+    out
+
+// Whether the Time Stamp of `m` is a Date Time this service allows.
+@tier(embedded)
+@no_alloc
+fn wss_time_valid(m: WssMeasurement) -> Bool
+    wire.date_time_known(m.time)
+
+// What is wrong with `m` for a scale with `f`, WSS_OK for nothing.  The
+// first rule broken is named: a value outside its field, a Time Stamp or User
+// ID that disagrees with the feature bit, a Time Stamp outside the Date Time,
+// a BMI and Height pair the scale does not support, one it must send because
+// it includes a Body Composition Service (`require_bmi`), or optional fields
+// on a measurement that did not succeed.
+@tier(embedded)
+@no_alloc
+fn wss_measurement_error(f: WssFeatures, require_bmi: Bool, m: WssMeasurement) -> Int
+    if m.weight < 0 or m.weight > 0xFFFF or m.user_id < 0 or m.user_id > 0xFF or m.bmi < 0 or m.bmi > 0xFFFF or m.height < 0 or m.height > 0xFFFF
+        return WSS_BAD_FIELD
+    if m.has_time_stamp != f.time_stamp
+        return WSS_TIME_STAMP_MISMATCH
+    if m.has_time_stamp and not wss_time_valid(m)
+        return WSS_TIME_STAMP_INVALID
+    if m.has_user != f.multiple_users
+        return WSS_USER_MISMATCH
+    if m.has_bmi and not f.bmi
+        return WSS_BMI_NOT_SUPPORTED
+    if m.weight == WEIGHT_UNSUCCESSFUL and m.has_bmi
+        return WSS_UNSUCCESSFUL_WITH_FIELDS
+    if require_bmi and m.weight != WEIGHT_UNSUCCESSFUL and not m.has_bmi
+        return WSS_BMI_REQUIRED
+    WSS_OK
+
+// The Weight Measurement value of `m`: Flags, Weight, then the fields it has.
+@tier(app)
+fn wss_measurement_value(m: WssMeasurement) -> [u8]
+    var flags = 0
+    if m.imperial
+        flags = flags | 0x01
+    if m.has_time_stamp
+        flags = flags | 0x02
+    if m.has_user
+        flags = flags | 0x04
+    if m.has_bmi
+        flags = flags | 0x08
+    var out: [u8] = []
+    wire.put(var out, flags, 1)
+    wire.put(var out, m.weight, 2)
+    if m.has_time_stamp
+        wire.put_date_time(var out, m.time)
+    if m.has_user
+        wire.put(var out, m.user_id, 1)
+    if m.has_bmi
+        wire.put(var out, m.bmi, 2)
+        wire.put(var out, m.height, 2)
+    out
+
+// The Service Data AD structure of the profile (WSP Table 3.2): length, AD
+// type 0x16, the service UUID and the User IDs that have measurements waiting.
+// Empty for more IDs than a legacy advertisement holds.
+@tier(app)
+fn wss_service_data(users: [Int]) -> [u8]
+    if list.len(users) > WSS_SERVICE_DATA_USERS
+        return []
+    var out: [u8] = []
+    wire.put(var out, 3 + list.len(users), 1)
+    wire.put(var out, 0x16, 1)
+    wire.put(var out, UUID_WEIGHT_SCALE_SERVICE, 2)
+    for u in users
+        wire.put(var out, u, 1)
+    out
+
+// ── The service ─────────────────────────────────────────────────────
+
+// Add the service to `db` after its last attribute.  InvalidValue: a Weight
+// Scale Feature with a Reserved resolution or a Height Measurement Resolution
+// without BMI, or a Body Composition Service to include that is not a service
+// declaration or that the features do not carry (it needs the BMI feature).
+@tier(app)
+fn add_wss_service(var db: GattDb, config: WssConfig) -> Result<WssHandles, profile_builder.ProfileError>
+    if not wss_features_valid(config.features)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    if config.included_service != 0 and not config.features.bmi
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_WEIGHT_SCALE_SERVICE))!
+    var included = 0
+    if config.included_service != 0
+        included = gatt_server.add_included(var db, config.included_service)
+        if included < 0
+            return Err(profile_builder.ProfileError.InvalidValue)
+    var properties = gatt_server.PROP_READ
+    if config.feature_indicate
+        properties = properties | gatt_server.PROP_INDICATE
+    let feature = profile_builder.add_value(
+        var db, properties, profile_builder.read_only(config.access), gatt_server.le16(UUID_WEIGHT_SCALE_FEATURE), wss_feature_value(config.features))!
+    var feature_cccd = 0
+    if config.feature_indicate
+        feature_cccd = profile_builder.add_cccd(var db, gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access })!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_WEIGHT_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, gatt_server.Permissions { read: gatt_server.Access.Open, write: config.access })!
+    Ok(WssHandles {
+        service: service as u16, included: included as u16, feature: feature as u16, feature_cccd: feature_cccd as u16,
+        measurement: measurement as u16, measurement_cccd: measurement_cccd as u16 })
+
+// Indicate `m` to the client of `link`: the PDUs to send, none when `m`
+// breaks a rule (`wss_measurement_error`; the value is then not changed) or
+// the client has not enabled indications.  An indication waits behind one
+// that is not confirmed; a caller that keeps measurements uses `WssStore`.
+@tier(app)
+fn wss_indicate(var db: GattDb, var link: AttLink, handles: WssHandles, f: WssFeatures, require_bmi: Bool, m: WssMeasurement, now_ms: Int) -> [[u8]]
+    if wss_measurement_error(f, require_bmi, m) != WSS_OK
+        return []
+    if not gatt_server.set_value(var db, handles.measurement, wss_measurement_value(m))
+        return []
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// Indicate the Weight Scale Feature value to the client of `link` (after a
+// reconnection, when the features changed): none when the characteristic does
+// not indicate or the client has not enabled it.
+@tier(app)
+fn wss_indicate_feature(var db: GattDb, var link: AttLink, handles: WssHandles, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.feature, now_ms)
+
+// Store a new Weight Scale Feature value; false (and the old value kept) for a
+// value that sets a Reserved bit.
+@tier(app)
+fn wss_set_features(var db: GattDb, handles: WssHandles, f: WssFeatures) -> Bool
+    wss_features_valid(f) and gatt_server.set_value(var db, handles.feature, wss_feature_value(f))
+
+// ── Stored measurements ─────────────────────────────────────────────
+
+// The measurements waiting for a collector, oldest first.  `in_flight` says
+// the oldest has been indicated and waits for its confirmation.  `per_user` is
+// the most kept for one user.
+struct WssStore
+    var items: [WssMeasurement]
+    var in_flight: Bool
+    per_user: Int
+
+@tier(app)
+fn new_wss_store(per_user: Int) -> WssStore
+    WssStore { items: [], in_flight: false, per_user: per_user }
+
+// The user a stored measurement belongs to: its User ID, or 0 for a scale with
+// one user.
+@tier(embedded)
+@no_alloc
+fn wss_user_of(m: WssMeasurement) -> Int
+    if m.has_user then m.user_id else 0
+
+// Keep `m` for the collector.  A scale without the Time Stamp feature keeps
+// nothing (WSS 3.3: the value is discarded), and neither does a measurement
+// that breaks a rule; both answer false.  When the user already has `per_user`
+// measurements stored, the oldest of that user, one that is not waiting for
+// its confirmation, is purged to make room.
+@tier(app)
+fn wss_store_push(var backlog: WssStore, f: WssFeatures, require_bmi: Bool, m: WssMeasurement) -> Bool
+    if not f.time_stamp or wss_measurement_error(f, require_bmi, m) != WSS_OK or backlog.per_user < 1
+        return false
+    let user = wss_user_of(m)
+    var count = 0
+    var oldest = -1
+    for i in 0..list.len(backlog.items)
+        if wss_user_of(backlog.items[i]) == user
+            count = count + 1
+            if oldest < 0 and not (backlog.in_flight and i == 0)
+                oldest = i
+    if count >= backlog.per_user
+        if oldest < 0
+            return false
+        var kept: [WssMeasurement] = []
+        for i in 0..list.len(backlog.items)
+            if i != oldest
+                list.push(kept, backlog.items[i])
+        backlog.items = kept
+    list.push(backlog.items, m)
+    true
+
+@tier(embedded)
+@no_alloc
+fn wss_store_count(backlog: WssStore) -> Int
+    list.len(backlog.items)
+
+// Indicate the oldest stored measurement to the client of `link`, unless an
+// indication is waiting for its confirmation or the client has not enabled
+// them.  The measurement stays stored until `wss_store_confirmed`.
+@tier(app)
+fn wss_send_next(var db: GattDb, var link: AttLink, handles: WssHandles, var backlog: WssStore, f: WssFeatures, require_bmi: Bool, now_ms: Int) -> [[u8]]
+    if list.len(backlog.items) == 0 or backlog.in_flight or gatt_server.indication_pending(link, handles.measurement)
+        return []
+    let out = wss_indicate(var db, var link, handles, f, require_bmi, backlog.items[0], now_ms)
+    if list.len(out) > 0
+        backlog.in_flight = true
+    out
+
+// The collector confirmed the indication: the measurement is transferred and
+// leaves the store, never to be sent again.
+@tier(app)
+fn wss_store_confirmed(var backlog: WssStore)
+    if backlog.in_flight and list.len(backlog.items) > 0
+        backlog.items = backlog.items[1:]
+    backlog.in_flight = false
+
+// The link ended before the confirmation: the measurement stays and is sent
+// again at the next connection.
+@tier(embedded)
+@no_alloc
+fn wss_store_link_lost(var backlog: WssStore)
+    backlog.in_flight = false
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn basic() -> WssFeatures
+    WssFeatures { time_stamp: false, multiple_users: false, bmi: false, weight_resolution: 0, height_resolution: 0 }
+
+@tier(app)
+fn everything() -> WssFeatures
+    WssFeatures { time_stamp: true, multiple_users: true, bmi: true, weight_resolution: 7, height_resolution: 3 }
+
+// A full measurement: 70.000 kg at 2026-10-27 14:30:05, user 2, BMI 22.9 at 1.75 m.
+@tier(app)
+fn full_measurement() -> WssMeasurement
+    var m = wss_measurement(14000)
+    m.has_time_stamp = true
+    m.time = wire.date_time(2026, 10, 27, 14, 30, 5)
+    m.has_user = true
+    m.user_id = 2
+    m.has_bmi = true
+    m.bmi = 229
+    m.height = 1750
+    m
+
+// A server on an encrypted link of security level 2.
+@tier(app)
+fn server(config: WssConfig) -> (GattServer, WssHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_wss_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    (s, h)

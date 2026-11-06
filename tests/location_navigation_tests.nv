@@ -1,0 +1,1118 @@
+// tests/location_navigation_tests.nv — the unit tests of src/location_navigation.nv.
+//
+//   novo test tests/location_navigation_tests.nv
+
+use std.test
+use att
+use gatt_server
+use links
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer, subscribe, read }
+use wire
+use location_navigation.{ CONFIG_INVALID, CONFIG_NOT_PERMITTED, CONFIG_OK, F_BEACONS_IN_SOLUTION, F_CONTENT_MASKING, F_DEFINED_BITS, F_EHPE, F_ELEVATION, F_ELEVATION_SETTING, F_ESTIMATED_TIME_OF_ARRIVAL, F_FIX_RATE_SETTING, F_HDOP, F_HEADING, F_INSTANTANEOUS_SPEED, F_LOCATION, F_LOCATION_SPEED_BITS, F_NAVIGATION_BITS, F_POSITION_STATUS, F_QUALITY_BITS, F_REMAINING_DISTANCE, F_REMAINING_VERTICAL_DISTANCE, F_ROLLING_TIME, F_TOTAL_DISTANCE, F_UTC_TIME, F_VDOP, LnsConfig, LnsHandles, LnsLocation, LnsNavigation, LnsPolicy, LnsQuality, LnsState, NAV_CONTINUE, NAV_PAUSE, NAV_SELECT_NEAREST, NAV_SKIP_WAYPOINT, NAV_START, NAV_STOP, add_lns_service, default_lns_config, full_config, full_location, full_navigation, lns_apply, lns_config_error, lns_disconnected, lns_feature_value, lns_features_changed, lns_field_size, lns_location, lns_location_pack, lns_location_packets, lns_location_sent, lns_location_valid, lns_name_length, lns_navigation, lns_navigation_valid, lns_navigation_value, lns_needs_control_point, lns_notify_location, lns_notify_navigation, lns_quality, lns_quality_valid, lns_quality_value, lns_receive, lns_set_quality, new_lns_state, receive_default, server, server_at }
+
+// Write the Client Characteristic Configuration descriptor at `cccd`.
+// The Error Code of the first PDU of `out` when it is an Error Response, 0
+// otherwise.
+@tier(app)
+fn error_of(out: [[u8]]) -> Int
+    if list.len(out) > 0 and list.len(out[0]) >= 5 and (out[0][0] as Int) == 0x01
+        return out[0][4] as Int
+    0
+
+// A server with the notifications of the location and the navigation and the
+// indication of the control point enabled.
+@tier(app)
+fn control_server(config: LnsConfig) -> (GattServer, LnsHandles)
+    let (s, h) = server(config)
+    var t = s
+    subscribe(var t, h.control_point_cccd, 2)
+    subscribe(var t, h.location_cccd, 1)
+    if h.navigation_cccd != 0
+        subscribe(var t, h.navigation_cccd, 1)
+    (t, h)
+
+// Write `value` to the control point, confirm the indication and answer its
+// value: the response code, the opcode, the result and the response parameter.
+@tier(app)
+fn command(var s: GattServer, h: LnsHandles, config: LnsConfig, var st: LnsState, value: [Int]) -> [u8]
+    let out = receive_default(var s, h, config, var st, req(0x12, h.control_point, value), 0)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 0)), 0)
+    out[1][3:list.len(out[1])]
+
+@tier(app)
+fn full_quality() -> LnsQuality
+    LnsQuality {
+        present: 0x7F, in_solution: 7, in_view: 12, time_to_first_fix: 0x0102, ehpe: 0x03040506, evpe: 0x0708090A,
+        hdop: 5, vdop: 6, position_status: 2 }
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_minimal_service_is_a_readable_feature_and_a_notified_location()
+    let (s, h) = server(default_lns_config(0))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.feature_cccd, 0)
+    test.assert_eq(h.location, 5)
+    test.assert_eq(h.location_cccd, 6)
+    test.assert_eq(h.quality, 0)
+    test.assert_eq(h.control_point, 0)
+    test.assert_eq(h.control_point_cccd, 0)
+    test.assert_eq(h.navigation, 0)
+    test.assert_eq(h.navigation_cccd, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 6)
+    test.assert_eq(s.db.attributes[0].value, [0x19, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 3, 0, 0x6A, 0x2A])
+    test.assert_eq(s.db.attributes[3].value, [0x10, 5, 0, 0x67, 0x2A])
+    // The feature reads as 4 octets of zero; the location is notified only and the feature cannot be written.
+    var t = s
+    test.assert_eq(read(var t, h.feature), [0x0B, 0, 0, 0, 0])
+    test.assert_eq(read(var t, h.location)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.feature, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.location, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_full_service_lists_its_characteristics_in_the_table_order()
+    let (s, h) = server(full_config())
+    // The feature with its descriptor, the location, the quality, the control point, the navigation.
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.feature_cccd, 4)
+    test.assert_eq(h.location, 6)
+    test.assert_eq(h.location_cccd, 7)
+    test.assert_eq(h.quality, 9)
+    test.assert_eq(h.control_point, 11)
+    test.assert_eq(h.control_point_cccd, 12)
+    test.assert_eq(h.navigation, 14)
+    test.assert_eq(h.navigation_cccd, 15)
+    test.assert_eq(gatt_server.last_handle(s.db), 15)
+    test.assert_eq(s.db.attributes[1].value, [0x22, 3, 0, 0x6A, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x10, 6, 0, 0x67, 0x2A])
+    test.assert_eq(s.db.attributes[7].value, [0x02, 9, 0, 0x69, 0x2A])
+    test.assert_eq(s.db.attributes[9].value, [0x28, 11, 0, 0x6B, 0x2A])
+    test.assert_eq(s.db.attributes[12].value, [0x10, 14, 0, 0x68, 0x2A])
+    // The Position Quality reads as its Flags field alone until the product sets a value; the control point and
+    // the two notified values cannot be read.
+    var t = s
+    test.assert_eq(read(var t, h.quality), [0x0B, 0, 0])
+    test.assert_eq(read(var t, h.control_point)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(read(var t, h.navigation)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_feature_value_is_32_bits_with_one_bit_for_each_feature()
+    for i in 0..21
+        test.assert_eq(lns_feature_value(1 << i), wire.octets([(1 << i) & 0xFF, ((1 << i) >>> 8) & 0xFF, ((1 << i) >>> 16) & 0xFF, 0]))
+    test.assert_eq(lns_feature_value(F_DEFINED_BITS), [0xFF, 0xFF, 0x1F, 0x00])
+    test.assert_eq(F_POSITION_STATUS, 1 << 20)
+    test.assert_eq(F_ELEVATION_SETTING, 1 << 19)
+    test.assert_eq(F_FIX_RATE_SETTING, 1 << 18)
+    test.assert_eq(F_CONTENT_MASKING, 1 << 17)
+    test.assert_eq(F_VDOP, 1 << 16)
+    test.assert_eq(F_BEACONS_IN_SOLUTION, 1 << 10)
+    test.assert_eq(F_ESTIMATED_TIME_OF_ARRIVAL, 1 << 9)
+    test.assert_eq(F_REMAINING_VERTICAL_DISTANCE, 1 << 8)
+    test.assert_eq(F_REMAINING_DISTANCE, 1 << 7)
+    test.assert_eq(F_UTC_TIME, 1 << 6)
+    // The service reads the value it was built with.
+    let (s, h) = server(full_config())
+    var t = s
+    test.assert_eq(read(var t, h.feature), [0x0B, 0xFF, 0xFF, 0x1F, 0x00])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_parts_follow_from_the_features()
+    var r = gatt_server.new_server([], 65)
+    // A feature bit above bit 20 is reserved.
+    var reserved = default_lns_config(0)
+    reserved.features = 1 << 21
+    test.assert_eq(lns_config_error(reserved), CONFIG_INVALID)
+    reserved.features = -1
+    test.assert_eq(lns_config_error(reserved), CONFIG_INVALID)
+    match add_lns_service(var r.db, reserved)
+        Ok(_) => test.fail("a reserved feature bit")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    test.assert_eq(gatt_server.last_handle(r.db), 0)
+    // Elevation Setting needs Elevation.
+    test.assert_eq(lns_config_error(default_lns_config(F_ELEVATION_SETTING)), CONFIG_INVALID)
+    test.assert_eq(lns_config_error(default_lns_config(F_ELEVATION_SETTING | F_ELEVATION)), CONFIG_OK)
+    // A field of the Position Quality needs the characteristic, a field of the Navigation the characteristic.
+    var quality = default_lns_config(F_HDOP)
+    quality.position_quality = false
+    test.assert_eq(lns_config_error(quality), CONFIG_INVALID)
+    var navigation = default_lns_config(F_ESTIMATED_TIME_OF_ARRIVAL)
+    navigation.navigation = false
+    test.assert_eq(lns_config_error(navigation), CONFIG_INVALID)
+    // The characteristics may be there without a feature that names them.
+    var bare = default_lns_config(0)
+    bare.position_quality = true
+    bare.navigation = true
+    test.assert_eq(lns_config_error(bare), CONFIG_OK)
+    // Routes need the Navigation characteristic.
+    var routes = default_lns_config(0)
+    routes.routes = [wire.text("A")]
+    test.assert_eq(lns_config_error(routes), CONFIG_INVALID)
+    routes.navigation = true
+    test.assert_eq(lns_config_error(routes), CONFIG_OK)
+    // The number of routes is a uint16.
+    var many: [[u8]] = []
+    for _ in 0..ROUTES_MAX
+        list.push(many, wire.text("r"))
+    routes.routes = many
+    test.assert_eq(lns_config_error(routes), CONFIG_OK)
+    list.push(many, wire.text("r"))
+    routes.routes = many
+    test.assert_eq(lns_config_error(routes), CONFIG_INVALID)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_control_point_is_there_when_a_feature_needs_a_procedure()
+    test.assert(not lns_needs_control_point((F_LOCATION_SPEED_BITS ^ F_TOTAL_DISTANCE) | F_POSITION_STATUS | F_QUALITY_BITS | F_NAVIGATION_BITS, false))
+    test.assert(lns_needs_control_point(F_TOTAL_DISTANCE, false))
+    test.assert(lns_needs_control_point(F_CONTENT_MASKING, false))
+    test.assert(lns_needs_control_point(F_FIX_RATE_SETTING, false))
+    test.assert(lns_needs_control_point(F_ELEVATION_SETTING, false))
+    test.assert(lns_needs_control_point(0, true))
+    let (s, h) = server(default_lns_config(F_TOTAL_DISTANCE))
+    test.assert_eq(h.control_point, 8)
+    test.assert_eq(h.control_point_cccd, 9)
+    test.assert_eq(h.navigation, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 9)
+    let (p, ph) = server(default_lns_config(F_LOCATION | F_INSTANTANEOUS_SPEED))
+    test.assert_eq(ph.control_point, 0)
+    test.assert_eq(gatt_server.last_handle(p.db), 6)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_profile_allows_security_levels_1_to_3()
+    // Denied and level 4 are outside LE security mode 1 levels 1 to 3.
+    var denied = default_lns_config(0)
+    denied.access = gatt_server.Access.Denied
+    test.assert_eq(lns_config_error(denied), CONFIG_NOT_PERMITTED)
+    var strong = default_lns_config(0)
+    strong.access = gatt_server.Access.SecureConnections
+    test.assert_eq(lns_config_error(strong), CONFIG_NOT_PERMITTED)
+    var r = gatt_server.new_server([], 65)
+    match add_lns_service(var r.db, strong)
+        Ok(_) => test.fail("level 4 is not a level of the profile")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NotPermitted)
+    test.assert_eq(gatt_server.last_handle(r.db), 0)
+    var open = default_lns_config(0)
+    test.assert_eq(lns_config_error(open), CONFIG_OK)
+    open.access = gatt_server.Access.Authorized
+    test.assert_eq(lns_config_error(open), CONFIG_OK)
+    open.access = gatt_server.Access.Encrypted
+    test.assert_eq(lns_config_error(open), CONFIG_OK)
+    open.access = gatt_server.Access.Authenticated
+    test.assert_eq(lns_config_error(open), CONFIG_OK)
+    // The access comes before the other rules.
+    strong.features = 1 << 25
+    test.assert_eq(lns_config_error(strong), CONFIG_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_access_is_enforced_on_every_characteristic_and_descriptor()
+    var config = full_config()
+    config.access = gatt_server.Access.Authenticated
+    // A link in the clear: the feature, the quality, the descriptors and the control point are refused.
+    let (s, h) = server_at(config, 0)
+    var t = s
+    test.assert_eq(read(var t, h.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var t, h.quality)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var t, h.location_cccd)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.location_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.navigation_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.control_point_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x12, h.feature_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // An encrypted link is not authenticated.
+    let (e, eh) = server_at(config, 2)
+    var u = e
+    test.assert_eq(read(var u, eh.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // An authenticated link reads and subscribes.
+    let (a, ah) = server_at(config, 3)
+    var v = a
+    test.assert_eq(read(var v, ah.feature), [0x0B, 0xFF, 0xFF, 0x1F, 0x00])
+    subscribe(var v, ah.location_cccd, 1)
+    subscribe(var v, ah.control_point_cccd, 2)
+    var st = new_lns_state(config)
+    test.assert_eq(list.len(command(var v, ah, config, var st, [4])), 5)
+    // The control point write is refused where the access is, and the procedure does not start.
+    let (c, ch) = server_at(config, 2)
+    var w = c
+    var fresh = new_lns_state(config)
+    let out = receive_default(var w, ch, config, var fresh, req(0x12, ch.control_point, [7, 5]), 0)
+    test.assert_eq(error_of(out), att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(fresh.fix_rate_set, false)
+
+// The value `m` with field number `field` (the order of the struct) replaced by
+// `v`, to build the values a test refuses.
+@tier(app)
+fn with(m: LnsLocation, field: Int, v: Int) -> LnsLocation
+    LnsLocation {
+        present: m.present, speed: if field == 0 then v else m.speed, distance: if field == 1 then v else m.distance,
+        latitude: if field == 2 then v else m.latitude, longitude: if field == 3 then v else m.longitude,
+        elevation: if field == 4 then v else m.elevation, heading: if field == 5 then v else m.heading,
+        rolling_time: if field == 6 then v else m.rolling_time, time: wire.date_time(
+            if field == 7 then v else m.time.year as Int, if field == 8 then v else m.time.month as Int, if field == 9 then v else m.time.day as Int,
+            if field == 10 then v else m.time.hours as Int, if field == 11 then v else m.time.minutes as Int,
+            if field == 12 then v else m.time.seconds as Int), position_status: if field == 13 then v else m.position_status,
+        three_d: m.three_d, elevation_source: if field == 14 then v else m.elevation_source, heading_compass: m.heading_compass }
+
+// The value `full_location` without the status bits.
+@tier(app)
+fn plain_location() -> LnsLocation
+    LnsLocation {
+        present: F_LOCATION_SPEED_BITS, speed: 0x0102, distance: 0x030405, latitude: 0x0A0B0C0D, longitude: 0x1A2B3C4D,
+        elevation: 0x0A0B0C, heading: 0x1234, rolling_time: 0x56, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, three_d: false, elevation_source: 0, heading_compass: false }
+
+// The Flags field of the value that holds no field.
+@tier(app)
+fn flags_of(features: Int, m: LnsLocation) -> Int
+    wire.get(lns_location_pack(features, m, 0), 0, 2)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_every_location_field_has_its_flag_its_size_and_its_place()
+    let f = F_LOCATION_SPEED_BITS
+    let m = plain_location()
+    test.assert_eq(lns_location_pack(f, m, 0x01), [0x01, 0x00, 0x02, 0x01])
+    test.assert_eq(lns_location_pack(f, m, 0x02), [0x02, 0x00, 0x05, 0x04, 0x03])
+    test.assert_eq(lns_location_pack(f, m, 0x04), [0x04, 0x00, 0x0D, 0x0C, 0x0B, 0x0A, 0x4D, 0x3C, 0x2B, 0x1A])
+    test.assert_eq(lns_location_pack(f, m, 0x08), [0x08, 0x00, 0x0C, 0x0B, 0x0A])
+    test.assert_eq(lns_location_pack(f, m, 0x10), [0x10, 0x00, 0x34, 0x12])
+    test.assert_eq(lns_location_pack(f, m, 0x20), [0x20, 0x00, 0x56])
+    test.assert_eq(lns_location_pack(f, m, 0x40), [0x40, 0x00, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    test.assert_eq(lns_location_pack(f, m, 0x7F), [0x7F, 0x00, 0x02, 0x01, 0x05, 0x04, 0x03, 0x0D, 0x0C, 0x0B, 0x0A, 0x4D, 0x3C, 0x2B, 0x1A, 0x0C, 0x0B, 0x0A, 0x34, 0x12, 0x56, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    for k in 0..7
+        test.assert_eq(list.len(lns_location_pack(f, m, 1 << k)), 2 + lns_field_size(k))
+    // A field with no field in the value: only the Flags field.
+    test.assert_eq(lns_location_pack(f, m, 0), [0x00, 0x00])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_negative_latitude_longitude_and_elevation_are_twos_complement()
+    let m = with(with(with(plain_location(), 2, -1), 3, -1800000000), 4, -8388608)
+    test.assert_eq(lns_location_pack(F_LOCATION_SPEED_BITS, m, 0x04), [0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x2E, 0xB6, 0x94])
+    test.assert_eq(lns_location_pack(F_LOCATION_SPEED_BITS, m, 0x08), [0x08, 0x00, 0x00, 0x00, 0x80])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_status_bits_of_the_flags_follow_their_features()
+    // Position status 3, 3D, elevation source 3 and a compass heading, offered to every feature set.
+    let m = LnsLocation {
+        present: F_LOCATION_SPEED_BITS, speed: 1, distance: 1, latitude: 1, longitude: 1, elevation: 1, heading: 1, rolling_time: 1,
+        time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 3, three_d: true,
+        elevation_source: 3, heading_compass: true }
+    test.assert_eq(flags_of(0, m), 0)
+    test.assert_eq(flags_of(F_POSITION_STATUS, m), 0x180)
+    test.assert_eq(flags_of(F_INSTANTANEOUS_SPEED, m), 0x200)
+    test.assert_eq(flags_of(F_TOTAL_DISTANCE, m), 0x200)
+    test.assert_eq(flags_of(F_LOCATION, m), 0)
+    test.assert_eq(flags_of(F_ELEVATION, m), 0xC00)
+    test.assert_eq(flags_of(F_HEADING, m), 0x1000)
+    test.assert_eq(flags_of(F_ROLLING_TIME | F_UTC_TIME | F_REMAINING_DISTANCE | F_QUALITY_BITS, m), 0)
+    test.assert_eq(flags_of(F_DEFINED_BITS, m), 0x1F80)
+    // 2D, the compass off, each source and each status.
+    let flat = with(plain_location(), 13, 2)
+    test.assert_eq(flags_of(F_DEFINED_BITS, flat), 0x100)
+    test.assert_eq(flags_of(F_DEFINED_BITS, with(plain_location(), 14, 2)), 0x800)
+    test.assert_eq(flags_of(F_DEFINED_BITS, with(plain_location(), 13, 1)), 0x80)
+    // The reserved bits 13 to 15 are never set.
+    for i in 0..21
+        test.assert_eq(flags_of(1 << i, m) >>> 13, 0)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_field_is_sent_only_when_the_sensor_supports_it_and_the_product_has_it()
+    let m = plain_location()
+    test.assert_eq(lns_location_packets(F_INSTANTANEOUS_SPEED | F_LOCATION, m, 0, 23)[0], [0x05, 0x00, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A, 0x4D, 0x3C, 0x2B, 0x1A])
+    // The product has the speed only.
+    let speed = LnsLocation {
+        present: F_INSTANTANEOUS_SPEED, speed: 0x0102, distance: 0, latitude: 0, longitude: 0, elevation: 0, heading: 0, rolling_time: 0,
+        time: wire.date_time_unknown(), position_status: 0, three_d: false, elevation_source: 0, heading_compass: false }
+    test.assert_eq(lns_location_packets(F_INSTANTANEOUS_SPEED | F_LOCATION, speed, 0, 23)[0], [0x01, 0x00, 0x02, 0x01])
+    // The product has nothing: the Flags field alone is a value.
+    let none = lns_location(0)
+    test.assert_eq(lns_location_packets(F_LOCATION_SPEED_BITS, none, 0, 23)[0], [0x00, 0x00])
+    test.assert_eq(list.len(lns_location_packets(F_LOCATION_SPEED_BITS, none, 0, 23)), 1)
+    // The sensor supports nothing: the same.
+    test.assert_eq(lns_location_packets(0, m, 0, 23)[0], [0x00, 0x00])
+    // A field of a feature the sensor lacks, or the product has not, is not looked at.
+    test.assert_eq(list.len(lns_location_packets(F_LOCATION, with(m, 0, 70000), 0, 23)), 1)
+    test.assert_eq(list.len(lns_location_packets(F_INSTANTANEOUS_SPEED, with(lns_location(0), 0, 70000), 0, 23)), 1)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_fields_that_do_not_fit_the_default_mtu_go_into_the_next_notification()
+    let f = F_LOCATION_SPEED_BITS | F_POSITION_STATUS
+    let m = full_location()
+    // 20 octets fit the flags, the speed, the distance, the location pair, the elevation and the heading.
+    let p = lns_location_packets(f, m, 0, 23)
+    test.assert_eq(list.len(p), 2)
+    test.assert_eq(list.len(p[0]), 20)
+    test.assert_eq(p[0][0:2], [0x9F, 0x16])
+    test.assert_eq(p[0][2:6], [0x02, 0x01, 0x05, 0x04])
+    // The next one has its own Flags field, the status bits again, the rolling time and the UTC time.
+    test.assert_eq(p[1], [0xE0, 0x16, 0x56, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    // The fields keep the order of the table across the notifications.
+    let one = lns_location_packets(f, m, 0, 64)
+    test.assert_eq(list.len(one), 1)
+    test.assert_eq(list.len(one[0]), 28)
+    test.assert_eq(one[0][0:2], [0xFF, 0x16])
+    var joined: [u8] = p[0][2:20]
+    list.append(joined, p[1][2:10])
+    test.assert_eq(joined, one[0][2:28])
+    // The ATT_MTU decides: 28 octets fit at 31, the UTC time does not fit at 30.
+    test.assert_eq(list.len(lns_location_packets(f, m, 0, 31)), 1)
+    let q = lns_location_packets(f, m, 0, 30)
+    test.assert_eq(list.len(q), 2)
+    test.assert_eq(list.len(q[0]), 21)
+    test.assert_eq(q[1], [0xC0, 0x16, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    // A value that fits has one notification.
+    test.assert_eq(list.len(lns_location_packets(F_INSTANTANEOUS_SPEED | F_TOTAL_DISTANCE | F_HEADING, m, 0, 23)), 1)
+    // No value for an ATT_MTU under 23.
+    test.assert_eq(list.len(lns_location_packets(f, m, 0, 22)), 0)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_fields_the_client_turned_off_are_left_out_and_their_flags_are_clear()
+    let f = F_LOCATION_SPEED_BITS | F_POSITION_STATUS
+    let m = full_location()
+    // All seven fields off: the Flags field alone, the status bits stay.
+    test.assert_eq(lns_location_packets(f, m, 0x7F, 23)[0], [0x80, 0x16])
+    // The location off: the other six fit one notification of 20 octets.
+    let l = lns_location_packets(f, m, 0x04, 23)
+    test.assert_eq(list.len(l), 1)
+    test.assert_eq(list.len(l[0]), 20)
+    test.assert_eq(l[0][0:2], [0xFB, 0x16])
+    // The speed and the distance off: the rest still needs two notifications.
+    let s = lns_location_packets(f, m, 0x03, 23)
+    test.assert_eq(list.len(s), 2)
+    test.assert_eq(s[0][0:2], [0xBC, 0x16])
+    test.assert_eq(s[1], [0xC0, 0x16, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    // A bit above bit 6 turns nothing off.
+    test.assert_eq(lns_location_packets(f, m, 0xFF80, 23), lns_location_packets(f, m, 0, 23))
+    test.assert_eq(lns_location_sent(0x7F, 0x7F, 0x41), 0x3E)
+    test.assert_eq(lns_location_sent(0x15, 0x7F, 0), 0x15)
+    test.assert_eq(lns_location_sent(0x7F, 0x0F, 0x02), 0x0D)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_location_the_service_cannot_hold_is_not_sent()
+    let f = F_LOCATION_SPEED_BITS
+    let m = plain_location()
+    test.assert(lns_location_valid(f, m))
+    // Both ends of every range are accepted.
+    test.assert(lns_location_valid(f, with(m, 0, 0)))
+    test.assert(lns_location_valid(f, with(m, 0, 0xFFFF)))
+    test.assert(lns_location_valid(f, with(m, 1, 0)))
+    test.assert(lns_location_valid(f, with(m, 2, -900000000)))
+    test.assert(lns_location_valid(f, with(m, 2, 900000000)))
+    test.assert(lns_location_valid(f, with(m, 3, -1800000000)))
+    test.assert(lns_location_valid(f, with(m, 3, 1800000000)))
+    test.assert(lns_location_valid(f, with(m, 4, -8388608)))
+    test.assert(lns_location_valid(f, with(m, 4, 8388607)))
+    test.assert(lns_location_valid(f, with(m, 5, 0)))
+    test.assert(lns_location_valid(f, with(m, 5, 35999)))
+    test.assert(lns_location_valid(f, with(m, 6, 0)))
+    test.assert(lns_location_valid(f, with(m, 14, 3)))
+    test.assert(lns_location_valid(f, with(m, 13, 3)))
+    // Beyond them: a speed of 16 bits, a negative distance, a latitude beyond 90 degrees, a longitude beyond 180, an
+    // elevation of 25 bits, a heading of 360 degrees, a negative rolling time, a UTC time without a date or off the clock,
+    // a position status or elevation source above 3.
+    let refused = [0x10000, -1, 900000001, -900000001, 1800000001, 8388608, -8388609, 36000, -1, -1, 0, 0, 0, 24, 60, 60]
+    let fields = [0, 1, 2, 2, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12]
+    for i in 0..16
+        test.assert(not lns_location_valid(f, with(m, fields[i], refused[i])))
+        test.assert_eq(list.len(lns_location_packets(f, with(m, fields[i], refused[i]), 0, 23)), 0)
+    test.assert(not lns_location_valid(f, with(m, 13, 4)))
+    test.assert(not lns_location_valid(f, with(m, 13, -1)))
+    test.assert(not lns_location_valid(f, with(m, 14, 4)))
+    test.assert(not lns_location_valid(0, with(m, 13, 4)))
+    // The distance and the rolling time roll over: 24 and 8 bits.
+    test.assert_eq(lns_location_pack(f, with(m, 1, 0x1000005), 0x02), [0x02, 0x00, 0x05, 0x00, 0x00])
+    test.assert_eq(lns_location_pack(f, with(m, 6, 0x101), 0x20), [0x20, 0x00, 0x01])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_location_is_notified_to_a_client_that_enabled_it()
+    let config = default_lns_config(F_LOCATION_SPEED_BITS | F_POSITION_STATUS)
+    let (s, h) = server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let m = full_location()
+    // Nothing goes before the client enables the notification.
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, m, 0)), 0)
+    subscribe(var t, h.location_cccd, 1)
+    let n = lns_notify_location(var t.db, var t.link, h, config, st, m, 0)
+    test.assert_eq(list.len(n), 2)
+    test.assert_eq(list.len(n[0]), 23)
+    test.assert_eq(n[0][0:5], wire.octets([0x1B, h.location, 0, 0x9F, 0x16]))
+    test.assert_eq(n[1], wire.octets([0x1B, h.location, 0, 0xE0, 0x16, 0x56, 0xEA, 0x07, 10, 27, 9, 5, 3]))
+    // A larger ATT_MTU takes the value whole.
+    gatt_server.set_mtu(var t.link, 0, 64)
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, m, 0)), 1)
+    gatt_server.set_mtu(var t.link, 0, 23)
+    // A value the service cannot hold is not sent.
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, with(m, 5, 36000), 0)), 0)
+    // The fields the client turned off are not sent, and a client that disables the notification hears nothing.
+    st.mask = 0x7F
+    let off = lns_notify_location(var t.db, var t.link, h, config, st, m, 0)
+    test.assert_eq(list.len(off), 1)
+    test.assert_eq(off[0], wire.octets([0x1B, h.location, 0, 0x80, 0x16]))
+    subscribe(var t, h.location_cccd, 0)
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, m, 0)), 0)
+    // The notification is not repeated by a read.
+    test.assert_eq(read(var t, h.location)[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_every_position_quality_field_has_its_flag_its_size_and_its_place()
+    let q = full_quality()
+    let sizes = [1, 1, 2, 4, 4, 1, 1]
+    for i in 0..7
+        let v = lns_quality_value(1 << (10 + i), q)
+        test.assert_eq(list.len(v), 2 + sizes[i])
+        test.assert_eq(wire.get(v, 0, 2), 1 << i)
+    test.assert_eq(lns_quality_value(1 << 10, q), [0x01, 0x00, 7])
+    test.assert_eq(lns_quality_value(1 << 11, q), [0x02, 0x00, 12])
+    test.assert_eq(lns_quality_value(1 << 12, q), [0x04, 0x00, 0x02, 0x01])
+    test.assert_eq(lns_quality_value(1 << 13, q), [0x08, 0x00, 0x06, 0x05, 0x04, 0x03])
+    test.assert_eq(lns_quality_value(1 << 14, q), [0x10, 0x00, 0x0A, 0x09, 0x08, 0x07])
+    test.assert_eq(lns_quality_value(1 << 15, q), [0x20, 0x00, 5])
+    test.assert_eq(lns_quality_value(1 << 16, q), [0x40, 0x00, 6])
+    // Every field, with the position status (bits 7 and 8) of a sensor that has it.
+    test.assert_eq(lns_quality_value(F_QUALITY_BITS | F_POSITION_STATUS, q), [0x7F, 0x01, 7, 12, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03, 0x0A, 0x09, 0x08, 0x07, 5, 6])
+    // Without the feature the status is 0, and a field of a feature the sensor lacks is left out.
+    test.assert_eq(lns_quality_value(F_QUALITY_BITS, q), [0x7F, 0x00, 7, 12, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03, 0x0A, 0x09, 0x08, 0x07, 5, 6])
+    test.assert_eq(lns_quality_value(F_HDOP | F_EHPE, q), [0x28, 0x00, 0x06, 0x05, 0x04, 0x03, 5])
+    test.assert_eq(lns_quality_value(0, q), [0x00, 0x00])
+    // A field the product has not is left out.
+    test.assert_eq(lns_quality_value(F_QUALITY_BITS, lns_quality(0x20)), [0x20, 0x00, 0])
+    test.assert_eq(lns_quality_value(F_QUALITY_BITS, lns_quality(0)), [0x00, 0x00])
+    // The longest value fits the default ATT_MTU.
+    test.assert(list.len(lns_quality_value(F_QUALITY_BITS, q)) <= 20)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_position_quality_the_service_cannot_hold_is_refused_and_the_old_value_stays()
+    let config = default_lns_config(F_QUALITY_BITS | F_POSITION_STATUS)
+    let (s, h) = server(config)
+    var t = s
+    test.assert(lns_set_quality(var t.db, h, config, full_quality()))
+    let first = read(var t, h.quality)
+    test.assert_eq(first, [0x0B, 0x7F, 0x01, 7, 12, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03, 0x0A, 0x09, 0x08, 0x07, 5, 6])
+    let q = full_quality()
+    // 256 beacons, a negative count, a time of 17 bits, 33-bit errors, a dilution of 9 bits, a status of 4.
+    var bad: [LnsQuality] = []
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 256, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 1, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: -1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 1, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 0x10000, ehpe: 1, evpe: 1, hdop: 1, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 1, ehpe: 0x100000000, evpe: 1, hdop: 1, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: -1, hdop: 1, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 256, vdop: 1, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 1, vdop: 256, position_status: 0 })
+    list.push(bad, LnsQuality { present: 0x7F, in_solution: 1, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 1, vdop: 1, position_status: 4 })
+    for b in bad
+        test.assert(not lns_quality_valid(config.features, b))
+        test.assert(not lns_set_quality(var t.db, h, config, b))
+        test.assert_eq(list.len(lns_quality_value(config.features, b)), 0)
+        test.assert_eq(read(var t, h.quality), first)
+    // A field outside the features is not looked at.
+    test.assert(lns_quality_valid(F_HDOP, LnsQuality { present: 0x7F, in_solution: 999, in_view: 1, time_to_first_fix: 1, ehpe: 1, evpe: 1, hdop: 1, vdop: 1, position_status: 0 }))
+    // A service without the characteristic has nothing to set.
+    let (p, ph) = server(default_lns_config(0))
+    var u = p
+    test.assert(not lns_set_quality(var u.db, ph, default_lns_config(0), q))
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_navigation_value_is_the_flags_the_bearing_the_heading_and_the_optional_fields()
+    let f = F_NAVIGATION_BITS | F_POSITION_STATUS
+    let v = lns_navigation_value(f, full_navigation())
+    test.assert_eq(v, [0xEF, 0x01, 0x02, 0x01, 0x04, 0x03, 0x07, 0x06, 0x05, 0xFE, 0xFF, 0xFF, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    test.assert(list.len(v) <= 20)
+    // The three optional fields one by one.
+    test.assert_eq(lns_navigation_value(F_REMAINING_DISTANCE, full_navigation()), [0xE1, 0x01, 0x02, 0x01, 0x04, 0x03, 0x07, 0x06, 0x05])
+    test.assert_eq(lns_navigation_value(F_REMAINING_VERTICAL_DISTANCE, full_navigation()), [0xE2, 0x01, 0x02, 0x01, 0x04, 0x03, 0xFE, 0xFF, 0xFF])
+    test.assert_eq(lns_navigation_value(F_ESTIMATED_TIME_OF_ARRIVAL, full_navigation()), [0xE4, 0x01, 0x02, 0x01, 0x04, 0x03, 0xEA, 0x07, 10, 27, 9, 5, 3])
+    // Without the features only the mandatory fields remain: the position status and the indicator type are 0, the
+    // heading source and the two reached bits stay.
+    test.assert_eq(lns_navigation_value(0, full_navigation()), [0xA0, 0x01, 0x02, 0x01, 0x04, 0x03])
+    test.assert_eq(lns_navigation_value(0, lns_navigation(0x0102, 0x0304)), [0x00, 0x00, 0x02, 0x01, 0x04, 0x03])
+    // A field the product has not is left out.
+    let some = LnsNavigation {
+        present: 4, bearing: 1, heading: 2, remaining_distance: 9, remaining_vertical: 9, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 2, heading_compass: false, to_destination: false, waypoint_reached: false,
+        destination_reached: false }
+    test.assert_eq(lns_navigation_value(f, some), [0x14, 0x00, 1, 0, 2, 0, 0xEA, 0x07, 10, 27, 9, 5, 3])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_navigation_flags_are_the_status_the_source_the_indicator_and_the_two_reached_bits()
+    let n = lns_navigation(1, 2)
+    let st = LnsNavigation {
+        present: 0, bearing: 1, heading: 2, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time_unknown(), position_status: 3, heading_compass: false, to_destination: true, waypoint_reached: false, destination_reached: false }
+    // The position status is bits 3 and 4 and needs its feature.
+    test.assert_eq(wire.get(lns_navigation_value(F_POSITION_STATUS, st), 0, 2), 0x18)
+    test.assert_eq(wire.get(lns_navigation_value(0, st), 0, 2), 0)
+    // The indicator type, bit 6, needs a feature of the optional fields.
+    test.assert_eq(wire.get(lns_navigation_value(F_REMAINING_DISTANCE, st), 0, 2), 0x40)
+    test.assert_eq(wire.get(lns_navigation_value(F_ESTIMATED_TIME_OF_ARRIVAL, st), 0, 2), 0x40)
+    test.assert_eq(wire.get(lns_navigation_value(F_LOCATION, st), 0, 2), 0)
+    // The heading source, bit 5, and the reached bits, 7 and 8, need nothing.
+    let reached = LnsNavigation {
+        present: 0, bearing: 1, heading: 2, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time_unknown(), position_status: 0, heading_compass: true, to_destination: false, waypoint_reached: true, destination_reached: false }
+    test.assert_eq(wire.get(lns_navigation_value(0, reached), 0, 2), 0xA0)
+    let arrived = LnsNavigation {
+        present: 0, bearing: 1, heading: 2, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time_unknown(), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: true }
+    test.assert_eq(wire.get(lns_navigation_value(0, arrived), 0, 2), 0x100)
+    test.assert_eq(wire.get(lns_navigation_value(F_DEFINED_BITS, n), 0, 2), 0)
+    // The reserved bits 9 to 15 are never set.
+    for i in 0..21
+        test.assert_eq(wire.get(lns_navigation_value(1 << i, full_navigation()), 0, 2) >>> 9, 0)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_navigation_the_service_cannot_hold_is_not_sent()
+    let f = F_NAVIGATION_BITS
+    let ok = full_navigation()
+    test.assert(lns_navigation_valid(f, ok))
+    var bad: [LnsNavigation] = []
+    list.push(bad, LnsNavigation { present: 7, bearing: 36000, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 36000, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: -1, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0x1000000, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: -1, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: 8388608, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: -8388609, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 0, 27, 9, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 24, 5, 3), position_status: 0, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    list.push(bad, LnsNavigation { present: 7, bearing: 0, heading: 0, remaining_distance: 0, remaining_vertical: 0, time: wire.date_time(2026, 10, 27, 9, 5, 3), position_status: 4, heading_compass: false, to_destination: false, waypoint_reached: false, destination_reached: false })
+    for b in bad
+        test.assert(not lns_navigation_valid(f, b))
+        test.assert_eq(list.len(lns_navigation_value(f, b)), 0)
+    // Both ends of the ranges are accepted, and a field outside the features or not present is not looked at.
+    let ends = LnsNavigation {
+        present: 7, bearing: 35999, heading: 0, remaining_distance: 0xFFFFFF, remaining_vertical: -8388608, time: wire.date_time(9999, 12, 31, 23, 59, 59), position_status: 3, heading_compass: false, to_destination: false,
+        waypoint_reached: false, destination_reached: false }
+    test.assert(lns_navigation_valid(f, ends))
+    test.assert(lns_navigation_valid(0, bad[3]))
+    test.assert(lns_navigation_valid(F_REMAINING_VERTICAL_DISTANCE, bad[7]))
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_navigation_is_notified_only_while_the_client_has_started_it()
+    let config = default_lns_config(F_NAVIGATION_BITS)
+    let (s, h) = server(config)
+    var t = s
+    var st = new_lns_state(config)
+    subscribe(var t, h.navigation_cccd, 1)
+    let m = full_navigation()
+    // The notification needs the Navigation Control procedure first.
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 0)
+    st.navigating = true
+    let n = lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0], wire.octets([0x1B, h.navigation, 0, 0xE7, 0x01, 0x02, 0x01, 0x04, 0x03, 0x07, 0x06, 0x05, 0xFE, 0xFF, 0xFF, 0xEA, 0x07, 10, 27, 9, 5, 3]))
+    // A value the service cannot hold, and a client that disabled the notification, hear nothing.
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, lns_navigation(36000, 0), 0)), 0)
+    subscribe(var t, h.navigation_cccd, 0)
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 0)
+    // A service without the characteristic has no notification.
+    let (p, ph) = server(default_lns_config(0))
+    var u = p
+    st.navigating = true
+    test.assert_eq(list.len(lns_notify_navigation(var u.db, var u.link, ph, default_lns_config(0), st, m, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_procedure_is_answered_by_the_write_response_and_then_the_indication()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let out = receive_default(var t, h, config, var st, req(0x12, h.control_point, [4]), 0)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0], [0x13])
+    test.assert_eq(out[1], wire.octets([0x1D, h.control_point, 0, 0x20, 0x04, 0x01, 0x03, 0x00]))
+    // The control point declares Write and Indicate and is not readable; a second write waits for the confirmation.
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, [4]), 0)), att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    test.assert_eq(list.len(gatt_server.receive(var t.db, var t.link, [0x1E], 1)), 0)
+    test.assert_eq(list.len(receive_default(var t, h, config, var st, req(0x12, h.control_point, [4]), 2)), 2)
+    // Any other PDU is the ATT server's.
+    test.assert_eq(receive_default(var t, h, config, var st, req(0x0A, h.feature, []), 3)[0], [0x0B, 0xFF, 0xFF, 0x1F, 0x00])
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.feature, [1]), 3)), att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_write_to_the_control_point_needs_the_indication_enabled_and_none_unconfirmed()
+    let config = full_config()
+    let (s, h) = server(config)
+    var t = s
+    var st = new_lns_state(config)
+    // The client has not enabled the indication: Client Characteristic Configuration Descriptor Improperly Configured (0xFD).
+    let refused = receive_default(var t, h, config, var st, req(0x12, h.control_point, [1, 1, 0, 0]), 0)
+    test.assert_eq(list.len(refused), 1)
+    test.assert_eq(error_of(refused), att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    test.assert_eq(error_of(refused), 0xFD)
+    test.assert_eq(st.distance_set, false)
+    // With the indication on, one procedure runs; a write before the confirmation is Procedure Already In Progress (0xFE).
+    subscribe(var t, h.control_point_cccd, 2)
+    test.assert_eq(list.len(receive_default(var t, h, config, var st, req(0x12, h.control_point, [1, 1, 0, 0]), 0)), 2)
+    test.assert_eq(st.total_distance, 1)
+    let busy = receive_default(var t, h, config, var st, req(0x12, h.control_point, [1, 2, 0, 0]), 0)
+    test.assert_eq(list.len(busy), 1)
+    test.assert_eq(error_of(busy), 0xFE)
+    test.assert_eq(st.total_distance, 1)
+    // The client confirms and can go on; five writes in a row are answered the same way.
+    let _ = gatt_server.receive(var t.db, var t.link, [0x1E], 0)
+    test.assert_eq(list.len(receive_default(var t, h, config, var st, req(0x12, h.control_point, [1, 2, 0, 0]), 0)), 2)
+    test.assert_eq(st.total_distance, 2)
+    for _ in 0..5
+        test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, [4]), 0)), 0xFE)
+    // The client turns the indication off again.
+    let _ = gatt_server.receive(var t.db, var t.link, [0x1E], 0)
+    subscribe(var t, h.control_point_cccd, 0)
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, [4]), 0)), 0xFD)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_long_write_to_the_control_point_is_refused_and_a_write_command_does_nothing()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let long = receive_default(var t, h, config, var st, req(0x16, h.control_point, [0, 0, 1, 1, 0, 0]), 0)
+    test.assert_eq(error_of(long), att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    test.assert_eq(list.len(long), 1)
+    test.assert_eq(list.len(receive_default(var t, h, config, var st, req(0x52, h.control_point, [1, 1, 0, 0]), 0)), 0)
+    test.assert_eq(st.distance_set, false)
+    // A service without the control point leaves every PDU to the ATT server.
+    let (p, ph) = server(default_lns_config(F_LOCATION))
+    var u = p
+    var none = new_lns_state(default_lns_config(F_LOCATION))
+    test.assert_eq(error_of(receive_default(var u, ph, default_lns_config(F_LOCATION), var none, req(0x12, ph.feature, [1]), 0)), att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(receive_default(var u, ph, default_lns_config(F_LOCATION), var none, req(0x0A, ph.feature, []), 0)[0], [0x0B, 0x04, 0x00, 0x00, 0x00])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_set_cumulative_value_sets_the_total_distance_and_wants_three_octets()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    test.assert_eq(command(var t, h, config, var st, [1, 0, 0, 0]), [0x20, 0x01, 0x01])
+    test.assert(st.distance_set)
+    test.assert_eq(st.total_distance, 0)
+    st.distance_set = false
+    test.assert_eq(command(var t, h, config, var st, [1, 0x78, 0x56, 0x34]), [0x20, 0x01, 0x01])
+    test.assert_eq(st.total_distance, 0x345678)
+    test.assert(st.distance_set)
+    st.distance_set = false
+    test.assert_eq(command(var t, h, config, var st, [1, 0xFF, 0xFF, 0xFF]), [0x20, 0x01, 0x01])
+    test.assert_eq(st.total_distance, 0xFFFFFF)
+    // A parameter of two octets (a uint16), of four, or none: Invalid Parameter, the value stays.
+    st.distance_set = false
+    test.assert_eq(command(var t, h, config, var st, [1, 1, 2]), [0x20, 0x01, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [1, 1, 2, 3, 4]), [0x20, 0x01, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [1]), [0x20, 0x01, 0x03])
+    test.assert_eq(st.distance_set, false)
+    test.assert_eq(st.total_distance, 0xFFFFFF)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_mask_content_turns_fields_off_until_the_connection_ends()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let m = full_location()
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, m, 0)), 2)
+    // All seven fields off: the next notification is the Flags field alone.
+    test.assert_eq(command(var t, h, config, var st, [2, 0x7F, 0x00]), [0x20, 0x02, 0x01])
+    test.assert_eq(st.mask, 0x7F)
+    let n = lns_notify_location(var t.db, var t.link, h, config, st, m, 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0], wire.octets([0x1B, h.location, 0, 0x80, 0x16]))
+    // A mask replaces the one before it; 0 turns nothing off.
+    test.assert_eq(command(var t, h, config, var st, [2, 0x01, 0x00]), [0x20, 0x02, 0x01])
+    test.assert_eq(st.mask, 1)
+    test.assert_eq(command(var t, h, config, var st, [2, 0x00, 0x00]), [0x20, 0x02, 0x01])
+    test.assert_eq(st.mask, 0)
+    // A mask with a reserved bit, or of the wrong length: Invalid Parameter, the mask stays.
+    test.assert_eq(command(var t, h, config, var st, [2, 0x05, 0x00]), [0x20, 0x02, 0x01])
+    test.assert_eq(command(var t, h, config, var st, [2, 0x80, 0x00]), [0x20, 0x02, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [2, 0x00, 0x01]), [0x20, 0x02, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [2, 0x7F]), [0x20, 0x02, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [2]), [0x20, 0x02, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [2, 0, 0, 0]), [0x20, 0x02, 0x03])
+    test.assert_eq(st.mask, 5)
+    // The mask is not kept for the next connection.
+    lns_disconnected(var st)
+    test.assert_eq(st.mask, 0)
+    test.assert_eq(list.len(lns_notify_location(var t.db, var t.link, h, config, st, m, 0)), 2)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_navigation_control_starts_pauses_continues_skips_and_stops()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let m = full_navigation()
+    let ok: [u8] = [0x20, 0x03, 0x01]
+    test.assert_eq(st.route, 0)
+    // Start: the notification of the Navigation characteristic follows.
+    test.assert_eq(command(var t, h, config, var st, [3, 1]), ok)
+    test.assert(st.navigating)
+    test.assert_eq(st.paused, false)
+    test.assert_eq(st.nav_action, NAV_START)
+    test.assert(st.nav_requested)
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 1)
+    // Pause stops the notification and keeps the place.
+    test.assert_eq(command(var t, h, config, var st, [3, 2]), ok)
+    test.assert_eq(st.navigating, false)
+    test.assert(st.paused)
+    test.assert_eq(st.nav_action, NAV_PAUSE)
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 0)
+    // Continue starts it again.
+    test.assert_eq(command(var t, h, config, var st, [3, 3]), ok)
+    test.assert(st.navigating)
+    test.assert_eq(st.paused, false)
+    test.assert_eq(st.nav_action, NAV_CONTINUE)
+    // Skip Waypoint leaves the notification as it is.
+    st.nav_requested = false
+    test.assert_eq(command(var t, h, config, var st, [3, 4]), ok)
+    test.assert(st.navigating)
+    test.assert_eq(st.nav_action, NAV_SKIP_WAYPOINT)
+    test.assert(st.nav_requested)
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 1)
+    // Stop ends it, and stopping twice is no error.
+    test.assert_eq(command(var t, h, config, var st, [3, 0]), ok)
+    test.assert_eq(st.navigating, false)
+    test.assert_eq(st.paused, false)
+    test.assert_eq(st.nav_action, NAV_STOP)
+    test.assert_eq(list.len(lns_notify_navigation(var t.db, var t.link, h, config, st, m, 0)), 0)
+    test.assert_eq(command(var t, h, config, var st, [3, 0]), ok)
+    // Select Nearest Waypoint starts it.
+    test.assert_eq(command(var t, h, config, var st, [3, 5]), ok)
+    test.assert(st.navigating)
+    test.assert_eq(st.nav_action, NAV_SELECT_NEAREST)
+    // A connection that ends stops the navigation.
+    lns_disconnected(var st)
+    test.assert_eq(st.navigating, false)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_navigation_control_with_an_unknown_action_or_a_bad_length_is_invalid_and_one_that_cannot_run_fails()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    let invalid: [u8] = [0x20, 0x03, 0x03]
+    let failed: [u8] = [0x20, 0x03, 0x04]
+    test.assert_eq(command(var t, h, config, var st, [3, 6]), invalid)
+    test.assert_eq(command(var t, h, config, var st, [3, 0xFF]), invalid)
+    test.assert_eq(command(var t, h, config, var st, [3]), invalid)
+    test.assert_eq(command(var t, h, config, var st, [3, 1, 0]), invalid)
+    test.assert_eq(st.nav_requested, false)
+    test.assert_eq(st.navigating, false)
+    // Pause, Continue and Skip Waypoint need a navigation to act on.
+    test.assert_eq(command(var t, h, config, var st, [3, 2]), failed)
+    test.assert_eq(command(var t, h, config, var st, [3, 3]), failed)
+    test.assert_eq(command(var t, h, config, var st, [3, 4]), failed)
+    test.assert_eq(st.nav_requested, false)
+    test.assert_eq(st.paused, false)
+    // Continue needs a pause, not a running navigation.
+    test.assert_eq(command(var t, h, config, var st, [3, 1]), [0x20, 0x03, 0x01])
+    test.assert_eq(command(var t, h, config, var st, [3, 3]), failed)
+    // Start and Select Nearest Waypoint need a route.
+    var empty = full_config()
+    empty.routes = []
+    let (e, eh) = control_server(empty)
+    var u = e
+    var est = new_lns_state(empty)
+    test.assert_eq(est.route, -1)
+    test.assert_eq(command(var u, eh, empty, var est, [3, 1]), failed)
+    test.assert_eq(command(var u, eh, empty, var est, [3, 5]), failed)
+    test.assert_eq(est.navigating, false)
+    test.assert_eq(est.nav_requested, false)
+
+// A policy that declines Start and remembers every action it was asked about.
+@value
+struct Busy
+    asked: Int
+    seen: Int
+
+impl LnsPolicy[] for Busy
+    @tier(app)
+    fn navigation(var self, _peer: links.LinkId, action: Int) -> Bool
+        self.asked = self.asked + 1
+        self.seen = self.seen | (1 << action)
+        action != NAV_START
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_policy_is_asked_for_a_valid_navigation_control_and_a_refusal_is_operation_failed()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    var busy = Busy { asked: 0, seen: 0 }
+    let start = lns_receive(var t.db, var t.link, h, config, var st, var busy, peer(), req(0x12, h.control_point, [3, NAV_START]), 0)
+    test.assert_eq(list.len(start), 2)
+    test.assert_eq(start[1][3:list.len(start[1])], [0x20, 0x03, 0x04])
+    test.assert_eq(st.navigating, false)
+    test.assert_eq(st.nav_requested, false)
+    let _ = gatt_server.receive(var t.db, var t.link, [0x1E], 0)
+    let stop = lns_receive(var t.db, var t.link, h, config, var st, var busy, peer(), req(0x12, h.control_point, [3, NAV_STOP]), 0)
+    test.assert_eq(stop[1][3:list.len(stop[1])], [0x20, 0x03, 0x01])
+    let _ = gatt_server.receive(var t.db, var t.link, [0x1E], 0)
+    // An action out of range is an invalid parameter and is not asked.
+    let bad = lns_receive(var t.db, var t.link, h, config, var st, var busy, peer(), req(0x12, h.control_point, [3, 9]), 0)
+    test.assert_eq(bad[1][3:list.len(bad[1])], [0x20, 0x03, 0x03])
+    test.assert_eq(busy.asked, 2)
+    test.assert_eq(busy.seen, (1 << NAV_START) | (1 << NAV_STOP))
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_navigation_control_needs_the_navigation_notification_enabled()
+    let config = full_config()
+    let (s, h) = server(config)
+    var t = s
+    var st = new_lns_state(config)
+    subscribe(var t, h.control_point_cccd, 2)
+    // The Navigation notification is off: Client Characteristic Configuration Descriptor Improperly Configured, no procedure.
+    for action in 0..6
+        let out = receive_default(var t, h, config, var st, req(0x12, h.control_point, [3, action]), 0)
+        test.assert_eq(list.len(out), 1)
+        test.assert_eq(error_of(out), 0xFD)
+    test.assert_eq(st.navigating, false)
+    test.assert_eq(st.nav_requested, false)
+    // The other navigation procedures do not need it.
+    test.assert_eq(command(var t, h, config, var st, [4]), [0x20, 0x04, 0x01, 0x03, 0x00])
+    test.assert_eq(command(var t, h, config, var st, [6, 1, 0]), [0x20, 0x06, 0x01])
+    subscribe(var t, h.navigation_cccd, 1)
+    test.assert_eq(command(var t, h, config, var st, [3, 1]), [0x20, 0x03, 0x01])
+    // The client turns the notification off again.
+    subscribe(var t, h.navigation_cccd, 0)
+    test.assert_eq(error_of(receive_default(var t, h, config, var st, req(0x12, h.control_point, [3, 0]), 0)), 0xFD)
+    test.assert(st.navigating)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_routes_are_counted_named_and_selected()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    test.assert_eq(command(var t, h, config, var st, [4]), [0x20, 0x04, 0x01, 0x03, 0x00])
+    test.assert_eq(command(var t, h, config, var st, [4, 0]), [0x20, 0x04, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [5, 0, 0]), [0x20, 0x05, 0x01, 0x48, 0x6F, 0x6D, 0x65])
+    test.assert_eq(command(var t, h, config, var st, [5, 1, 0]), [0x20, 0x05, 0x01, 0x57, 0x6F, 0x72, 0x6B])
+    test.assert_eq(command(var t, h, config, var st, [5, 2, 0]), [0x20, 0x05, 0x01, 0x48, 0x69, 0x6C, 0x6C])
+    // A route number is 0 to the number of routes less one.
+    test.assert_eq(command(var t, h, config, var st, [5, 3, 0]), [0x20, 0x05, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [5, 0xFF, 0xFF]), [0x20, 0x05, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [5, 0]), [0x20, 0x05, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [5]), [0x20, 0x05, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [5, 0, 0, 0]), [0x20, 0x05, 0x03])
+    // Select Route.
+    test.assert_eq(command(var t, h, config, var st, [6, 2, 0]), [0x20, 0x06, 0x01])
+    test.assert_eq(st.route, 2)
+    test.assert_eq(command(var t, h, config, var st, [6, 3, 0]), [0x20, 0x06, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [6, 1]), [0x20, 0x06, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [6]), [0x20, 0x06, 0x03])
+    test.assert_eq(st.route, 2)
+    // The connection ending leaves the route selected.
+    lns_disconnected(var st)
+    test.assert_eq(st.route, 2)
+    // A sensor with no route counts 0 and has no name to give.
+    var empty = full_config()
+    empty.routes = []
+    let (e, eh) = control_server(empty)
+    var u = e
+    var est = new_lns_state(empty)
+    test.assert_eq(command(var u, eh, empty, var est, [4]), [0x20, 0x04, 0x01, 0x00, 0x00])
+    test.assert_eq(command(var u, eh, empty, var est, [5, 0, 0]), [0x20, 0x05, 0x03])
+    test.assert_eq(command(var u, eh, empty, var est, [6, 0, 0]), [0x20, 0x06, 0x03])
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_route_name_is_cut_to_the_indication_and_never_inside_a_character()
+    var long: [u8] = []
+    for _ in 0..30
+        list.push(long, 0x61)
+    var config = default_lns_config(F_NAVIGATION_BITS)
+    config.routes = [long]
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    // At the default ATT_MTU an indication holds 20 octets, 3 of them the header of the response.
+    let cut = command(var t, h, config, var st, [5, 0, 0])
+    test.assert_eq(list.len(cut), 20)
+    test.assert_eq(cut[0:3], [0x20, 0x05, 0x01])
+    // A larger ATT_MTU takes the whole name.
+    gatt_server.set_mtu(var t.link, 0, 64)
+    test.assert_eq(list.len(command(var t, h, config, var st, [5, 0, 0])), 33)
+    // The same function cut at an exact room and in UTF-8.
+    test.assert_eq(lns_name_length(long, 30), 30)
+    test.assert_eq(lns_name_length(long, 31), 30)
+    test.assert_eq(lns_name_length(long, 17), 17)
+    test.assert_eq(lns_name_length(long, 0), 0)
+    test.assert_eq(lns_name_length(long, -1), 0)
+    // "a" and the euro sign E2 82 AC: a limit inside the sign cuts before it.
+    let euro: [u8] = [0x61, 0xE2, 0x82, 0xAC]
+    test.assert_eq(lns_name_length(euro, 4), 4)
+    test.assert_eq(lns_name_length(euro, 3), 1)
+    test.assert_eq(lns_name_length(euro, 2), 1)
+    test.assert_eq(lns_name_length(euro, 1), 1)
+    // 16 letters, e with acute (C3 A9) and a letter: the 17 octets of the room end inside the e.
+    var accent: [u8] = []
+    for _ in 0..16
+        list.push(accent, 0x61)
+    list.append(accent, [0xC3, 0xA9, 0x62])
+    test.assert_eq(lns_name_length(accent, 17), 16)
+    test.assert_eq(lns_name_length(accent, 18), 18)
+    var accented = default_lns_config(F_NAVIGATION_BITS)
+    accented.routes = [accent]
+    let (a, ah) = control_server(accented)
+    var u = a
+    var ast = new_lns_state(accented)
+    test.assert_eq(list.len(command(var u, ah, accented, var ast, [5, 0, 0])), 3 + 16)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_set_fix_rate_takes_one_octet_of_seconds()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    test.assert_eq(command(var t, h, config, var st, [7, 10]), [0x20, 0x07, 0x01])
+    test.assert_eq(st.fix_rate, 10)
+    test.assert(st.fix_rate_set)
+    st.fix_rate_set = false
+    // 0 is the fastest possible rate; 255 is the slowest.
+    test.assert_eq(command(var t, h, config, var st, [7, 0]), [0x20, 0x07, 0x01])
+    test.assert_eq(st.fix_rate, 0)
+    test.assert(st.fix_rate_set)
+    test.assert_eq(command(var t, h, config, var st, [7, 255]), [0x20, 0x07, 0x01])
+    test.assert_eq(st.fix_rate, 255)
+    st.fix_rate_set = false
+    test.assert_eq(command(var t, h, config, var st, [7]), [0x20, 0x07, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [7, 1, 2]), [0x20, 0x07, 0x03])
+    test.assert_eq(st.fix_rate_set, false)
+    test.assert_eq(st.fix_rate, 255)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_set_elevation_takes_three_octets_signed()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    test.assert_eq(command(var t, h, config, var st, [8, 0, 0, 0]), [0x20, 0x08, 0x01])
+    test.assert_eq(st.elevation, 0)
+    test.assert(st.elevation_set)
+    st.elevation_set = false
+    test.assert_eq(command(var t, h, config, var st, [8, 0x10, 0x27, 0x00]), [0x20, 0x08, 0x01])
+    test.assert_eq(st.elevation, 10000)
+    test.assert_eq(command(var t, h, config, var st, [8, 0xFF, 0xFF, 0xFF]), [0x20, 0x08, 0x01])
+    test.assert_eq(st.elevation, -1)
+    test.assert_eq(command(var t, h, config, var st, [8, 0x00, 0x00, 0x80]), [0x20, 0x08, 0x01])
+    test.assert_eq(st.elevation, -8388608)
+    test.assert_eq(command(var t, h, config, var st, [8, 0xFF, 0xFF, 0x7F]), [0x20, 0x08, 0x01])
+    test.assert_eq(st.elevation, 8388607)
+    st.elevation_set = false
+    test.assert_eq(command(var t, h, config, var st, [8, 1, 2]), [0x20, 0x08, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [8, 1, 2, 3, 4]), [0x20, 0x08, 0x03])
+    test.assert_eq(command(var t, h, config, var st, [8]), [0x20, 0x08, 0x03])
+    test.assert_eq(st.elevation_set, false)
+    test.assert_eq(st.elevation, 8388607)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_an_opcode_the_service_does_not_define_is_not_supported_and_changes_nothing()
+    let config = full_config()
+    let (s, h) = control_server(config)
+    var t = s
+    var st = new_lns_state(config)
+    // The reserved 0x00 and 0x09 to 0x1F, the response code itself and the rest.
+    for op in [0x00, 0x09, 0x0A, 0x1F, 0x20, 0x21, 0x7F, 0xFF]
+        test.assert_eq(command(var t, h, config, var st, [op]), wire.octets([0x20, op, 0x02]))
+        test.assert_eq(command(var t, h, config, var st, [op, 1, 2, 3]), wire.octets([0x20, op, 0x02]))
+    // A write of no octet has no opcode: the response answers opcode 0.
+    test.assert_eq(command(var t, h, config, var st, []), [0x20, 0x00, 0x02])
+    test.assert_eq(st.mask, 0)
+    test.assert_eq(st.distance_set, false)
+    test.assert_eq(st.elevation_set, false)
+    test.assert_eq(st.fix_rate_set, false)
+    test.assert_eq(st.nav_requested, false)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_a_procedure_the_sensor_lacks_is_not_supported()
+    let ops: [[u8]] = [[1, 0, 0, 0], [2, 0, 0], [3, 1], [4], [5, 0, 0], [6, 0, 0], [7, 1], [8, 0, 0, 0]]
+    // The total distance only: Set Cumulative Value runs, the others are not supported.
+    var st = new_lns_state(default_lns_config(F_TOTAL_DISTANCE))
+    for i in 0..8
+        let r = lns_apply(default_lns_config(F_TOTAL_DISTANCE), var st, ops[i], 17)
+        test.assert_eq(r.0, if i == 0 then sensor_control.RESULT_SUCCESS else sensor_control.RESULT_OP_CODE_NOT_SUPPORTED)
+    // Masking and fix rate only.
+    let two = default_lns_config(F_CONTENT_MASKING | F_FIX_RATE_SETTING)
+    var st2 = new_lns_state(two)
+    for i in 0..8
+        let r = lns_apply(two, var st2, ops[i], 17)
+        test.assert_eq(r.0, if i == 1 or i == 6 then sensor_control.RESULT_SUCCESS else sensor_control.RESULT_OP_CODE_NOT_SUPPORTED)
+    // The elevation setting only (with the elevation).
+    let three = default_lns_config(F_ELEVATION | F_ELEVATION_SETTING)
+    var st3 = new_lns_state(three)
+    for i in 0..8
+        let r = lns_apply(three, var st3, ops[i], 17)
+        test.assert_eq(r.0, if i == 7 then sensor_control.RESULT_SUCCESS else sensor_control.RESULT_OP_CODE_NOT_SUPPORTED)
+    // The navigation only: the four navigation procedures run (Request Name and Select Route need a route).
+    var nav = default_lns_config(0)
+    nav.navigation = true
+    nav.routes = [wire.text("A")]
+    var st4 = new_lns_state(nav)
+    for i in 0..8
+        let r = lns_apply(nav, var st4, ops[i], 17)
+        test.assert_eq(r.0, if i >= 2 and i <= 5 then sensor_control.RESULT_SUCCESS else sensor_control.RESULT_OP_CODE_NOT_SUPPORTED)
+    // The empty request.
+    test.assert_eq(lns_apply(nav, var st4, [], 17).0, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_feature_is_indicated_when_it_changed()
+    let config = full_config()
+    let (s, h) = server(config)
+    var t = s
+    test.assert_eq(list.len(lns_features_changed(var t.db, var t.link, h, config, 0)), 0)
+    subscribe(var t, h.feature_cccd, 2)
+    let f = lns_features_changed(var t.db, var t.link, h, config, 0)
+    test.assert_eq(f[0], [0x1D, 3, 0, 0xFF, 0xFF, 0x1F, 0x00])
+    // The value changed with the features: a sensor of fewer features indicates its new value.
+    var fewer = config
+    fewer.features = F_LOCATION
+    let _ = gatt_server.receive(var t.db, var t.link, [0x1E], 1)
+    test.assert_eq(lns_features_changed(var t.db, var t.link, h, fewer, 2)[0], [0x1D, 3, 0, 0x04, 0x00, 0x00, 0x00])
+    // A sensor without the Indicate property never indicates it.
+    let (p, ph) = server(default_lns_config(0))
+    var u = p
+    test.assert_eq(list.len(lns_features_changed(var u.db, var u.link, ph, default_lns_config(0), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-LNS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_lns_service(var s.db, full_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

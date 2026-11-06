@@ -1,0 +1,240 @@
+// src/cycling_speed_cadence_client.nv — the Collector side of the
+// Cycling Speed and Cadence Service (0x1816): the decoders of its characteristics, the
+// SC Control Point requests and responses (which the Running Speed and Cadence client
+// uses too), the speed and cadence helpers, and the client session.
+//
+//   CSC Measurement   0x2A5B   `csc_decode`
+//   CSC Feature       0x2A5C   `csc_decode_feature`
+//   Sensor Location   0x2A5D   `csc_decode_location`
+//   SC Control Point  0x2A55   `sc_req_*` build, `sc_decode_response` reads
+//
+// Layout of a measurement ([GSS] 3.61): the flags octet (bit 0 wheel revolution data
+// present, bit 1 crank revolution data present, bits 2 to 7 reserved and ignored), then the
+// wheel data (a 32-bit cumulative count and the time of the last event, 16 bits in units of
+// 1/1024 second) and the crank data (a 16-bit count and the time of the last event in units
+// of 1/1024 second).  A value shorter than its flags require answers `None`.
+//
+// Speed and cadence are the difference of two samples.  The counters wrap (the wheel count
+// at 2^32, the crank count and both times at 2^16), so every difference is taken modulo
+// the width of its field.  A difference of the event times of 0 means the sensor sent no
+// new event (the wheel or the crank stood still): the helpers answer -1.  The helpers
+// allocate nothing.
+//
+// The session runs on `sensor_client.nv`.
+
+use gatt_client
+use links
+use cycling_speed_cadence
+use sensor_client
+use sensor_control
+use wire
+
+const CSCM_WHEEL = 0x01
+const CSCM_CRANK = 0x02
+
+// The bits of the CSC Feature value ([GSS] 3.60.1) are `cycling_speed_cadence.FEATURE_*`.
+
+// The units: event times in 1/1024 second.
+const TIME_TICKS_PER_SECOND = 1024
+
+// One decoded measurement; a part whose bit is not in `present` is 0.
+@value
+struct CscMeasurement
+    present: Int
+    wheel_revs: Int
+    wheel_time: Int
+    crank_revs: Int
+    crank_time: Int
+
+@tier(embedded)
+@no_alloc
+fn csc_has_wheel(m: CscMeasurement) -> Bool
+    (m.present & CSCM_WHEEL) != 0
+
+@tier(embedded)
+@no_alloc
+fn csc_has_crank(m: CscMeasurement) -> Bool
+    (m.present & CSCM_CRANK) != 0
+
+// The measurement in `b`, `None` when `b` is shorter than its flags require.
+@tier(embedded)
+@no_alloc
+fn csc_decode(b: [u8]) -> ?CscMeasurement
+    let n = list.len(b)
+    if n < 1
+        return None
+    let flags = b[0] as Int
+    var at = 1
+    var wheel_revs = 0
+    var wheel_time = 0
+    var crank_revs = 0
+    var crank_time = 0
+    if (flags & CSCM_WHEEL) != 0
+        if n < at + 6
+            return None
+        wheel_revs = wire.get(b, at, 4)
+        wheel_time = wire.get(b, at + 4, 2)
+        at = at + 6
+    if (flags & CSCM_CRANK) != 0
+        if n < at + 4
+            return None
+        crank_revs = wire.get(b, at, 2)
+        crank_time = wire.get(b, at + 2, 2)
+    Some(CscMeasurement {
+        present: flags & 0x03, wheel_revs: wheel_revs, wheel_time: wheel_time, crank_revs: crank_revs, crank_time: crank_time })
+
+// The CSC Feature value (16 bits), `None` unless two octets.
+@tier(embedded)
+@no_alloc
+fn csc_decode_feature(b: [u8]) -> ?Int
+    if list.len(b) != 2
+        return None
+    Some(wire.get(b, 0, 2))
+
+// The Sensor Location, `None` unless one octet.
+@tier(embedded)
+@no_alloc
+fn csc_decode_location(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    Some(b[0] as Int)
+
+// ── Deltas ──────────────────────────────────────────────────────────
+
+// The wheel revolutions between two samples, modulo 2^32.
+@tier(embedded)
+@no_alloc
+fn csc_wheel_delta(prev: CscMeasurement, cur: CscMeasurement) -> Int
+    (cur.wheel_revs - prev.wheel_revs) & 0xFFFFFFFF
+
+// The crank revolutions between two samples, modulo 2^16.
+@tier(embedded)
+@no_alloc
+fn csc_crank_delta(prev: CscMeasurement, cur: CscMeasurement) -> Int
+    (cur.crank_revs - prev.crank_revs) & 0xFFFF
+
+// The time between the wheel events of two samples in 1/1024 second, modulo 2^16.
+@tier(embedded)
+@no_alloc
+fn csc_wheel_ticks(prev: CscMeasurement, cur: CscMeasurement) -> Int
+    (cur.wheel_time - prev.wheel_time) & 0xFFFF
+
+// The time between the crank events of two samples in 1/1024 second, modulo 2^16.
+@tier(embedded)
+@no_alloc
+fn csc_crank_ticks(prev: CscMeasurement, cur: CscMeasurement) -> Int
+    (cur.crank_time - prev.crank_time) & 0xFFFF
+
+// The distance rolled between two samples in millimetres for a wheel of `circumference_mm`.
+@tier(embedded)
+@no_alloc
+fn csc_distance_mm(prev: CscMeasurement, cur: CscMeasurement, circumference_mm: Int) -> Int
+    csc_wheel_delta(prev, cur) * circumference_mm
+
+// The speed between two samples in millimetres per second for a wheel of `circumference_mm`, rounded to
+// the nearest; -1 when the wheel event time did not change.
+@tier(embedded)
+@no_alloc
+fn csc_speed_mm_per_s(prev: CscMeasurement, cur: CscMeasurement, circumference_mm: Int) -> Int
+    let ticks = csc_wheel_ticks(prev, cur)
+    if ticks == 0
+        return -1
+    (csc_wheel_delta(prev, cur) * circumference_mm * TIME_TICKS_PER_SECOND + ticks / 2) / ticks
+
+// The cadence between two samples in tenths of a revolution per minute, rounded to the nearest; -1 when
+// the crank event time did not change.
+@tier(embedded)
+@no_alloc
+fn csc_cadence_rpm_x10(prev: CscMeasurement, cur: CscMeasurement) -> Int
+    let ticks = csc_crank_ticks(prev, cur)
+    if ticks == 0
+        return -1
+    (csc_crank_delta(prev, cur) * 600 * TIME_TICKS_PER_SECOND + ticks / 2) / ticks
+
+// ── SC Control Point ([GSS] 3.192) ──────────────────────────────────
+
+const SC_OP_SET_CUMULATIVE_VALUE = 0x01
+const SC_OP_START_SENSOR_CALIBRATION = 0x02
+const SC_OP_UPDATE_SENSOR_LOCATION = 0x03
+const SC_OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS = 0x04
+const SC_OP_RESPONSE_CODE = 0x10
+
+const SC_RESULT_SUCCESS = 0x01
+const SC_RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const SC_RESULT_INVALID_PARAMETER = 0x03
+const SC_RESULT_OPERATION_FAILED = 0x04
+
+// The Application Error Codes of a write to the SC Control Point (the CSC and RSC services).
+const SC_ERR_PROCEDURE_ALREADY_IN_PROGRESS = 0x80
+const SC_ERR_CCCD_IMPROPERLY_CONFIGURED = 0x81
+
+// Set Cumulative Value: the wheel revolutions of the CSC service, the total distance in 1/10 metre of the
+// RSC service (four octets either way).
+@tier(app)
+fn sc_req_set_cumulative(value: Int) -> [u8]
+    var out: [u8] = [SC_OP_SET_CUMULATIVE_VALUE]
+    wire.put(var out, value, 4)
+    out
+
+@tier(app)
+fn sc_req_start_calibration() -> [u8]
+    [SC_OP_START_SENSOR_CALIBRATION]
+
+@tier(app)
+fn sc_req_update_location(location: Int) -> [u8]
+    [SC_OP_UPDATE_SENSOR_LOCATION as u8, location as u8]
+
+@tier(app)
+fn sc_req_list_locations() -> [u8]
+    [SC_OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS]
+
+// A decoded response: the op code it answers, the result and where its parameter lies.
+@value
+struct ScResponse
+    request_op: Int
+    result: Int
+    param_at: Int
+    param_len: Int
+
+// The response in `b`, `None` when `b` is no response (the op code 0x10, the request's op code and the result).
+@tier(embedded)
+@no_alloc
+fn sc_decode_response(b: [u8]) -> ?ScResponse
+    if list.len(b) < 3 or b[0] as Int != SC_OP_RESPONSE_CODE
+        return None
+    Some(ScResponse { request_op: b[1] as Int, result: b[2] as Int, param_at: 3, param_len: list.len(b) - 3 })
+
+// The number of locations a successful Request Supported Sensor Locations response lists, and the `k`-th (-1 past the end).
+@tier(embedded)
+@no_alloc
+fn sc_response_location_count(r: ScResponse) -> Int
+    if r.result == SC_RESULT_SUCCESS and r.request_op == SC_OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS then r.param_len else 0
+
+@tier(embedded)
+@no_alloc
+fn sc_response_location_at(b: [u8], r: ScResponse, k: Int) -> Int
+    if k < 0 or k >= sc_response_location_count(r)
+        return -1
+    b[r.param_at + k] as Int
+
+// ── Session ─────────────────────────────────────────────────────────
+
+@tier(app)
+fn csc_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, cycling_speed_cadence.UUID_CYCLING_SPEED_AND_CADENCE_SERVICE)
+
+// Discover the service; read the Feature (required) and the Sensor Location; subscribe to the measurement
+// (required) and, by indication, the SC Control Point (optional).
+@tier(app)
+fn csc_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, cycling_speed_cadence.UUID_CSC_FEATURE, true)
+    sensor_client.sc_queue_read(var c, sensor_control.UUID_SENSOR_LOCATION, false)
+    sensor_client.sc_queue_subscribe(var c, cycling_speed_cadence.UUID_CSC_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, cycling_speed_cadence.UUID_SC_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (an `sc_req_*` value) to the SC Control Point; the response arrives as an indication.
+@tier(app)
+fn csc_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, cycling_speed_cadence.UUID_SC_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

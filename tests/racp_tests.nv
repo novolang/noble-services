@@ -1,0 +1,152 @@
+// tests/racp_tests.nv — the unit tests of src/racp.nv.
+//
+//   novo test tests/racp_tests.nv
+
+use std.test
+use racp.{ OPERATOR_WITHIN_RANGE_OF, RESPONSE_INVALID_OPERAND, RESPONSE_INVALID_OPERATOR, RESPONSE_NO_RECORDS_FOUND, RESPONSE_OPERAND_NOT_SUPPORTED, RESPONSE_OPERATOR_NOT_SUPPORTED, RESPONSE_OP_CODE_NOT_SUPPORTED, RacpRequest, racp_abandon, racp_count_response, racp_decode, racp_execute, racp_finish, racp_next, racp_response, racp_run_new, racp_select, racp_support_all, racp_support_minimal }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+fn decode_all(v: [Int]) -> RacpRequest
+    racp_decode(octets(v), racp_support_all())
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_an_op_code_the_service_lacks_is_not_supported()
+    // [GLS] SPE/BI-01: 0x00 and the reserved range, with an Operator of All records.
+    test.assert_eq(decode_all([0x00, 0x01]).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x09, 0x01]).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x09, 0x01]).op, 0x09)
+    // The responses are not requests, and an empty write has no Op Code.
+    test.assert_eq(decode_all([0x05, 0x00, 1, 0]).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x06, 0x00, 1, 1]).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(decode_all([]).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    // A service without Delete refuses its Op Code.
+    test.assert_eq(racp_decode(octets([0x02, 0x01]), racp_support_minimal()).error, RESPONSE_OP_CODE_NOT_SUPPORTED)
+    test.assert_eq(racp_decode(octets([0x02, 0x01]), racp_support_all()).error, 0)
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_the_operator_is_invalid_when_null_and_unsupported_when_reserved_or_not_offered()
+    // [GLS] SPE/BI-02: Null where an Operator is needed.
+    test.assert_eq(decode_all([0x01, 0x00]).error, RESPONSE_INVALID_OPERATOR)
+    test.assert_eq(decode_all([0x01]).error, RESPONSE_INVALID_OPERATOR)
+    // [GLS] SPE/BI-03: the reserved range.
+    test.assert_eq(decode_all([0x01, 0x07]).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x04, 0xFF]).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    // An operator the service does not offer.
+    let minimal = racp_support_minimal()
+    test.assert_eq(racp_decode(octets([0x01, 0x02, 1, 5, 0]), minimal).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(racp_decode(octets([0x01, 0x04, 1, 1, 0, 5, 0]), minimal).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(racp_decode(octets([0x01, 0x05]), minimal).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(racp_decode(octets([0x01, 0x06]), minimal).error, RESPONSE_OPERATOR_NOT_SUPPORTED)
+    test.assert_eq(racp_decode(octets([0x01, 0x03, 1, 5, 0]), minimal).error, 0)
+    test.assert_eq(racp_decode(octets([0x01, 0x01]), minimal).error, 0)
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_the_operand_must_fit_the_operator_and_use_the_filter_type_of_the_service()
+    // [GLS] SPE/BI-04: an Operand where none is used.
+    test.assert_eq(decode_all([0x01, 0x01, 1, 1, 0]).error, RESPONSE_INVALID_OPERAND)
+    test.assert_eq(decode_all([0x01, 0x05, 1]).error, RESPONSE_INVALID_OPERAND)
+    // A filter with no Operand, a short value, a long value.
+    test.assert_eq(decode_all([0x01, 0x03]).error, RESPONSE_INVALID_OPERAND)
+    test.assert_eq(decode_all([0x01, 0x03, 1, 5]).error, RESPONSE_INVALID_OPERAND)
+    test.assert_eq(decode_all([0x01, 0x03, 1, 5, 0, 0]).error, RESPONSE_INVALID_OPERAND)
+    test.assert_eq(decode_all([0x01, 0x04, 1, 1, 0, 5]).error, RESPONSE_INVALID_OPERAND)
+    // [GLS] SPE/BI-05: a minimum above the maximum.
+    test.assert_eq(decode_all([0x01, 0x04, 1, 0xFF, 0xFF, 0x00, 0x00]).error, RESPONSE_INVALID_OPERAND)
+    // [GLS] SPE/BI-06: a Filter Type of the reserved range, and the User Facing Time.
+    test.assert_eq(decode_all([0x01, 0x03, 0x03, 0x0F, 0x00]).error, RESPONSE_OPERAND_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x01, 0x03, 0x00, 0x0F, 0x00]).error, RESPONSE_OPERAND_NOT_SUPPORTED)
+    test.assert_eq(decode_all([0x01, 0x02, 0x02, 0x0F, 0x00]).error, RESPONSE_OPERAND_NOT_SUPPORTED)
+    // Abort takes Null and no Operand.
+    test.assert_eq(decode_all([0x03, 0x00]).error, 0)
+    test.assert_eq(decode_all([0x03, 0x01]).error, RESPONSE_INVALID_OPERATOR)
+    test.assert_eq(decode_all([0x03, 0x00, 0x01]).error, RESPONSE_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_a_filter_carries_its_values_little_endian()
+    let ge = decode_all([0x01, 0x03, 1, 0x34, 0x12])
+    test.assert_eq(ge.error, 0)
+    test.assert_eq(ge.lo, 0x1234)
+    let le = decode_all([0x04, 0x02, 1, 0xFF, 0xFF])
+    test.assert_eq(le.hi, 0xFFFF)
+    let within = decode_all([0x01, 0x04, 1, 2, 0, 9, 1])
+    test.assert_eq(within.lo, 2)
+    test.assert_eq(within.hi, 0x109)
+    test.assert_eq(within.operator, OPERATOR_WITHIN_RANGE_OF)
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_each_operator_selects_its_keys_oldest_first()
+    let keys = [3, 4, 7, 9, 12]
+    test.assert_eq(racp_select(decode_all([0x01, 0x01]), keys), keys)
+    test.assert_eq(racp_select(decode_all([0x01, 0x02, 1, 7, 0]), keys), [3, 4, 7])
+    test.assert_eq(racp_select(decode_all([0x01, 0x03, 1, 7, 0]), keys), [7, 9, 12])
+    test.assert_eq(racp_select(decode_all([0x01, 0x04, 1, 4, 0, 9, 0]), keys), [4, 7, 9])
+    test.assert_eq(racp_select(decode_all([0x01, 0x05]), keys), [3])
+    test.assert_eq(racp_select(decode_all([0x01, 0x06]), keys), [12])
+    test.assert_eq(racp_select(decode_all([0x01, 0x03, 1, 13, 0]), keys), [])
+    test.assert_eq(racp_select(decode_all([0x01, 0x05]), []), [])
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_the_response_values_have_the_op_code_the_operator_null_and_the_operand()
+    test.assert_eq(racp_response(0x01, RESPONSE_NO_RECORDS_FOUND), octets([0x06, 0x00, 0x01, 0x06]))
+    test.assert_eq(racp_count_response(0x0102), octets([0x05, 0x00, 0x02, 0x01]))
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_report_starts_a_run_and_the_other_procedures_answer_at_once()
+    var run = racp_run_new()
+    let keys = [1, 2, 3]
+    // Report Number of Stored Records counts, and a count of nothing is 0.
+    test.assert_eq(racp_execute(var run, decode_all([0x04, 0x01]), keys).reply, octets([0x05, 0x00, 3, 0]))
+    test.assert_eq(racp_execute(var run, decode_all([0x04, 0x03, 1, 9, 0]), keys).reply, octets([0x05, 0x00, 0, 0]))
+    test.assert_eq(run.active, false)
+    // Report with no match is No records found; with a match it waits for the records.
+    test.assert_eq(racp_execute(var run, decode_all([0x01, 0x03, 1, 9, 0]), keys).reply, octets([0x06, 0x00, 1, 6]))
+    test.assert_eq(run.active, false)
+    let started = racp_execute(var run, decode_all([0x01, 0x03, 1, 2, 0]), keys)
+    test.assert_eq(started.reply, [])
+    test.assert_eq(run.active, true)
+    test.assert_eq(run.fresh, true)
+    test.assert_eq(racp_next(var run), 2)
+    test.assert_eq(run.fresh, false)
+    test.assert_eq(racp_next(var run), 3)
+    test.assert_eq(racp_next(var run), -1)
+    test.assert_eq(racp_finish(var run), octets([0x06, 0x00, 1, 1]))
+    test.assert_eq(run.active, false)
+    // Delete names the keys and answers Success; no match is No records found.
+    let deleted = racp_execute(var run, decode_all([0x02, 0x04, 1, 1, 0, 2, 0]), keys)
+    test.assert_eq(deleted.deleted, [1, 2])
+    test.assert_eq(deleted.reply, octets([0x06, 0x00, 2, 1]))
+    test.assert_eq(racp_execute(var run, decode_all([0x02, 0x01]), []).reply, octets([0x06, 0x00, 2, 6]))
+    // An error request answers its code and starts nothing.
+    test.assert_eq(racp_execute(var run, decode_all([0x01, 0x00]), keys).reply, octets([0x06, 0x00, 1, 3]))
+    test.assert_eq(run.active, false)
+
+@test
+@satisfies("REQ-BLE-RACP-001")
+fn test_abort_stops_a_run_and_a_lost_link_abandons_it()
+    var run = racp_run_new()
+    let _ = racp_execute(var run, decode_all([0x01, 0x01]), [1, 2, 3])
+    test.assert_eq(run.active, true)
+    let aborted = racp_execute(var run, decode_all([0x03, 0x00]), [1, 2, 3])
+    test.assert_eq(aborted.reply, octets([0x06, 0x00, 3, 1]))
+    test.assert_eq(run.active, false)
+    test.assert_eq(racp_next(var run), -1)
+    // Nothing running: there is nothing to stop, which is a success.
+    test.assert_eq(racp_execute(var run, decode_all([0x03, 0x00]), [1]).reply, octets([0x06, 0x00, 3, 1]))
+    let _ = racp_execute(var run, decode_all([0x01, 0x01]), [1, 2, 3])
+    racp_abandon(var run)
+    test.assert_eq(run.active, false)
+    test.assert_eq(list.len(run.pending), 0)

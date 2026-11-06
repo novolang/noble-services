@@ -1,0 +1,438 @@
+// src/location_navigation_client.nv — the Collector side of the Location and
+// Navigation Service (0x1819): the decoders of its characteristics, the LN Control Point
+// requests and responses, and the client session.
+//
+//   LN Feature          0x2A6A   decoded by `ln_decode_features`; read
+//   Location and Speed  0x2A67   decoded by `ln_decode_location`; notified
+//   Position Quality    0x2A69   decoded by `ln_decode_quality`; read
+//   Navigation          0x2A68   decoded by `ln_decode_navigation`; notified
+//   LN Control Point    0x2A6B   `ln_req_*` build the requests, `ln_decode_response` reads
+//                                the indication
+//
+// Layout of Location and Speed ([GSS] 3.133): the two-octet flags (bit 0 Instantaneous Speed,
+// 1 Total Distance, 2 Location, 3 Elevation, 4 Heading, 5 Rolling Time, 6 UTC Time; bits 7 and
+// 8 the Position Status; bit 9 a speed and distance that count the elevation; bits 10 and 11
+// the Elevation Source; bit 12 a heading from a compass), then the fields in that order: the
+// speed (a uint16, 0.01 m/s), the Total Distance (a uint24, 0.1 m), the latitude and the
+// longitude (two sint32, 1e-7 degrees), the elevation (a sint24, 0.01 m), the heading (a
+// uint16, 0.01 degrees), the Rolling Time (a uint8, seconds) and the UTC Time (a Date Time).
+// Over the default ATT_MTU a sensor splits a value over several notifications, each with its
+// own flags; `ln_location_merge` joins two.  Position Quality ([GSS] 3.153) is the flags (bits
+// 0 to 6 the presence of the beacons in solution and in view, the time to first fix, the
+// EHPE and EVPE, the HDOP and VDOP; bits 7 and 8 the Position Status) and those fields.
+// Navigation ([GSS] 3.134) is the flags (bits 0 to 2 the presence of the remaining distance,
+// the remaining vertical distance and the estimated time of arrival; bits 3 and 4 the Position
+// Status; bit 5 a compass heading; bit 6 distances to the destination, not the next waypoint;
+// bits 7 and 8 the waypoint and the destination reached), the bearing and the heading (two
+// uint16, 0.01 degrees), the remaining distance (a uint24, 0.1 m), the remaining vertical
+// distance (a sint24, 0.01 m) and the arrival time (a Date Time).  The LN Feature ([GSS]
+// 3.136) is a uint32 whose bits 0 to 6 are the Location and Speed fields, 7 to 9 the
+// Navigation fields, 10 to 16 the Position Quality fields, 17 to 19 the three procedures
+// that are features and 20 the Position Status; the other bits are reserved.
+//
+// A decoder answers `None` for a value too short for the fields its flags name, a latitude,
+// longitude, heading or bearing outside its range, and a Date Time that is not one.  It
+// allocates nothing and keeps no state.  A field whose flag is clear is 0.  Octets after the
+// fields are not read.
+//
+// The LN Control Point ([LNS] 3.4) takes a request and answers with an indication: the Response
+// Code opcode 0x20, the opcode it answers, the result (1 success, 2 Op Code Not Supported, 3
+// Invalid Parameter, 4 Operation Failed) and the parameter.  `ln_decode_response` reads the
+// indication; `ln_response_routes` and `ln_response_name` read the parameters of the two route
+// requests.
+//
+// The session (`ln_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Feature and the Position Quality, enable the notification of the Location and Speed and
+// of the Navigation, and enable the indication of the Control Point and of the Feature.
+// `ln_client_write` writes a request.
+//
+// Satisfies: REQ-BLE-PRFC-012.
+
+use gatt_client
+use links
+use location_navigation
+use sensor_client
+use wire
+
+// The Position Status values of the flags.
+const LN_STATUS_NO_POSITION = 0
+const LN_STATUS_OK = 1
+const LN_STATUS_ESTIMATED = 2
+const LN_STATUS_LAST_KNOWN = 3
+
+// The bits of the `present` mask of a Location and Speed value (the flag bits 0 to 6).
+const LN_SPEED = 0x01
+const LN_DISTANCE = 0x02
+const LN_LOCATION = 0x04
+const LN_ELEVATION = 0x08
+const LN_HEADING = 0x10
+const LN_ROLLING_TIME = 0x20
+const LN_UTC = 0x40
+const LN_LOCATION_FIELDS = 0x7F
+
+// The bits of the `present` mask of a Navigation value.
+const LN_NAV_REMAINING = 0x01
+const LN_NAV_VERTICAL = 0x02
+const LN_NAV_ETA = 0x04
+
+// The bits of the `present` mask of a Position Quality value.
+const LN_Q_IN_SOLUTION = 0x01
+const LN_Q_IN_VIEW = 0x02
+const LN_Q_TTFF = 0x04
+const LN_Q_EHPE = 0x08
+const LN_Q_EVPE = 0x10
+const LN_Q_HDOP = 0x20
+const LN_Q_VDOP = 0x40
+
+// The results of a procedure.
+const LN_RESULT_SUCCESS = 0x01
+const LN_RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const LN_RESULT_INVALID_PARAMETER = 0x03
+const LN_RESULT_OPERATION_FAILED = 0x04
+
+// The actions of Navigation Control.
+const LN_NAV_STOP = 0
+const LN_NAV_START = 1
+const LN_NAV_PAUSE = 2
+const LN_NAV_CONTINUE = 3
+const LN_NAV_SKIP_WAYPOINT = 4
+const LN_NAV_SELECT_NEAREST = 5
+
+// The most a bearing or a heading holds: 359.99 degrees.
+const LN_DIRECTION_MAX = 35999
+
+// One decoded Location and Speed value (see the units above).
+@value
+struct LnLocation
+    present: Int
+    speed: Int
+    distance: Int
+    latitude: Int
+    longitude: Int
+    elevation: Int
+    heading: Int
+    rolling_time: Int
+    time: wire.DateTime
+    position_status: Int
+    three_d: Bool
+    elevation_source: Int
+    heading_compass: Bool
+
+// One decoded Position Quality value.
+@value
+struct LnQuality
+    present: Int
+    in_solution: Int
+    in_view: Int
+    time_to_first_fix: Int
+    ehpe: Int
+    evpe: Int
+    hdop: Int
+    vdop: Int
+    position_status: Int
+
+// One decoded Navigation value.
+@value
+struct LnNavigation
+    present: Int
+    bearing: Int
+    heading: Int
+    remaining_distance: Int
+    remaining_vertical: Int
+    time: wire.DateTime
+    position_status: Int
+    heading_compass: Bool
+    to_destination: Bool
+    waypoint_reached: Bool
+    destination_reached: Bool
+
+// The size in octets of the Location and Speed field `k` (the number of its flag bit).
+@tier(embedded)
+@no_alloc
+fn ln_location_size(k: Int) -> Int
+    if k == 0
+        return 2
+    if k == 1
+        return 3
+    if k == 2
+        return 8
+    if k == 3
+        return 3
+    if k == 4
+        return 2
+    if k == 5
+        return 1
+    7
+
+// The offset of the Location and Speed field `k` in a value whose presence mask is `present`.
+@tier(embedded)
+@no_alloc
+fn ln_location_offset(present: Int, k: Int) -> Int
+    var at = 2
+    for j in 0..k
+        if (present & (1 << j)) != 0
+            at = at + ln_location_size(j)
+    at
+
+// Whether the signed `v` is inside `lo` to `hi`.
+@tier(embedded)
+@no_alloc
+fn ln_in(v: Int, lo: Int, hi: Int) -> Bool
+    v >= lo and v <= hi
+
+// The Location and Speed value in `b`, `None` when `b` is not a whole value.
+@tier(embedded)
+@no_alloc
+fn ln_decode_location(b: [u8]) -> ?LnLocation
+    if list.len(b) < 2
+        return None
+    let flags = wire.get(b, 0, 2)
+    let present = flags & LN_LOCATION_FIELDS
+    if list.len(b) < ln_location_offset(present, 7)
+        return None
+    var lat = 0
+    var lon = 0
+    if (present & LN_LOCATION) != 0
+        let at = ln_location_offset(present, 2)
+        lat = wire.get_signed(b, at, 4)
+        lon = wire.get_signed(b, at + 4, 4)
+        if not ln_in(lat, -900000000, 900000000) or not ln_in(lon, -1800000000, 1800000000)
+            return None
+    var heading = 0
+    if (present & LN_HEADING) != 0
+        heading = wire.get(b, ln_location_offset(present, 4), 2)
+        if heading > LN_DIRECTION_MAX
+            return None
+    var stamp = wire.date_time_unknown()
+    if (present & LN_UTC) != 0
+        stamp = wire.get_date_time(b, ln_location_offset(present, 6))
+        if not wire.date_time_valid(stamp)
+            return None
+    Some(LnLocation {
+        present: present,
+        speed: if (present & LN_SPEED) != 0 then wire.get(b, ln_location_offset(present, 0), 2) else 0,
+        distance: if (present & LN_DISTANCE) != 0 then wire.get(b, ln_location_offset(present, 1), 3) else 0,
+        latitude: lat, longitude: lon,
+        elevation: if (present & LN_ELEVATION) != 0 then wire.get_signed(b, ln_location_offset(present, 3), 3) else 0,
+        heading: heading,
+        rolling_time: if (present & LN_ROLLING_TIME) != 0 then b[ln_location_offset(present, 5)] as Int else 0,
+        time: stamp, position_status: (flags >>> 7) & 0x3, three_d: (flags & 0x200) != 0,
+        elevation_source: (flags >>> 10) & 0x3, heading_compass: (flags & 0x1000) != 0 })
+
+// `a` joined with the value `b` that continues it: the fields of `b` replace those of `a`, the status
+// bits are `b`'s.
+@tier(embedded)
+@no_alloc
+fn ln_location_merge(a: LnLocation, b: LnLocation) -> LnLocation
+    let take = b.present
+    LnLocation {
+        present: a.present | b.present,
+        speed: if (take & LN_SPEED) != 0 then b.speed else a.speed,
+        distance: if (take & LN_DISTANCE) != 0 then b.distance else a.distance,
+        latitude: if (take & LN_LOCATION) != 0 then b.latitude else a.latitude,
+        longitude: if (take & LN_LOCATION) != 0 then b.longitude else a.longitude,
+        elevation: if (take & LN_ELEVATION) != 0 then b.elevation else a.elevation,
+        heading: if (take & LN_HEADING) != 0 then b.heading else a.heading,
+        rolling_time: if (take & LN_ROLLING_TIME) != 0 then b.rolling_time else a.rolling_time,
+        time: if (take & LN_UTC) != 0 then b.time else a.time,
+        position_status: b.position_status, three_d: b.three_d, elevation_source: b.elevation_source,
+        heading_compass: b.heading_compass }
+
+// The size in octets of the Position Quality field `k`.
+@tier(embedded)
+@no_alloc
+fn ln_quality_size(k: Int) -> Int
+    if k == 2
+        return 2
+    if k == 3 or k == 4
+        return 4
+    1
+
+// The offset of the Position Quality field `k` in a value whose presence mask is `present`.
+@tier(embedded)
+@no_alloc
+fn ln_quality_offset(present: Int, k: Int) -> Int
+    var at = 2
+    for j in 0..k
+        if (present & (1 << j)) != 0
+            at = at + ln_quality_size(j)
+    at
+
+// The Position Quality value in `b`, `None` when `b` is not a whole value.
+@tier(embedded)
+@no_alloc
+fn ln_decode_quality(b: [u8]) -> ?LnQuality
+    if list.len(b) < 2
+        return None
+    let flags = wire.get(b, 0, 2)
+    let present = flags & 0x7F
+    if list.len(b) < ln_quality_offset(present, 7)
+        return None
+    Some(LnQuality {
+        present: present,
+        in_solution: if (present & LN_Q_IN_SOLUTION) != 0 then b[ln_quality_offset(present, 0)] as Int else 0,
+        in_view: if (present & LN_Q_IN_VIEW) != 0 then b[ln_quality_offset(present, 1)] as Int else 0,
+        time_to_first_fix: if (present & LN_Q_TTFF) != 0 then wire.get(b, ln_quality_offset(present, 2), 2) else 0,
+        ehpe: if (present & LN_Q_EHPE) != 0 then wire.get(b, ln_quality_offset(present, 3), 4) else 0,
+        evpe: if (present & LN_Q_EVPE) != 0 then wire.get(b, ln_quality_offset(present, 4), 4) else 0,
+        hdop: if (present & LN_Q_HDOP) != 0 then b[ln_quality_offset(present, 5)] as Int else 0,
+        vdop: if (present & LN_Q_VDOP) != 0 then b[ln_quality_offset(present, 6)] as Int else 0,
+        position_status: (flags >>> 7) & 0x3 })
+
+// The Navigation value in `b`, `None` when `b` is not a whole value.
+@tier(embedded)
+@no_alloc
+fn ln_decode_navigation(b: [u8]) -> ?LnNavigation
+    if list.len(b) < 6
+        return None
+    let flags = wire.get(b, 0, 2)
+    let present = flags & 0x7
+    var end = 6
+    if (present & LN_NAV_REMAINING) != 0
+        end = end + 3
+    if (present & LN_NAV_VERTICAL) != 0
+        end = end + 3
+    if (present & LN_NAV_ETA) != 0
+        end = end + 7
+    if list.len(b) < end
+        return None
+    let bearing = wire.get(b, 2, 2)
+    let heading = wire.get(b, 4, 2)
+    if bearing > LN_DIRECTION_MAX or heading > LN_DIRECTION_MAX
+        return None
+    var at = 6
+    var remaining = 0
+    var vertical = 0
+    var stamp = wire.date_time_unknown()
+    if (present & LN_NAV_REMAINING) != 0
+        remaining = wire.get(b, at, 3)
+        at = at + 3
+    if (present & LN_NAV_VERTICAL) != 0
+        vertical = wire.get_signed(b, at, 3)
+        at = at + 3
+    if (present & LN_NAV_ETA) != 0
+        stamp = wire.get_date_time(b, at)
+        if not wire.date_time_valid(stamp)
+            return None
+    Some(LnNavigation {
+        present: present, bearing: bearing, heading: heading, remaining_distance: remaining, remaining_vertical: vertical,
+        time: stamp, position_status: (flags >>> 3) & 0x3, heading_compass: (flags & 0x20) != 0,
+        to_destination: (flags & 0x40) != 0, waypoint_reached: (flags & 0x80) != 0, destination_reached: (flags & 0x100) != 0 })
+
+// The LN Feature in `b` as its 32 bits (the `F_` constants of `location_navigation`), `None` unless it
+// is four octets.  The reserved bits 21 to 31 are cleared.
+@tier(embedded)
+@no_alloc
+fn ln_decode_features(b: [u8]) -> ?Int
+    if list.len(b) != 4
+        return None
+    Some(wire.get(b, 0, 4) & location_navigation.F_DEFINED_BITS)
+
+// ── The Control Point ───────────────────────────────────────────────
+
+// The request Set Cumulative Value: the Total Distance in 0.1 m, limited to 24 bits.
+@tier(app)
+fn ln_req_set_cumulative(distance: Int) -> [u8]
+    var out: [u8] = [location_navigation.OP_SET_CUMULATIVE_VALUE as u8]
+    wire.put(var out, wire.clamp(distance, 0, 0xFFFFFF), 3)
+    out
+
+// The request Mask Location and Speed Characteristic Content: the `LN_` field bits to turn off.
+@tier(app)
+fn ln_req_mask(fields: Int) -> [u8]
+    var out: [u8] = [location_navigation.OP_MASK_CONTENT as u8]
+    wire.put(var out, fields, 2)
+    out
+
+// The request Navigation Control with an action (`LN_NAV_`).
+@tier(app)
+fn ln_req_navigation(action: Int) -> [u8]
+    [location_navigation.OP_NAVIGATION_CONTROL as u8, action as u8]
+
+@tier(app)
+fn ln_req_number_of_routes() -> [u8]
+    [location_navigation.OP_REQUEST_NUMBER_OF_ROUTES as u8]
+
+// The request for the name of the route `route`.
+@tier(app)
+fn ln_req_route_name(route: Int) -> [u8]
+    var out: [u8] = [location_navigation.OP_REQUEST_NAME_OF_ROUTE as u8]
+    wire.put(var out, route, 2)
+    out
+
+// The request to select the route `route`.
+@tier(app)
+fn ln_req_select_route(route: Int) -> [u8]
+    var out: [u8] = [location_navigation.OP_SELECT_ROUTE as u8]
+    wire.put(var out, route, 2)
+    out
+
+// The request Set Fix Rate, in seconds, limited to one octet.
+@tier(app)
+fn ln_req_fix_rate(seconds: Int) -> [u8]
+    [location_navigation.OP_SET_FIX_RATE as u8, wire.clamp(seconds, 0, 255) as u8]
+
+// The request Set Elevation, in 0.01 m, limited to a sint24.
+@tier(app)
+fn ln_req_elevation(elevation: Int) -> [u8]
+    var out: [u8] = [location_navigation.OP_SET_ELEVATION as u8]
+    wire.put(var out, wire.clamp(elevation, -8388608, 8388607), 3)
+    out
+
+// A decoded response: the opcode it answers, the result and where its parameter lies.
+@value
+struct LnResponse
+    request_op: Int
+    result: Int
+    param_at: Int
+    param_len: Int
+
+// The response in `b`, `None` when `b` is not one (the Response Code opcode, the opcode it answers and the result).
+@tier(embedded)
+@no_alloc
+fn ln_decode_response(b: [u8]) -> ?LnResponse
+    if list.len(b) < 3 or (b[0] as Int) != location_navigation.OP_RESPONSE_CODE
+        return None
+    Some(LnResponse { request_op: b[1] as Int, result: b[2] as Int, param_at: 3, param_len: list.len(b) - 3 })
+
+// The number of routes a successful Request Number of Routes answered, -1 for another response.
+@tier(embedded)
+@no_alloc
+fn ln_response_routes(b: [u8], r: LnResponse) -> Int
+    if r.request_op != location_navigation.OP_REQUEST_NUMBER_OF_ROUTES or r.result != LN_RESULT_SUCCESS or r.param_len != 2
+        return -1
+    wire.get(b, r.param_at, 2)
+
+// The name of a route in a successful Request Name of Route response: the UTF-8 octets, empty for another response.
+@tier(app)
+fn ln_response_name(b: [u8], r: LnResponse) -> [u8]
+    if r.request_op != location_navigation.OP_REQUEST_NAME_OF_ROUTE or r.result != LN_RESULT_SUCCESS
+        return []
+    b[r.param_at:list.len(b)]
+
+// ── The session ─────────────────────────────────────────────────────
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn ln_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, location_navigation.UUID_LOCATION_AND_NAVIGATION_SERVICE)
+
+// Discover the service, read the Feature (required) and the Position Quality (optional), enable the
+// notification of the Location and Speed (required) and of the Navigation (optional), and the
+// indication of the Control Point and of the Feature (optional).
+@tier(app)
+fn ln_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, location_navigation.UUID_LN_FEATURE, true)
+    sensor_client.sc_queue_read(var c, location_navigation.UUID_POSITION_QUALITY, false)
+    sensor_client.sc_queue_subscribe(var c, location_navigation.UUID_LOCATION_AND_SPEED, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, location_navigation.UUID_NAVIGATION, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, location_navigation.UUID_LN_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_queue_subscribe(var c, location_navigation.UUID_LN_FEATURE, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (an `ln_req_*` value) to the LN Control Point; the response arrives as an indication.
+// The session must have finished its plan.
+@tier(app)
+fn ln_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, location_navigation.UUID_LN_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

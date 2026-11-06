@@ -1,0 +1,242 @@
+// tests/weight_scale_client_tests.nv — the unit tests of src/weight_scale_client.nv.
+//
+//   novo test tests/weight_scale_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use sensor_client
+use weight_scale
+use wire
+use weight_scale_client.{ WS_UNSUCCESSFUL, WS_USER_UNKNOWN, WsMeasurement, ws_client_new, ws_client_start, ws_decode, ws_decode_features, ws_height_mm, ws_height_step, ws_weight_grams, ws_weight_step }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> WsMeasurement
+    match ws_decode(b)
+        Some(m) => m
+        None =>
+            test.fail("a measurement")
+            WsMeasurement {
+                imperial: false, weight: 0, unsuccessful: false, has_time: false, time: wire.date_time_unknown(),
+                has_user: false, user_id: 0, has_bmi: false, bmi: 0, height: 0 }
+
+@tier(app)
+fn stamp_octets() -> [Int]
+    [0xEA, 0x07, 10, 27, 14, 30, 5]
+
+// A measurement: the flags, the weight, then `rest`.
+@tier(app)
+fn value_of(flags: Int, weight: Int, rest: [Int]) -> [u8]
+    var out: [u8] = [flags as u8]
+    wire.put(var out, weight, 2)
+    for x in rest
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_the_weight_and_the_units()
+    let si = must(value_of(0x00, 14000, []))
+    test.assert_eq(si.imperial, false)
+    test.assert_eq(si.weight, 14000)
+    test.assert_eq(ws_weight_grams(si), 70000)
+    test.assert_eq(si.has_time, false)
+    test.assert_eq(si.has_user, false)
+    test.assert_eq(si.has_bmi, false)
+    // 154.32 lb is 69998 g.
+    let lb = must(value_of(0x01, 15432, []))
+    test.assert_eq(lb.imperial, true)
+    test.assert_eq(ws_weight_grams(lb), 69998)
+    // The smallest and the largest weights that are not the unsuccessful marker.
+    test.assert_eq(ws_weight_grams(must(value_of(0x00, 0, []))), 0)
+    test.assert_eq(ws_weight_grams(must(value_of(0x00, 0xFFFE, []))), 327670)
+    // Reserved flag bits 4 to 7 are ignored.
+    test.assert_eq(must(value_of(0xF0, 14000, [])).weight, 14000)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_every_combination_of_the_optional_fields()
+    for flags in 0..16
+        var rest: [Int] = []
+        if (flags & 2) != 0
+            for x in stamp_octets()
+                list.push(rest, x)
+        if (flags & 4) != 0
+            list.push(rest, 3)
+        if (flags & 8) != 0
+            for x in [0xE5, 0x00, 0xD6, 0x06]
+                list.push(rest, x)
+        let m = must(value_of(flags, 14000, rest))
+        test.assert_eq(m.imperial, (flags & 1) != 0)
+        test.assert_eq(m.has_time, (flags & 2) != 0)
+        test.assert_eq(m.has_user, (flags & 4) != 0)
+        test.assert_eq(m.has_bmi, (flags & 8) != 0)
+        if m.has_time
+            test.assert_eq(m.time.year as Int, 2026)
+            test.assert_eq(m.time.seconds as Int, 5)
+        if m.has_user
+            test.assert_eq(m.user_id, 3)
+        if m.has_bmi
+            test.assert_eq(m.bmi, 229)
+            test.assert_eq(m.height, 1750)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_an_unsuccessful_measurement_keeps_the_time_stamp_and_the_user()
+    var rest: [Int] = []
+    for x in stamp_octets()
+        list.push(rest, x)
+    list.push(rest, 0xFF)
+    let m = must(value_of(0x06, WS_UNSUCCESSFUL, rest))
+    test.assert_eq(m.unsuccessful, true)
+    test.assert_eq(m.has_time, true)
+    test.assert_eq(m.user_id, WS_USER_UNKNOWN)
+    test.assert_eq(ws_weight_grams(m), 0)
+    // The BMI flag after a failed measurement is not read.
+    let bmi = must(value_of(0x08, WS_UNSUCCESSFUL, []))
+    test.assert_eq(bmi.has_bmi, false)
+    test.assert_eq(bmi.unsuccessful, true)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_bmi_and_height_units()
+    let si = must(value_of(0x08, 14000, [0xE5, 0x00, 0xD6, 0x06]))
+    test.assert_eq(si.bmi, 229)
+    test.assert_eq(ws_height_mm(si), 1750)
+    // 68.9 in is 1750 mm.
+    let inch = must(value_of(0x09, 15432, [0xE5, 0x00, 0xB1, 0x02]))
+    test.assert_eq(inch.height, 689)
+    test.assert_eq(ws_height_mm(inch), 1750)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_truncations_and_bad_time_stamps_answer_none()
+    test.assert_eq(ws_decode([]), None)
+    test.assert_eq(ws_decode(octets([0, 1])), None)
+    var rest: [Int] = []
+    for x in stamp_octets()
+        list.push(rest, x)
+    list.push(rest, 2)
+    for x in [0xE5, 0x00, 0xD6, 0x06]
+        list.push(rest, x)
+    let full = value_of(0x0E, 14000, rest)
+    for k in 0..list.len(full)
+        test.assert_eq(ws_decode(full[:k]), None)
+    test.assert(ws_decode(full) != None)
+    // A time stamp with a year, month or day of 0 is not allowed by the service; so is a month of 13.
+    test.assert_eq(ws_decode(value_of(0x02, 1, [0, 0, 10, 27, 14, 30, 5])), None)
+    test.assert_eq(ws_decode(value_of(0x02, 1, [0xEA, 0x07, 0, 27, 14, 30, 5])), None)
+    test.assert_eq(ws_decode(value_of(0x02, 1, [0xEA, 0x07, 10, 0, 14, 30, 5])), None)
+    test.assert_eq(ws_decode(value_of(0x02, 1, [0xEA, 0x07, 13, 27, 14, 30, 5])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_the_feature_and_its_resolution_steps()
+    test.assert(features_are(octets([0, 0, 0, 0]), false, false, false, 0, 0))
+    // Time stamp, multiple users, BMI, weight resolution 7 and height resolution 3.
+    test.assert(features_are(octets([0xBF, 0x01, 0, 0]), true, true, true, 7, 3))
+    // The reserved bits are ignored.
+    test.assert(features_are(octets([0x00, 0xFC, 0xFF, 0xFF]), false, false, false, 0, 0))
+    test.assert_eq(ws_decode_features(octets([0, 0, 0])), None)
+    test.assert_eq(ws_decode_features(octets([0, 0, 0, 0, 0])), None)
+    test.assert_eq(ws_weight_step(0, false), 0)
+    test.assert_eq(ws_weight_step(1, false), 500)
+    test.assert_eq(ws_weight_step(7, false), 5)
+    test.assert_eq(ws_weight_step(1, true), 100)
+    test.assert_eq(ws_weight_step(7, true), 1)
+    test.assert_eq(ws_weight_step(8, false), 0)
+    test.assert_eq(ws_height_step(0, false), 0)
+    test.assert_eq(ws_height_step(1, false), 10)
+    test.assert_eq(ws_height_step(3, false), 1)
+    test.assert_eq(ws_height_step(2, true), 5)
+    test.assert_eq(ws_height_step(4, true), 0)
+
+// Whether `b` decodes to these features.
+@tier(app)
+fn features_are(b: [u8], time_stamp: Bool, users: Bool, bmi: Bool, weight: Int, height: Int) -> Bool
+    match ws_decode_features(b)
+        Some(f) => f.time_stamp == time_stamp and f.multiple_users == users and f.bmi == bmi and f.weight_resolution == weight and f.height_resolution == height
+        None => false
+
+@tier(app)
+fn test_server(config: weight_scale.WssConfig) -> (gatt_server.GattServer, weight_scale.WssHandles)
+    weight_scale.server(config)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_session_against_the_scale_server()
+    if not fixtures.client_engine_present()
+        return
+    let features = weight_scale.everything()
+    let config = weight_scale.WssConfig {
+        features: features, access: gatt_server.Access.Encrypted, feature_indicate: true, included_service: 0 }
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(weight_scale.UUID_WEIGHT_SCALE_SERVICE)
+    var t = both.0
+    var c = ws_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ws_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    // The Feature read says what the scale was built with.
+    test.assert_eq(sensor_client.sc_uuid(c), weight_scale.UUID_WEIGHT_SCALE_FEATURE)
+    test.assert(features_are(sensor_client.sc_value(c), true, true, true, 7, 3))
+    // An indicated measurement reaches the decoder.
+    let ind = weight_scale.wss_indicate(var s.db, var s.link, h, features, false, weight_scale.full_measurement(), 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    test.assert_eq(sensor_client.sc_uuid(c), weight_scale.UUID_WEIGHT_MEASUREMENT)
+    let m = must(sensor_client.sc_value(c))
+    test.assert_eq(ws_weight_grams(m), 70000)
+    test.assert_eq(m.user_id, 2)
+    test.assert_eq(m.bmi, 229)
+    test.assert_eq(ws_height_mm(m), 1750)
+    test.assert_eq(m.time.day as Int, 27)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_session_with_a_basic_scale()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(weight_scale.default_wss_config(weight_scale.basic()))
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(weight_scale.UUID_WEIGHT_SCALE_SERVICE)
+    var t = both.0
+    var c = ws_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, ws_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    let ind = weight_scale.wss_indicate(var s.db, var s.link, h, weight_scale.basic(), false, weight_scale.wss_measurement(14000), 0)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, ind), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    let m = must(sensor_client.sc_value(c))
+    test.assert_eq(m.has_time, false)
+    test.assert_eq(m.has_user, false)
+    test.assert_eq(m.weight, 14000)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(weight_scale.UUID_WEIGHT_SCALE_SERVICE)
+    var t = both.0
+    var c = ws_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, ws_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

@@ -1,0 +1,135 @@
+// src/heart_rate_client.nv — the Collector side of the Heart Rate
+// Service (0x180D): the decoders of its characteristics and the client session.
+//
+//   Heart Rate Measurement   0x2A37   decoded by `hr_decode`
+//   Body Sensor Location     0x2A38   decoded by `hr_decode_location`
+//   Heart Rate Control Point 0x2A39   written by `hr_client_reset_energy`
+//
+// Layout of a measurement ([GSS] 3.113): the flags octet (bit 0 the width of the heart
+// rate, bit 1 sensor contact detected, bit 2 sensor contact supported, bit 3 Energy
+// Expended present, bit 4 RR-Intervals present, bits 5 to 7 reserved and ignored), the heart
+// rate in one or two octets, Energy Expended in two octets (kilojoules), then the
+// RR-Intervals, two octets each in units of 1/1024 second, oldest first.  The number of
+// RR-Intervals follows from the length of the value.
+//
+// A decoder takes the octets of a value and answers `None` for a value that is too short
+// for the fields its flags name, or whose RR-Intervals do not fill whole two-octet
+// fields.  It allocates nothing and keeps no state; the RR-Intervals stay in the value
+// and `hr_rr_at` reads one.  The contact bits 1 and 2 follow [GSS] 3.113.1: contact
+// is meaningful only when bit 2 says it is supported.
+//
+// The session (`hr_client_*`) runs on `sensor_client.nv`: discover the service, subscribe
+// to the measurement, read the Body Sensor Location when the sensor has one, and write
+// the control point to reset the Energy Expended.
+
+use gatt_client
+use links
+use heart_rate
+use sensor_client
+use wire
+
+const HR_FLAG_VALUE_16 = 0x01
+const HR_FLAG_CONTACT_DETECTED = 0x02
+const HR_FLAG_CONTACT_SUPPORTED = 0x04
+const HR_FLAG_ENERGY = 0x08
+const HR_FLAG_RR = 0x10
+
+// The Body Sensor Location values ([GSS] 3.35.1).
+const BSL_OTHER = 0
+const BSL_CHEST = 1
+const BSL_WRIST = 2
+const BSL_FINGER = 3
+const BSL_HAND = 4
+const BSL_EAR_LOBE = 5
+const BSL_FOOT = 6
+
+// The Application Error Code the control point answers to a value it does not support.
+const HR_ERR_CONTROL_POINT_NOT_SUPPORTED = 0x80
+
+// One decoded measurement.  `rr_at` is the index of the first RR-Interval octet in the
+// value, `rr_count` the number of RR-Intervals.  `energy_expended` is 0 when `has_energy`
+// is false.
+@value
+struct HrMeasurement
+    heart_rate: Int
+    contact_supported: Bool
+    contact_detected: Bool
+    has_energy: Bool
+    energy_expended: Int
+    rr_count: Int
+    rr_at: Int
+
+// The measurement in `b`, `None` when `b` is not a whole measurement.
+@tier(embedded)
+@no_alloc
+fn hr_decode(b: [u8]) -> ?HrMeasurement
+    let n = list.len(b)
+    if n < 2
+        return None
+    let flags = b[0] as Int
+    let wide = (flags & HR_FLAG_VALUE_16) != 0
+    var at = if wide then 3 else 2
+    if n < at
+        return None
+    let rate = wire.get(b, 1, if wide then 2 else 1)
+    let has_energy = (flags & HR_FLAG_ENERGY) != 0
+    var energy = 0
+    if has_energy
+        if n < at + 2
+            return None
+        energy = wire.get(b, at, 2)
+        at = at + 2
+    var count = 0
+    if (flags & HR_FLAG_RR) != 0
+        if (n - at) % 2 != 0
+            return None
+        count = (n - at) / 2
+    Some(HrMeasurement {
+        heart_rate: rate, contact_supported: (flags & HR_FLAG_CONTACT_SUPPORTED) != 0,
+        contact_detected: (flags & HR_FLAG_CONTACT_SUPPORTED) != 0 and (flags & HR_FLAG_CONTACT_DETECTED) != 0,
+        has_energy: has_energy, energy_expended: energy, rr_count: count, rr_at: at })
+
+// The `k`-th RR-Interval of the value `b` decoded as `m`, in units of 1/1024 second; 0 past the end.
+@tier(embedded)
+@no_alloc
+fn hr_rr_at(b: [u8], m: HrMeasurement, k: Int) -> Int
+    if k < 0 or k >= m.rr_count
+        return 0
+    wire.get(b, m.rr_at + 2 * k, 2)
+
+// An RR-Interval of `raw` units of 1/1024 second in milliseconds.
+@tier(embedded)
+@no_alloc
+fn hr_rr_ms(raw: Int) -> Int
+    raw * 1000 / 1024
+
+// The Body Sensor Location in `b`, `None` unless `b` is one octet.
+@tier(embedded)
+@no_alloc
+fn hr_decode_location(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    Some(b[0] as Int)
+
+// The control point value that resets the Energy Expended.
+@tier(app)
+fn hr_reset_energy_value() -> [u8]
+    [1]
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn hr_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, heart_rate.UUID_HEART_RATE_SERVICE)
+
+// Discover the service, subscribe to the measurement (required), read the location if there is one.
+@tier(app)
+fn hr_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_subscribe(var c, heart_rate.UUID_HEART_RATE_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_read(var c, heart_rate.UUID_BODY_SENSOR_LOCATION, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write the control point to reset the Energy Expended.  The session must have finished its plan.
+@tier(app)
+fn hr_client_reset_energy(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, heart_rate.UUID_HEART_RATE_CONTROL_POINT, hr_reset_energy_value())
+    sensor_client.sc_kick(var t, var c, now_ms)

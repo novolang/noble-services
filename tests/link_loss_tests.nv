@@ -1,0 +1,101 @@
+// tests/link_loss_tests.nv — the unit tests of src/link_loss.nv.
+//
+//   novo test tests/link_loss_tests.nv
+
+use std.test
+use att
+use links
+use gatt_server
+use profile_builder
+use fixtures.{ req, peer }
+use link_loss.{ ALERT_HIGH, ALERT_MILD, ALERT_NONE, LlsConfig, LlsPolicy, REASON_CONNECTION_TIMEOUT, add_lls_service, alert_level_valid, default_lls_config, default_lls_policy, link_loss_alerts, link_loss_level, lls_link_ended, lls_reconnected }
+
+struct Tag
+    var alerts: [Int]
+    var stops: Int
+
+impl LlsPolicy[] for Tag
+    @tier(app)
+    fn alert(var self, peer: links.LinkId, level: Int)
+        list.push(self.alerts, level)
+    @tier(app)
+    fn stop(var self, peer: links.LinkId)
+        self.stops = self.stops + 1
+
+@test
+@satisfies("REQ-BLE-LLS-001")
+fn test_the_service_has_one_alert_level_that_is_read_and_written()
+    var s = gatt_server.new_server([], 65)
+    let h = add_lls_service(var s.db, default_lls_config())!
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.level, 3)
+    test.assert_eq(gatt_server.last_handle(s.db), 3)
+    test.assert_eq(s.db.attributes[0].value, [0x03, 0x18])
+    // Read and Write (with response), no Write Without Response, no Notify.
+    test.assert_eq(s.db.attributes[1].value, [0x0A, 0x03, 0x00, 0x06, 0x2A])
+    // The level starts as No Alert.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 0])
+    test.assert_eq(link_loss_level(s.db, h), ALERT_NONE)
+
+@test
+@satisfies("REQ-BLE-LLS-001")
+fn test_a_client_sets_a_level_and_a_reserved_one_is_refused()
+    var s = gatt_server.new_server([], 65)
+    let h = add_lls_service(var s.db, default_lls_config())!
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [ALERT_HIGH]), 0)[0], [0x13])
+    test.assert_eq(link_loss_level(s.db, h), ALERT_HIGH)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0], [0x0B, 2])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [ALERT_MILD]), 0)[0], [0x13])
+    let refused = gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [3]), 0)
+    test.assert_eq(refused[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(link_loss_level(s.db, h), ALERT_MILD)
+    // An empty write and a longer one are refused too.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, []), 0)[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [1, 1]), 0)[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(link_loss_level(s.db, h), ALERT_MILD)
+    test.assert(alert_level_valid(0) and alert_level_valid(2) and not alert_level_valid(3) and not alert_level_valid(-1))
+
+@test
+@satisfies("REQ-BLE-LLS-001")
+fn test_a_loss_without_warning_alerts_at_the_level_and_a_terminated_link_does_not()
+    var s = gatt_server.new_server([], 65)
+    let h = add_lls_service(var s.db, default_lls_config())!
+    var tag = Tag { alerts: [], stops: 0 }
+    // No Alert: nothing, even on a timeout.
+    test.assert(not lls_link_ended(s.db, h, var tag, peer(), REASON_CONNECTION_TIMEOUT))
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [ALERT_MILD]), 0)
+    test.assert(lls_link_ended(s.db, h, var tag, peer(), REASON_CONNECTION_TIMEOUT))
+    // Remote User Terminated (0x13), Local Host Terminated (0x16): no alert.
+    test.assert(not lls_link_ended(s.db, h, var tag, peer(), 0x13))
+    test.assert(not lls_link_ended(s.db, h, var tag, peer(), 0x16))
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [ALERT_HIGH]), 0)
+    test.assert(lls_link_ended(s.db, h, var tag, peer(), REASON_CONNECTION_TIMEOUT))
+    test.assert_eq(tag.alerts, [1, 2])
+    lls_reconnected(var tag, peer())
+    test.assert_eq(tag.stops, 1)
+    test.assert(link_loss_alerts(0x08) and not link_loss_alerts(0x13))
+
+@test
+@satisfies("REQ-BLE-LLS-001")
+fn test_the_default_policy_does_nothing_and_the_access_can_be_raised()
+    var s = gatt_server.new_server([], 65)
+    let h = add_lls_service(var s.db, LlsConfig { access: gatt_server.Access.Encrypted })!
+    var p = default_lls_policy()
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x0A, h.level, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.level, [1]), 0)[0], [0x13])
+    test.assert(lls_link_ended(s.db, h, var p, peer(), REASON_CONNECTION_TIMEOUT))
+    lls_reconnected(var p, peer())
+
+@test
+@satisfies("REQ-BLE-LLS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_lls_service(var s.db, default_lls_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

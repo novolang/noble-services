@@ -1,0 +1,543 @@
+// src/insulin_delivery_command.nv — the third family of the Insulin Delivery
+// Service (0x183A): the IDD Command Control Point and IDD Command Data, with the
+// procedures that need no template.
+//
+//   IDD Command Control Point  0x2B25  Write, Indicate
+//   IDD Command Data           0x2B26  Notify; mandatory with the control point
+//                                      ([IDS] Table 3.1, C.1)
+//
+// The service of `insulin_delivery.nv` is the first family; this file adds the two
+// characteristics after it (`add_ids_command`) and answers the writes to the control point
+// (`ids_command_receive`).  A product with the history of `insulin_delivery_history.nv` adds
+// the history characteristics after these two and dispatches a write with `ids_command_owns`:
+// the writes to the Command Control Point to `ids_command_receive`, every other PDU to
+// `ids_history_receive` (or to `insulin_delivery.ids_receive` without history).
+//
+// Built (the Op Codes of [IDS] Table 4.36):
+//
+//   Set Therapy Control State 0x0F5A      Set Flight Mode 0x0F66
+//   Snooze Annunciation 0x0F69 (response 0x0F96), Confirm Annunciation 0x0F99 (0x0FA5)
+//   Set TBR Adjustment 0x0FFF, Cancel TBR Adjustment 0x1111
+//   Set Bolus 0x114B (0x1177), Cancel Bolus 0x1178 (0x1187), Get Available Boluses 0x1188 (0x11B4)
+//   Start Priming 0x127B, Stop Priming 0x1284, Set Initial Reservoir Fill Level 0x128B,
+//   Reset Reservoir Insulin Operation Time 0x12B7
+//   Get Max Bolus Amount 0x147D (0x1482), Set Max Bolus Amount 0x148D
+//
+// NOT IMPLEMENTED: the procedures on templates, which also use the IDD Command Data
+// characteristic (Read and Write of the Basal Rate, ISF, I2CHO Ratio and Target Glucose Range
+// Profile Templates, Get and Set TBR Template, Get and Set Bolus Template, Get Template Status
+// and Details, Reset Template Status, Activate and Get Activated Profile Templates).  They are
+// answered Op Code not supported, and a TBR or a bolus that names a template is answered
+// Procedure not applicable, which is the answer for a template that is not configured
+// ([IDS] 3.7.2.8, 3.7.2.12).  A device with the Basal Rate Supported bit does not conform
+// until the Basal Rate Profile Template procedures exist ([IDS] Table 3.10, C.1).  The
+// characteristic IDD Command Data is built and nothing notifies it yet.
+//
+// The checks come in the order of [IDS] 3.11.4: the Op Code, then the Operand (its size, the
+// Flags, the enumerations and the Features it needs: Invalid Operand), then the range
+// (Parameter out of range), then whether the procedure applies (Procedure not applicable).
+// Nothing is carried out unless all the checks pass.  The write is first checked as the
+// Status Reader write is: the descriptor (0xFD), the procedure in progress (0xFE), the
+// E2E-CRC and E2E-Counter (0x81, 0x82).
+//
+// What the product decides (`IdsCommandConfig`): which of the optional procedures it offers,
+// every range (`out of range` is the product's limit), the default of the Reservoir Insulin
+// Operation Time and which bolus types can be set now (`ids_command_set_available`).  The
+// product also makes the pump do what it was told: the state here is the Status the Collector
+// reads back.
+//
+// Specification checked against: Insulin Delivery Service 1.0.2 and the test suite
+// IDS.TS.p3 (IDS/SEN/CCP, CCPE and CBE).
+//
+// Satisfies: REQ-BLE-IDS-003.
+
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use insulin_delivery
+use profile_builder
+use wire
+
+const UUID_IDD_COMMAND_CONTROL_POINT = 0x2B25
+const UUID_IDD_COMMAND_DATA = 0x2B26
+
+// The Op Codes of the IDD Command Control Point ([IDS] Table 4.36).
+const CMD_RESPONSE_CODE = 0x0F55
+const CMD_SET_THERAPY_CONTROL_STATE = 0x0F5A
+const CMD_SET_FLIGHT_MODE = 0x0F66
+const CMD_SNOOZE_ANNUNCIATION = 0x0F69
+const CMD_SNOOZE_ANNUNCIATION_RESPONSE = 0x0F96
+const CMD_CONFIRM_ANNUNCIATION = 0x0F99
+const CMD_CONFIRM_ANNUNCIATION_RESPONSE = 0x0FA5
+const CMD_SET_TBR_ADJUSTMENT = 0x0FFF
+const CMD_CANCEL_TBR_ADJUSTMENT = 0x1111
+const CMD_SET_BOLUS = 0x114B
+const CMD_SET_BOLUS_RESPONSE = 0x1177
+const CMD_CANCEL_BOLUS = 0x1178
+const CMD_CANCEL_BOLUS_RESPONSE = 0x1187
+const CMD_GET_AVAILABLE_BOLUSES = 0x1188
+const CMD_GET_AVAILABLE_BOLUSES_RESPONSE = 0x11B4
+const CMD_START_PRIMING = 0x127B
+const CMD_STOP_PRIMING = 0x1284
+const CMD_SET_INITIAL_RESERVOIR_FILL_LEVEL = 0x128B
+const CMD_RESET_RESERVOIR_INSULIN_OPERATION_TIME = 0x12B7
+const CMD_GET_MAX_BOLUS_AMOUNT = 0x147D
+const CMD_GET_MAX_BOLUS_AMOUNT_RESPONSE = 0x1482
+const CMD_SET_MAX_BOLUS_AMOUNT = 0x148D
+
+// The Response Code Values the Command Control Point adds to those of the Status Reader
+// ([IDS] Table 4.38).
+const RESULT_PLAUSIBILITY_CHECK_FAILED = 0x75
+const RESULT_MAXIMUM_BOLUS_NUMBER_REACHED = 0x76
+
+// The Flags of Set TBR Adjustment ([IDS] Table 4.50).
+const TBR_FLAG_TEMPLATE_NUMBER = 0x01
+const TBR_FLAG_DELIVERY_CONTEXT = 0x02
+const TBR_FLAG_CHANGE = 0x04
+
+// The Flags of Get Available Boluses Response ([IDS] Table 4.63).
+const AVAILABLE_FAST = 0x01
+const AVAILABLE_EXTENDED = 0x02
+const AVAILABLE_MULTIWAVE = 0x04
+
+// What the product offers and where it draws its limits.  `priming` says Start and Stop
+// Priming, `max_bolus` Get and Set Max Bolus Amount are offered.  The limits are in thousandths
+// of an IU (the amounts), in minutes (the durations and the delay) and in minutes
+// (`operation_time_default`, the default of the Remaining Reservoir Insulin Operation Time).
+struct IdsCommandConfig
+    priming: Bool
+    fill_level: Bool
+    operation_time: Bool
+    max_bolus: Bool
+    tbr_value_max: Int
+    tbr_duration_max: Int
+    bolus_amount_max: Int
+    bolus_duration_max: Int
+    bolus_delay_max: Int
+    fill_level_max: Int
+    priming_max: Int
+    operation_time_default: Int
+
+// The limits of a 3 mL U100 pump with every optional procedure.
+@tier(app)
+fn default_ids_command_config() -> IdsCommandConfig
+    IdsCommandConfig {
+        priming: true, fill_level: true, operation_time: true, max_bolus: true, tbr_value_max: 5000, tbr_duration_max: 1440,
+        bolus_amount_max: 25000, bolus_duration_max: 480, bolus_delay_max: 60, fill_level_max: 300000, priming_max: 10000,
+        operation_time_default: 10080 }
+
+// What the Command Control Point changes besides the device of `insulin_delivery.nv`.
+struct IdsCommand
+    var flight_mode: Bool
+    var priming: Bool
+    var priming_amount: Int
+    var max_bolus: Int
+    var available: Int
+    var next_bolus_id: Int
+    config: IdsCommandConfig
+
+// A command state with the maximum bolus amount `max_bolus` (a raw SFLOAT in IU) and the
+// bolus types `available` (the Flags of Get Available Boluses Response).
+@tier(app)
+fn new_ids_command(config: IdsCommandConfig, max_bolus: Int, available: Int) -> IdsCommand
+    IdsCommand { flight_mode: false, priming: false, priming_amount: 0, max_bolus: max_bolus, available: available, next_bolus_id: 1, config: config }
+
+// Set the bolus types that can be set now ([IDS] 3.7.2.14); a type in use or past the
+// product's limit is not.  Bits other than the three are dropped.
+@tier(embedded)
+@no_alloc
+fn ids_command_set_available(var cmd: IdsCommand, available: Int)
+    cmd.available = available & 0x07
+
+// The snoozing time is over: the annunciation is Pending again ([IDS] 3.7.2.4).
+@tier(app)
+fn ids_annunciation_snooze_over(var dev: insulin_delivery.IdsDevice) -> Bool
+    if not dev.annunciation.present or dev.annunciation.status != insulin_delivery.ANNUNCIATION_SNOOZED
+        return false
+    let a = dev.annunciation
+    return insulin_delivery.ids_set_annunciation(var dev, insulin_delivery.IdsAnnunciation {
+        present: true, instance: a.instance, annunciation_type: a.annunciation_type, status: insulin_delivery.ANNUNCIATION_PENDING,
+        aux_mask: a.aux_mask, aux: a.aux })
+
+// ── The procedures ──────────────────────────────────────────────────
+
+// The Response Code record of the Command Control Point: the Op Code 0x0F55, the Request Op
+// Code and the Response Code Value.
+@tier(app)
+fn ids_command_response_code(features: Int, request_op: Int, code: Int, counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, CMD_RESPONSE_CODE, 2)
+    wire.put(var body, request_op, 2)
+    list.push(body, code as u8)
+    insulin_delivery.ids_protect(features, body, counter)
+
+@tier(app)
+fn ids_command_response(features: Int, op: Int, operand: [u8], counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, op, 2)
+    list.append(body, operand)
+    insulin_delivery.ids_protect(features, body, counter)
+
+// Whether the device offers the Command Op Code `op` ([IDS] Table 3.10): the four device and
+// annunciation procedures always, TBR with a TBR feature, boluses with a bolus feature, the
+// others as the config says.  The template procedures are not built and are never offered.
+@tier(embedded)
+@no_alloc
+fn ids_command_offered(features: Int, c: IdsCommandConfig, op: Int) -> Bool
+    if op == CMD_SET_THERAPY_CONTROL_STATE or op == CMD_SET_FLIGHT_MODE or op == CMD_SNOOZE_ANNUNCIATION or op == CMD_CONFIRM_ANNUNCIATION
+        return true
+    if op == CMD_SET_TBR_ADJUSTMENT or op == CMD_CANCEL_TBR_ADJUSTMENT
+        return (features & (insulin_delivery.FEATURE_TBR_ABSOLUTE | insulin_delivery.FEATURE_TBR_RELATIVE)) != 0
+    if op == CMD_SET_BOLUS or op == CMD_CANCEL_BOLUS or op == CMD_GET_AVAILABLE_BOLUSES
+        return (features & insulin_delivery.FEATURE_BOLUS_ANY) != 0
+    if op == CMD_START_PRIMING or op == CMD_STOP_PRIMING
+        return c.priming
+    if op == CMD_SET_INITIAL_RESERVOIR_FILL_LEVEL
+        return c.fill_level
+    if op == CMD_RESET_RESERVOIR_INSULIN_OPERATION_TIME
+        return c.operation_time
+    if op == CMD_GET_MAX_BOLUS_AMOUNT or op == CMD_SET_MAX_BOLUS_AMOUNT
+        return c.max_bolus
+    false
+
+// Whether `raw` is an SFLOAT that holds a number that is not negative.
+@tier(embedded)
+@no_alloc
+fn cmd_amount(raw: Int) -> Bool
+    insulin_delivery.ids_sfloat_number(raw) and wire.sfloat_mantissa(raw) >= 0
+
+@tier(embedded)
+@no_alloc
+fn cmd_milli(raw: Int) -> Int
+    wire.sfloat_scaled(raw, 3)
+
+// The size an Operand must have for the fixed-size Op Codes, -1 for Set TBR Adjustment and Set
+// Bolus, whose size follows the Flags.
+@tier(embedded)
+@no_alloc
+fn ids_command_operand_size(op: Int) -> Int
+    if op == CMD_SET_THERAPY_CONTROL_STATE
+        return 1
+    if op == CMD_SNOOZE_ANNUNCIATION or op == CMD_CONFIRM_ANNUNCIATION or op == CMD_CANCEL_BOLUS
+        return 2
+    if op == CMD_START_PRIMING or op == CMD_SET_INITIAL_RESERVOIR_FILL_LEVEL or op == CMD_SET_MAX_BOLUS_AMOUNT
+        return 2
+    if op == CMD_SET_TBR_ADJUSTMENT or op == CMD_SET_BOLUS
+        return -1
+    0
+
+// Whether the TBR Delivery Context `v` is a defined one ([IDS] Table 4.51).
+@tier(embedded)
+@no_alloc
+fn cmd_tbr_context_ok(v: Int) -> Bool
+    v == 0x0F or v == 0x33 or v == 0x3C or v == 0x55
+
+// Set TBR Adjustment ([IDS] 3.7.2.8).
+@tier(app)
+fn cmd_set_tbr(var dev: insulin_delivery.IdsDevice, cmd: IdsCommand, operand: [u8]) -> Int
+    let f = dev.features
+    if list.len(operand) < 6
+        return insulin_delivery.RESULT_INVALID_OPERAND
+    let flags = operand[0] as Int
+    let has_template = (flags & TBR_FLAG_TEMPLATE_NUMBER) != 0
+    let has_context = (flags & TBR_FLAG_DELIVERY_CONTEXT) != 0
+    if (flags & 0xF8) != 0 or list.len(operand) != 6 + (if has_template then 1 else 0) + (if has_context then 1 else 0)
+        return insulin_delivery.RESULT_INVALID_OPERAND
+    let kind = operand[1] as Int
+    let allowed = (kind == insulin_delivery.TBR_ABSOLUTE and (f & insulin_delivery.FEATURE_TBR_ABSOLUTE) != 0)
+        or (kind == insulin_delivery.TBR_RELATIVE and (f & insulin_delivery.FEATURE_TBR_RELATIVE) != 0)
+    if not allowed or (has_template and (f & insulin_delivery.FEATURE_TBR_TEMPLATE) == 0) or not cmd_amount(wire.get(operand, 2, 2))
+        return insulin_delivery.RESULT_INVALID_OPERAND
+    var at = 6
+    if has_template
+        at = at + 1
+    if has_context and not cmd_tbr_context_ok(operand[at] as Int)
+        return insulin_delivery.RESULT_INVALID_OPERAND
+    let duration = wire.get(operand, 4, 2)
+    if cmd_milli(wire.get(operand, 2, 2)) > cmd.config.tbr_value_max or duration < 1 or duration > cmd.config.tbr_duration_max
+        return insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE
+    let change = (flags & TBR_FLAG_CHANGE) != 0
+    // A template that is not configured: the templates are not built, so none is.
+    if has_template or not dev.basal.active or dev.basal.tbr_present != change
+        return insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE
+    let b = dev.basal
+    let updated = insulin_delivery.IdsBasal {
+        active: true, template: b.template, rate: b.rate, tbr_present: true, tbr_type: kind, tbr_value: wire.get(operand, 2, 2),
+        tbr_programmed: duration, tbr_remaining: duration, tbr_template: -1,
+        context: if has_context then operand[at] as Int else b.context }
+    if not insulin_delivery.ids_set_basal(var dev, updated)
+        return insulin_delivery.RESULT_PROCEDURE_NOT_COMPLETED
+    insulin_delivery.RESULT_SUCCESS
+
+// Set Bolus ([IDS] 3.7.2.12): the response is the Set Bolus Response with the new Bolus ID, or
+// the error code with `ok` false.
+struct CmdOutcome
+    ok: Bool
+    code: Int
+    operand: [u8]
+
+@tier(app)
+fn cmd_fail(code: Int) -> CmdOutcome
+    CmdOutcome { ok: false, code: code, operand: [] }
+
+@tier(app)
+fn cmd_set_bolus(var dev: insulin_delivery.IdsDevice, var cmd: IdsCommand, operand: [u8]) -> CmdOutcome
+    let f = dev.features
+    if list.len(operand) < 8
+        return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    let flags = operand[0] as Int
+    let has_delay = (flags & insulin_delivery.BOLUS_FLAG_DELAY_TIME) != 0
+    let has_template = (flags & insulin_delivery.BOLUS_FLAG_TEMPLATE_NUMBER) != 0
+    let has_activation = (flags & insulin_delivery.BOLUS_FLAG_ACTIVATION_TYPE) != 0
+    let size = 8 + (if has_delay then 2 else 0) + (if has_template then 1 else 0) + (if has_activation then 1 else 0)
+    if (flags & 0xE0) != 0 or list.len(operand) != size
+        return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    let kind = operand[1] as Int
+    let fast = wire.get(operand, 2, 2)
+    let extended = wire.get(operand, 4, 2)
+    let duration = wire.get(operand, 6, 2)
+    let typed = (kind == insulin_delivery.BOLUS_TYPE_FAST and (f & insulin_delivery.FEATURE_FAST_BOLUS) != 0)
+        or (kind == insulin_delivery.BOLUS_TYPE_EXTENDED and (f & insulin_delivery.FEATURE_EXTENDED_BOLUS) != 0)
+        or (kind == insulin_delivery.BOLUS_TYPE_MULTIWAVE and (f & insulin_delivery.FEATURE_MULTIWAVE_BOLUS) != 0)
+    if not typed or not cmd_amount(fast) or not cmd_amount(extended)
+        return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    if (kind == insulin_delivery.BOLUS_TYPE_EXTENDED and fast != 0) or (kind == insulin_delivery.BOLUS_TYPE_FAST and (extended != 0 or duration != 0))
+        return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    if (has_delay and (f & insulin_delivery.FEATURE_BOLUS_DELAY_TIME) == 0) or (has_template and (f & insulin_delivery.FEATURE_BOLUS_TEMPLATE) == 0)
+        or (has_activation and (f & insulin_delivery.FEATURE_BOLUS_ACTIVATION_TYPE) == 0)
+        return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    var at = 8
+    var delay = 0
+    if has_delay
+        delay = wire.get(operand, at, 2)
+        at = at + 2
+    if has_template
+        at = at + 1
+    var activation = -1
+    if has_activation
+        activation = operand[at] as Int
+        if activation != 0x0F and activation != 0x33 and activation != 0x3C and activation != 0x55 and activation != 0x5A
+            return cmd_fail(insulin_delivery.RESULT_INVALID_OPERAND)
+    let c = cmd.config
+    if cmd_milli(fast) > c.bolus_amount_max or cmd_milli(extended) > c.bolus_amount_max or duration > c.bolus_duration_max or delay > c.bolus_delay_max
+        return cmd_fail(insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE)
+    if cmd_milli(fast) + cmd_milli(extended) > cmd_milli(cmd.max_bolus)
+        return cmd_fail(insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE)
+    if has_template
+        return cmd_fail(insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE)
+    let bit = if kind == insulin_delivery.BOLUS_TYPE_FAST then AVAILABLE_FAST else if kind == insulin_delivery.BOLUS_TYPE_EXTENDED then AVAILABLE_EXTENDED else AVAILABLE_MULTIWAVE
+    if (cmd.available & bit) == 0
+        return cmd_fail(RESULT_MAXIMUM_BOLUS_NUMBER_REACHED)
+    var id = cmd.next_bolus_id
+    while insulin_delivery.ids_find_bolus(dev, id) >= 0
+        id = (id + 1) & 0xFFFF
+    let amounts = insulin_delivery.IdsBolusAmounts { fast: fast, extended: extended, duration: duration, delay: delay }
+    let bolus = insulin_delivery.IdsBolus {
+        id: id, bolus_type: kind, template: -1, activation: activation, programmed: amounts, remaining: amounts,
+        delivered: insulin_delivery.IdsBolusAmounts { fast: 0, extended: 0, duration: 0, delay: 0xFFFF } }
+    if not insulin_delivery.ids_add_active_bolus(var dev, bolus)
+        return cmd_fail(insulin_delivery.RESULT_PROCEDURE_NOT_COMPLETED)
+    cmd.next_bolus_id = (id + 1) & 0xFFFF
+    var out: [u8] = []
+    wire.put(var out, id, 2)
+    CmdOutcome { ok: true, code: insulin_delivery.RESULT_SUCCESS, operand: out }
+
+// Carry out the Command Control Point request `op` with `operand`; the value to indicate
+// ([IDS] 3.7.2).
+@tier(app)
+fn ids_command_execute(var dev: insulin_delivery.IdsDevice, var cmd: IdsCommand, op: Int, operand: [u8]) -> [u8]
+    let f = dev.features
+    let c = insulin_delivery.ids_take_counter(var dev, insulin_delivery.COUNTER_COMMAND)
+    if not ids_command_offered(f, cmd.config, op)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_OP_CODE_NOT_SUPPORTED, c)
+    let size = ids_command_operand_size(op)
+    if size >= 0 and list.len(operand) != size
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_INVALID_OPERAND, c)
+    if op == CMD_SET_THERAPY_CONTROL_STATE
+        let state = operand[0] as Int
+        if state != insulin_delivery.THERAPY_STOP and state != insulin_delivery.THERAPY_PAUSE and state != insulin_delivery.THERAPY_RUN
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_INVALID_OPERAND, c)
+        // Run needs a reservoir ([IDS] 3.7.2.2).
+        if state == insulin_delivery.THERAPY_RUN and not dev.attached
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        let _ = insulin_delivery.ids_set_therapy_control_state(var dev, state)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_SET_FLIGHT_MODE
+        cmd.flight_mode = true
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_SNOOZE_ANNUNCIATION or op == CMD_CONFIRM_ANNUNCIATION
+        let id = wire.get(operand, 0, 2)
+        let a = dev.annunciation
+        if not a.present or a.instance != id or a.status == insulin_delivery.ANNUNCIATION_CONFIRMED
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        if op == CMD_SNOOZE_ANNUNCIATION
+            let snoozed = insulin_delivery.IdsAnnunciation {
+                present: true, instance: a.instance, annunciation_type: a.annunciation_type, status: insulin_delivery.ANNUNCIATION_SNOOZED,
+                aux_mask: a.aux_mask, aux: a.aux }
+            let _ = insulin_delivery.ids_set_annunciation(var dev, snoozed)
+            return ids_command_response(f, CMD_SNOOZE_ANNUNCIATION_RESPONSE, operand, c)
+        // A confirmed annunciation is no longer exposed ([IDS] 3.7.2.5, 3.4).
+        let _ = insulin_delivery.ids_set_annunciation(var dev, insulin_delivery.IdsAnnunciation { present: false, instance: 0, annunciation_type: 0, status: 0, aux_mask: 0, aux: [] })
+        return ids_command_response(f, CMD_CONFIRM_ANNUNCIATION_RESPONSE, operand, c)
+    if op == CMD_SET_TBR_ADJUSTMENT
+        return ids_command_response_code(f, op, cmd_set_tbr(var dev, cmd, operand), c)
+    if op == CMD_CANCEL_TBR_ADJUSTMENT
+        if not dev.basal.tbr_present
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        let b = dev.basal
+        let cleared = insulin_delivery.IdsBasal {
+            active: b.active, template: b.template, rate: b.rate, tbr_present: false, tbr_type: insulin_delivery.TBR_UNDETERMINED, tbr_value: 0,
+            tbr_programmed: 0, tbr_remaining: 0, tbr_template: -1, context: b.context }
+        let _ = insulin_delivery.ids_set_basal(var dev, cleared)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_SET_BOLUS
+        let r = cmd_set_bolus(var dev, var cmd, operand)
+        if not r.ok
+            return ids_command_response_code(f, op, r.code, c)
+        return ids_command_response(f, CMD_SET_BOLUS_RESPONSE, r.operand, c)
+    if op == CMD_CANCEL_BOLUS
+        if not insulin_delivery.ids_end_active_bolus(var dev, wire.get(operand, 0, 2))
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        return ids_command_response(f, CMD_CANCEL_BOLUS_RESPONSE, operand, c)
+    if op == CMD_GET_AVAILABLE_BOLUSES
+        return ids_command_response(f, CMD_GET_AVAILABLE_BOLUSES_RESPONSE, [(cmd.available & 0x07) as u8], c)
+    if op == CMD_START_PRIMING
+        let amount = wire.get(operand, 0, 2)
+        if not cmd_amount(amount)
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_INVALID_OPERAND, c)
+        if cmd_milli(amount) < 1 or cmd_milli(amount) > cmd.config.priming_max
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE, c)
+        // The device cannot be configured while the therapy runs ([IDS] Table 4.4).
+        if dev.therapy == insulin_delivery.THERAPY_RUN or cmd.priming
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        cmd.priming = true
+        cmd.priming_amount = amount
+        let _ = insulin_delivery.ids_set_operational_state(var dev, insulin_delivery.OPERATIONAL_PRIMING)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_STOP_PRIMING
+        if not cmd.priming
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        cmd.priming = false
+        // The state after priming is Waiting for the infusion set ([IDS] Table 4.5); the product may set another.
+        let _ = insulin_delivery.ids_set_operational_state(var dev, insulin_delivery.OPERATIONAL_WAITING)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_SET_INITIAL_RESERVOIR_FILL_LEVEL
+        let level = wire.get(operand, 0, 2)
+        if not cmd_amount(level)
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_INVALID_OPERAND, c)
+        if cmd_milli(level) > cmd.config.fill_level_max
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE, c)
+        if not dev.attached
+            return ids_command_response_code(f, op, insulin_delivery.RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        let _ = insulin_delivery.ids_set_reservoir(var dev, true, level)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_RESET_RESERVOIR_INSULIN_OPERATION_TIME
+        // Remaining back to the default, Elapsed to 0 ([IDS] 3.7.2.24).
+        let _ = insulin_delivery.ids_set_counter(var dev, insulin_delivery.COUNTER_RESERVOIR_INSULIN_OPERATION_TIME, insulin_delivery.COUNTER_SELECTION_REMAINING, cmd.config.operation_time_default)
+        let _ = insulin_delivery.ids_set_counter(var dev, insulin_delivery.COUNTER_RESERVOIR_INSULIN_OPERATION_TIME, insulin_delivery.COUNTER_SELECTION_ELAPSED, 0)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+    if op == CMD_GET_MAX_BOLUS_AMOUNT
+        var body: [u8] = []
+        wire.put(var body, cmd.max_bolus, 2)
+        return ids_command_response(f, CMD_GET_MAX_BOLUS_AMOUNT_RESPONSE, body, c)
+    // Set Max Bolus Amount.
+    let amount = wire.get(operand, 0, 2)
+    if not cmd_amount(amount)
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_INVALID_OPERAND, c)
+    if cmd_milli(amount) < 1 or cmd_milli(amount) > cmd.config.bolus_amount_max
+        return ids_command_response_code(f, op, insulin_delivery.RESULT_PARAMETER_OUT_OF_RANGE, c)
+    cmd.max_bolus = amount
+    ids_command_response_code(f, op, insulin_delivery.RESULT_SUCCESS, c)
+
+// ── The characteristics ─────────────────────────────────────────────
+
+@value
+struct IdsCommandHandles
+    control: u16
+    control_cccd: u16
+    data: u16
+    data_cccd: u16
+
+// Add the Command Control Point and the Command Data after the last characteristic of the
+// service built by `insulin_delivery.add_ids_service` ([IDS] Table 3.1), with the access of
+// `config`; `dev` learns the handle, so that the other control points refuse a procedure
+// while an indication of this one is unconfirmed.
+@tier(app)
+fn add_ids_command(var db: GattDb, config: insulin_delivery.IdsConfig, var dev: insulin_delivery.IdsDevice) -> Result<IdsCommandHandles, profile_builder.ProfileError>
+    if not insulin_delivery.ids_access_authenticated(config.access)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let both = gatt_server.both_ways(config.access)
+    let control = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.access },
+        gatt_server.le16(UUID_IDD_COMMAND_CONTROL_POINT), [])!
+    let control_cccd = profile_builder.add_cccd(var db, both)!
+    let data = profile_builder.add_value(
+        var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_IDD_COMMAND_DATA), [])!
+    let data_cccd = profile_builder.add_cccd(var db, both)!
+    dev.command_handle = control
+    Ok(IdsCommandHandles { control: control as u16, control_cccd: control_cccd as u16, data: data as u16, data_cccd: data_cccd as u16 })
+
+// Whether `pdu` is a write to the Command Control Point.
+@tier(embedded)
+@no_alloc
+fn ids_command_owns(ch: IdsCommandHandles, pdu: [u8]) -> Bool
+    list.len(pdu) >= 3 and (pdu[0] as Int) == att.ATT_OP_WRITE_REQ and gatt_server.read_le16(pdu, 1) == ch.control as Int
+
+// Answer a write to the Command Control Point (see `ids_command_owns`): checked first (the
+// descriptor, the procedure in progress, the E2E-CRC and E2E-Counter), carried out when the
+// Write Response is out and answered by one indication.  Any other PDU is
+// `insulin_delivery.ids_receive`'s.
+@tier(app)
+fn ids_command_receive(var db: GattDb, var link: AttLink, handles: insulin_delivery.IdsHandles, ch: IdsCommandHandles, config: insulin_delivery.IdsConfig, var dev: insulin_delivery.IdsDevice, var cmd: IdsCommand, pdu: [u8], now_ms: Int) -> [[u8]]
+    if not ids_command_owns(ch, pdu)
+        return insulin_delivery.ids_receive(var db, var link, handles, config, var dev, pdu, now_ms)
+    let handle = ch.control as Int
+    let value = pdu[3:]
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+    if access == 0
+        var refused = 0
+        if not insulin_delivery.ids_subscribed(link, ch.control_cccd as Int, gatt_server.CCC_INDICATION)
+            refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+        else if insulin_delivery.ids_busy(link, handles, dev)
+            refused = att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+        else
+            refused = insulin_delivery.ids_e2e_error(dev, insulin_delivery.COUNTER_COMMAND, value, 2)
+            if refused == 0 and list.len(insulin_delivery.ids_body(dev.features, value)) < 2
+                refused = att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+        if refused != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handle, refused)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if access != 0 or list.len(out) == 0 or (out[0][0] as Int) != att.ATT_OP_WRITE_RSP
+        return out
+    if insulin_delivery.ids_e2e(dev.features)
+        dev.rx[insulin_delivery.COUNTER_COMMAND] = value[list.len(value) - 3] as Int
+    let body = insulin_delivery.ids_body(dev.features, value)
+    let reply = ids_command_execute(var dev, var cmd, wire.get(body, 0, 2), body[2:])
+    if gatt_server.set_value(var db, ch.control as Int, reply)
+        list.append(out, gatt_server.send_value(var db, var link, ch.control as Int, now_ms))
+    out
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+const ALL_FEATURES = 0x00FFFE
+
+// Run one request against a fresh pump and report the indicated value.  The pump has a
+// reservoir, a basal rate, the therapy stopped and the three bolus types free.
+@tier(app)
+fn setup() -> insulin_delivery.IdsDevice
+    var dev = insulin_delivery.new_ids_device(ALL_FEATURES)
+    let _ = insulin_delivery.ids_set_reservoir(var dev, true, wire.sfloat(180, 0))
+    let _ = insulin_delivery.ids_set_therapy_control_state(var dev, insulin_delivery.THERAPY_STOP)
+    let basal = insulin_delivery.IdsBasal {
+        active: true, template: 1, rate: wire.sfloat(8, -1), tbr_present: false, tbr_type: insulin_delivery.TBR_UNDETERMINED, tbr_value: 0,
+        tbr_programmed: 0, tbr_remaining: 0, tbr_template: -1, context: -1 }
+    let _ = insulin_delivery.ids_set_basal(var dev, basal)
+    dev
+
+@tier(app)
+fn fresh_command() -> IdsCommand
+    new_ids_command(default_ids_command_config(), wire.sfloat(10, 0), 0x07)

@@ -1,0 +1,1183 @@
+// src/insulin_delivery.nv — the Insulin Delivery Service (0x183A), the
+// server of an insulin pump or pen: the status of the therapy and of the device, the
+// annunciation, the Features and the Status Reader Control Point.
+//
+// Its builders run at start-up and allocate, so the functions that build lists or
+// records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   IDD Status Changed             0x2B20  Read, Indicate; the Flags of what changed
+//   IDD Status                     0x2B21  Read, Indicate; therapy control state,
+//                                          operational state, reservoir, Flags
+//   IDD Annunciation Status        0x2B22  Read, Indicate; the active annunciation and
+//                                          up to five AuxInfo fields
+//   IDD Features                   0x2B23  Read, Indicate optional; E2E-CRC,
+//                                          E2E-Counter, insulin concentration, Flags
+//   IDD Status Reader Control Point 0x2B24 Write, Indicate; see the operations below
+//
+// This file is the first family of the service.  The IDD Record Access Control Point and
+// IDD History Data are `insulin_delivery_history.nv`, which adds them after this service
+// and hands every other PDU to `ids_receive`; the IDD Command Control Point and IDD Command
+// Data are `insulin_delivery_command.nv`.
+//
+// E2E-Protection ([IDS] 1.9, 3.1).  When the Features Flags bit 0 is set, every
+// characteristic of the service ends with an E2E-Counter and a 16-bit E2E-CRC.  The
+// transmit E2E-Counter of each characteristic starts at 1 for each connection, steps by
+// 1 for each read response, indication and notification (and for each indicated
+// response of a control point), rolls from 255 to 1 and skips 0 ([IDS] 3.1.1).  The
+// received counter of each control point starts at 255 and a written counter is valid
+// when it minus (the last one modulo 255) is 1 ([IDS] 3.15).  The CRC is the CRC-CCITT
+// with the seed 0xFFFF over all other octets of the value, least significant octet
+// first ([IDS] 3.16, `reconnection_configuration.crc16`).  A write with a wrong CRC is
+// answered Invalid CRC (0x81) and one with an invalid counter Invalid Counter (0x82)
+// ([IDS] 1.8, 3.12; the test cases IDS/SEN/CBE/BI-05 and BI-06 expect both as an ATT
+// Error Response, which is what 3.12 says for the CRC and not for the counter).
+// The Features characteristic always has the CRC and the counter in front of it, 0xFFFF
+// and 0 without E2E-Protection ([IDS] 3.5.1.1).
+//
+// The Status Reader Control Point.  A write is checked before it is accepted: while
+// another control point procedure runs, or the last indication of this one is not
+// confirmed, the answer is Procedure Already in Progress (0xFE); with the descriptor
+// not configured for indications it is Client Characteristic Configuration descriptor
+// improperly configured (0xFD) ([IDS] 3.11.1, 3.11.4).  The procedure runs when the
+// Write Response is out, and the result is one indication: the response Op Code and its
+// record, or the Response Code Op Code (0x0303) with the Request Op Code and a Response
+// Code Value ([IDS] 4.5.2.1).
+//
+// Security.  The Insulin Delivery Profile 1.0.2 puts every characteristic at security
+// mode 1, level 3 ([IDP] 6.1), so `access` is Authenticated or SecureConnections.  The
+// Authorization the service table names ([IDS] Table 3.1) is the application's decision
+// about whom to serve and is not modelled here.
+//
+// What the product decides: the values of the therapy state (`IdsDevice`), when a bit of
+// the Status Changed is raised, the Features, which optional Status Reader Op Codes are
+// offered and the counters it exposes.  The encoding, the value rules and the answers to
+// a malformed write are the stack's.
+//
+// Specification checked against: Insulin Delivery Service 1.0.2 (IDS), Insulin Delivery
+// Profile 1.0.2 (IDP) and the test suite IDS.TS.p3.
+//
+// Satisfies: REQ-BLE-IDS-001.
+
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use reconnection_configuration
+use wire
+
+const UUID_INSULIN_DELIVERY_SERVICE = 0x183A
+const UUID_IDD_STATUS_CHANGED = 0x2B20
+const UUID_IDD_STATUS = 0x2B21
+const UUID_IDD_ANNUNCIATION_STATUS = 0x2B22
+const UUID_IDD_FEATURES = 0x2B23
+const UUID_IDD_STATUS_READER_CONTROL_POINT = 0x2B24
+
+// The Application Error Codes of [IDS] 1.8.
+const ERR_INVALID_CRC = 0x81
+const ERR_INVALID_COUNTER = 0x82
+
+// The IDD Features Flags ([IDS] Table 4.12).
+const FEATURE_E2E_PROTECTION = 0x000001
+const FEATURE_BASAL_RATE = 0x000002
+const FEATURE_TBR_ABSOLUTE = 0x000004
+const FEATURE_TBR_RELATIVE = 0x000008
+const FEATURE_TBR_TEMPLATE = 0x000010
+const FEATURE_FAST_BOLUS = 0x000020
+const FEATURE_EXTENDED_BOLUS = 0x000040
+const FEATURE_MULTIWAVE_BOLUS = 0x000080
+const FEATURE_BOLUS_DELAY_TIME = 0x000100
+const FEATURE_BOLUS_TEMPLATE = 0x000200
+const FEATURE_BOLUS_ACTIVATION_TYPE = 0x000400
+const FEATURE_MULTIPLE_BOND = 0x000800
+const FEATURE_ISF_PROFILE_TEMPLATE = 0x001000
+const FEATURE_I2CHO_RATIO_PROFILE_TEMPLATE = 0x002000
+const FEATURE_TARGET_GLUCOSE_RANGE_PROFILE_TEMPLATE = 0x004000
+const FEATURE_INSULIN_ON_BOARD = 0x008000
+const FEATURE_BOLUS_ANY = 0x0000E0
+
+// The IDD Status Changed Flags ([IDS] Table 4.2).
+const CHANGED_THERAPY_CONTROL_STATE = 0x0001
+const CHANGED_OPERATIONAL_STATE = 0x0002
+const CHANGED_RESERVOIR_STATUS = 0x0004
+const CHANGED_ANNUNCIATION_STATUS = 0x0008
+const CHANGED_TOTAL_DAILY_INSULIN_STATUS = 0x0010
+const CHANGED_ACTIVE_BASAL_RATE_STATUS = 0x0020
+const CHANGED_ACTIVE_BOLUS_STATUS = 0x0040
+const CHANGED_HISTORY_EVENT_RECORDED = 0x0080
+const CHANGED_DEFINED_BITS = 0x00FF
+
+// The Therapy Control State values ([IDS] Table 4.4).
+const THERAPY_UNDETERMINED = 0x0F
+const THERAPY_STOP = 0x33
+const THERAPY_PAUSE = 0x3C
+const THERAPY_RUN = 0x55
+
+// The Operational State values ([IDS] Table 4.5).
+const OPERATIONAL_UNDETERMINED = 0x0F
+const OPERATIONAL_OFF = 0x33
+const OPERATIONAL_STANDBY = 0x3C
+const OPERATIONAL_PREPARING = 0x55
+const OPERATIONAL_PRIMING = 0x5A
+const OPERATIONAL_WAITING = 0x66
+const OPERATIONAL_READY = 0x96
+
+// The IDD Status Flags ([IDS] Table 4.6).
+const STATUS_RESERVOIR_ATTACHED = 0x01
+
+// The IDD Annunciation Status Flags ([IDS] Table 4.8).
+const ANNUNCIATION_PRESENT = 0x01
+const ANNUNCIATION_AUX_ALL = 0x3E
+
+// The Annunciation Type values ([IDS] Table 4.9) the stack names.
+const ANNUNCIATION_TYPE_TEMPERATURE = 0x0365
+const ANNUNCIATION_TYPE_MANUFACTURER_FIRST = 0xF000
+const ANNUNCIATION_TYPE_MANUFACTURER_LAST = 0xFFF0
+
+// The Annunciation Status values ([IDS] Table 4.10).
+const ANNUNCIATION_UNDETERMINED = 0x0F
+const ANNUNCIATION_PENDING = 0x33
+const ANNUNCIATION_SNOOZED = 0x3C
+const ANNUNCIATION_CONFIRMED = 0x55
+
+// The Op Codes of the IDD Status Reader Control Point ([IDS] Table 4.14).
+const SR_RESPONSE_CODE = 0x0303
+const SR_RESET_STATUS = 0x030C
+const SR_GET_ACTIVE_BOLUS_IDS = 0x0330
+const SR_GET_ACTIVE_BOLUS_IDS_RESPONSE = 0x033F
+const SR_GET_ACTIVE_BOLUS_DELIVERY = 0x0356
+const SR_GET_ACTIVE_BOLUS_DELIVERY_RESPONSE = 0x0359
+const SR_GET_ACTIVE_BASAL_RATE_DELIVERY = 0x0365
+const SR_GET_ACTIVE_BASAL_RATE_DELIVERY_RESPONSE = 0x036A
+const SR_GET_TOTAL_DAILY_INSULIN_STATUS = 0x0395
+const SR_GET_TOTAL_DAILY_INSULIN_STATUS_RESPONSE = 0x039A
+const SR_GET_COUNTER = 0x03A6
+const SR_GET_COUNTER_RESPONSE = 0x03A9
+const SR_GET_DELIVERED_INSULIN = 0x03C0
+const SR_GET_DELIVERED_INSULIN_RESPONSE = 0x03CF
+const SR_GET_INSULIN_ON_BOARD = 0x03F3
+const SR_GET_INSULIN_ON_BOARD_RESPONSE = 0x03FC
+
+// The Response Code Values of the Status Reader Control Point ([IDS] Table 4.16).
+const RESULT_SUCCESS = 0x0F
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x70
+const RESULT_INVALID_OPERAND = 0x71
+const RESULT_PROCEDURE_NOT_COMPLETED = 0x72
+const RESULT_PARAMETER_OUT_OF_RANGE = 0x73
+const RESULT_PROCEDURE_NOT_APPLICABLE = 0x74
+
+// The Bolus Value Selection values ([IDS] Table 4.20).
+const BOLUS_SELECTION_PROGRAMMED = 0x0F
+const BOLUS_SELECTION_REMAINING = 0x33
+const BOLUS_SELECTION_DELIVERED = 0x3C
+
+// The Bolus Type values ([IDS] Table 4.22).
+const BOLUS_TYPE_UNDETERMINED = 0x0F
+const BOLUS_TYPE_FAST = 0x33
+const BOLUS_TYPE_EXTENDED = 0x3C
+const BOLUS_TYPE_MULTIWAVE = 0x55
+
+// The Bolus Activation Type values ([IDS] Table 4.58).
+const BOLUS_ACTIVATION_UNDETERMINED = 0x0F
+const BOLUS_ACTIVATION_MANUAL = 0x33
+const BOLUS_ACTIVATION_RECOMMENDED = 0x3C
+const BOLUS_ACTIVATION_MANUALLY_CHANGED = 0x55
+const BOLUS_ACTIVATION_COMMANDED = 0x5A
+
+// The Flags of the Active Bolus Delivery record ([IDS] 4.6.2.18.1, bits 0 to 2).
+const BOLUS_FLAG_DELAY_TIME = 0x01
+const BOLUS_FLAG_TEMPLATE_NUMBER = 0x02
+const BOLUS_FLAG_ACTIVATION_TYPE = 0x04
+
+// The Flags of the Active Basal Rate Delivery record ([IDS] Table 4.24).
+const BASAL_FLAG_TBR_PRESENT = 0x01
+const BASAL_FLAG_TBR_TEMPLATE_NUMBER = 0x02
+const BASAL_FLAG_DELIVERY_CONTEXT = 0x04
+
+// The TBR Type values ([IDS] Table 4.25).
+const TBR_UNDETERMINED = 0x0F
+const TBR_ABSOLUTE = 0x33
+const TBR_RELATIVE = 0x3C
+
+// The Basal Delivery Context values ([IDS] Table 4.26).
+const BASAL_CONTEXT_UNDETERMINED = 0x0F
+const BASAL_CONTEXT_DEVICE_BASED = 0x33
+const BASAL_CONTEXT_REMOTE_CONTROL = 0x3C
+const BASAL_CONTEXT_ARTIFICIAL_PANCREAS = 0x55
+
+// The Counter Type values ([IDS] Table 4.29) and the Counter Value Selection values
+// ([IDS] Table 4.30).
+const COUNTER_IDD_LIFETIME = 0x0F
+const COUNTER_IDD_WARRANTY_TIME = 0x33
+const COUNTER_IDD_LOANER_TIME = 0x3C
+const COUNTER_RESERVOIR_INSULIN_OPERATION_TIME = 0x55
+const COUNTER_SELECTION_REMAINING = 0x0F
+const COUNTER_SELECTION_ELAPSED = 0x33
+
+// The number of IDs one Get Active Bolus IDs Response holds ([IDS] 3.6.2.2).
+const ACTIVE_BOLUS_IDS_MAX = 7
+
+// The roll-over of the delivered insulin amounts, in hundredths of an IU ([IDS] 3.6.2.7).
+const DELIVERED_ROLLOVER = 8000000
+
+// The characteristics that carry an E2E-Counter, in the order of the transmit counters.
+const COUNTER_STATUS_CHANGED = 0
+const COUNTER_STATUS = 1
+const COUNTER_ANNUNCIATION = 2
+const COUNTER_FEATURES = 3
+const COUNTER_STATUS_READER = 4
+const COUNTER_COMMAND = 5
+const COUNTER_COMMAND_DATA = 6
+const COUNTER_RACP = 7
+const COUNTER_SLOTS = 8
+
+// ── The data of the service ─────────────────────────────────────────
+
+// The amounts of a bolus under one Bolus Value Selection ([IDS] 4.5.2.6): the fast and
+// the extended amount as raw SFLOATs in IU, the Duration and the Delay Time in minutes.
+// The Delay Time of a delivered bolus is not applicable and is sent as 0xFFFF.
+@value
+struct IdsBolusAmounts
+    fast: Int
+    extended: Int
+    duration: Int
+    delay: Int
+
+// One Active Bolus.  `template` and `activation` are -1 when the record carries no
+// Bolus Template Number or Bolus Activation Type.
+@value
+struct IdsBolus
+    id: Int
+    bolus_type: Int
+    template: Int
+    activation: Int
+    programmed: IdsBolusAmounts
+    remaining: IdsBolusAmounts
+    delivered: IdsBolusAmounts
+
+// The active basal rate ([IDS] 4.5.2.8).  `rate` is the Active Basal Rate Current Config
+// Value, a raw SFLOAT in IU/h; the TBR fields are used when `tbr_present`; `tbr_value`
+// is a raw SFLOAT in IU/h for an absolute TBR and a scaling factor for a relative one;
+// `tbr_template` and `context` are -1 when the record carries none.
+@value
+struct IdsBasal
+    active: Bool
+    template: Int
+    rate: Int
+    tbr_present: Bool
+    tbr_type: Int
+    tbr_value: Int
+    tbr_programmed: Int
+    tbr_remaining: Int
+    tbr_template: Int
+    context: Int
+
+// The active annunciation ([IDS] 4.3).  `aux_mask` is bits 1 to 5 of the Flags for the
+// AuxInfo fields that follow, `aux` holds their raw 16-bit values, AuxInfo1 first.
+struct IdsAnnunciation
+    present: Bool
+    instance: Int
+    annunciation_type: Int
+    status: Int
+    aux_mask: Int
+    aux: [Int]
+
+// What the pump holds.  The fields without `var` are fixed when the device is made.
+// `counter_values` is the Counter Value of the Get Counter response for each Counter
+// Type and Counter Value Selection (type index times 2 plus selection index), and
+// `counters_offered` the mask of the slots the device has.
+struct IdsDevice
+    var changed: Int
+    var therapy: Int
+    var operational: Int
+    var attached: Bool
+    var reservoir: Int
+    var annunciation: IdsAnnunciation
+    var boluses: [IdsBolus]
+    var basal: IdsBasal
+    var daily_bolus: Int
+    var daily_basal: Int
+    var daily_total: Int
+    var counters_offered: Int
+    var counter_values: [Int]
+    var delivered_bolus: Int
+    var delivered_basal: Int
+    var iob: Int
+    var iob_remaining: Int
+    var tx: [Int]
+    var rx: [Int]
+    var busy: Bool
+    var command_handle: Int
+    features: Int
+
+// A device with the Features `features`: nothing changed, the therapy stopped and the
+// device off, no reservoir, no annunciation, nothing delivered.
+@tier(app)
+fn new_ids_device(features: Int) -> IdsDevice
+    IdsDevice {
+        changed: 0, therapy: THERAPY_UNDETERMINED, operational: OPERATIONAL_UNDETERMINED, attached: false,
+        reservoir: wire.SFLOAT_NAN,
+        annunciation: IdsAnnunciation { present: false, instance: 0, annunciation_type: 0, status: 0, aux_mask: 0, aux: [] },
+        boluses: [],
+        basal: IdsBasal {
+            active: false, template: 0, rate: 0, tbr_present: false, tbr_type: TBR_UNDETERMINED, tbr_value: 0,
+            tbr_programmed: 0, tbr_remaining: 0, tbr_template: -1, context: -1 },
+        daily_bolus: 0, daily_basal: 0, daily_total: 0, counters_offered: 0, counter_values: [0, 0, 0, 0, 0, 0, 0, 0],
+        delivered_bolus: 0, delivered_basal: 0, iob: 0, iob_remaining: -1,
+        tx: [1, 1, 1, 1, 1, 1, 1, 1], rx: [255, 255, 255, 255, 255, 255, 255, 255], busy: false, command_handle: 0, features: features }
+
+// A new connection: every transmit E2E-Counter is 1 and every received one 255
+// ([IDS] 3.1.1).  The Status Changed Flags and the values of the therapy are kept.
+@tier(embedded)
+@no_alloc
+fn ids_connection_reset(var dev: IdsDevice)
+    for i in 0..COUNTER_SLOTS
+        dev.tx[i] = 1
+        dev.rx[i] = 255
+    dev.busy = false
+
+// Raise the Status Changed Flags `flags`; the Server retains a bit until the Collector
+// resets it with Reset Status ([IDS] 3.2).
+@tier(embedded)
+@no_alloc
+fn ids_raise(var dev: IdsDevice, flags: Int)
+    dev.changed = dev.changed | (flags & CHANGED_DEFINED_BITS)
+
+// Whether `v` is a defined Therapy Control State.
+@tier(embedded)
+@no_alloc
+fn ids_therapy_valid(v: Int) -> Bool
+    v == THERAPY_UNDETERMINED or v == THERAPY_STOP or v == THERAPY_PAUSE or v == THERAPY_RUN
+
+// Whether `v` is a defined Operational State.
+@tier(embedded)
+@no_alloc
+fn ids_operational_valid(v: Int) -> Bool
+    v == OPERATIONAL_UNDETERMINED or v == OPERATIONAL_OFF or v == OPERATIONAL_STANDBY or v == OPERATIONAL_PREPARING
+        or v == OPERATIONAL_PRIMING or v == OPERATIONAL_WAITING or v == OPERATIONAL_READY
+
+// Set the Therapy Control State and raise Therapy Control State Changed.  False for a
+// value the service does not define.
+@tier(embedded)
+@no_alloc
+fn ids_set_therapy_control_state(var dev: IdsDevice, v: Int) -> Bool
+    if not ids_therapy_valid(v)
+        return false
+    dev.therapy = v
+    ids_raise(var dev, CHANGED_THERAPY_CONTROL_STATE)
+    true
+
+// Set the Operational State and raise Operational State Changed.
+@tier(embedded)
+@no_alloc
+fn ids_set_operational_state(var dev: IdsDevice, v: Int) -> Bool
+    if not ids_operational_valid(v)
+        return false
+    dev.operational = v
+    ids_raise(var dev, CHANGED_OPERATIONAL_STATE)
+    true
+
+// Whether `raw` is an SFLOAT the service may send as a number or as NaN.
+@tier(embedded)
+@no_alloc
+fn ids_sfloat_valid(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) != wire.KIND_RESERVED
+
+// Whether `raw` is an SFLOAT that holds a number.
+@tier(embedded)
+@no_alloc
+fn ids_sfloat_number(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) == wire.KIND_NUMBER
+
+// Set the reservoir and raise Reservoir Status Changed.  Without a reservoir the
+// Remaining Amount is NaN ([IDS] 3.3.1.3); with one it is a raw SFLOAT in IU that is a
+// number or NaN.  False for a value the service cannot send.
+@tier(embedded)
+@no_alloc
+fn ids_set_reservoir(var dev: IdsDevice, attached: Bool, remaining: Int) -> Bool
+    if attached and not ids_sfloat_valid(remaining)
+        return false
+    dev.attached = attached
+    dev.reservoir = if attached then remaining else wire.SFLOAT_NAN
+    ids_raise(var dev, CHANGED_RESERVOIR_STATUS)
+    true
+
+// Whether `t` is an Annunciation Type the service defines ([IDS] Table 4.9) or one of
+// the manufacturer range; the Hamming-code test of the range is the product's.
+@tier(embedded)
+@no_alloc
+fn ids_annunciation_type_valid(t: Int) -> Bool
+    if t >= ANNUNCIATION_TYPE_MANUFACTURER_FIRST and t <= ANNUNCIATION_TYPE_MANUFACTURER_LAST
+        return true
+    t == 0x000F or t == 0x0033 or t == 0x003C or t == 0x0055 or t == 0x005A or t == 0x0066 or t == 0x0069 or t == 0x0096
+        or t == 0x0099 or t == 0x00A5 or t == 0x00AA or t == 0x00C3 or t == 0x00CC or t == 0x00F0 or t == 0x00FF
+        or t == 0x0303 or t == 0x030C or t == 0x0330 or t == 0x033F or t == 0x0356 or t == 0x0359 or t == 0x0365
+
+// Whether `a` is an annunciation the service may expose: a defined Type and Status, the
+// AuxInfo fields only with the annunciation and as many as the mask names, and, for the
+// Temperature Type, the AuxInfo1 value and AuxInfo2 Temperature Flags and Context of
+// [IDS] Table 3.6 to 3.8.
+@tier(embedded)
+@no_alloc
+fn ids_annunciation_valid(a: IdsAnnunciation) -> Bool
+    if (a.aux_mask & ANNUNCIATION_AUX_ALL) != a.aux_mask
+        return false
+    var count = 0
+    for k in 1..6
+        if (a.aux_mask & (1 << k)) != 0
+            count = count + 1
+    if list.len(a.aux) != count
+        return false
+    for v in a.aux
+        if v < 0 or v > 0xFFFF
+            return false
+    if not a.present
+        return a.aux_mask == 0 and count == 0
+    if a.instance < 0 or a.instance > 0xFFFF or not ids_annunciation_type_valid(a.annunciation_type)
+        return false
+    if a.status != ANNUNCIATION_UNDETERMINED and a.status != ANNUNCIATION_PENDING and a.status != ANNUNCIATION_SNOOZED and a.status != ANNUNCIATION_CONFIRMED
+        return false
+    if a.annunciation_type == ANNUNCIATION_TYPE_TEMPERATURE
+        if (a.aux_mask & 0x06) != 0x06
+            return false
+        // AuxInfo1 is the value; AuxInfo2 is the Temperature Flags (low octet) and the Context.
+        if not ids_sfloat_number(a.aux[0])
+            return false
+        let flags = a.aux[1] & 0xFF
+        let context = (a.aux[1] >>> 8) & 0xFF
+        if (flags & 0x3E) != 0 or (flags & 0xC0) == 0xC0
+            return false
+        if context != 0x0F and context != 0x33
+            return false
+        var next = 2
+        for k in 3..5
+            if (a.aux_mask & (1 << k)) != 0
+                if not ids_sfloat_number(a.aux[next])
+                    return false
+                next = next + 1
+    true
+
+// Expose the annunciation `a` and raise Annunciation Status Changed.  False for one the
+// service may not expose.
+@tier(app)
+fn ids_set_annunciation(var dev: IdsDevice, a: IdsAnnunciation) -> Bool
+    if not ids_annunciation_valid(a)
+        return false
+    dev.annunciation = a
+    ids_raise(var dev, CHANGED_ANNUNCIATION_STATUS)
+    true
+
+// An annunciation of `instance`, `annunciation_type` and `status` with no AuxInfo.
+@tier(app)
+fn ids_annunciation(instance: Int, annunciation_type: Int, status: Int) -> IdsAnnunciation
+    IdsAnnunciation { present: true, instance: instance, annunciation_type: annunciation_type, status: status, aux_mask: 0, aux: [] }
+
+// `a` with the AuxInfo field number `n` (1 to 5) set to `value`.  The fields are kept in
+// the order of their numbers.
+@tier(app)
+fn ids_with_aux(a: IdsAnnunciation, n: Int, value: Int) -> IdsAnnunciation
+    var mask = a.aux_mask | (1 << n)
+    var aux: [Int] = []
+    for k in 1..6
+        if k == n
+            list.push(aux, value)
+        else if (a.aux_mask & (1 << k)) != 0
+            var at = 0
+            for j in 1..k
+                if (a.aux_mask & (1 << j)) != 0
+                    at = at + 1
+            list.push(aux, a.aux[at])
+    IdsAnnunciation { present: a.present, instance: a.instance, annunciation_type: a.annunciation_type, status: a.status, aux_mask: mask, aux: aux }
+
+// ── The values ──────────────────────────────────────────────────────
+
+// Whether the Features `features` name the E2E-Protection.
+@tier(embedded)
+@no_alloc
+fn ids_e2e(features: Int) -> Bool
+    (features & FEATURE_E2E_PROTECTION) != 0
+
+// The next transmit E2E-Counter of the slot `slot`: the value to send now; the one after
+// it is kept ([IDS] 3.1.1).  0 when the Features name no E2E-Protection.
+@tier(embedded)
+@no_alloc
+fn ids_take_counter(var dev: IdsDevice, slot: Int) -> Int
+    if not ids_e2e(dev.features)
+        return 0
+    let c = dev.tx[slot]
+    dev.tx[slot] = if c >= 255 then 1 else c + 1
+    c
+
+// `body` with the E2E-Counter `counter` and the CRC after it when the Features name
+// E2E-Protection, `body` as it is otherwise.
+@tier(app)
+fn ids_protect(features: Int, body: [u8], counter: Int) -> [u8]
+    var out = body[:]
+    if ids_e2e(features)
+        list.push(out, counter as u8)
+        wire.put(var out, reconnection_configuration.crc16(out), 2)
+    out
+
+// The IDD Status Changed value.
+@tier(app)
+fn ids_status_changed_value(features: Int, flags: Int, counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, flags, 2)
+    ids_protect(features, body, counter)
+
+// The IDD Status value.
+@tier(app)
+fn ids_status_value(features: Int, therapy: Int, operational: Int, reservoir: Int, attached: Bool, counter: Int) -> [u8]
+    var body: [u8] = [therapy as u8, operational as u8]
+    wire.put(var body, reservoir, 2)
+    list.push(body, (if attached then STATUS_RESERVOIR_ATTACHED else 0) as u8)
+    ids_protect(features, body, counter)
+
+// The IDD Annunciation Status value: the Flags, then, with an annunciation, the Instance
+// ID, the Type, the Status and the AuxInfo fields the Flags name ([IDS] 4.3).
+@tier(app)
+fn ids_annunciation_value(features: Int, a: IdsAnnunciation, counter: Int) -> [u8]
+    var body: [u8] = []
+    if not a.present
+        list.push(body, 0 as u8)
+        return ids_protect(features, body, counter)
+    list.push(body, (ANNUNCIATION_PRESENT | a.aux_mask) as u8)
+    wire.put(var body, a.instance, 2)
+    wire.put(var body, a.annunciation_type, 2)
+    list.push(body, a.status as u8)
+    for v in a.aux
+        wire.put(var body, v, 2)
+    ids_protect(features, body, counter)
+
+// The IDD Features value: the E2E-CRC, the E2E-Counter, the Insulin Concentration and the
+// 24 Flags ([IDS] 4.4).  Without E2E-Protection the CRC is 0xFFFF and the counter 0.
+@tier(app)
+fn ids_features_value(features: Int, concentration: Int, counter: Int) -> [u8]
+    var tail: [u8] = [counter as u8]
+    wire.put(var tail, concentration, 2)
+    wire.put(var tail, features, 3)
+    var out: [u8] = []
+    wire.put(var out, if ids_e2e(features) then reconnection_configuration.crc16(tail) else 0xFFFF, 2)
+    list.append(out, tail)
+    out
+
+// ── The service ─────────────────────────────────────────────────────
+
+// What the service has.  `concentration` is the raw SFLOAT in IU/mL.  `get_counter` and
+// `get_delivered` say whether the optional Op Codes Get Counter and Get Delivered Insulin
+// are offered.
+struct IdsConfig
+    access: gatt_server.Access
+    features: Int
+    concentration: Int
+    features_indicate: Bool
+    get_counter: Bool
+    get_delivered: Bool
+
+@tier(app)
+fn default_ids_config() -> IdsConfig
+    IdsConfig {
+        access: gatt_server.Access.Authenticated, features: 0, concentration: wire.sfloat(100, 0), features_indicate: false,
+        get_counter: false, get_delivered: false }
+
+@value
+struct IdsHandles
+    service: u16
+    status_changed: u16
+    status_changed_cccd: u16
+    status: u16
+    status_cccd: u16
+    annunciation: u16
+    annunciation_cccd: u16
+    features: u16
+    features_cccd: u16
+    reader: u16
+    reader_cccd: u16
+
+@tier(embedded)
+@no_alloc
+fn ids_access_authenticated(access: gatt_server.Access) -> Bool
+    match access
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// Whether the Features `features` are ones the service can describe: the 16 defined
+// bits, the Feature Extension bit 23 and the reserved bits clear ([IDS] 3.5.1.3).
+@tier(embedded)
+@no_alloc
+fn ids_features_valid(features: Int) -> Bool
+    features >= 0 and (features & 0xFF0000) == 0
+
+// Add the service to `db` after its last attribute, in the order of [IDS] Table 3.1.
+// `dev` gives the initial values.
+@tier(app)
+fn add_ids_service(var db: GattDb, config: IdsConfig, dev: IdsDevice) -> Result<IdsHandles, profile_builder.ProfileError>
+    if not ids_access_authenticated(config.access)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if not ids_features_valid(config.features) or config.features != dev.features or not ids_sfloat_number(config.concentration) or wire.sfloat_mantissa(config.concentration) <= 0
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let read_access = profile_builder.read_only(config.access)
+    let read_indicate = gatt_server.PROP_READ | gatt_server.PROP_INDICATE
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_INSULIN_DELIVERY_SERVICE))!
+    let changed = profile_builder.add_value(
+        var db, read_indicate, read_access, gatt_server.le16(UUID_IDD_STATUS_CHANGED), ids_status_changed_value(dev.features, dev.changed, 0))!
+    let changed_cccd = profile_builder.add_cccd(var db, both)!
+    let status = profile_builder.add_value(
+        var db, read_indicate, read_access, gatt_server.le16(UUID_IDD_STATUS),
+        ids_status_value(dev.features, dev.therapy, dev.operational, dev.reservoir, dev.attached, 0))!
+    let status_cccd = profile_builder.add_cccd(var db, both)!
+    let annunciation = profile_builder.add_value(
+        var db, read_indicate, read_access, gatt_server.le16(UUID_IDD_ANNUNCIATION_STATUS), ids_annunciation_value(dev.features, dev.annunciation, 0))!
+    let annunciation_cccd = profile_builder.add_cccd(var db, both)!
+    var feature_properties = gatt_server.PROP_READ
+    if config.features_indicate
+        feature_properties = feature_properties | gatt_server.PROP_INDICATE
+    let features = profile_builder.add_value(
+        var db, feature_properties, read_access, gatt_server.le16(UUID_IDD_FEATURES),
+        ids_features_value(config.features, config.concentration, 0))!
+    var features_cccd = 0
+    if config.features_indicate
+        features_cccd = profile_builder.add_cccd(var db, both)!
+    let reader = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.access },
+        gatt_server.le16(UUID_IDD_STATUS_READER_CONTROL_POINT), [])!
+    let reader_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(IdsHandles {
+        service: service as u16, status_changed: changed as u16, status_changed_cccd: changed_cccd as u16, status: status as u16,
+        status_cccd: status_cccd as u16, annunciation: annunciation as u16, annunciation_cccd: annunciation_cccd as u16,
+        features: features as u16, features_cccd: features_cccd as u16, reader: reader as u16, reader_cccd: reader_cccd as u16 })
+
+// Write the value of the characteristic at `handle` as the next read would return it,
+// with its next E2E-Counter, so the read that follows answers it.  Only the four
+// characteristics a client reads need it; nothing changes without E2E-Protection except
+// the values of the device state.
+@tier(app)
+fn ids_prepare_read(var db: GattDb, handles: IdsHandles, config: IdsConfig, var dev: IdsDevice, handle: Int)
+    if handle == handles.status_changed as Int
+        let c = ids_take_counter(var dev, COUNTER_STATUS_CHANGED)
+        let _ = gatt_server.set_value(var db, handle, ids_status_changed_value(dev.features, dev.changed, c))
+    else if handle == handles.status as Int
+        let c = ids_take_counter(var dev, COUNTER_STATUS)
+        let _ = gatt_server.set_value(var db, handle, ids_status_value(dev.features, dev.therapy, dev.operational, dev.reservoir, dev.attached, c))
+    else if handle == handles.annunciation as Int
+        let c = ids_take_counter(var dev, COUNTER_ANNUNCIATION)
+        let _ = gatt_server.set_value(var db, handle, ids_annunciation_value(dev.features, dev.annunciation, c))
+    else if handle == handles.features as Int
+        let c = ids_take_counter(var dev, COUNTER_FEATURES)
+        let _ = gatt_server.set_value(var db, handle, ids_features_value(config.features, config.concentration, c))
+
+// Indicate the characteristic at `handle` with its current value and next counter; none
+// unless the client enabled the indication.
+@tier(app)
+fn ids_indicate(var db: GattDb, var link: AttLink, handles: IdsHandles, config: IdsConfig, var dev: IdsDevice, handle: Int, now_ms: Int) -> [[u8]]
+    if handle == handles.features as Int and handles.features_cccd == 0
+        return []
+    if not ids_subscribed(link, ids_cccd_of(handles, handle), gatt_server.CCC_INDICATION)
+        return []
+    ids_prepare_read(var db, handles, config, var dev, handle)
+    gatt_server.send_value(var db, var link, handle, now_ms)
+
+// The descriptor of the characteristic at `handle`, 0 for one without.
+@tier(embedded)
+@no_alloc
+fn ids_cccd_of(handles: IdsHandles, handle: Int) -> Int
+    if handle == handles.status_changed as Int
+        return handles.status_changed_cccd as Int
+    if handle == handles.status as Int
+        return handles.status_cccd as Int
+    if handle == handles.annunciation as Int
+        return handles.annunciation_cccd as Int
+    if handle == handles.features as Int
+        return handles.features_cccd as Int
+    if handle == handles.reader as Int
+        return handles.reader_cccd as Int
+    0
+
+@tier(embedded)
+@no_alloc
+fn ids_subscribed(link: AttLink, cccd: Int, bit: Int) -> Bool
+    cccd != 0 and (gatt_server.configuration(link, cccd) & bit) != 0
+
+// ── The Status Reader Control Point ─────────────────────────────────
+
+// Whether the device offers the Status Reader Op Code `op` ([IDS] Table 3.9): Reset Status
+// and Get Total Daily Insulin Status always, the bolus Op Codes with a bolus feature, the
+// basal one with the Basal Rate feature, Insulin On Board with its feature, and the two
+// optional Op Codes when the config offers them.  False also for an Op Code the service
+// does not define.
+@tier(embedded)
+@no_alloc
+fn ids_reader_offered(config: IdsConfig, op: Int) -> Bool
+    if op == SR_RESET_STATUS or op == SR_GET_TOTAL_DAILY_INSULIN_STATUS
+        return true
+    if op == SR_GET_ACTIVE_BOLUS_IDS or op == SR_GET_ACTIVE_BOLUS_DELIVERY
+        return (config.features & FEATURE_BOLUS_ANY) != 0
+    if op == SR_GET_ACTIVE_BASAL_RATE_DELIVERY
+        return (config.features & FEATURE_BASAL_RATE) != 0
+    if op == SR_GET_INSULIN_ON_BOARD
+        return (config.features & FEATURE_INSULIN_ON_BOARD) != 0
+    if op == SR_GET_COUNTER
+        return config.get_counter
+    if op == SR_GET_DELIVERED_INSULIN
+        return config.get_delivered
+    false
+
+// The octets the Operand of the request `op` has, -1 for an Op Code without a fixed size.
+@tier(embedded)
+@no_alloc
+fn ids_reader_operand_size(op: Int) -> Int
+    if op == SR_RESET_STATUS
+        return 2
+    if op == SR_GET_ACTIVE_BOLUS_DELIVERY
+        return 3
+    if op == SR_GET_COUNTER
+        return 2
+    0
+
+// The response record of Response Code Op Code: the Request Op Code and the value.
+@tier(app)
+fn ids_reader_response_code(features: Int, request_op: Int, code: Int, counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, SR_RESPONSE_CODE, 2)
+    wire.put(var body, request_op, 2)
+    list.push(body, code as u8)
+    ids_protect(features, body, counter)
+
+// A response of the Op Code `op` with the Operand `operand`.
+@tier(app)
+fn ids_reader_response(features: Int, op: Int, operand: [u8], counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, op, 2)
+    list.append(body, operand)
+    ids_protect(features, body, counter)
+
+// The amounts of the bolus `b` under `selection`.
+@tier(embedded)
+@no_alloc
+fn ids_bolus_amounts(b: IdsBolus, selection: Int) -> IdsBolusAmounts
+    if selection == BOLUS_SELECTION_REMAINING
+        return b.remaining
+    if selection == BOLUS_SELECTION_DELIVERED
+        return b.delivered
+    b.programmed
+
+// The Active Bolus Delivery record of `b` under `selection` ([IDS] 4.5.2.6, 3.6.2.3):
+// a Fast bolus has no extended amount and no duration, an Extended bolus no fast amount,
+// and the Delay Time of a delivered bolus is 0xFFFF.
+@tier(app)
+fn ids_bolus_delivery_record(b: IdsBolus, selection: Int) -> [u8]
+    let a = ids_bolus_amounts(b, selection)
+    var flags = 0
+    if b.bolus_type != BOLUS_TYPE_UNDETERMINED
+        flags = flags | BOLUS_FLAG_DELAY_TIME
+    if b.template >= 0
+        flags = flags | BOLUS_FLAG_TEMPLATE_NUMBER
+    if b.activation >= 0
+        flags = flags | BOLUS_FLAG_ACTIVATION_TYPE
+    var fast = a.fast
+    var extended = a.extended
+    var duration = a.duration
+    if b.bolus_type == BOLUS_TYPE_FAST
+        extended = 0
+        duration = 0
+    if b.bolus_type == BOLUS_TYPE_EXTENDED
+        fast = 0
+    var out: [u8] = [flags as u8]
+    wire.put(var out, b.id, 2)
+    list.push(out, b.bolus_type as u8)
+    wire.put(var out, fast, 2)
+    wire.put(var out, extended, 2)
+    wire.put(var out, duration, 2)
+    if (flags & BOLUS_FLAG_DELAY_TIME) != 0
+        wire.put(var out, if selection == BOLUS_SELECTION_DELIVERED then 0xFFFF else a.delay, 2)
+    if b.template >= 0
+        list.push(out, b.template as u8)
+    if b.activation >= 0
+        list.push(out, b.activation as u8)
+    out
+
+// The Active Basal Rate Delivery record ([IDS] 4.5.2.8).
+@tier(app)
+fn ids_basal_delivery_record(x: IdsBasal) -> [u8]
+    var flags = 0
+    if x.tbr_present
+        flags = flags | BASAL_FLAG_TBR_PRESENT
+        if x.tbr_template >= 0
+            flags = flags | BASAL_FLAG_TBR_TEMPLATE_NUMBER
+    if x.context >= 0
+        flags = flags | BASAL_FLAG_DELIVERY_CONTEXT
+    var out: [u8] = [flags as u8, x.template as u8]
+    wire.put(var out, x.rate, 2)
+    if x.tbr_present
+        list.push(out, x.tbr_type as u8)
+        wire.put(var out, x.tbr_value, 2)
+        wire.put(var out, x.tbr_programmed, 2)
+        wire.put(var out, x.tbr_remaining, 2)
+        if x.tbr_template >= 0
+            list.push(out, x.tbr_template as u8)
+    if x.context >= 0
+        list.push(out, x.context as u8)
+    out
+
+// Whether `x` is a record the service can send: numbers where it asks for numbers, a TBR
+// Type and a Context that are defined, and a TBR Type that the Features allow.
+@tier(embedded)
+@no_alloc
+fn ids_basal_valid(features: Int, x: IdsBasal) -> Bool
+    if x.template < 0 or x.template > 255 or not ids_sfloat_valid(x.rate)
+        return false
+    if x.context >= 0 and x.context != BASAL_CONTEXT_UNDETERMINED and x.context != BASAL_CONTEXT_DEVICE_BASED and x.context != BASAL_CONTEXT_REMOTE_CONTROL and x.context != BASAL_CONTEXT_ARTIFICIAL_PANCREAS
+        return false
+    if not x.tbr_present
+        return true
+    if x.tbr_type != TBR_UNDETERMINED and x.tbr_type != TBR_ABSOLUTE and x.tbr_type != TBR_RELATIVE
+        return false
+    if (x.tbr_type == TBR_ABSOLUTE and (features & FEATURE_TBR_ABSOLUTE) == 0) or (x.tbr_type == TBR_RELATIVE and (features & FEATURE_TBR_RELATIVE) == 0)
+        return false
+    x.tbr_programmed >= 0 and x.tbr_programmed <= 0xFFFF and x.tbr_remaining >= 0 and x.tbr_remaining <= 0xFFFF
+        and ids_sfloat_valid(x.tbr_value) and x.tbr_template <= 255
+
+// Expose the active basal rate `x` and raise Active Basal Rate Status Changed.  False
+// for a record the service cannot send.
+@tier(embedded)
+@no_alloc
+fn ids_set_basal(var dev: IdsDevice, x: IdsBasal) -> Bool
+    if (dev.features & FEATURE_BASAL_RATE) == 0 or not ids_basal_valid(dev.features, x)
+        return false
+    dev.basal = x
+    ids_raise(var dev, CHANGED_ACTIVE_BASAL_RATE_STATUS)
+    true
+
+// Whether `a` is a set of amounts the service can send.
+@tier(embedded)
+@no_alloc
+fn ids_amounts_valid(a: IdsBolusAmounts) -> Bool
+    ids_sfloat_valid(a.fast) and ids_sfloat_valid(a.extended) and a.duration >= 0 and a.duration <= 0xFFFF and a.delay >= 0 and a.delay <= 0xFFFF
+
+// Whether `b` is a bolus the Features allow: a defined type the device can deliver, a
+// defined activation type only with Bolus Activation Type, a template number only with
+// Bolus Template, and a Delay Time only with Bolus Delay Time.
+@tier(embedded)
+@no_alloc
+fn ids_bolus_valid(features: Int, b: IdsBolus) -> Bool
+    if b.id < 0 or b.id > 0xFFFF
+        return false
+    let t = b.bolus_type
+    let allowed = (t == BOLUS_TYPE_FAST and (features & FEATURE_FAST_BOLUS) != 0)
+        or (t == BOLUS_TYPE_EXTENDED and (features & FEATURE_EXTENDED_BOLUS) != 0)
+        or (t == BOLUS_TYPE_MULTIWAVE and (features & FEATURE_MULTIWAVE_BOLUS) != 0)
+        or t == BOLUS_TYPE_UNDETERMINED
+    if not allowed
+        return false
+    if b.template >= 0 and ((features & FEATURE_BOLUS_TEMPLATE) == 0 or b.template > 255)
+        return false
+    if b.activation >= 0
+        let act = b.activation
+        if (features & FEATURE_BOLUS_ACTIVATION_TYPE) == 0
+            return false
+        if act != BOLUS_ACTIVATION_UNDETERMINED and act != BOLUS_ACTIVATION_MANUAL and act != BOLUS_ACTIVATION_RECOMMENDED and act != BOLUS_ACTIVATION_MANUALLY_CHANGED and act != BOLUS_ACTIVATION_COMMANDED
+            return false
+    if (features & FEATURE_BOLUS_DELAY_TIME) == 0 and (b.programmed.delay != 0 or b.remaining.delay != 0)
+        return false
+    ids_amounts_valid(b.programmed) and ids_amounts_valid(b.remaining) and ids_amounts_valid(b.delivered)
+
+// Add the Active Bolus `b` as the newest one and raise Active Bolus Status Changed.  False
+// for a bolus the Features do not allow or an ID that is already active.
+@tier(app)
+fn ids_add_active_bolus(var dev: IdsDevice, b: IdsBolus) -> Bool
+    if not ids_bolus_valid(dev.features, b)
+        return false
+    for x in dev.boluses
+        if x.id == b.id
+            return false
+    list.push(dev.boluses, b)
+    ids_raise(var dev, CHANGED_ACTIVE_BOLUS_STATUS)
+    true
+
+// Remove the Active Bolus `id`; False when it is not active.  Raises Active Bolus Status Changed.
+@tier(app)
+fn ids_end_active_bolus(var dev: IdsDevice, id: Int) -> Bool
+    var kept: [IdsBolus] = []
+    var found = false
+    for x in dev.boluses
+        if x.id == id
+            found = true
+        else
+            list.push(kept, x)
+    if found
+        dev.boluses = kept
+        ids_raise(var dev, CHANGED_ACTIVE_BOLUS_STATUS)
+    found
+
+// The index in the device of the Active Bolus `id`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn ids_find_bolus(dev: IdsDevice, id: Int) -> Int
+    for i in 0..list.len(dev.boluses)
+        if dev.boluses[i].id == id
+            return i
+    -1
+
+// Set the total daily insulin of the day so far, raw SFLOATs in IU, and raise Total Daily
+// Insulin Status Changed.  An amount the device cannot deliver is sent as 0 ([IDS]
+// 4.5.2.10).
+@tier(embedded)
+@no_alloc
+fn ids_set_total_daily(var dev: IdsDevice, bolus: Int, basal: Int, total: Int) -> Bool
+    if not ids_sfloat_valid(bolus) or not ids_sfloat_valid(basal) or not ids_sfloat_valid(total)
+        return false
+    dev.daily_bolus = bolus
+    dev.daily_basal = basal
+    dev.daily_total = total
+    ids_raise(var dev, CHANGED_TOTAL_DAILY_INSULIN_STATUS)
+    true
+
+// Set the amounts of insulin delivered since the roll-over, in hundredths of an IU; an
+// amount past 80 000.00 IU rolls over to 0 ([IDS] 3.6.2.7).
+@tier(embedded)
+@no_alloc
+fn ids_set_delivered(var dev: IdsDevice, bolus_centi: Int, basal_centi: Int)
+    dev.delivered_bolus = wire.float(if bolus_centi > DELIVERED_ROLLOVER then 0 else bolus_centi, -2)
+    dev.delivered_basal = wire.float(if basal_centi > DELIVERED_ROLLOVER then 0 else basal_centi, -2)
+
+// Set the Counter Value (minutes) of the Counter Type `counter_type` for the selection
+// `selection` and offer that slot.  False for a type or selection the service does not
+// define.  An Elapsed value is not negative ([IDS] 4.5.2.12.3).
+@tier(embedded)
+@no_alloc
+fn ids_set_counter(var dev: IdsDevice, counter_type: Int, selection: Int, minutes: Int) -> Bool
+    let slot = ids_counter_slot(counter_type, selection)
+    if slot < 0 or minutes < -2147483648 or minutes > 2147483647
+        return false
+    if selection == COUNTER_SELECTION_ELAPSED and minutes < 0
+        return false
+    dev.counters_offered = dev.counters_offered | (1 << slot)
+    dev.counter_values[slot] = minutes
+    true
+
+// The slot of a Counter Type and selection, -1 for a pair the service does not define.
+@tier(embedded)
+@no_alloc
+fn ids_counter_slot(counter_type: Int, selection: Int) -> Int
+    var t = -1
+    if counter_type == COUNTER_IDD_LIFETIME
+        t = 0
+    if counter_type == COUNTER_IDD_WARRANTY_TIME
+        t = 1
+    if counter_type == COUNTER_IDD_LOANER_TIME
+        t = 2
+    if counter_type == COUNTER_RESERVOIR_INSULIN_OPERATION_TIME
+        t = 3
+    var s = -1
+    if selection == COUNTER_SELECTION_REMAINING
+        s = 0
+    if selection == COUNTER_SELECTION_ELAPSED
+        s = 1
+    if t < 0 or s < 0
+        return -1
+    t * 2 + s
+
+// Set the Insulin On Board, a raw SFLOAT in IU, and its remaining duration in minutes
+// (-1 for a record without one).
+@tier(embedded)
+@no_alloc
+fn ids_set_insulin_on_board(var dev: IdsDevice, amount: Int, remaining_minutes: Int) -> Bool
+    if not ids_sfloat_valid(amount) or remaining_minutes > 0xFFFF
+        return false
+    dev.iob = amount
+    dev.iob_remaining = remaining_minutes
+    true
+
+// Carry out the Status Reader request `op` with `operand` against the device and answer
+// with the response record ([IDS] 3.6.2).  The checks come in the order of 3.11.4: the
+// Op Code, then the Operand, then whether the procedure applies.
+@tier(app)
+fn ids_reader_execute(config: IdsConfig, var dev: IdsDevice, op: Int, operand: [u8]) -> [u8]
+    let f = dev.features
+    let c = ids_take_counter(var dev, COUNTER_STATUS_READER)
+    if not ids_reader_offered(config, op)
+        return ids_reader_response_code(f, op, RESULT_OP_CODE_NOT_SUPPORTED, c)
+    if list.len(operand) != ids_reader_operand_size(op)
+        return ids_reader_response_code(f, op, RESULT_INVALID_OPERAND, c)
+    if op == SR_RESET_STATUS
+        let flags = wire.get(operand, 0, 2)
+        if (flags & CHANGED_DEFINED_BITS) != flags
+            return ids_reader_response_code(f, op, RESULT_INVALID_OPERAND, c)
+        dev.changed = dev.changed & (CHANGED_DEFINED_BITS ^ flags)
+        return ids_reader_response_code(f, op, RESULT_SUCCESS, c)
+    if op == SR_GET_ACTIVE_BOLUS_IDS
+        var body: [u8] = []
+        let n = if list.len(dev.boluses) > ACTIVE_BOLUS_IDS_MAX then ACTIVE_BOLUS_IDS_MAX else list.len(dev.boluses)
+        list.push(body, n as u8)
+        for i in 0..n
+            wire.put(var body, dev.boluses[i].id, 2)
+        return ids_reader_response(f, SR_GET_ACTIVE_BOLUS_IDS_RESPONSE, body, c)
+    if op == SR_GET_ACTIVE_BOLUS_DELIVERY
+        let selection = operand[2] as Int
+        if selection != BOLUS_SELECTION_PROGRAMMED and selection != BOLUS_SELECTION_REMAINING and selection != BOLUS_SELECTION_DELIVERED
+            return ids_reader_response_code(f, op, RESULT_INVALID_OPERAND, c)
+        let at = ids_find_bolus(dev, wire.get(operand, 0, 2))
+        if at < 0
+            return ids_reader_response_code(f, op, RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        return ids_reader_response(f, SR_GET_ACTIVE_BOLUS_DELIVERY_RESPONSE, ids_bolus_delivery_record(dev.boluses[at], selection), c)
+    if op == SR_GET_ACTIVE_BASAL_RATE_DELIVERY
+        if not dev.basal.active
+            return ids_reader_response_code(f, op, RESULT_PROCEDURE_NOT_APPLICABLE, c)
+        return ids_reader_response(f, SR_GET_ACTIVE_BASAL_RATE_DELIVERY_RESPONSE, ids_basal_delivery_record(dev.basal), c)
+    if op == SR_GET_TOTAL_DAILY_INSULIN_STATUS
+        var body: [u8] = []
+        wire.put(var body, if (f & FEATURE_BOLUS_ANY) != 0 then dev.daily_bolus else 0, 2)
+        wire.put(var body, if (f & FEATURE_BASAL_RATE) != 0 then dev.daily_basal else 0, 2)
+        wire.put(var body, dev.daily_total, 2)
+        return ids_reader_response(f, SR_GET_TOTAL_DAILY_INSULIN_STATUS_RESPONSE, body, c)
+    if op == SR_GET_COUNTER
+        let slot = ids_counter_slot(operand[0] as Int, operand[1] as Int)
+        if slot < 0 or (dev.counters_offered & (1 << slot)) == 0
+            return ids_reader_response_code(f, op, RESULT_INVALID_OPERAND, c)
+        var body: [u8] = [operand[0], operand[1]]
+        wire.put(var body, dev.counter_values[slot], 4)
+        return ids_reader_response(f, SR_GET_COUNTER_RESPONSE, body, c)
+    if op == SR_GET_DELIVERED_INSULIN
+        var body: [u8] = []
+        wire.put(var body, dev.delivered_bolus, 4)
+        wire.put(var body, dev.delivered_basal, 4)
+        return ids_reader_response(f, SR_GET_DELIVERED_INSULIN_RESPONSE, body, c)
+    // Get Insulin On Board.
+    var body: [u8] = [(if dev.iob_remaining >= 0 then 1 else 0) as u8]
+    wire.put(var body, dev.iob, 2)
+    if dev.iob_remaining >= 0
+        wire.put(var body, dev.iob_remaining, 2)
+    ids_reader_response(f, SR_GET_INSULIN_ON_BOARD_RESPONSE, body, c)
+
+// ── The write checks ────────────────────────────────────────────────
+
+// The Application Error Code a written value earns on a characteristic with E2E-
+// Protection: Invalid CRC (0x81) for a value too short to carry the counter and the CRC
+// or whose CRC does not match, then Invalid Counter (0x82) for a counter that is not the
+// one after the last received one ([IDS] 3.12, 3.15); 0 for a value that passes.
+@tier(app)
+fn ids_e2e_error(dev: IdsDevice, slot: Int, value: [u8], body_min: Int) -> Int
+    if not ids_e2e(dev.features)
+        return 0
+    let n = list.len(value)
+    if n < body_min + 3
+        return ERR_INVALID_CRC
+    if wire.get(value, n - 2, 2) != reconnection_configuration.crc16(value[0:n - 2])
+        return ERR_INVALID_CRC
+    let counter = value[n - 3] as Int
+    if counter - (dev.rx[slot] % 255) != 1
+        return ERR_INVALID_COUNTER
+    0
+
+// The value written without the E2E-Counter and the CRC.
+@tier(app)
+fn ids_body(features: Int, value: [u8]) -> [u8]
+    if not ids_e2e(features) or list.len(value) < 3
+        return value[:]
+    value[0:list.len(value) - 3]
+
+// Whether a Control Point procedure is running: the last indication of the Status Reader
+// Control Point or of the Command Control Point (`dev.command_handle`) is not confirmed, or
+// a procedure of another control point (the History transfer of the Record Access Control
+// Point) has set `dev.busy` ([IDS] 3.11.1).
+@tier(embedded)
+@no_alloc
+fn ids_busy(link: AttLink, handles: IdsHandles, dev: IdsDevice) -> Bool
+    dev.busy or gatt_server.indication_pending(link, handles.reader as Int) or (dev.command_handle != 0 and gatt_server.indication_pending(link, dev.command_handle))
+
+// Answer one ATT PDU.  Reads of the four characteristics return the value with its next
+// E2E-Counter; a write to the Status Reader Control Point is checked first (the
+// descriptor, the procedure in progress, the E2E-CRC and E2E-Counter) and carried out when
+// the Write Response is out; everything else is the plain server.
+@tier(app)
+fn ids_receive(var db: GattDb, var link: AttLink, handles: IdsHandles, config: IdsConfig, var dev: IdsDevice, pdu: [u8], now_ms: Int) -> [[u8]]
+    if list.len(pdu) >= 3 and (pdu[0] as Int) == att.ATT_OP_READ_REQ
+        ids_prepare_read(var db, handles, config, var dev, gatt_server.read_le16(pdu, 1))
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    if list.len(pdu) >= 5 and (pdu[0] as Int) == att.ATT_OP_READ_BLOB_REQ and gatt_server.read_le16(pdu, 3) == 0
+        ids_prepare_read(var db, handles, config, var dev, gatt_server.read_le16(pdu, 1))
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    if list.len(pdu) < 3 or (pdu[0] as Int) != att.ATT_OP_WRITE_REQ
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let handle = gatt_server.read_le16(pdu, 1)
+    if handle != handles.reader as Int
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let value = pdu[3:]
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+    if access == 0
+        var refused = 0
+        if not ids_subscribed(link, handles.reader_cccd as Int, gatt_server.CCC_INDICATION)
+            refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+        else if ids_busy(link, handles, dev)
+            refused = att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+        else
+            refused = ids_e2e_error(dev, COUNTER_STATUS_READER, value, 2)
+            if refused == 0 and list.len(ids_body(dev.features, value)) < 2
+                refused = att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+        if refused != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handle, refused)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if access != 0 or list.len(out) == 0 or (out[0][0] as Int) != att.ATT_OP_WRITE_RSP
+        return out
+    if ids_e2e(dev.features)
+        dev.rx[COUNTER_STATUS_READER] = value[list.len(value) - 3] as Int
+    let body = ids_body(dev.features, value)
+    let reply = ids_reader_execute(config, var dev, wire.get(body, 0, 2), body[2:])
+    if gatt_server.set_value(var db, handles.reader as Int, reply)
+        list.append(out, gatt_server.send_value(var db, var link, handles.reader as Int, now_ms))
+    out
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn full_config() -> IdsConfig
+    IdsConfig {
+        access: gatt_server.Access.Authenticated, features: 0x00FFFE, concentration: wire.sfloat(100, 0), features_indicate: true,
+        get_counter: true, get_delivered: true }
+
+@tier(app)
+fn e2e_config() -> IdsConfig
+    IdsConfig {
+        access: gatt_server.Access.Authenticated, features: 0x00FFFF, concentration: wire.sfloat(100, 0), features_indicate: true,
+        get_counter: true, get_delivered: true }
+
+@tier(app)
+fn device_for(config: IdsConfig) -> IdsDevice
+    new_ids_device(config.features)
+
+@tier(app)
+fn server(config: IdsConfig, dev: IdsDevice) -> (GattServer, IdsHandles)
+    var s = gatt_server.new_server([], 247)
+    let h = add_ids_service(var s.db, config, dev)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    gatt_server.set_mtu(var s.link, 0, 247)
+    (s, h)
+
+// A bolus the full Features allow: Extended, programmed 2.0 IU over 60 minutes after 5 minutes.
+@tier(app)
+fn sample_bolus(id: Int) -> IdsBolus
+    IdsBolus {
+        id: id, bolus_type: BOLUS_TYPE_MULTIWAVE, template: 3, activation: BOLUS_ACTIVATION_MANUAL,
+        programmed: IdsBolusAmounts { fast: wire.sfloat(1, 0), extended: wire.sfloat(2, 0), duration: 60, delay: 5 },
+        remaining: IdsBolusAmounts { fast: wire.sfloat(5, -1), extended: wire.sfloat(2, 0), duration: 55, delay: 0 },
+        delivered: IdsBolusAmounts { fast: wire.sfloat(5, -1), extended: 0, duration: 5, delay: 0 } }
+
+// Write `value` to the Status Reader Control Point and return the PDUs the server sends.
+@tier(app)
+fn write_reader(var s: GattServer, var dev: IdsDevice, h: IdsHandles, config: IdsConfig, value: [u8]) -> [[u8]]
+    var pdu: [u8] = [0x12, (h.reader & 0xFF) as u8, (h.reader >>> 8) as u8]
+    list.append(pdu, value)
+    ids_receive(var s.db, var s.link, h, config, var dev, pdu, 0)
+
+// The value of a request: the Op Code (two octets), the Operand and, with E2E-Protection, the counter and the CRC.
+@tier(app)
+fn request(features: Int, op: Int, operand: [Int], counter: Int) -> [u8]
+    var body: [u8] = []
+    wire.put(var body, op, 2)
+    list.append(body, wire.octets(operand))
+    ids_protect(features, body, counter)

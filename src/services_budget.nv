@@ -1,0 +1,34 @@
+// src/services_budget.nv — the RAM the Device Information, Battery and HID Services add up to, from their limits.
+//
+// The keys of this package's configuration (`noble_services_config`, schema in novo.toml) name the capacities
+// of the storage a session holds for the Device Information, Battery and HID Services, and this module adds
+// that storage up.  The test asserts that the sum equals `noble_services_config.budget_bytes()`, the total the
+// `bytes_expr` fields of the schema give (`novo config explain` prints it).  The Battery Service's levels,
+// whose cost multiplies `max_connections`, are added up in the package noble (`budget`), because a cost
+// formula reads only the keys of its own schema (docs/config.md, Cost formulas).
+//
+// The record sizes below are those of the schema's `bytes_expr` fields.
+
+use std.test
+use noble_services_config
+
+// The BTP Device Information, Battery and HID Services (btp/btp_profiles.nv): the handles of the three
+// services, the owned ranges and the registers of the commands, and the handles of one HID Report.
+const PRF_BTP_FIXED = 512
+const PRF_REPORT_HANDLES = 64
+
+// The BTP face of the Device Information, Battery and HID Services, where `noble_services_config.MAX_PROFILES_BTP`
+// asks for it.
+@tier(embedded)
+const fn profiles_btp_bytes() -> Int
+    if noble_services_config.MAX_PROFILES_BTP then PRF_BTP_FIXED + noble_services_config.MAX_HID_REPORTS * PRF_REPORT_HANDLES else 0
+
+// The storage of the keys of this package's schema, in bytes.
+@tier(embedded)
+const fn total_bytes() -> Int
+    profiles_btp_bytes()
+
+// The storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
+assert_const(total_bytes() == noble_services_config.budget_bytes(), "noble-services: services_budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")
+// The profiles keep their minimum.
+assert_const(noble_services_config.MAX_HID_REPORTS >= 3, "noble-services: MAX_HID_REPORTS must be at least 3")

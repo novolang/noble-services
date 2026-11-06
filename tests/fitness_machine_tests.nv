@@ -1,0 +1,463 @@
+// tests/fitness_machine_tests.nv — the unit tests of src/fitness_machine.nv.
+//
+//   novo test tests/fitness_machine_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use wire
+use fitness_machine.{ ERR_CCCD_IMPROPERLY_CONFIGURED, ERR_PROCEDURE_ALREADY_IN_PROGRESS, ExpendedEnergy, FITNESS_TYPE_INDOOR_BIKE, FITNESS_TYPE_ROWER, FITNESS_TYPE_TREADMILL, FitnessMachineConfig, FitnessMachineHandles, FitnessMachineState, FitnessRange, FitnessRanges, IndoorBikeData, MACHINE_AVERAGE_SPEED, MACHINE_HEART_RATE, MACHINE_POWER_MEASUREMENT, TARGET_HEART_RATE, TARGET_INCLINATION, TARGET_POWER, TARGET_RESISTANCE, TARGET_SPEED, TRAINING_COOL_DOWN, TRAINING_FITNESS_TEST, TRAINING_HIGH_INTENSITY_INTERVAL, TRAINING_POST_WORKOUT, TRAINING_RECOVERY_INTERVAL, TRAINING_WARMING_UP, TreadmillData, add_fitness_machine_service, bike_speed_only, default_indoor_bike_config, default_treadmill_config, encrypted_control_point_cccd, fitness_control_permission_lost, fitness_control_point_outcome, fitness_handle_control_point, fitness_link_lost, fitness_machine_feature_value, fitness_machine_service_data, fitness_state_for, fitness_status_notify, fitness_stopped_by_safety_key, full_ranges, indoor_bike_data_records, indoor_bike_data_value, indoor_bike_notify, new_fitness_machine_state, secure, training_status_notify, training_status_value, treadmill_data_records, treadmill_data_value, treadmill_notify, treadmill_speed_only }
+
+fn added(var s: GattServer, config: FitnessMachineConfig) -> FitnessMachineHandles
+    match add_fitness_machine_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            FitnessMachineHandles {
+                service: 0, feature: 0, treadmill: 0, treadmill_cccd: 0, indoor_bike: 0, indoor_bike_cccd: 0,
+                training_status: 0, training_status_cccd: 0, control_point: 0, control_point_cccd: 0, status: 0, status_cccd: 0,
+                speed_range: 0, inclination_range: 0, resistance_range: 0, power_range: 0, heart_rate_range: 0 }
+
+fn request(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+fn all_targets() -> Int
+    TARGET_SPEED | TARGET_INCLINATION | TARGET_RESISTANCE | TARGET_POWER | TARGET_HEART_RATE
+
+// Subscribe to what a client of the control point subscribes to.
+fn subscribe_all(var s: GattServer, h: FitnessMachineHandles)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.status_cccd, [1, 0]), 0)[0], [0x13])
+
+// Write `value` to the control point, let the service answer, and confirm
+// the indication; the PDUs the service sent.
+fn exchange(var s: GattServer, h: FitnessMachineHandles, var state: FitnessMachineState, value: [Int]) -> [[u8]]
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, value), 0)[0], [0x13])
+    let out = fitness_handle_control_point(var s.db, var s.link, h, var state, 0)
+    let _ = gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+    out
+
+@test
+fn test_feature_value()
+    test.assert(fitness_machine_feature_value(MACHINE_AVERAGE_SPEED | MACHINE_HEART_RATE, TARGET_SPEED | TARGET_RESISTANCE)
+        == [0x01, 0x04, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00])
+
+@test
+fn test_treadmill_data_values()
+    test.assert_eq(treadmill_data_value(treadmill_speed_only(1000)), [0x00, 0x00, 0xE8, 0x03])
+    let d = TreadmillData {
+        speed: 1000, average_speed: 900, total_distance: 0x010203, has_inclination: true, inclination: -15, ramp_angle: 20,
+        has_energy: true, energy: ExpendedEnergy { total: 100, per_hour: 600, per_minute: 10 }, heart_rate: 140,
+        elapsed_time: 300, remaining_time: 60 }
+    // Flags 0x0002 | 0x0004 | 0x0008 | 0x0080 | 0x0100 | 0x0400 | 0x0800 = 0x0D8E.
+    test.assert(treadmill_data_value(d) == [
+        0x8E, 0x0D, 0xE8, 0x03, 0x84, 0x03, 0x03, 0x02, 0x01, 0xF1, 0xFF, 0x14, 0x00,
+        100, 0, 0x58, 0x02, 10, 140, 0x2C, 0x01, 60, 0])
+
+@test
+fn test_indoor_bike_data_values()
+    test.assert_eq(indoor_bike_data_value(bike_speed_only(2500)), [0x00, 0x00, 0xC4, 0x09])
+    let d = IndoorBikeData {
+        speed: 2500, average_speed: 2400, cadence: 180, average_cadence: 170, total_distance: 5000, has_power: true,
+        power: 200, average_power: 190, has_energy: true, energy: ExpendedEnergy { total: 50, per_hour: 700, per_minute: 12 },
+        heart_rate: 130, elapsed_time: 120, remaining_time: 0 }
+    // Flags 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x0800 | 0x1000 = 0x1BDE.
+    test.assert(indoor_bike_data_value(d) == [
+        0xDE, 0x1B, 0xC4, 0x09, 0x60, 0x09, 180, 0, 170, 0, 0x88, 0x13, 0x00, 200, 0, 190, 0,
+        50, 0, 0xBC, 0x02, 12, 130, 120, 0, 0, 0])
+    // Power without an average.
+    let p = IndoorBikeData {
+        speed: 0, average_speed: -1, cadence: -1, average_cadence: -1, total_distance: -1, has_power: true,
+        power: -5, average_power: -1, has_energy: false, energy: ExpendedEnergy { total: 0, per_hour: 0, per_minute: 0 },
+        heart_rate: -1, elapsed_time: -1, remaining_time: -1 }
+    test.assert_eq(indoor_bike_data_value(p), [0x40, 0x00, 0x00, 0x00, 0xFB, 0xFF])
+
+@test
+fn test_training_status_value()
+    test.assert_eq(training_status_value(TRAINING_WARMING_UP, [], 23), [0x00, 0x02])
+    test.assert_eq(training_status_value(TRAINING_FITNESS_TEST, wire.octets(['G' as Int, 'o' as Int]), 23), wire.octets([0x01, 0x08, 'G' as Int, 'o' as Int]))
+
+@test
+fn test_layout_of_a_treadmill()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(MACHINE_HEART_RATE, all_targets()))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.treadmill, 5)
+    test.assert_eq(h.treadmill_cccd, 6)
+    test.assert_eq(h.indoor_bike, 0)
+    test.assert_eq(h.training_status, 8)
+    test.assert_eq(h.training_status_cccd, 9)
+    test.assert_eq(h.control_point, 11)
+    test.assert_eq(h.control_point_cccd, 12)
+    test.assert_eq(h.status, 14)
+    test.assert_eq(h.status_cccd, 15)
+    // The five Supported Range characteristics follow, one for each target setting feature.
+    test.assert_eq(h.speed_range, 17)
+    test.assert_eq(h.inclination_range, 19)
+    test.assert_eq(h.resistance_range, 21)
+    test.assert_eq(h.power_range, 23)
+    test.assert_eq(h.heart_rate_range, 25)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.speed_range, []), 0)[0], [0x0B, 0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.resistance_range, []), 0)[0], [0x0B, 0x00, 0xFF, 0x01])
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, 16)].value[0] as Int, 0x02)
+    test.assert_eq(s.db.attributes[0].value, [0x26, 0x18])
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, 4)].value[0] as Int, 0x10)
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, 7)].value[0] as Int, 0x12)
+    test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, 10)].value[0] as Int, 0x28)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0], [0x0B, 0x00, 0x04, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.training_status, []), 0)[0], [0x0B, 0x00, 0x01])
+    // A bike with neither training status nor control point.
+    var bike = gatt_server.new_server([], 65)
+    let config = FitnessMachineConfig {
+        machine_features: 0, target_features: 0, ranges: full_ranges(), read: gatt_server.Access.Open, treadmill: false,
+        indoor_bike: true, training_status: false, control_point: false, data_cccd: gatt_server.open_permissions(),
+        control_point_write: gatt_server.Access.Denied, control_point_cccd: gatt_server.open_permissions() }
+    let b = added(var bike, config)
+    test.assert_eq(b.indoor_bike, 5)
+    test.assert_eq(b.training_status, 0)
+    test.assert_eq(b.control_point, 0)
+    test.assert_eq(b.status, 0)
+    test.assert_eq(b.speed_range, 0)
+    test.assert_eq(gatt_server.last_handle(bike.db), 6)
+    var st = new_fitness_machine_state(0)
+    test.assert_eq(list.len(fitness_handle_control_point(var bike.db, var bike.link, b, var st, 0)), 0)
+    test.assert_eq(list.len(treadmill_notify(var bike.db, var bike.link, b, treadmill_speed_only(1), 0)), 0)
+    test.assert_eq(list.len(training_status_notify(var bike.db, var bike.link, b, 1, [], 0)), 0)
+    test.assert_eq(list.len(fitness_status_notify(var bike.db, var bike.link, b, [1], 0)), 0)
+
+@test
+fn test_data_and_training_status_notifications()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_indoor_bike_config(MACHINE_POWER_MEASUREMENT, 0))
+    test.assert_eq(list.len(indoor_bike_notify(var s.db, var s.link, h, bike_speed_only(2000), 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.indoor_bike_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(indoor_bike_notify(var s.db, var s.link, h, bike_speed_only(2000), 0)[0], [0x1B, 0x05, 0x00, 0x00, 0x00, 0xD0, 0x07])
+    // The data cannot be read; the training status can, and notifies.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.indoor_bike, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(list.len(training_status_notify(var s.db, var s.link, h, TRAINING_HIGH_INTENSITY_INTERVAL, [], 0)), 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.training_status, []), 0)[0], [0x0B, 0x00, 0x04])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.training_status_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(training_status_notify(var s.db, var s.link, h, TRAINING_RECOVERY_INTERVAL, [], 0)[0], [0x1B, 0x08, 0x00, 0x00, 0x05])
+    let t = default_treadmill_config(0, 0)
+    var ts = gatt_server.new_server([], 65)
+    let th = added(var ts, t)
+    let _ = gatt_server.receive(var ts.db, var ts.link, request(0x12, th.treadmill_cccd, [1, 0]), 0)
+    test.assert_eq(list.len(treadmill_notify(var ts.db, var ts.link, th, treadmill_speed_only(900), 0)), 1)
+
+@test
+fn test_control_point_session()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(MACHINE_HEART_RATE, all_targets()))
+    var st = new_fitness_machine_state(all_targets())
+    secure(var s)
+    // Without indications the write is refused.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0][4] as Int, ERR_CCCD_IMPROPERLY_CONFIGURED)
+    subscribe_all(var s, h)
+    // Before Request Control every procedure is refused.
+    let denied = exchange(var s, h, var st, [0x07])
+    test.assert_eq(list.len(denied), 1)
+    test.assert_eq(denied[0], [0x1D, 0x0B, 0x00, 0x80, 0x07, 0x05])
+    test.assert_eq(st.running, false)
+    // Request Control.
+    let granted = exchange(var s, h, var st, [0x00])
+    test.assert_eq(granted[0], [0x1D, 0x0B, 0x00, 0x80, 0x00, 0x01])
+    test.assert(st.control_granted)
+    // Set Target Speed 8.00 km/h: the response, then the status.
+    let speed = exchange(var s, h, var st, [0x02, 0x20, 0x03])
+    test.assert_eq(list.len(speed), 2)
+    test.assert_eq(speed[0], [0x1D, 0x0B, 0x00, 0x80, 0x02, 0x01])
+    test.assert_eq(speed[1], [0x1B, 0x0E, 0x00, 0x05, 0x20, 0x03])
+    test.assert_eq(st.target_speed, 800)
+    // Inclination, resistance, power and heart rate.
+    test.assert_eq(exchange(var s, h, var st, [0x03, 0xF6, 0xFF])[1], [0x1B, 0x0E, 0x00, 0x06, 0xF6, 0xFF])
+    test.assert_eq(st.target_inclination, -10)
+    test.assert(st.target_inclination_set)
+    // The request holds the level as a UINT8, the status as a SINT16.
+    test.assert_eq(exchange(var s, h, var st, [0x04, 25])[1], [0x1B, 0x0E, 0x00, 0x07, 25, 0])
+    test.assert_eq(st.target_resistance, 25)
+    test.assert_eq(exchange(var s, h, var st, [0x05, 0xC8, 0x00])[1], [0x1B, 0x0E, 0x00, 0x08, 0xC8, 0x00])
+    test.assert_eq(st.target_power, 200)
+    test.assert_eq(exchange(var s, h, var st, [0x06, 150])[1], [0x1B, 0x0E, 0x00, 0x09, 150])
+    test.assert_eq(st.target_heart_rate, 150)
+    // Start, Pause, Resume and Stop.
+    test.assert_eq(exchange(var s, h, var st, [0x07])[1], [0x1B, 0x0E, 0x00, 0x04])
+    test.assert(st.running)
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x02])[1], [0x1B, 0x0E, 0x00, 0x02, 0x02])
+    test.assert_eq(st.running, false)
+    test.assert(st.paused)
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x07])), 2)
+    test.assert_eq(st.paused, false)
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x01])[1], [0x1B, 0x0E, 0x00, 0x02, 0x01])
+    test.assert_eq(st.paused, false)
+    // Reset clears the targets and ends the control.
+    test.assert_eq(exchange(var s, h, var st, [0x01])[1], [0x1B, 0x0E, 0x00, 0x01])
+    test.assert_eq(st.target_speed, -1)
+    test.assert_eq(st.target_power_set, false)
+    test.assert_eq(st.control_granted, false)
+    test.assert_eq(exchange(var s, h, var st, [0x07])[0], [0x1D, 0x0B, 0x00, 0x80, 0x07, 0x05])
+
+@test
+fn test_control_point_refusals()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(0, TARGET_SPEED))
+    var st = new_fitness_machine_state(TARGET_SPEED)
+    secure(var s)
+    subscribe_all(var s, h)
+    let _ = exchange(var s, h, var st, [0x00])
+    // Wrong lengths: Invalid Parameter, no status.
+    let short = exchange(var s, h, var st, [0x02, 0x20])
+    test.assert_eq(list.len(short), 1)
+    test.assert_eq(short[0], [0x1D, 0x0B, 0x00, 0x80, 0x02, 0x03])
+    test.assert_eq(st.target_speed, -1)
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x03])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x03])
+    test.assert_eq(exchange(var s, h, var st, [0x08])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x03])
+    // Start of a machine that runs, Stop or Pause of one that does not: Operation Failed.
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x01])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x04])
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x02])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x04])
+    test.assert_eq(exchange(var s, h, var st, [0x07])[0], [0x1D, 0x0B, 0x00, 0x80, 0x07, 0x01])
+    test.assert_eq(exchange(var s, h, var st, [0x07])[0], [0x1D, 0x0B, 0x00, 0x80, 0x07, 0x04])
+    // A paused machine can be stopped, but not paused again.
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x02])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x01])
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x02])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x04])
+    test.assert_eq(exchange(var s, h, var st, [0x08, 0x01])[0], [0x1D, 0x0B, 0x00, 0x80, 0x08, 0x01])
+    // A target the machine does not offer, an opcode it does not know.
+    test.assert_eq(exchange(var s, h, var st, [0x05, 0x10, 0x00])[0], [0x1D, 0x0B, 0x00, 0x80, 0x05, 0x02])
+    test.assert_eq(exchange(var s, h, var st, [0x42])[0], [0x1D, 0x0B, 0x00, 0x80, 0x42, 0x02])
+    test.assert_eq(fitness_control_point_outcome(var st, []).response, [0x80, 0x00, 0x02])
+    // An unconfirmed indication holds the next write off.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0x07]), 0)[0], [0x13])
+    let _ = fitness_handle_control_point(var s.db, var s.link, h, var st, 0)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0x07]), 0)[0][4] as Int, ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+
+@test
+fn test_control_permission_lost()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(0, 0))
+    var st = new_fitness_machine_state(0)
+    secure(var s)
+    subscribe_all(var s, h)
+    let _ = exchange(var s, h, var st, [0x00])
+    let lost = fitness_control_permission_lost(var s.db, var s.link, h, var st, 0)
+    test.assert_eq(lost[0], [0x1B, 0x0E, 0x00, 0xFF])
+    test.assert_eq(st.control_granted, false)
+
+@test
+fn test_targets_outside_the_supported_range_are_invalid()
+    let ranges = FitnessRanges {
+        speed: FitnessRange { minimum: 100, maximum: 2000, increment: 10 },
+        inclination: FitnessRange { minimum: -50, maximum: 150, increment: 5 },
+        resistance: FitnessRange { minimum: 10, maximum: 100, increment: 10 },
+        power: FitnessRange { minimum: 25, maximum: 400, increment: 5 },
+        heart_rate: FitnessRange { minimum: 60, maximum: 200, increment: 1 } }
+    var s = gatt_server.new_server([], 65)
+    let config = FitnessMachineConfig {
+        machine_features: 0, target_features: all_targets(), ranges: ranges, read: gatt_server.Access.Open, treadmill: true,
+        indoor_bike: false, training_status: true, control_point: true, data_cccd: gatt_server.open_permissions(),
+        control_point_write: gatt_server.Access.Encrypted, control_point_cccd: encrypted_control_point_cccd() }
+    let h = added(var s, config)
+    var st = fitness_state_for(config)
+    secure(var s)
+    subscribe_all(var s, h)
+    let _ = exchange(var s, h, var st, [0x00])
+    // The range characteristics carry the minimum, the maximum and the increment.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.speed_range, []), 0)[0], [0x0B, 100, 0, 0xD0, 0x07, 10, 0])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.inclination_range, []), 0)[0], [0x0B, 0xCE, 0xFF, 150, 0, 5, 0])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.heart_rate_range, []), 0)[0], [0x0B, 60, 200, 1])
+    // Each target one step beyond a bound is Invalid Parameter, without a status; the bounds are accepted.
+    test.assert_eq(exchange(var s, h, var st, [0x02, 99, 0])[0], [0x1D, 0x0B, 0x00, 0x80, 0x02, 0x03])
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x02, 0xD1, 0x07])), 1)
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x02, 0xD0, 0x07])), 2)
+    test.assert_eq(exchange(var s, h, var st, [0x03, 0xCD, 0xFF])[0], [0x1D, 0x0B, 0x00, 0x80, 0x03, 0x03])
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x03, 0xCE, 0xFF])), 2)
+    test.assert_eq(exchange(var s, h, var st, [0x04, 9])[0], [0x1D, 0x0B, 0x00, 0x80, 0x04, 0x03])
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x04, 10])), 2)
+    test.assert_eq(exchange(var s, h, var st, [0x05, 24, 0])[0], [0x1D, 0x0B, 0x00, 0x80, 0x05, 0x03])
+    test.assert_eq(exchange(var s, h, var st, [0x05, 0x91, 0x01])[0], [0x1D, 0x0B, 0x00, 0x80, 0x05, 0x03])
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x05, 0x90, 0x01])), 2)
+    test.assert_eq(exchange(var s, h, var st, [0x06, 59])[0], [0x1D, 0x0B, 0x00, 0x80, 0x06, 0x03])
+    test.assert_eq(list.len(exchange(var s, h, var st, [0x06, 200])), 2)
+    test.assert_eq(st.target_heart_rate, 200)
+
+@test
+fn test_reset_sets_the_training_status_to_idle()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(0, 0))
+    var st = new_fitness_machine_state(0)
+    secure(var s)
+    subscribe_all(var s, h)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.training_status_cccd, [1, 0]), 0)[0], [0x13])
+    let _ = exchange(var s, h, var st, [0x00])
+    let _ = training_status_notify(var s.db, var s.link, h, TRAINING_WARMING_UP, [], 0)
+    let reset = exchange(var s, h, var st, [0x01])
+    test.assert_eq(list.len(reset), 3)
+    test.assert_eq(reset[2], [0x1B, 0x08, 0x00, 0x00, 0x01])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.training_status, []), 0)[0], [0x0B, 0x00, 0x01])
+
+@test
+fn test_a_long_record_is_split_with_the_more_data_bit()
+    let d = TreadmillData {
+        speed: 1000, average_speed: 900, total_distance: 0x010203, has_inclination: true, inclination: -15, ramp_angle: 20,
+        has_energy: true, energy: ExpendedEnergy { total: 100, per_hour: 600, per_minute: 10 }, heart_rate: 140,
+        elapsed_time: 300, remaining_time: 60 }
+    // Twenty octets carry the flags and 18 of the fields. The fields need 19 and the speed 2, so the
+    // first value takes all the fields that fit and the last the remaining time and the speed.
+    let two = treadmill_data_records(d, 20)
+    test.assert_eq(list.len(two), 2)
+    // First value: More Data set, the bits of the six fields it holds, and no speed.
+    test.assert_eq(two[0], [0x8F, 0x05, 0x84, 0x03, 0x03, 0x02, 0x01, 0xF1, 0xFF, 0x14, 0x00, 100, 0, 0x58, 0x02, 10, 140, 0x2C, 0x01])
+    // The last value: More Data clear, the remaining time bit, the speed, then the field.
+    test.assert_eq(two[1], [0x00, 0x08, 0xE8, 0x03, 60, 0])
+    // A value that fits is one value with the bit clear.
+    test.assert_eq(list.len(treadmill_data_records(d, 40)), 1)
+    // A record of a speed only fits any payload of four octets.
+    test.assert_eq(list.len(treadmill_data_records(treadmill_speed_only(1), 4)), 1)
+    // Over the link: the notifications follow one another at the ATT_MTU in force.
+    var s = gatt_server.new_server([], 23)
+    let h = added(var s, default_treadmill_config(0, 0))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.treadmill_cccd, [1, 0]), 0)[0], [0x13])
+    let sent = treadmill_notify(var s.db, var s.link, h, d, 0)
+    test.assert_eq(list.len(sent), 2)
+    test.assert_eq(sent[0][0] as Int, 0x1B)
+    test.assert_eq(sent[0][3] as Int & 0x01, 1)
+    test.assert_eq(sent[1][3] as Int & 0x01, 0)
+    // The same for a bike.
+    let b = IndoorBikeData {
+        speed: 2500, average_speed: 2400, cadence: 180, average_cadence: 170, total_distance: 5000, has_power: true,
+        power: 200, average_power: 190, has_energy: true, energy: ExpendedEnergy { total: 50, per_hour: 700, per_minute: 12 },
+        heart_rate: 130, elapsed_time: 120, remaining_time: 0 }
+    let parts = indoor_bike_data_records(b, 20)
+    test.assert_eq(list.len(parts), 2)
+    test.assert_eq(parts[0][0] as Int & 0x01, 1)
+    test.assert_eq(parts[1][0] as Int & 0x01, 0)
+    test.assert(parts[1][2] == [0xC4][0] and parts[1][3] == [0x09][0])
+
+@test
+fn test_data_not_available_and_training_status_extended_string()
+    // A negative energy field is Data Not Available.
+    let na = IndoorBikeData {
+        speed: 0, average_speed: -1, cadence: -1, average_cadence: -1, total_distance: -1, has_power: false,
+        power: 0, average_power: 0, has_energy: true, energy: ExpendedEnergy { total: -1, per_hour: -1, per_minute: -1 },
+        heart_rate: -1, elapsed_time: -1, remaining_time: -1 }
+    test.assert_eq(indoor_bike_data_value(na), [0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    // A string longer than the ATT_MTU less 5 octets sets the Extended String bit.
+    var text: [u8] = []
+    for _ in 0..18
+        list.push(text, 'x')
+    test.assert_eq(training_status_value(TRAINING_COOL_DOWN, text, 23)[0] as Int, 0x01)
+    list.push(text, 'x')
+    test.assert_eq(training_status_value(TRAINING_COOL_DOWN, text, 23)[0] as Int, 0x03)
+    test.assert_eq(training_status_value(TRAINING_COOL_DOWN, text, 64)[0] as Int, 0x01)
+    test.assert_eq(training_status_value(TRAINING_POST_WORKOUT, [], 23)[1] as Int, 0x0F)
+
+@test
+fn test_service_data_and_the_safety_key()
+    let sd = fitness_machine_service_data(true, FITNESS_TYPE_TREADMILL | FITNESS_TYPE_INDOOR_BIKE)
+    test.assert_eq(sd, [0x06, 0x16, 0x26, 0x18, 0x01, 0x21, 0x00])
+    test.assert_eq(fitness_machine_service_data(false, FITNESS_TYPE_ROWER), [0x06, 0x16, 0x26, 0x18, 0x00, 0x10, 0x00])
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_treadmill_config(0, 0))
+    var st = new_fitness_machine_state(0)
+    secure(var s)
+    subscribe_all(var s, h)
+    let _ = exchange(var s, h, var st, [0x00])
+    let _ = exchange(var s, h, var st, [0x07])
+    test.assert(st.running)
+    test.assert_eq(fitness_stopped_by_safety_key(var s.db, var s.link, h, var st, 0)[0], [0x1B, 0x0E, 0x00, 0x03])
+    test.assert_eq(st.running, false)
+
+@test
+fn test_control_ends_with_the_link()
+    var st = new_fitness_machine_state(TARGET_SPEED)
+    let _ = fitness_control_point_outcome(var st, [0x00])
+    let _ = fitness_control_point_outcome(var st, [0x02, 0x20, 0x03])
+    let _ = fitness_control_point_outcome(var st, [0x07])
+    test.assert(st.control_granted)
+    fitness_link_lost(var st)
+    test.assert_eq(st.control_granted, false)
+    // The machine's session goes on; a procedure needs the control again.
+    test.assert(st.running)
+    test.assert_eq(st.target_speed, 800)
+    test.assert_eq(fitness_control_point_outcome(var st, [0x07]).response, [0x80, 0x07, 0x05])
+
+@test
+fn test_control_point_needs_security_level_2()
+    // The defaults ask for an encrypted link, for the write and for the descriptor.
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_indoor_bike_config(0, TARGET_SPEED))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // The data and the status stay open to any link (level 1).
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.indoor_bike_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.status_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][0] as Int, 0x0B)
+    secure(var s)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0], [0x13])
+
+fn refused(access: gatt_server.Access, read: gatt_server.Access) -> Bool
+    var s = gatt_server.new_server([], 65)
+    let config = FitnessMachineConfig {
+        machine_features: 0, target_features: 0, ranges: full_ranges(), read: read, treadmill: true, indoor_bike: false,
+        training_status: true, control_point: true,
+        data_cccd: gatt_server.open_permissions(), control_point_write: access, control_point_cccd: gatt_server.open_permissions() }
+    match add_fitness_machine_service(var s.db, config)
+        Ok(_) => false
+        Err(e) => e == profile_builder.ProfileError.NotPermitted
+
+@test
+fn test_a_configuration_the_profile_forbids_is_refused()
+    let open = gatt_server.Access.Open
+    // A control point below level 2.
+    test.assert(refused(gatt_server.Access.Open, open))
+    test.assert(refused(gatt_server.Access.Authorized, open))
+    test.assert(refused(gatt_server.Access.Denied, open))
+    test.assert_eq(refused(gatt_server.Access.Encrypted, open), false)
+    test.assert_eq(refused(gatt_server.Access.Authenticated, open), false)
+    test.assert_eq(refused(gatt_server.Access.SecureConnections, open), false)
+    // The Feature and the Training Status must be readable.
+    test.assert(refused(gatt_server.Access.Encrypted, gatt_server.Access.Denied))
+    // Without a control point its access does not matter.
+    var s = gatt_server.new_server([], 65)
+    let config = FitnessMachineConfig {
+        machine_features: 0, target_features: 0, ranges: full_ranges(), read: gatt_server.Access.Open, treadmill: false,
+        indoor_bike: true, training_status: true, control_point: false, data_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Denied,
+        control_point_cccd: gatt_server.open_permissions() }
+    let h = added(var s, config)
+    test.assert_eq(h.control_point, 0)
+    test.assert(h.training_status != 0)
+
+@test
+fn test_permissions_are_enforced_per_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let config = FitnessMachineConfig {
+        machine_features: 0, target_features: 0, ranges: full_ranges(), read: gatt_server.Access.Encrypted, treadmill: true,
+        indoor_bike: false, training_status: true, control_point: true,
+        data_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authenticated },
+        control_point_write: gatt_server.Access.SecureConnections,
+        control_point_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted } }
+    let h = added(var s, config)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.treadmill_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.feature, []), 0)[0][0] as Int, 0x0B)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.treadmill_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.treadmill_cccd, [1, 0]), 0)[0], [0x13])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0], [0x13])
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, FitnessMachineConfig {
+        machine_features: 0, target_features: 0, ranges: full_ranges(), read: gatt_server.Access.Authorized, treadmill: true,
+        indoor_bike: false, training_status: false, control_point: true, data_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Authorized },
+        control_point_write: gatt_server.Access.Encrypted, control_point_cccd: gatt_server.open_permissions() })
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.treadmill_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)

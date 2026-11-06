@@ -1,0 +1,606 @@
+// tests/reconnection_configuration_tests.nv — the unit tests of src/reconnection_configuration.nv.
+//
+//   novo test tests/reconnection_configuration_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use sensor_control
+use fixtures.{ req }
+use wire
+use reconnection_configuration.{ ERR_INVALID_CRC, ERR_MISSING_CRC, FILTER_TIMER_NONE, F_ADV_CONFIG_1, F_ADV_CONFIG_2, F_ADV_CONFIG_3, F_ADV_CONFIG_4, F_DEFINED, F_E2E_CRC, F_ENABLE_DISCONNECT, F_PROPOSE_INTERVAL, F_PROPOSE_LATENCY, F_READY_FOR_DISCONNECT, KEEP, NO_CLIENT, OP_ACTIVATE_STORED, OP_ENABLE_DISCONNECT, OP_GET_ACTUAL, OP_GET_FILTER_TIMER, OP_GET_MAX, OP_GET_MIN, OP_GET_STORED, OP_LESC_ONLY, OP_LIMITED_ACCESS, OP_OOB_PAIRING, OP_PARAMETER_RESPONSE, OP_PROPOSE_SETTINGS, OP_SET_ADVERTISEMENT, OP_SET_FILTER_TIMER, RESULT_DEVICE_BUSY, RESULT_INVALID_COMBINATION, RESULT_INVALID_OPERAND, RESULT_OPERATION_FAILED, RESULT_OP_CODE_NOT_SUPPORTED, RESULT_OUT_OF_RANGE, RESULT_PROPOSAL_ACCEPTED, RESULT_REJECTED, RESULT_SUCCESS, RcsConfig, RcsHandles, RcsPolicy, RcsState, S_LESC_ONLY, S_LIMITED_ACCESS, S_READY_FOR_DISCONNECT, S_USE_OOB, add_rcs_service, crc16, default_rcs_config, default_rcs_policy, new_rcs_state, rcs_client_forgotten, rcs_client_parameters, rcs_crc_error, rcs_feature_field, rcs_feature_value, rcs_features_changed, rcs_receive, rcs_set_bit, rcs_set_ready_for_disconnect, rcs_settings_value }
+
+struct Tag
+    var calls: [Int]
+    var busy_now: Bool
+    var disconnect_ok: Bool
+    var code: Int
+    var mask: Int
+    var advertise_ok: Bool
+    var apply_ok: Bool
+    var proposed: [Int]
+
+@tier(app)
+fn new_tag() -> Tag
+    Tag { calls: [], busy_now: false, disconnect_ok: true, code: RESULT_SUCCESS, mask: 0, advertise_ok: true, apply_ok: true, proposed: [] }
+
+impl RcsPolicy[] for Tag
+    @tier(app)
+    fn busy(var self) -> Bool
+        self.busy_now
+
+    @tier(app)
+    fn request_disconnect(var self) -> Bool
+        list.push(self.calls, OP_ENABLE_DISCONNECT)
+        self.disconnect_ok
+
+    @tier(app)
+    fn actual(var self) -> [Int]
+        [20, 24, 30, 2, 100, 64, 5, 10]
+
+    @tier(app)
+    fn stored(var self, set: Int) -> [Int]
+        [set * 10, 24, 24, 0, 100, 64, 3, 0]
+
+    @tier(app)
+    fn limit(var self, maximum: Bool) -> [Int]
+        if maximum then [20000, 3200, 3200, 499, 3200, 0x4000, 1000, 10000] else [0, 6, 6, 0, 10, 0x20, 1, 0]
+
+    @tier(app)
+    fn propose(var self, values: [Int]) -> (Int, Int)
+        list.push(self.calls, OP_PROPOSE_SETTINGS)
+        self.proposed = values[:]
+        (self.code, self.mask)
+
+    @tier(app)
+    fn activate(var self, set: Int) -> Int
+        list.push(self.calls, OP_ACTIVATE_STORED * 256 + set)
+        self.code
+
+    @tier(app)
+    fn advertise(var self, configuration: Int) -> Bool
+        list.push(self.calls, OP_SET_ADVERTISEMENT * 256 + configuration)
+        self.advertise_ok
+
+    @tier(app)
+    fn apply(var self, setting: Int, on: Bool) -> Bool
+        list.push(self.calls, 0x1000 + setting * 2 + (if on then 1 else 0))
+        self.apply_ok
+
+// A server on an encrypted link with the indications of both characteristics on.
+@tier(app)
+fn server(config: RcsConfig) -> (GattServer, RcsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_rcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    if h.control_point_cccd != 0
+        test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    if h.settings_cccd != 0
+        test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.settings_cccd, [1, 0]), 0)[0], [0x13])
+    (s, h)
+
+@tier(app)
+fn feature_config(features: Int) -> RcsConfig
+    RcsConfig {
+        features: features, extension: [], sets: 3, filter_min: 20, filter_max: 300,
+        changes: false, access: gatt_server.Access.Encrypted }
+
+// `rcs_receive` for the client with the identity `client`.
+@tier(app)
+fn receive_as<P: RcsPolicy[e]>(client: Int, var s: GattServer, h: RcsHandles, config: RcsConfig, var state: RcsState, var tag: P, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    gatt_server.set_identity(var s.link, client)
+    rcs_receive(var s.db, var s.link, h, config, var state, var tag, pdu, now_ms)
+
+// Write `value` to the control point as the client with the identity `client`
+// and return the PDUs.
+@tier(app)
+fn write_as(client: Int, var s: GattServer, h: RcsHandles, config: RcsConfig, var state: RcsState, var tag: Tag, value: [Int]) -> [[u8]] [mutate]
+    receive_as(client, var s, h, config, var state, var tag, req(0x12, h.control_point, value), 0)
+
+// Write, check the Write Response, confirm the indication and return the
+// indicated value (the handle and opcode of the indication taken off).
+@tier(app)
+fn step(var s: GattServer, h: RcsHandles, config: RcsConfig, var state: RcsState, var tag: Tag, value: [Int]) -> [u8] [mutate]
+    let r = write_as(1, var s, h, config, var state, var tag, value)
+    test.assert_eq(list.len(r), 2)
+    test.assert_eq(r[0], [0x13])
+    test.assert_eq(r[1][0] as Int, 0x1D)
+    test.assert_eq(gatt_server.read_le16(r[1], 1), h.control_point)
+    let out = r[1][3:list.len(r[1])]
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    out
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_crc_is_the_one_of_the_specification()
+    test.assert_eq(crc16([0x3E, 1, 2, 3, 4, 5, 6, 7, 8, 9]), 0x2F01)
+    test.assert_eq(crc16([0x0E, 0x03, 0x01]), 0x12C9)
+    test.assert_eq(crc16([0x0E, 0x03, 0x09]), 0x9E81)
+    test.assert_eq(crc16([]), 0xFFFF)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_service_has_the_characteristics_table_3_1_asks_for()
+    let (s, h) = server(default_rcs_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.feature, 3)
+    test.assert_eq(h.settings, 5)
+    test.assert_eq(h.settings_cccd, 6)
+    test.assert_eq(h.control_point, 8)
+    test.assert_eq(h.control_point_cccd, 9)
+    test.assert_eq(h.feature_cccd, 0)
+    test.assert_eq(s.db.attributes[0].value, [0x29, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x02, 3, 0, 0x1D, 0x2B])
+    test.assert_eq(s.db.attributes[3].value, [0x12, 5, 0, 0x1E, 0x2B])
+    test.assert_eq(s.db.attributes[6].value, [0x28, 8, 0, 0x1F, 0x2B])
+    // No feature: RC Feature alone.
+    let (_, none) = server(feature_config(0))
+    test.assert_eq(none.settings, 0)
+    test.assert_eq(none.control_point, 0)
+    // A Propose feature: the control point, no settings.
+    let (_, propose) = server(feature_config(F_PROPOSE_INTERVAL))
+    test.assert_eq(propose.settings, 0)
+    test.assert(propose.control_point != 0)
+    // Ready for Disconnect: the settings, no control point.
+    let (_, ready) = server(feature_config(F_READY_FOR_DISCONNECT))
+    test.assert(ready.settings != 0)
+    test.assert_eq(ready.control_point, 0)
+    // One Advertisement Configuration needs neither, two need both.
+    let (_, one) = server(feature_config(F_ADV_CONFIG_1))
+    test.assert_eq(one.settings + one.control_point, 0)
+    let (_, two) = server(feature_config(F_ADV_CONFIG_1 | F_ADV_CONFIG_3))
+    test.assert(two.settings != 0 and two.control_point != 0)
+    // A value that can change has the Indicate property and a descriptor.
+    var changing = feature_config(F_ENABLE_DISCONNECT)
+    changing.changes = true
+    let (c, ch) = server(changing)
+    test.assert(ch.feature_cccd != 0)
+    test.assert_eq(c.db.attributes[1].value[0] as Int, 0x22)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_service_refuses_sets_and_extensions_it_cannot_hold()
+    var s = gatt_server.new_server([], 65)
+    var none = default_rcs_config()
+    none.sets = 0
+    match add_rcs_service(var s.db, none)
+        Ok(_) => test.fail("a service with no Parameter-Set 0 is refused")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    var many = default_rcs_config()
+    many.sets = 256
+    match add_rcs_service(var s.db, many)
+        Ok(_) => test.fail("255 sets at most")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    var inverted = default_rcs_config()
+    inverted.filter_min = 400
+    match add_rcs_service(var s.db, inverted)
+        Ok(_) => test.fail("the timer minimum is not above its maximum")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_feature_value_holds_the_crc_the_field_and_the_extension()
+    var config = default_rcs_config()
+    test.assert_eq(rcs_feature_value(config), [0xFF, 0xFF, 0xFE, 0xFF, 0x03])
+    let (s, h) = server(config)
+    var t = s
+    test.assert_eq(gatt_server.receive(var t.db, var t.link, req(0x0A, h.feature, []), 0)[0], [0x0B, 0xFF, 0xFF, 0xFE, 0xFF, 0x03])
+    // Reserved bits are sent as 0.
+    config.features = 0x7FFFFFF
+    test.assert_eq(rcs_feature_field(config), [0xFF, 0xFF, 0x03])
+    // E2E-CRC: the CRC of the field comes first.
+    config.features = F_DEFINED
+    let field = rcs_feature_field(config)
+    let value = rcs_feature_value(config)
+    test.assert_eq(list.len(value), 5)
+    test.assert_eq(wire.get(value, 0, 2), crc16(field))
+    test.assert_eq(value[2:5], field)
+    // The extension sets bit 23 and, but for the last octet, bit 31 and the following.
+    config.extension = [0x01]
+    test.assert_eq(rcs_feature_field(config), [0xFF, 0xFF, 0x83, 0x01])
+    config.extension = [0x01, 0x82, 0x05]
+    test.assert_eq(rcs_feature_field(config), [0xFF, 0xFF, 0x83, 0x81, 0x82, 0x05])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_settings_value_has_a_length_the_bits_and_the_access_permitted_of_the_owner()
+    var config = default_rcs_config()
+    var state = new_rcs_state()
+    test.assert_eq(rcs_settings_value(config, state, 1), [3, 0, 0])
+    rcs_set_bit(var state, S_LESC_ONLY, true)
+    rcs_set_bit(var state, S_USE_OOB, true)
+    rcs_set_bit(var state, S_READY_FOR_DISCONNECT, true)
+    state.mode = 3
+    test.assert_eq(rcs_settings_value(config, state, 1), [3, 0x16, 3])
+    // Limited Access: bit 6 for the client that set it, 0 for the others.
+    rcs_set_bit(var state, S_LIMITED_ACCESS, true)
+    state.owner = 1
+    test.assert_eq(rcs_settings_value(config, state, 1), [3, 0x76, 3])
+    test.assert_eq(rcs_settings_value(config, state, 2), [3, 0x36, 3])
+    // Access Permitted is ignored without Limited Access.
+    rcs_client_forgotten(var state, 1)
+    test.assert_eq(rcs_settings_value(config, state, 1), [3, 0x16, 3])
+    // E2E-CRC: a length of 5 and the CRC of the three octets.
+    config.features = config.features | F_E2E_CRC
+    let e2e = rcs_settings_value(config, state, 1)
+    test.assert_eq(list.len(e2e), 5)
+    test.assert_eq(e2e[0] as Int, 5)
+    test.assert_eq(wire.get(e2e, 3, 2), crc16(e2e[0:3]))
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_enable_disconnect_is_open_to_all_and_answers_busy_or_failed()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(step(var s, h, config, var state, var tag, [0x00]), [0x0E, 0x00, RESULT_SUCCESS])
+    tag.busy_now = true
+    test.assert_eq(step(var s, h, config, var state, var tag, [0x00]), [0x0E, 0x00, RESULT_DEVICE_BUSY])
+    tag.busy_now = false
+    tag.disconnect_ok = false
+    test.assert_eq(step(var s, h, config, var state, var tag, [0x00]), [0x0E, 0x00, RESULT_OPERATION_FAILED])
+    // An operand is invalid.
+    test.assert_eq(step(var s, h, config, var state, var tag, [0x00, 0x01]), [0x0E, 0x00, RESULT_INVALID_OPERAND])
+    // Under Limited Access held by client 7 it still answers client 1.
+    rcs_set_bit(var state, S_LIMITED_ACCESS, true)
+    state.owner = 7
+    tag.disconnect_ok = true
+    test.assert_eq(step(var s, h, config, var state, var tag, [0x00]), [0x0E, 0x00, RESULT_SUCCESS])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_get_actual_parameters_answers_a_client_parameter_indication_with_one_interval()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    let v = step(var s, h, config, var state, var tag, [0x01])
+    test.assert_eq(v, [0x11, 20, 0, 24, 0, 24, 0, 2, 0, 100, 0, 64, 0, 5, 0, 10, 0])
+    // The parameters of a feature the device lacks are 0xFFFF.
+    let few = feature_config(F_PROPOSE_INTERVAL)
+    var (t, g) = server(few)
+    let w = step(var t, g, few, var state, var tag, [0x01])
+    test.assert_eq(w, [0x11, 0xFF, 0xFF, 24, 0, 24, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_propose_settings_checks_each_field_then_asks_the_policy()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    // All kept but a latency of 4: the policy is asked and accepts.
+    tag.code = RESULT_PROPOSAL_ACCEPTED
+    var propose: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(propose, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert_eq(step(var s, h, config, var state, var tag, propose), [0x0E, 0x02, RESULT_PROPOSAL_ACCEPTED])
+    test.assert_eq(tag.proposed, [KEEP, KEEP, KEEP, 4, KEEP, KEEP, KEEP, KEEP])
+    // Advertising only: Success.
+    tag.code = RESULT_SUCCESS
+    var advertising: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(advertising, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x40, 0, 9, 0, 0, 0])
+    test.assert_eq(step(var s, h, config, var state, var tag, advertising), [0x0E, 0x02, RESULT_SUCCESS])
+    test.assert_eq(tag.proposed, [KEEP, KEEP, KEEP, KEEP, KEEP, 0x40, 9, 0])
+    // The policy refuses, or fails, or finds a combination at fault (bits 1 and 3).
+    tag.code = RESULT_REJECTED
+    test.assert_eq(step(var s, h, config, var state, var tag, advertising), [0x0E, 0x02, RESULT_REJECTED])
+    tag.code = RESULT_INVALID_COMBINATION
+    tag.mask = 0x0A
+    test.assert_eq(step(var s, h, config, var state, var tag, advertising), [0x0E, 0x02, RESULT_INVALID_COMBINATION, 0x0A])
+    // A code a proposal cannot have is Operation Failed.
+    tag.code = RESULT_DEVICE_BUSY
+    test.assert_eq(step(var s, h, config, var state, var tag, advertising), [0x0E, 0x02, RESULT_OPERATION_FAILED])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_a_proposal_out_of_range_names_the_fields_and_is_not_passed_on()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    // Minimum interval 0x0C81 (field 1) and latency 500 (field 3); the rest in range.
+    var bad: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(bad, [0xFF, 0xFF, 0x81, 0x0C, 0xFF, 0xFF, 0xF4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert_eq(step(var s, h, config, var state, var tag, bad), [0x0E, 0x02, RESULT_OUT_OF_RANGE, 0x0A])
+    // Minimum above maximum: both field bits.
+    var swapped: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(swapped, [0xFF, 0xFF, 40, 0, 20, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert_eq(step(var s, h, config, var state, var tag, swapped), [0x0E, 0x02, RESULT_OUT_OF_RANGE, 0x06])
+    // A field out of range for a feature the device lacks is ignored.
+    let few = feature_config(F_PROPOSE_INTERVAL)
+    var (t, g) = server(few)
+    var ignored: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(ignored, [0xFF, 0xFF, 10, 0, 20, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    tag.code = RESULT_PROPOSAL_ACCEPTED
+    test.assert_eq(step(var t, g, few, var state, var tag, ignored), [0x0E, 0x02, RESULT_PROPOSAL_ACCEPTED])
+    var lax: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(lax, [0xFF, 0xFF, 10, 0, 20, 0, 0xF4, 0x01, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(step(var t, g, few, var state, var tag, lax), [0x0E, 0x02, RESULT_PROPOSAL_ACCEPTED])
+    test.assert_eq(tag.proposed, [KEEP, 10, 20, KEEP, KEEP, KEEP, KEEP, KEEP])
+    // The bounds themselves are in range: timeout 20000 and 0xFFFE, interval 6 and 3200.
+    var edges: [Int] = [OP_PROPOSE_SETTINGS]
+    list.append(edges, [0x20, 0x4E, 6, 0, 0x80, 0x0C, 0xF3, 0x01, 10, 0, 0x20, 0, 1, 0, 0x10, 0x27])
+    tag.code = RESULT_SUCCESS
+    test.assert_eq(step(var s, h, config, var state, var tag, edges), [0x0E, 0x02, RESULT_SUCCESS])
+    // Wrong length is an invalid operand.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_PROPOSE_SETTINGS, 1, 2]), [0x0E, 0x02, RESULT_INVALID_OPERAND])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_activate_stored_settings_takes_a_set_the_device_has()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    tag.code = RESULT_PROPOSAL_ACCEPTED
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 0]), [0x0E, 0x03, RESULT_PROPOSAL_ACCEPTED])
+    tag.code = RESULT_SUCCESS
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 2]), [0x0E, 0x03, RESULT_SUCCESS])
+    test.assert_eq(tag.calls, [0x0300, 0x0302])
+    // Set 3 does not exist (the device has 0 to 2): Invalid Operand, the policy not asked.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 3]), [0x0E, 0x03, RESULT_INVALID_OPERAND])
+    test.assert_eq(list.len(tag.calls), 2)
+    tag.code = RESULT_REJECTED
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 1]), [0x0E, 0x03, RESULT_REJECTED])
+    tag.code = RESULT_OUT_OF_RANGE
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 1]), [0x0E, 0x03, RESULT_OPERATION_FAILED])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_limits_and_the_stored_values_answer_a_communication_parameter_response()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    let max = step(var s, h, config, var state, var tag, [OP_GET_MAX])
+    test.assert_eq(max, [0x0F, 0x04, 0x20, 0x4E, 0x80, 0x0C, 0x80, 0x0C, 0xF3, 0x01, 0x80, 0x0C, 0x00, 0x40, 0xE8, 0x03, 0x10, 0x27])
+    let min = step(var s, h, config, var state, var tag, [OP_GET_MIN])
+    test.assert_eq(min, [0x0F, 0x05, 0, 0, 6, 0, 6, 0, 0, 0, 10, 0, 0x20, 0, 1, 0, 0, 0])
+    let stored = step(var s, h, config, var state, var tag, [OP_GET_STORED, 2])
+    test.assert_eq(stored, [0x0F, 0x06, 20, 0, 24, 0, 24, 0, 0, 0, 100, 0, 64, 0, 3, 0, 0, 0])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_GET_STORED, 3]), [0x0E, 0x06, RESULT_INVALID_OPERAND])
+    // Parameters the device does not support are 0xFFFF.
+    let few = feature_config(F_PROPOSE_LATENCY)
+    var (t, g) = server(few)
+    let m = step(var t, g, few, var state, var tag, [OP_GET_MIN])
+    test.assert_eq(m, [0x0F, 0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_filter_accept_list_timer_takes_zero_none_or_a_value_in_range()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 27, 0, 0, 0]), [0x0E, 0x07, RESULT_SUCCESS])
+    test.assert_eq(state.filter_timer, 27)
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_GET_FILTER_TIMER]), [0x10, 27, 0, 0, 0, 20, 0, 0, 0, 0x2C, 0x01, 0, 0])
+    // 17 and 370 are out of the range 20 to 300, 20 and 300 are in.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 17, 0, 0, 0]), [0x0E, 0x07, RESULT_INVALID_OPERAND])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 0x72, 0x01, 0, 0]), [0x0E, 0x07, RESULT_INVALID_OPERAND])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 0x2C, 0x01, 0, 0]), [0x0E, 0x07, RESULT_SUCCESS])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 20, 0, 0, 0]), [0x0E, 0x07, RESULT_SUCCESS])
+    test.assert_eq(state.filter_timer, 20)
+    // 0 disables the list, 0xFFFFFFFE disables the timer.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 0, 0, 0, 0]), [0x0E, 0x07, RESULT_SUCCESS])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 0xFE, 0xFF, 0xFF, 0xFF]), [0x0E, 0x07, RESULT_SUCCESS])
+    test.assert_eq(state.filter_timer, FILTER_TIMER_NONE)
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_FILTER_TIMER, 1, 2]), [0x0E, 0x07, RESULT_INVALID_OPERAND])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_an_advertisement_configuration_is_one_the_device_supports()
+    let config = feature_config(F_ADV_CONFIG_1 | F_ADV_CONFIG_2 | F_ADV_CONFIG_4)
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_ADVERTISEMENT, 3]), [0x0E, 0x09, RESULT_SUCCESS])
+    test.assert_eq(state.mode, 3)
+    test.assert_eq(rcs_settings_value(config, state, 1), [3, 0, 3])
+    // Configuration 3 is not supported, 4 is the last value, 5 is reserved.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_ADVERTISEMENT, 2]), [0x0E, 0x09, RESULT_INVALID_OPERAND])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_ADVERTISEMENT, 4]), [0x0E, 0x09, RESULT_INVALID_OPERAND])
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_ADVERTISEMENT, 0xFF]), [0x0E, 0x09, RESULT_INVALID_OPERAND])
+    test.assert_eq(state.mode, 3)
+    tag.advertise_ok = false
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_SET_ADVERTISEMENT, 0]), [0x0E, 0x09, RESULT_OPERATION_FAILED])
+    test.assert_eq(state.mode, 3)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_lesc_and_oob_switches_set_the_settings_bits_when_the_policy_agrees()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_LESC_ONLY, 0xFF]), [0x0E, 0x0A, RESULT_SUCCESS])
+    test.assert((state.settings & S_LESC_ONLY) != 0)
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_OOB_PAIRING, 0xFF]), [0x0E, 0x0B, RESULT_SUCCESS])
+    test.assert((state.settings & S_USE_OOB) != 0)
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_LESC_ONLY, 0x00]), [0x0E, 0x0A, RESULT_SUCCESS])
+    test.assert_eq(state.settings, S_USE_OOB)
+    test.assert_eq(tag.calls, [0x1003, 0x1005, 0x1002])
+    // Any other operand is invalid and the policy is not asked.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_OOB_PAIRING, 0x01]), [0x0E, 0x0B, RESULT_INVALID_OPERAND])
+    test.assert_eq(list.len(tag.calls), 3)
+    tag.apply_ok = false
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_OOB_PAIRING, 0x00]), [0x0E, 0x0B, RESULT_OPERATION_FAILED])
+    test.assert_eq(state.settings, S_USE_OOB)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_limited_access_is_kept_by_the_client_that_set_it()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    let on = write_as(3, var s, h, config, var state, var tag, [OP_LIMITED_ACCESS, 0xFF])
+    test.assert_eq(on[0], [0x13])
+    test.assert_eq(on[1][3:list.len(on[1])], [0x0E, 0x0C, RESULT_SUCCESS])
+    test.assert_eq(state.owner, 3)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    // Another client reads Limited Access without Access Permitted, the owner with it.
+    let own = receive_as(3, var s, h, config, var state, var tag, req(0x0A, h.settings, []), 0)
+    test.assert_eq(own[0], [0x0B, 3, 0x60, 0])
+    let other = receive_as(4, var s, h, config, var state, var tag, req(0x0A, h.settings, []), 0)
+    test.assert_eq(other[0], [0x0B, 3, 0x20, 0])
+    // Every procedure that changes a setting from another client is Insufficient Authorization.
+    for body in [[OP_PROPOSE_SETTINGS], [OP_ACTIVATE_STORED, 0], [OP_SET_FILTER_TIMER, 0, 0, 0, 0], [OP_SET_ADVERTISEMENT, 0], [OP_LESC_ONLY, 0], [OP_OOB_PAIRING, 0], [OP_LIMITED_ACCESS, 0]]
+        let r = write_as(4, var s, h, config, var state, var tag, body)
+        test.assert_eq(r[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+        test.assert_eq(list.len(r), 1)
+    test.assert_eq(state.owner, 3)
+    test.assert_eq(list.len(tag.calls), 0)
+    // Reading, and Get procedures, are open to it.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_GET_MIN])[0] as Int, OP_PARAMETER_RESPONSE)
+    // The owner clears the bit; a bond deleted does too.
+    let off = write_as(3, var s, h, config, var state, var tag, [OP_LIMITED_ACCESS, 0x00])
+    test.assert_eq(off[0], [0x13])
+    test.assert_eq(state.owner, NO_CLIENT)
+    test.assert_eq(state.settings & S_LIMITED_ACCESS, 0)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    let again = write_as(4, var s, h, config, var state, var tag, [OP_LIMITED_ACCESS, 0xFF])
+    test.assert_eq(again[0], [0x13])
+    test.assert_eq(state.owner, 4)
+    rcs_client_forgotten(var state, 3)
+    test.assert_eq(state.owner, 4)
+    rcs_client_forgotten(var state, 4)
+    test.assert_eq(state.owner, NO_CLIENT)
+    test.assert_eq(state.settings & S_LIMITED_ACCESS, 0)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_an_unsupported_opcode_and_a_bad_operand_are_procedure_responses()
+    let config = feature_config(F_ENABLE_DISCONNECT)
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    // Every procedure the feature does not enable, the reserved 0x0D and the response opcodes.
+    for op in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0xFF]
+        test.assert_eq(step(var s, h, config, var state, var tag, [op]), wire.octets([0x0E, op, RESULT_OP_CODE_NOT_SUPPORTED]))
+    test.assert_eq(list.len(tag.calls), 0)
+    // A supported opcode with an operand of the wrong size.
+    test.assert_eq(step(var s, h, config, var state, var tag, [OP_ENABLE_DISCONNECT, 1]), [0x0E, 0x00, RESULT_INVALID_OPERAND])
+    // An empty write has no opcode.
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [])[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_control_point_needs_indications_and_waits_for_the_confirmation()
+    let config = default_rcs_config()
+    var s = gatt_server.new_server([], 65)
+    let h = add_rcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_GET_ACTUAL])[0][4] as Int, 0xFD)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point_cccd, [2, 0]), 0)[0], [0x13])
+    let first = write_as(1, var s, h, config, var state, var tag, [OP_GET_ACTUAL])
+    test.assert_eq(list.len(first), 2)
+    // The next write before the confirmation is refused.
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_GET_ACTUAL])[0][4] as Int, 0xFE)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    test.assert_eq(list.len(write_as(1, var s, h, config, var state, var tag, [OP_GET_ACTUAL])), 2)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_with_e2e_crc_the_control_point_checks_and_adds_the_crc()
+    let config = feature_config(F_DEFINED)
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var tag = new_tag()
+    tag.code = RESULT_SUCCESS
+    // Activate Stored Settings, set 0, with its CRC: the indication of the specification, 0E 03 01 C9 12.
+    let crc = crc16([OP_ACTIVATE_STORED, 0])
+    let ok = step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 0, crc & 0xFF, crc >>> 8])
+    test.assert_eq(ok, [0x0E, 0x03, 0x01, 0xC9, 0x12])
+    tag.code = RESULT_PROPOSAL_ACCEPTED
+    let accepted = step(var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 0, crc & 0xFF, crc >>> 8])
+    test.assert_eq(accepted, [0x0E, 0x03, 0x09, 0x81, 0x9E])
+    // A wrong CRC is 0x81, a missing one 0x80, and the policy is not asked.
+    let calls = list.len(tag.calls)
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 0, 0x00, 0x00])[0][4] as Int, ERR_INVALID_CRC)
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_ACTIVATE_STORED, 0])[0][4] as Int, ERR_MISSING_CRC)
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_ENABLE_DISCONNECT])[0][4] as Int, ERR_MISSING_CRC)
+    var propose: [Int] = [OP_PROPOSE_SETTINGS]
+    for _ in 0..16
+        list.push(propose, 0xFF)
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, propose)[0][4] as Int, ERR_MISSING_CRC)
+    test.assert_eq(list.len(tag.calls), calls)
+    // A response that is long: Get Max Values is 18 octets and a CRC.
+    let crc_get = crc16([OP_GET_MAX])
+    let max = step(var s, h, config, var state, var tag, [OP_GET_MAX, crc_get & 0xFF, crc_get >>> 8])
+    test.assert_eq(list.len(max), 20)
+    test.assert_eq(wire.get(max, 18, 2), crc16(max[0:18]))
+    // RC Settings carries a CRC too.
+    test.assert_eq(list.len(rcs_settings_value(config, state, 1)), 5)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_a_missing_crc_is_told_from_an_invalid_one_by_the_length_of_the_operand()
+    test.assert_eq(rcs_crc_error([]), ERR_MISSING_CRC)
+    test.assert_eq(rcs_crc_error([OP_ENABLE_DISCONNECT]), ERR_MISSING_CRC)
+    test.assert_eq(rcs_crc_error([OP_ACTIVATE_STORED, 0]), ERR_MISSING_CRC)
+    test.assert_eq(rcs_crc_error([OP_SET_FILTER_TIMER, 1, 0, 0, 0]), ERR_MISSING_CRC)
+    test.assert_eq(rcs_crc_error([OP_ACTIVATE_STORED, 0, 1]), ERR_INVALID_CRC)
+    test.assert_eq(rcs_crc_error([OP_ENABLE_DISCONNECT, 0, 0]), ERR_INVALID_CRC)
+    let crc = crc16([OP_ENABLE_DISCONNECT])
+    test.assert_eq(rcs_crc_error(wire.octets([OP_ENABLE_DISCONNECT, crc & 0xFF, crc >>> 8])), 0)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_ready_for_disconnect_is_notified_and_a_proposal_ends_with_client_parameters()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    let n = rcs_set_ready_for_disconnect(var s.db, var s.link, h, config, var state, true, 1, 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0], [0x1B, 5, 0, 3, 0x10, 0])
+    let off = rcs_set_ready_for_disconnect(var s.db, var s.link, h, config, var state, false, 1, 0)
+    test.assert_eq(off[0], [0x1B, 5, 0, 3, 0, 0])
+    // The device without the feature notifies nothing.
+    let plain = feature_config(F_ENABLE_DISCONNECT | F_PROPOSE_INTERVAL | F_PROPOSE_LATENCY)
+    var (t, g) = server(plain)
+    test.assert_eq(list.len(rcs_set_ready_for_disconnect(var t.db, var t.link, g, plain, var state, true, 1, 0)), 0)
+    // The Client Parameter Indication after an accepted proposal: the interval in use is both limits.
+    let ind = rcs_client_parameters(var t.db, var t.link, g, plain, [KEEP, 30, 40, 2, KEEP, KEEP, KEEP, KEEP], 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(ind[0][3:list.len(ind[0])], [0x11, 0xFF, 0xFF, 30, 0, 30, 0, 2, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    // RC Feature is indicated when the features changed, for a service built with that property.
+    var changing = default_rcs_config()
+    changing.changes = true
+    var (c, ch) = server(changing)
+    test.assert_eq(list.len(rcs_features_changed(var c.db, var c.link, ch, changing, 0)), 0)
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, req(0x12, ch.feature_cccd, [2, 0]), 0)[0], [0x13])
+    let f = rcs_features_changed(var c.db, var c.link, ch, changing, 0)
+    test.assert_eq(f[0], [0x1D, 3, 0, 0xFF, 0xFF, 0xFE, 0xFF, 0x03])
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_characteristics_need_the_link_security_of_the_service()
+    var config = default_rcs_config()
+    config.access = gatt_server.Access.Authenticated
+    var s = gatt_server.new_server([], 65)
+    let h = add_rcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    var state = new_rcs_state()
+    var tag = new_tag()
+    test.assert_eq(write_as(1, var s, h, config, var state, var tag, [OP_ENABLE_DISCONNECT])[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(list.len(tag.calls), 0)
+    test.assert_eq(receive_as(1, var s, h, config, var state, var tag, req(0x0A, h.feature, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(receive_as(1, var s, h, config, var state, var tag, req(0x0A, h.settings, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+
+@test
+@satisfies("REQ-BLE-RCS-001")
+fn test_the_default_policy_changes_nothing()
+    let config = default_rcs_config()
+    var (s, h) = server(config)
+    var state = new_rcs_state()
+    var p = default_rcs_policy()
+    let r = receive_as(1, var s, h, config, var state, var p, req(0x12, h.control_point, [OP_ENABLE_DISCONNECT]), 0)
+    test.assert_eq(r[1][3:list.len(r[1])], [0x0E, 0x00, RESULT_OPERATION_FAILED])
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, [0x1E], 1)), 0)
+    let a = receive_as(1, var s, h, config, var state, var p, req(0x12, h.control_point, [OP_SET_ADVERTISEMENT, 0]), 0)
+    test.assert_eq(a[1][3:list.len(a[1])], [0x0E, 0x09, RESULT_OPERATION_FAILED])

@@ -1,0 +1,155 @@
+// tests/nordic_uart_tests.nv — the unit tests of src/nordic_uart.nv.
+//
+//   novo test tests/nordic_uart_tests.nv
+
+use std.test
+use att
+use gatt_server
+use nordic_uart.{ NUS_UUID_SERVICE, NUS_UUID_TX, NordicUartConfig, NordicUartHandles, add_nordic_uart_service, default_nordic_uart_config, nus_chunk_size, nus_received, nus_send, nus_uuid, secured_nordic_uart_config }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn zero_handles() -> NordicUartHandles
+    NordicUartHandles { service: 0, rx: 0, tx: 0, tx_cccd: 0 }
+
+fn added(var s: GattServer, config: NordicUartConfig) -> NordicUartHandles
+    match add_nordic_uart_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            zero_handles()
+
+@test
+fn test_uuids_are_the_vendor_base()
+    // 6E400001-B5A3-F393-E0A9-E50E24DCCA9E, least significant octet first.
+    test.assert(gatt_server.same_bytes(nus_uuid(1), octets([
+        0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E])))
+    test.assert_eq(nus_uuid(3)[12] as Int, 3)
+
+@test
+fn test_layout_and_permissions()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_nordic_uart_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.rx, 3)
+    test.assert_eq(h.tx, 5)
+    test.assert_eq(h.tx_cccd, 6)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 6)
+    test.assert(gatt_server.same_bytes(s.db.attributes[0].value, nus_uuid(NUS_UUID_SERVICE)))
+    // RX declares Write and Write Without Response, TX declares Notify; both
+    // declarations carry the 128-bit UUID after the value handle.
+    test.assert_eq(s.db.attributes[1].value[0] as Int, 0x0C)
+    test.assert_eq(list.len(s.db.attributes[1].value), 3 + 16)
+    test.assert_eq(s.db.attributes[3].value[0] as Int, 0x10)
+    test.assert(gatt_server.same_bytes(s.db.attributes[3].value[3:], nus_uuid(NUS_UUID_TX)))
+    // RX is write-only, TX is neither readable nor writable, and the
+    // descriptor takes both.
+    test.assert_eq(s.db.attributes[2].permissions, gatt_server.PERM_WRITE)
+    test.assert_eq(s.db.attributes[4].permissions, 0)
+    test.assert_eq(s.db.attributes[5].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE)
+
+@test
+fn test_write_and_notify_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_nordic_uart_config())
+    // The client writes RX with a request and then with a command.
+    let rsp = gatt_server.receive(var s.db, var s.link, octets([0x12, h.rx & 0xFF, h.rx >>> 8, 'h' as Int, 'i' as Int]), 0)
+    test.assert(gatt_server.same_bytes(rsp[0], octets([0x13])))
+    test.assert(gatt_server.same_bytes(nus_received(s.db, h), octets(['h' as Int, 'i' as Int])))
+    test.assert_eq(list.len(gatt_server.take_changed(var s.link)), 1)
+    test.assert_eq(list.len(gatt_server.receive(var s.db, var s.link, octets([0x52, h.rx & 0xFF, h.rx >>> 8, 'o' as Int, 'k' as Int, '!' as Int]), 0)), 0)
+    test.assert(gatt_server.same_bytes(nus_received(s.db, h), octets(['o' as Int, 'k' as Int, '!' as Int])))
+    test.assert_eq(gatt_server.take_changed(var s.link)[0], h.rx)
+    // RX cannot be read back by the client.
+    let read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.rx & 0xFF, h.rx >>> 8]), 0)
+    test.assert(gatt_server.same_bytes(read[0], octets([0x01, 0x0A, h.rx & 0xFF, h.rx >>> 8, att.ATT_ERR_READ_NOT_PERMITTED])))
+    // TX is neither readable nor writable.
+    let tx_read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.tx & 0xFF, h.tx >>> 8]), 0)
+    test.assert_eq(tx_read[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    let refused = gatt_server.receive(var s.db, var s.link, octets([0x12, h.tx & 0xFF, h.tx >>> 8, 1]), 0)
+    test.assert_eq(refused[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // Nothing goes out before the client enables notifications.
+    test.assert_eq(list.len(nus_send(var s.db, var s.link, h, octets([1, 2, 3]), 0)), 0)
+    let on = gatt_server.receive(var s.db, var s.link, octets([0x12, h.tx_cccd & 0xFF, h.tx_cccd >>> 8, 0x01, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(on[0], octets([0x13])))
+    let ntf = nus_send(var s.db, var s.link, h, octets([1, 2, 3]), 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert(gatt_server.same_bytes(ntf[0], octets([0x1B, h.tx & 0xFF, h.tx >>> 8, 1, 2, 3])))
+
+@test
+fn test_notifications_are_cut_to_the_mtu()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_nordic_uart_config())
+    gatt_server.set_configuration(var s.link, h.tx_cccd, gatt_server.CCC_NOTIFICATION)
+    test.assert_eq(nus_chunk_size(s.link, 0), 20)
+    var data: [u8] = []
+    for k in 0..30
+        list.push(data, k as u8)
+    let ntf = nus_send(var s.db, var s.link, h, data, 0)
+    test.assert_eq(list.len(ntf[0]), 3 + 20)
+    // After an MTU exchange the piece grows.
+    let mtu = gatt_server.receive(var s.db, var s.link, octets([0x02, 65, 0x00]), 0)
+    test.assert(gatt_server.same_bytes(mtu[0], octets([0x03, 65, 0x00])))
+    test.assert_eq(nus_chunk_size(s.link, 0), 62)
+    test.assert_eq(list.len(nus_send(var s.db, var s.link, h, data, 0)[0]), 3 + 30)
+
+@test
+fn test_encrypted_service_is_notify_only_and_needs_the_link()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, secured_nordic_uart_config(gatt_server.Access.Encrypted))
+    // TX has no read permission; the descriptor is readable, writable once encrypted.
+    test.assert_eq(s.db.attributes[2].permissions, gatt_server.PERM_WRITE_ENCRYPT)
+    test.assert_eq(s.db.attributes[4].permissions, 0)
+    test.assert_eq(s.db.attributes[5].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE_ENCRYPT)
+    let clear = gatt_server.receive(var s.db, var s.link, octets([0x12, h.rx & 0xFF, h.rx >>> 8, 1]), 0)
+    test.assert_eq(clear[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    let subscribe = octets([0x12, h.tx_cccd & 0xFF, h.tx_cccd >>> 8, 0x01, 0x00])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, subscribe, 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, subscribe, 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_configuration(var s.link, h.tx_cccd, gatt_server.CCC_NOTIFICATION)
+    test.assert_eq(list.len(nus_send(var s.db, var s.link, h, octets([9]), 0)), 0)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    let ok = gatt_server.receive(var s.db, var s.link, octets([0x12, h.rx & 0xFF, h.rx >>> 8, 1]), 0)
+    test.assert(gatt_server.same_bytes(ok[0], octets([0x13])))
+    test.assert(gatt_server.same_bytes(gatt_server.receive(var s.db, var s.link, subscribe, 0)[0], octets([0x13])))
+    test.assert_eq(list.len(nus_send(var s.db, var s.link, h, octets([9]), 0)), 1)
+    // TX still cannot be read, even on the encrypted link.
+    let tx_read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.tx & 0xFF, h.tx >>> 8]), 0)
+    test.assert_eq(tx_read[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_higher_access_levels_of_the_service()
+    var a = gatt_server.new_server([], 65)
+    let ha = added(var a, secured_nordic_uart_config(gatt_server.Access.Authenticated))
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.rx, 0, 1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.tx_cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var a.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.rx, 0, 1]), 0)[0][0] as Int, 0x13)
+    test.assert_eq(gatt_server.receive(var a.db, var a.link, octets([0x12, ha.tx_cccd, 0, 1, 0]), 0)[0][0] as Int, 0x13)
+    var c = gatt_server.new_server([], 65)
+    let hc = added(var c, secured_nordic_uart_config(gatt_server.Access.SecureConnections))
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.rx, 0, 1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.tx_cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var c.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.rx, 0, 1]), 0)[0][0] as Int, 0x13)
+    test.assert_eq(gatt_server.receive(var c.db, var c.link, octets([0x12, hc.tx_cccd, 0, 1, 0]), 0)[0][0] as Int, 0x13)
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, secured_nordic_uart_config(gatt_server.Access.Authorized))
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, octets([0x12, hz.rx, 0, 1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, octets([0x12, hz.tx_cccd, 0, 1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+
+@test
+fn test_discovery_by_128_bit_uuid()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_nordic_uart_config())
+    var req = octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28])
+    list.append(req, nus_uuid(NUS_UUID_SERVICE))
+    let found = gatt_server.receive(var s.db, var s.link, req, 0)
+    test.assert(gatt_server.same_bytes(found[0], octets([0x07, 0x01, 0x00, h.tx_cccd & 0xFF, h.tx_cccd >>> 8])))

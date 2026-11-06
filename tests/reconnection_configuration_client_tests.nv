@@ -1,0 +1,478 @@
+// tests/reconnection_configuration_client_tests.nv — the unit tests of src/reconnection_configuration_client.nv.
+//
+//   novo test tests/reconnection_configuration_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use reconnection_configuration
+use sensor_client
+use wire
+use reconnection_configuration_client.{ RC_ERR_AUTHORIZATION, RC_ERR_CCCD, RC_ERR_INVALID_CRC, RC_ERR_IN_PROGRESS, RC_ERR_MISSING_CRC, RC_ERR_NONE, RC_ERR_OTHER, RC_RESP_CLIENT, RC_RESP_FILTER_TIMER, RC_RESP_PARAMETERS, RC_RESP_PROCEDURE, RcFeature, RcResponse, rc_client_new, rc_client_start, rc_client_write, rc_crc, rc_decode_feature, rc_decode_response, rc_decode_settings, rc_error_kind, rc_feature_reserved, rc_has_control_point, rc_has_settings, rc_none_parameters, rc_request, rc_request_advertisement, rc_request_filter_timer, rc_request_propose, rc_request_set, rc_request_switch, rc_supports }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn with_crc(v: [Int]) -> [u8]
+    let b = octets(v)
+    var out = b[:]
+    wire.put(var out, reconnection_configuration.crc16(b), 2)
+    out
+
+@tier(app)
+fn feature_of(v: [Int]) -> RcFeature
+    match rc_decode_feature(octets(v))
+        Some(f) => f
+        None =>
+            test.fail("a feature")
+            RcFeature { features: 0, extension: 0, e2e: false }
+
+@tier(app)
+fn response_of(v: [Int], e2e: Bool) -> RcResponse
+    let b = if e2e then with_crc(v) else octets(v)
+    match rc_decode_response(b, e2e)
+        Some(r) => r
+        None =>
+            test.fail("a response")
+            RcResponse {
+                kind: 0, request: 0, result: 0, fields: 0, parameters: rc_none_parameters(), timer: 0,
+                timer_min: 0, timer_max: 0 }
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_the_crc_is_the_one_of_the_specification()
+    // The sample of [RCS] 3.4: ten octets, CRC 0x2F01.
+    let sample = octets([0x3E, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09])
+    test.assert_eq(rc_crc(sample, 10), 0x2F01)
+    test.assert_eq(rc_crc(sample, 10), reconnection_configuration.crc16(sample))
+    test.assert_eq(rc_crc(sample, 0), 0xFFFF)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_the_feature_without_and_with_e2e_crc_and_its_extension()
+    // No E2E-CRC: the field 0xFFFF, three octets.
+    let plain = feature_of([0xFF, 0xFF, 0xFE, 0xFF, 0x03])
+    test.assert_eq(plain.features, 0x03FFFE)
+    test.assert_eq(plain.e2e, false)
+    test.assert_eq(plain.extension, 0)
+    test.assert(rc_supports(plain, reconnection_configuration.OP_ENABLE_DISCONNECT))
+    test.assert(rc_supports(plain, reconnection_configuration.OP_LIMITED_ACCESS))
+    test.assert(rc_has_settings(plain) and rc_has_control_point(plain))
+    // With E2E-CRC the CRC covers the Feature field.
+    let field = octets([0x03, 0x00, 0x00])
+    var v: [u8] = []
+    wire.put(var v, rc_crc(field, 3), 2)
+    list.append(v, field)
+    let e = rc_decode_feature(v)!
+    test.assert(e.e2e)
+    test.assert_eq(e.features, 0x03)
+    var bad = v[:]
+    bad[0] = bad[0] ^ 1
+    test.assert_eq(rc_decode_feature(bad), None)
+    // One extension octet, then two.
+    let one = feature_of([0xFF, 0xFF, 0x00, 0x00, 0x80, 0x05])
+    test.assert_eq(one.extension, 1)
+    let two = feature_of([0xFF, 0xFF, 0x00, 0x00, 0x80, 0x85, 0x01])
+    test.assert_eq(two.extension, 2)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_a_feature_that_is_not_whole_is_none()
+    test.assert_eq(rc_decode_feature([]), None)
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0, 0])), None)
+    // Octets past the field, an extension the value lacks or leaves open.
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0, 0, 0, 0])), None)
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0, 0, 0x80])), None)
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0, 0, 0x80, 0x80])), None)
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0, 0, 0x80, 0x00, 0x00])), None)
+    // Without E2E-CRC the field must be 0xFFFF.
+    test.assert_eq(rc_decode_feature(octets([0x00, 0x00, 0x02, 0, 0])), None)
+    // With E2E-CRC a missing CRC (0xFFFF) does not match.
+    test.assert_eq(rc_decode_feature(octets([0xFF, 0xFF, 0x01, 0, 0])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_reserved_feature_bits_are_told()
+    test.assert(not rc_feature_reserved(feature_of([0xFF, 0xFF, 0xFE, 0xFF, 0x03])))
+    test.assert(rc_feature_reserved(feature_of([0xFF, 0xFF, 0x00, 0x00, 0x04])))
+    test.assert(rc_feature_reserved(feature_of([0xFF, 0xFF, 0x00, 0x00, 0x40])))
+    test.assert(not rc_feature_reserved(feature_of([0xFF, 0xFF, 0x00, 0x00, 0x80, 0x00])))
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_settings_bits_the_length_and_the_crc()
+    let s = rc_decode_settings(octets([3, 0x76, 0x03]), false)!
+    test.assert(s.use_oob and s.ready_for_disconnect and s.limited_access and s.access_permitted)
+    test.assert(s.lesc_only)
+    test.assert_eq(s.adv_mode, 3)
+    let z = rc_decode_settings(octets([3, 0x00, 0x00]), false)!
+    test.assert(not z.lesc_only and not z.use_oob and not z.ready_for_disconnect and not z.limited_access and not z.access_permitted)
+    test.assert_eq(z.adv_mode, 0)
+    test.assert_eq(rc_decode_settings(octets([3, 0, 2]), false)!.adv_mode, 2)
+    // A longer Settings field is read for its first two octets.
+    test.assert_eq(rc_decode_settings(octets([4, 0x02, 0x01, 0xFF]), false)!.adv_mode, 1)
+    // With E2E-CRC.
+    let framed = with_crc([5, 0x02, 0x01])
+    test.assert(rc_decode_settings(framed, true)!.lesc_only)
+    var bad = framed[:]
+    bad[3] = bad[3] ^ 0xFF
+    test.assert_eq(rc_decode_settings(bad, true), None)
+    // Length mismatches and short values.
+    test.assert_eq(rc_decode_settings(octets([4, 0, 0]), false), None)
+    test.assert_eq(rc_decode_settings(octets([2, 0]), false), None)
+    test.assert_eq(rc_decode_settings(octets([3, 0, 0, 0]), false), None)
+    test.assert_eq(rc_decode_settings([], false), None)
+    test.assert_eq(rc_decode_settings(octets([3, 0, 0]), true), None)
+
+@tier(app)
+fn parameters_value(op: Int, request: Int, v: [Int]) -> [Int]
+    var out: [Int] = [op]
+    if request >= 0
+        list.push(out, request)
+    for x in v
+        list.push(out, x & 0xFF)
+        list.push(out, x >> 8)
+    out
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_the_four_kinds_of_indication()
+    for e2e in [false, true]
+        let r = response_of([0x0E, 0x02, 0x09], e2e)
+        test.assert_eq(r.kind, RC_RESP_PROCEDURE)
+        test.assert_eq(r.request, 2)
+        test.assert_eq(r.result, 9)
+        test.assert_eq(r.fields, -1)
+        let o = response_of([0x0E, 0x02, 0x05, 0x06], e2e)
+        test.assert_eq(o.result, 5)
+        test.assert_eq(o.fields, 6)
+        let g = response_of(parameters_value(0x0F, 0x04, [20000, 3200, 3200, 499, 3200, 0x4000, 1000, 10000]), e2e)
+        test.assert_eq(g.kind, RC_RESP_PARAMETERS)
+        test.assert_eq(g.request, 4)
+        test.assert_eq(g.parameters.reconnection_timeout, 20000)
+        test.assert_eq(g.parameters.max_interval, 3200)
+        test.assert_eq(g.parameters.adv_repetition, 10000)
+        let c = response_of(parameters_value(0x11, -1, [20, 24, 24, 2, 100, 64, 5, 0xFFFF]), e2e)
+        test.assert_eq(c.kind, RC_RESP_CLIENT)
+        test.assert_eq(c.parameters.latency, 2)
+        test.assert_eq(c.parameters.adv_repetition, 0xFFFF)
+        let t = response_of([0x10, 60, 0, 0, 0, 20, 0, 0, 0, 0x2C, 0x01, 0, 0], e2e)
+        test.assert_eq(t.kind, RC_RESP_FILTER_TIMER)
+        test.assert_eq(t.timer, 60)
+        test.assert_eq(t.timer_min, 20)
+        test.assert_eq(t.timer_max, 300)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_every_result_code_and_a_reserved_one()
+    for code in 1..10
+        let with_fields = code == 5 or code == 6
+        var v: [Int] = [0x0E, 0x00, code]
+        if with_fields
+            list.push(v, 1)
+        test.assert_eq(response_of(v, false).result, code)
+        // The field octet is there for 5 and 6 only.
+        var wrong = v[:]
+        if with_fields
+            wrong = [0x0E, 0x00, code]
+        else
+            list.push(wrong, 1)
+        test.assert_eq(rc_decode_response(octets(wrong), false), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x00, 0x00]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x00, 0x0A]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x00, 0xFF]), false), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_a_malformed_indication_is_none()
+    test.assert_eq(rc_decode_response([], false), None)
+    test.assert_eq(rc_decode_response([], true), None)
+    // Reserved opcodes and request opcodes.
+    test.assert_eq(rc_decode_response(octets([0x0D]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x12, 0, 0]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x0D, 0x01]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x01]), false), None)
+    // A Communication Parameter Response answers Get Max, Get Min and Get Stored only.
+    let ok = [20000, 3200, 3200, 499, 3200, 0x4000, 1000, 10000]
+    for request in [0x01, 0x02, 0x03, 0x07, 0x08]
+        test.assert_eq(rc_decode_response(octets(parameters_value(0x0F, request, ok)), false), None)
+    for request in [0x04, 0x05, 0x06]
+        test.assert(rc_decode_response(octets(parameters_value(0x0F, request, ok)), false) != None)
+    // Lengths of the parameter kinds, the filter timer and the minimum above the maximum.
+    let v = parameters_value(0x11, -1, ok)
+    for k in 0..list.len(v)
+        test.assert_eq(rc_decode_response(octets(v[:k]), false), None)
+    var long = v[:]
+    list.push(long, 0)
+    test.assert_eq(rc_decode_response(octets(long), false), None)
+    test.assert_eq(rc_decode_response(octets([0x10, 0, 0, 0, 0, 20, 0, 0, 0, 10, 0, 0, 0]), false), None)
+    test.assert_eq(rc_decode_response(octets([0x10, 0, 0, 0, 0, 20, 0, 0, 0]), false), None)
+    // A wrong or a missing CRC.
+    var framed = with_crc([0x0E, 0x00, 0x01])
+    test.assert(rc_decode_response(framed, true) != None)
+    framed[4] = framed[4] ^ 1
+    test.assert_eq(rc_decode_response(framed, true), None)
+    test.assert_eq(rc_decode_response(octets([0x0E, 0x00, 0x01]), true), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_a_parameter_outside_table_3_8_is_none()
+    // One parameter at a time: the first value past the range of each field.
+    let past = [20001, 5, 5, 500, 9, 0x1F, 0, 10001]
+    let ok = [20000, 6, 6, 499, 10, 0x20, 1, 10000]
+    for f in 0..8
+        var v: [Int] = ok[:]
+        v[f] = past[f]
+        test.assert_eq(rc_decode_response(octets(parameters_value(0x11, -1, v)), false), None)
+        test.assert(rc_decode_response(octets(parameters_value(0x11, -1, ok)), false) != None)
+    // 0xFFFF keeps a parameter in every field and 0xFFFE disables the Reconnection Timeout.
+    var keep: [Int] = []
+    for _ in 0..8
+        list.push(keep, 0xFFFF)
+    let k = response_of(parameters_value(0x11, -1, keep), false)
+    test.assert_eq(k.parameters.reconnection_timeout, 0xFFFF)
+    var off: [Int] = keep[:]
+    off[0] = 0xFFFE
+    test.assert_eq(response_of(parameters_value(0x11, -1, off), false).parameters.reconnection_timeout, 0xFFFE)
+    var other: [Int] = keep[:]
+    other[3] = 0xFFFE
+    test.assert_eq(rc_decode_response(octets(parameters_value(0x11, -1, other)), false), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_the_requests_with_and_without_the_crc()
+    test.assert_eq(rc_request(0x00, false), Some(octets([0x00])))
+    test.assert_eq(rc_request(0x01, false), Some(octets([0x01])))
+    test.assert_eq(rc_request(0x04, false), Some(octets([0x04])))
+    test.assert_eq(rc_request(0x05, false), Some(octets([0x05])))
+    test.assert_eq(rc_request(0x08, false), Some(octets([0x08])))
+    test.assert_eq(rc_request(0x02, false), None)
+    test.assert_eq(rc_request(0x0E, false), None)
+    test.assert_eq(rc_request(0x08, true), Some(with_crc([0x08])))
+    test.assert_eq(rc_request_set(0x03, 2, false), Some(octets([0x03, 2])))
+    test.assert_eq(rc_request_set(0x06, 255, true), Some(with_crc([0x06, 255])))
+    test.assert_eq(rc_request_set(0x04, 0, false), None)
+    test.assert_eq(rc_request_set(0x03, 256, false), None)
+    test.assert_eq(rc_request_set(0x03, -1, false), None)
+    test.assert_eq(rc_request_filter_timer(300, false), Some(octets([0x07, 0x2C, 0x01, 0, 0])))
+    test.assert_eq(rc_request_filter_timer(0xFFFFFFFE, false), Some(octets([0x07, 0xFE, 0xFF, 0xFF, 0xFF])))
+    test.assert_eq(rc_request_filter_timer(0, true), Some(with_crc([0x07, 0, 0, 0, 0])))
+    test.assert_eq(rc_request_filter_timer(0xFFFFFFFF, false), None)
+    test.assert_eq(rc_request_filter_timer(-1, false), None)
+    for n in 1..5
+        test.assert_eq(rc_request_advertisement(n, false), Some(octets([0x09, n - 1])))
+    test.assert_eq(rc_request_advertisement(0, false), None)
+    test.assert_eq(rc_request_advertisement(5, false), None)
+    for op in [0x0A, 0x0B, 0x0C]
+        test.assert_eq(rc_request_switch(op, true, false), Some(octets([op, 0xFF])))
+        test.assert_eq(rc_request_switch(op, false, true), Some(with_crc([op, 0x00])))
+    test.assert_eq(rc_request_switch(0x09, true, false), None)
+    test.assert_eq(rc_request_switch(0x0D, true, false), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_propose_settings_checks_each_parameter()
+    let ok = [10, 24, 40, 2, 100, 64, 5, 0]
+    let r = rc_request_propose(ok, false)!
+    test.assert_eq(r, octets([0x02, 10, 0, 24, 0, 40, 0, 2, 0, 100, 0, 64, 0, 5, 0, 0, 0]))
+    test.assert_eq(rc_request_propose(ok, true), Some(with_crc([0x02, 10, 0, 24, 0, 40, 0, 2, 0, 100, 0, 64, 0, 5, 0, 0, 0])))
+    var keep: [Int] = []
+    for _ in 0..8
+        list.push(keep, 0xFFFF)
+    test.assert_eq(list.len(rc_request_propose(keep, false)!), 17)
+    let past = [20001, 5, 5, 500, 9, 0x1F, 0, 10001]
+    for f in 0..8
+        var v: [Int] = ok[:]
+        v[f] = past[f]
+        test.assert_eq(rc_request_propose(v, false), None)
+    // The minimum interval above the maximum; either left alone is fine.
+    test.assert_eq(rc_request_propose([0xFFFF, 40, 24, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF], false), None)
+    test.assert(rc_request_propose([0xFFFF, 40, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF], false) != None)
+    test.assert_eq(rc_request_propose([1, 2, 3], false), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_the_errors_of_a_request_are_named()
+    test.assert_eq(rc_error_kind(0), RC_ERR_NONE)
+    test.assert_eq(rc_error_kind(0x80), RC_ERR_MISSING_CRC)
+    test.assert_eq(rc_error_kind(0x81), RC_ERR_INVALID_CRC)
+    test.assert_eq(rc_error_kind(0x08), RC_ERR_AUTHORIZATION)
+    test.assert_eq(rc_error_kind(0xFE), RC_ERR_IN_PROGRESS)
+    test.assert_eq(rc_error_kind(0xFD), RC_ERR_CCCD)
+    test.assert_eq(rc_error_kind(0x03), RC_ERR_OTHER)
+
+// The policy of the test server.
+struct Tag
+    var calls: [Int]
+
+impl reconnection_configuration.RcsPolicy[] for Tag
+    fn busy(var self) -> Bool
+        false
+
+    fn request_disconnect(var self) -> Bool
+        list.push(self.calls, 0)
+        true
+
+    @tier(app)
+    fn actual(var self) -> [Int]
+        [20, 24, 30, 2, 100, 64, 5, 10]
+
+    @tier(app)
+    fn stored(var self, set: Int) -> [Int]
+        [set * 10, 24, 24, 0, 100, 64, 3, 0]
+
+    @tier(app)
+    fn limit(var self, maximum: Bool) -> [Int]
+        if maximum then [20000, 3200, 3200, 499, 3200, 0x4000, 1000, 10000] else [0, 6, 6, 0, 10, 0x20, 1, 0]
+
+    @tier(app)
+    fn propose(var self, values: [Int]) -> (Int, Int)
+        list.push(self.calls, 2)
+        (reconnection_configuration.RESULT_PROPOSAL_ACCEPTED, 0)
+
+    fn activate(var self, set: Int) -> Int
+        list.push(self.calls, 3)
+        reconnection_configuration.RESULT_SUCCESS
+
+    fn advertise(var self, configuration: Int) -> Bool
+        list.push(self.calls, 9)
+        true
+
+    fn apply(var self, setting: Int, on: Bool) -> Bool
+        list.push(self.calls, 10)
+        true
+
+// Carry `first` to the server through `rcs_receive`; the answers (Write Response and indication) go back to
+// the session.  The events are or-ed and the Control Point indications decoded into `got`.
+@tier(app)
+fn rc_pump(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, var s: gatt_server.GattServer, h: reconnection_configuration.RcsHandles, config: reconnection_configuration.RcsConfig, var state: reconnection_configuration.RcsState, var tag: Tag, first: sensor_client.ScStep, var got: [[u8]]) -> Int [mutate]
+    var all = first.event
+    var pending = first.pdus[:]
+    for _ in 0..60
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for item in pending
+            for a in reconnection_configuration.rcs_receive(var s.db, var s.link, h, config, var state, var tag, item[:], 0)
+                let step = sensor_client.sc_on_pdu(var t, var c, a, 0)
+                list.append(next, step.pdus[:])
+                all = all | step.event
+                if (step.event & sensor_client.SE_VALUE) != 0 and sensor_client.sc_uuid(c) == reconnection_configuration.UUID_RC_CONTROL_POINT
+                    list.push(got, sensor_client.sc_value(c))
+        pending = next
+    all
+
+@tier(app)
+fn test_server(config: reconnection_configuration.RcsConfig) -> (gatt_server.GattServer, reconnection_configuration.RcsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = reconnection_configuration.add_rcs_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_session_against_the_full_server_without_e2e_crc()
+    if not fixtures.client_engine_present()
+        return
+    let config = reconnection_configuration.default_rcs_config()
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = reconnection_configuration.new_rcs_state()
+    var tag = Tag { calls: [] }
+    let both = sensor_client.test_open(reconnection_configuration.UUID_RECONNECTION_CONFIGURATION_SERVICE)
+    var t = both.0
+    var c = rc_client_new(sensor_client.test_link())
+    var got: [[u8]] = []
+    let all = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_start(var t, var c, 0), var got)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_handle(var t, c, reconnection_configuration.UUID_RC_CONTROL_POINT), h.control_point as Int)
+    test.assert_eq(sensor_client.sc_uuid(c), reconnection_configuration.UUID_RC_SETTINGS)
+    let st = rc_decode_settings(sensor_client.sc_value(c), false)!
+    test.assert_eq(st.adv_mode, 0)
+    // Get Max Values: the Communication Parameter Response.
+    let max = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request(0x04, false)!, 0), var got)
+    test.assert((max & sensor_client.SE_DONE) != 0)
+    test.assert_eq(list.len(got), 1)
+    let r = rc_decode_response(got[0], false)!
+    test.assert_eq(r.kind, RC_RESP_PARAMETERS)
+    test.assert_eq(r.request, 4)
+    test.assert_eq(r.parameters.supervision_timeout, 3200)
+    // Get Actual: the Client Parameter Indication, both intervals the one in use.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request(0x01, false)!, 0), var got)
+    let a = rc_decode_response(got[1], false)!
+    test.assert_eq(a.kind, RC_RESP_CLIENT)
+    test.assert_eq(a.parameters.min_interval, a.parameters.max_interval)
+    // Propose Settings: Proposal Accepted.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request_propose([0xFFFF, 24, 40, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF], false)!, 0), var got)
+    let p = rc_decode_response(got[2], false)!
+    test.assert_eq(p.kind, RC_RESP_PROCEDURE)
+    test.assert_eq(p.result, reconnection_configuration.RESULT_PROPOSAL_ACCEPTED)
+    // Set Advertisement Configuration 3, and the RC Settings the server holds.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request_advertisement(3, false)!, 0), var got)
+    test.assert_eq(rc_decode_response(got[3], false)!.result, reconnection_configuration.RESULT_SUCCESS)
+    test.assert_eq(state.mode, 2)
+    // Get Filter Accept List Timer.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request(0x08, false)!, 0), var got)
+    let f = rc_decode_response(got[4], false)!
+    test.assert_eq(f.kind, RC_RESP_FILTER_TIMER)
+    test.assert_eq(f.timer_min, 20)
+    test.assert_eq(f.timer_max, 300)
+    // An operand the server refuses: a Filter Accept List Timer of 5 s is below the minimum.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request_filter_timer(5, false)!, 0), var got)
+    test.assert_eq(rc_decode_response(got[5], false)!.result, reconnection_configuration.RESULT_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_session_against_a_server_with_e2e_crc()
+    if not fixtures.client_engine_present()
+        return
+    var config = reconnection_configuration.default_rcs_config()
+    config.features = reconnection_configuration.F_DEFINED
+    var built = test_server(config)
+    var s = built.0
+    let h = built.1
+    var state = reconnection_configuration.new_rcs_state()
+    var tag = Tag { calls: [] }
+    let both = sensor_client.test_open(reconnection_configuration.UUID_RECONNECTION_CONFIGURATION_SERVICE)
+    var t = both.0
+    var c = rc_client_new(sensor_client.test_link())
+    var got: [[u8]] = []
+    // The Feature is read first; the session leaves it in `sc_value` until the next read.
+    let all = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_start(var t, var c, 0), var got)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    let feature = rc_decode_feature(reconnection_configuration.rcs_feature_value(config))!
+    test.assert(feature.e2e)
+    test.assert(rc_decode_settings(reconnection_configuration.rcs_settings_value(config, state, 0), true) != None)
+    // A request with its CRC is answered with a CRC.
+    let _ = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request(0x00, true)!, 0), var got)
+    test.assert_eq(list.len(got), 1)
+    let r = rc_decode_response(got[0], true)!
+    test.assert_eq(r.result, reconnection_configuration.RESULT_SUCCESS)
+    test.assert_eq(list.len(tag.calls), 1)
+    // A request without its CRC is refused with Missing CRC; one with a wrong CRC with Invalid CRC.
+    let miss = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, rc_request(0x01, false)!, 0), var got)
+    test.assert((miss & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(rc_error_kind(sensor_client.sc_status(c)), RC_ERR_MISSING_CRC)
+    var wrong = rc_request(0x01, true)!
+    wrong[1] = wrong[1] ^ 0xFF
+    let inv = rc_pump(var t, var c, var s, h, config, var state, var tag, rc_client_write(var t, var c, wrong, 0), var got)
+    test.assert((inv & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(rc_error_kind(sensor_client.sc_status(c)), RC_ERR_INVALID_CRC)
+
+@test
+@satisfies("REQ-BLE-PRFC-019")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(reconnection_configuration.UUID_RECONNECTION_CONFIGURATION_SERVICE)
+    var t = both.0
+    var c = rc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, rc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

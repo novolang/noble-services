@@ -1,0 +1,445 @@
+// src/health_thermometer.nv — the Health Thermometer Service
+// (0x1809), with which a thermometer sends temperature measurements to a
+// collector.
+//
+// Its builders run at start-up and allocate, so the functions that build lists
+// or records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   Temperature Measurement   0x2A1C  Indicate; flags, a FLOAT, an optional time
+//                                     stamp and an optional temperature type
+//   Temperature Type          0x2A1D  Read; optional, one octet 1 to 9
+//   Intermediate Temperature  0x2A1E  Notify; optional, the format of the
+//                                     measurement
+//   Measurement Interval      0x2A21  Read; optional, with Indicate and Write as
+//                                     options; seconds as uint16, 0 for none
+//   Valid Range               0x2906  Read; the lower and upper interval,
+//                                     present when the interval is writable
+//
+// Every characteristic with Indicate or Notify has a Client Characteristic
+// Configuration descriptor.  The measurement is time-sensitive data ([HTS]
+// 3.5): the service sends the one it is given and keeps none.
+//
+// Security.  The service imposes none ([HTS] Table 3.1), except that the
+// Measurement Interval is writable with authentication.  The Health
+// Thermometer Profile 1.0 raises it ([HTP] 6.1): the thermometer uses security
+// mode 1, level 2 or 3, for every characteristic of the service.  So
+// `add_hts_service` takes the access of the service as Encrypted,
+// Authenticated or SecureConnections, refuses the others with `NotPermitted`,
+// and puts it on each value and descriptor; the Client Characteristic
+// Configuration descriptors take it too, and a notification or indication
+// goes to a client whose link grants the write of its descriptor.  The write of
+// the Measurement Interval needs Authenticated or SecureConnections.
+//
+// The Measurement Interval and its Out of Range error (0x80).  A write is
+// evaluated before its Write Response: an interval of 0 (no periodic
+// measurement) or one inside the Valid Range is stored; any other is answered
+// with Out of Range ([HTS] 3.4.1), through a Write Request or the first part of
+// a long write, which is a value of exactly two octets.  `hts_receive` does
+// it, and `hts_interval_written` tells the product that a client changed the
+// interval, which resets the measurement schedule ([HTS] 3.4.1).  The
+// schedule itself, the periodic measurement and the connectable mode belong
+// to the product, which reads the interval with `hts_interval`.
+//
+// Temperature Type.  The characteristic holds a type that does not change
+// during a connection; a type that does is a field of the measurement ([HTS]
+// 3.2).  A service with the characteristic leaves the field out of the values
+// it sends, so a collector gets the type by one method only.
+//
+// NOT IMPLEMENTED: the storage of measurements for a later connection ([HTS]
+// 3.5).  A product that stores time-stamped measurements indicates them with
+// `hts_indicate`, the oldest first.
+//
+// Specification checked against: Health Thermometer Service 1.0 (HTS), Health
+// Thermometer Profile 1.0 (HTP) and the GATT Specification Supplement v9,
+// Sections 3.70, 3.126, 3.149, 3.215, 3.218 and 4.1.
+//
+// Satisfies: REQ-BLE-HTS-001.
+
+use att
+use gatt_server
+use links
+use profile_builder
+use fixtures.{ req, peer, subscribe, read }
+use wire
+
+const UUID_HEALTH_THERMOMETER_SERVICE = 0x1809
+const UUID_TEMPERATURE_MEASUREMENT = 0x2A1C
+const UUID_TEMPERATURE_TYPE = 0x2A1D
+const UUID_INTERMEDIATE_TEMPERATURE = 0x2A1E
+const UUID_MEASUREMENT_INTERVAL = 0x2A21
+const UUID_VALID_RANGE = 0x2906
+
+// The Application Error Code of [HTS] 1.6: the Measurement Interval written is
+// outside the Valid Range.  (Not the Common Profile and Service Error Code
+// Out of Range, 0xFF, which is `att.ATT_ERR_OUT_OF_RANGE`.)
+const ERR_INTERVAL_OUT_OF_RANGE = 0x80
+
+// The bits of the Flags field.
+const FLAG_FAHRENHEIT = 0x01
+const FLAG_TIME_STAMP = 0x02
+const FLAG_TEMPERATURE_TYPE = 0x04
+
+// The Temperature Type values of [GSS] Table 3.331.
+const TYPE_ARMPIT = 1
+const TYPE_BODY = 2
+const TYPE_EAR = 3
+const TYPE_FINGER = 4
+const TYPE_GASTROINTESTINAL_TRACT = 5
+const TYPE_MOUTH = 6
+const TYPE_RECTUM = 7
+const TYPE_TOE = 8
+const TYPE_TYMPANUM = 9
+
+// What the product decides.  The Valid Range is the thermometer's own limit, so
+// the service checks it; `interval_change` is asked only for a value inside it.
+trait HtsPolicy[e]
+    // Whether the thermometer takes the Measurement Interval `seconds` that
+    // `peer` wrote (0, or a value the Valid Range allows); false is answered
+    // Out of Range (0x80), as for a value outside the range.
+    fn interval_change(var self, peer: links.LinkId, seconds: Int) -> Bool [e]
+
+// The policy of a thermometer that takes every interval the Valid Range allows
+// (`accept`) or none of them.
+@value
+struct DefaultHtsPolicy
+    accept: Bool
+
+@tier(embedded)
+fn default_hts_policy() -> DefaultHtsPolicy
+    DefaultHtsPolicy { accept: true }
+
+impl HtsPolicy[] for DefaultHtsPolicy
+    fn interval_change(var self, _peer: links.LinkId, _seconds: Int) -> Bool
+        self.accept
+
+// What the service has.  `access` is the access of every value and descriptor
+// (Encrypted, Authenticated or SecureConnections) and `write_access` the one
+// to write the Measurement Interval (Authenticated or SecureConnections).
+// `temperature_type` is the static Temperature Type, 1 to 9, 0 for a service
+// without the characteristic.  `interval` is the first Measurement Interval in
+// seconds, -1 for a service without the characteristic; `interval_writable`
+// and `interval_indicate` add the Write and the Indicate property, and
+// `interval_min` and `interval_max` are the Valid Range of a writable interval
+// (1 to 65535, the lower value is never 0).
+struct HtsConfig
+    access: gatt_server.Access
+    write_access: gatt_server.Access
+    temperature_type: Int
+    intermediate: Bool
+    interval: Int
+    interval_writable: Bool
+    interval_indicate: Bool
+    interval_min: Int
+    interval_max: Int
+
+// A thermometer with the Temperature Measurement only, on an encrypted link.
+@tier(app)
+fn default_hts_config() -> HtsConfig
+    HtsConfig {
+        access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated,
+        temperature_type: 0, intermediate: false, interval: -1,
+        interval_writable: false, interval_indicate: false, interval_min: 1, interval_max: 65535 }
+
+// The handles of the service; 0 for a characteristic or descriptor it does
+// not have.
+@value
+struct HtsHandles
+    service: u16
+    measurement: u16
+    measurement_cccd: u16
+    temperature_type: u16
+    intermediate: u16
+    intermediate_cccd: u16
+    interval: u16
+    interval_cccd: u16
+    valid_range: u16
+
+// One temperature measurement.  `temperature` is the raw FLOAT of the value
+// (`wire.float(364, -1)` for 36.4, `wire.FLOAT_NAN` for a reading that is not
+// valid) in Celsius, or in Fahrenheit when `fahrenheit` is set.  `has_time`
+// puts the time stamp `time` in; its month and day are never 0
+// ([HTS] 3.1.1.3).  `temperature_type` is 0 for no Temperature Type field, or
+// 1 to 9.
+@value
+struct HtsMeasurement
+    temperature: Int
+    fahrenheit: Bool
+    has_time: Bool
+    time: wire.DateTime
+    temperature_type: u8
+
+// A measurement without a time stamp and without a Temperature Type field.
+@tier(embedded)
+@no_alloc
+fn hts_measurement(temperature: Int, fahrenheit: Bool) -> HtsMeasurement
+    HtsMeasurement {
+        temperature: temperature, fahrenheit: fahrenheit, has_time: false,
+        time: wire.date_time_unknown(), temperature_type: 0 }
+
+// Whether `t` is a Temperature Type value or 0 for none.
+@tier(embedded)
+@no_alloc
+fn hts_type_valid(t: Int) -> Bool
+    t >= 0 and t <= TYPE_TYMPANUM
+
+// Whether the service can send `m`: a 32-bit FLOAT that is not the reserved
+// value, a known type, and a time stamp that is a Date Time with a month and a
+// day.
+@tier(embedded)
+@no_alloc
+fn hts_measurement_valid(m: HtsMeasurement) -> Bool
+    if m.temperature < 0 or m.temperature > 0xFFFFFFFF or wire.float_kind(m.temperature) == wire.KIND_RESERVED
+        return false
+    if not hts_type_valid(m.temperature_type)
+        return false
+    if not m.has_time
+        return true
+    wire.date_time_valid(m.time) and m.time.month != 0 and m.time.day != 0
+
+// The value of Temperature Measurement and of Intermediate Temperature, which
+// have one format: the Flags field, the FLOAT, then the time stamp and the
+// type when the flags say so.  RFU bits are 0.
+@tier(app)
+fn hts_measurement_value(m: HtsMeasurement) -> [u8]
+    var flags = 0
+    if m.fahrenheit
+        flags = flags | FLAG_FAHRENHEIT
+    if m.has_time
+        flags = flags | FLAG_TIME_STAMP
+    if m.temperature_type != 0
+        flags = flags | FLAG_TEMPERATURE_TYPE
+    var out: [u8] = [flags as u8]
+    wire.put(var out, m.temperature, 4)
+    if m.has_time
+        wire.put_date_time(var out, m.time)
+    if m.temperature_type != 0
+        wire.put(var out, m.temperature_type, 1)
+    out
+
+@tier(app)
+fn interval_value(seconds: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, seconds, 2)
+    out
+
+// Whether `access` is a security level the Health Thermometer Profile allows.
+@tier(embedded)
+@no_alloc
+fn hts_access_secure(access: gatt_server.Access) -> Bool
+    match access
+        Encrypted => true
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// Whether `access` is authenticated, the access of the interval's write.
+@tier(embedded)
+@no_alloc
+fn hts_access_authenticated(access: gatt_server.Access) -> Bool
+    match access
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// What is wrong with `config`, the first thing: CONFIG_OK for a thermometer the
+// service can describe, CONFIG_NOT_PERMITTED for an access below the profile's
+// and CONFIG_INVALID for a value out of its range.
+const CONFIG_OK = 0
+const CONFIG_NOT_PERMITTED = 1
+const CONFIG_INVALID = 2
+
+@tier(embedded)
+@no_alloc
+fn hts_config_error(config: HtsConfig) -> Int
+    if not hts_access_secure(config.access)
+        return CONFIG_NOT_PERMITTED
+    if not hts_type_valid(config.temperature_type)
+        return CONFIG_INVALID
+    if config.interval < -1 or config.interval > 65535
+        return CONFIG_INVALID
+    if config.interval < 0 and (config.interval_writable or config.interval_indicate)
+        return CONFIG_INVALID
+    if config.interval_writable
+        if not hts_access_authenticated(config.write_access)
+            return CONFIG_NOT_PERMITTED
+        if config.interval_min < 1 or config.interval_max < config.interval_min or config.interval_max > 65535
+            return CONFIG_INVALID
+        if config.interval != 0 and (config.interval < config.interval_min or config.interval > config.interval_max)
+            return CONFIG_INVALID
+    CONFIG_OK
+
+// Add the service to `db` after its last attribute.  The characteristics come
+// in the order of the specification's table: the measurement, the type, the
+// intermediate temperature, the interval with its descriptors.
+@tier(app)
+fn add_hts_service(var db: GattDb, config: HtsConfig) -> Result<HtsHandles, profile_builder.ProfileError>
+    let problem = hts_config_error(config)
+    if problem == CONFIG_NOT_PERMITTED
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if problem == CONFIG_INVALID
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_HEALTH_THERMOMETER_SERVICE))!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE, profile_builder.notify_only(), gatt_server.le16(UUID_TEMPERATURE_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, both)!
+    var temperature_type = 0
+    if config.temperature_type != 0
+        temperature_type = profile_builder.add_value(
+            var db, gatt_server.PROP_READ, profile_builder.read_only(config.access),
+            gatt_server.le16(UUID_TEMPERATURE_TYPE), [config.temperature_type as u8])!
+    var intermediate = 0
+    var intermediate_cccd = 0
+    if config.intermediate
+        intermediate = profile_builder.add_value(
+            var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_INTERMEDIATE_TEMPERATURE), [])!
+        intermediate_cccd = profile_builder.add_cccd(var db, both)!
+    var interval = 0
+    var interval_cccd = 0
+    var valid_range = 0
+    if config.interval >= 0
+        var properties = gatt_server.PROP_READ
+        var permissions = profile_builder.read_only(config.access)
+        if config.interval_indicate
+            properties = properties | gatt_server.PROP_INDICATE
+        if config.interval_writable
+            properties = properties | gatt_server.PROP_WRITE
+            permissions = gatt_server.Permissions { read: config.access, write: config.write_access }
+        interval = profile_builder.add_value(
+            var db, properties, permissions, gatt_server.le16(UUID_MEASUREMENT_INTERVAL), interval_value(config.interval))!
+        if config.interval_writable
+            if not gatt_server.require_value_format(var db, interval, 2, 0, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+                return Err(profile_builder.ProfileError.NoRoom)
+        if config.interval_indicate
+            interval_cccd = profile_builder.add_cccd(var db, both)!
+        if config.interval_writable
+            var range: [u8] = []
+            wire.put(var range, config.interval_min, 2)
+            wire.put(var range, config.interval_max, 2)
+            valid_range = profile_builder.add_descriptor(var db, profile_builder.read_only(config.access), UUID_VALID_RANGE, range)!
+    Ok(HtsHandles {
+        service: service as u16, measurement: measurement as u16, measurement_cccd: measurement_cccd as u16,
+        temperature_type: temperature_type as u16, intermediate: intermediate as u16, intermediate_cccd: intermediate_cccd as u16,
+        interval: interval as u16, interval_cccd: interval_cccd as u16, valid_range: valid_range as u16 })
+
+// The attribute value at `handle`, empty for none.
+@tier(app)
+fn hts_attribute(db: GattDb, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// The Measurement Interval in seconds, -1 for a service without it.
+@tier(app)
+fn hts_interval(db: GattDb, handles: HtsHandles) -> Int
+    if handles.interval == 0
+        return -1
+    wire.get(hts_attribute(db, handles.interval), 0, 2)
+
+// Whether `seconds` is a Measurement Interval the service takes: 0, or a value
+// inside the Valid Range, which a service without one limits to 65535.
+@tier(app)
+fn hts_interval_in_range(db: GattDb, handles: HtsHandles, seconds: Int) -> Bool
+    if seconds < 0 or seconds > 65535
+        return false
+    if seconds == 0 or handles.valid_range == 0
+        return true
+    let range = hts_attribute(db, handles.valid_range)
+    seconds >= wire.get(range, 0, 2) and seconds <= wire.get(range, 2, 2)
+
+// Change the Measurement Interval at the thermometer itself; false (and the
+// old value kept) for a service without it or a value out of range.  The
+// client hears of it when `hts_indicate_interval` sends it.
+@tier(app)
+fn hts_set_interval(var db: GattDb, handles: HtsHandles, seconds: Int) -> Bool
+    handles.interval != 0 and hts_interval_in_range(db, handles, seconds) and gatt_server.set_value(var db, handles.interval, interval_value(seconds))
+
+// The measurement `m` as the service sends it: a service with the Temperature
+// Type characteristic leaves the type field out.
+@tier(embedded)
+@no_alloc
+fn hts_sent(handles: HtsHandles, m: HtsMeasurement) -> HtsMeasurement
+    if handles.temperature_type == 0
+        return m
+    HtsMeasurement {
+        temperature: m.temperature, fahrenheit: m.fahrenheit, has_time: m.has_time,
+        time: m.time,
+        temperature_type: 0 }
+
+// Store `m` as the Temperature Measurement and answer the indication PDU: the
+// indication when the client enabled it, none otherwise (and none for a
+// measurement the service cannot send, which is not stored).  A second
+// indication waits for the confirmation of the first.
+@tier(app)
+fn hts_indicate(var db: GattDb, var link: AttLink, handles: HtsHandles, m: HtsMeasurement, now_ms: Int) -> [[u8]]
+    if not hts_measurement_valid(m) or not gatt_server.set_value(var db, handles.measurement, hts_measurement_value(hts_sent(handles, m)))
+        return []
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// Store `m` as the Intermediate Temperature and answer the notification PDU,
+// none when the client did not enable it or the service has no such
+// characteristic.
+@tier(app)
+fn hts_intermediate_notify(var db: GattDb, var link: AttLink, handles: HtsHandles, m: HtsMeasurement, now_ms: Int) -> [[u8]]
+    if handles.intermediate == 0 or not hts_measurement_valid(m)
+        return []
+    if not gatt_server.set_value(var db, handles.intermediate, hts_measurement_value(hts_sent(handles, m)))
+        return []
+    gatt_server.send_value(var db, var link, handles.intermediate, now_ms)
+
+// Indicate the Measurement Interval, as the specification has the service do
+// after it changed locally; none unless the characteristic indicates and the
+// client enabled it.
+@tier(app)
+fn hts_indicate_interval(var db: GattDb, var link: AttLink, handles: HtsHandles, now_ms: Int) -> [[u8]]
+    if handles.interval_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.interval, now_ms)
+
+// Whether the client wrote the Measurement Interval; `changed` is what
+// `gatt_server.take_changed` answered.
+@tier(embedded)
+@no_alloc
+fn hts_interval_written(handles: HtsHandles, changed: [Int]) -> Bool
+    if handles.interval == 0
+        return false
+    for h in changed
+        if h == handles.interval
+            return true
+    false
+
+// Answer one ATT PDU of `peer`: a Write Request, or the first part of a long
+// write, that carries a two-octet interval is evaluated before it is answered.
+// The access comes first, then the range and `HtsPolicy.interval_change` (Out of
+// Range, 0x80); a value of another length is left to the length rule of the
+// characteristic.
+@tier(app)
+fn hts_receive<P: HtsPolicy[e]>(var db: GattDb, var link: AttLink, handles: HtsHandles, var policy: P, peer: links.LinkId, pdu: [u8], now_ms: Int) -> [[u8]] [e, mutate]
+    if handles.interval != 0 and list.len(pdu) >= 3 and gatt_server.read_le16(pdu, 1) == handles.interval
+        let op = pdu[0] as Int
+        var value: [u8] = []
+        if op == att.ATT_OP_WRITE_REQ
+            value = pdu[3:list.len(pdu)]
+        if op == att.ATT_OP_PREPARE_WRITE_REQ and list.len(pdu) >= 5 and gatt_server.read_le16(pdu, 3) == 0
+            value = pdu[5:list.len(pdu)]
+        if list.len(value) == 2
+            let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handles.interval), true)
+            if access != 0
+                return gatt_server.error(op, handles.interval, access)
+            let seconds = wire.get(value, 0, 2)
+            if not hts_interval_in_range(db, handles, seconds) or not policy.interval_change(peer, seconds)
+                return gatt_server.error(op, handles.interval, ERR_INTERVAL_OUT_OF_RANGE)
+    gatt_server.receive(var db, var link, pdu, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+// Everything the service can have: a type, the intermediate temperature and a
+// writable, indicating interval of 10 to 3600 seconds.
+@tier(app)
+fn full_config() -> HtsConfig
+    HtsConfig {
+        access: gatt_server.Access.Encrypted, write_access: gatt_server.Access.Authenticated,
+        temperature_type: TYPE_MOUTH, intermediate: true, interval: 60,
+        interval_writable: true, interval_indicate: true, interval_min: 10, interval_max: 3600 }

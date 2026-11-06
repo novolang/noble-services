@@ -1,0 +1,251 @@
+// tests/body_composition_client_tests.nv — the unit tests of src/body_composition_client.nv.
+//
+//   novo test tests/body_composition_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use body_composition
+use sensor_client
+use wire
+use body_composition_client.{ BC_BASAL_METABOLISM, BC_BODY_WATER_MASS, BC_FAT_FREE_MASS, BC_FIELD_MASK, BC_FLAG_IMPERIAL, BC_FLAG_MULTIPLE, BC_HEIGHT, BC_IMPEDANCE, BC_MUSCLE_MASS, BC_MUSCLE_PERCENTAGE, BC_SOFT_LEAN_MASS, BC_TIME_STAMP, BC_UNSUCCESSFUL, BC_USER, BC_WEIGHT, BcPacket, bc_client_new, bc_client_start, bc_continues, bc_decode, bc_decode_features, bc_has, bc_height_mm, bc_mass_grams, bc_merge, bc_unsuccessful }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@tier(app)
+fn must(b: [u8]) -> BcPacket
+    match bc_decode(b)
+        Some(p) => p
+        None =>
+            test.fail("a packet")
+            BcPacket {
+                imperial: false, multiple: false, body_fat: 0, present: 0, time: wire.date_time_unknown(), user_id: 0,
+                basal_metabolism: 0, muscle_percentage: 0, muscle_mass: 0, fat_free_mass: 0, soft_lean_mass: 0,
+                body_water_mass: 0, impedance: 0, weight: 0, height: 0 }
+
+// A packet: the flags for `present` and `extra` (units and multiple bits), the body fat, then `rest`.
+@tier(app)
+fn value_of(present: Int, extra: Int, body_fat: Int, rest: [Int]) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, (present << 1) | extra, 2)
+    wire.put(var out, body_fat, 2)
+    for x in rest
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+fn stamp_octets() -> [Int]
+    [0xEA, 0x07, 10, 27, 9, 5, 3]
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_a_packet_with_no_optional_field()
+    let p = must(value_of(0, 0, 0x0123, []))
+    test.assert_eq(p.body_fat, 0x0123)
+    test.assert_eq(p.present, 0)
+    test.assert_eq(p.imperial, false)
+    test.assert_eq(p.multiple, false)
+    test.assert_eq(bc_unsuccessful(p), false)
+    let lb = must(value_of(0, BC_FLAG_IMPERIAL, 100, []))
+    test.assert_eq(lb.imperial, true)
+    // Reserved flag bits 13 to 15 are ignored.
+    test.assert_eq(must(value_of(0, 0xE000, 100, [])).present, 0)
+    // 0xFFFF is the unsuccessful marker.
+    test.assert_eq(bc_unsuccessful(must(value_of(0, 0, BC_UNSUCCESSFUL, []))), true)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_each_field_alone_has_its_flag_its_size_and_its_place()
+    let t = must(value_of(BC_TIME_STAMP, 0, 1, stamp_octets()))
+    test.assert_eq(t.time.year as Int, 2026)
+    test.assert_eq(t.time.hours as Int, 9)
+    test.assert_eq(bc_has(t, BC_TIME_STAMP), true)
+    test.assert_eq(bc_has(t, BC_USER), false)
+    test.assert_eq(must(value_of(BC_USER, 0, 1, [7])).user_id, 7)
+    test.assert_eq(must(value_of(BC_BASAL_METABOLISM, 0, 1, [0x34, 0x12])).basal_metabolism, 0x1234)
+    test.assert_eq(must(value_of(BC_MUSCLE_PERCENTAGE, 0, 1, [0x35, 0x12])).muscle_percentage, 0x1235)
+    test.assert_eq(must(value_of(BC_MUSCLE_MASS, 0, 1, [0x36, 0x12])).muscle_mass, 0x1236)
+    test.assert_eq(must(value_of(BC_FAT_FREE_MASS, 0, 1, [0x37, 0x12])).fat_free_mass, 0x1237)
+    test.assert_eq(must(value_of(BC_SOFT_LEAN_MASS, 0, 1, [0x38, 0x12])).soft_lean_mass, 0x1238)
+    test.assert_eq(must(value_of(BC_BODY_WATER_MASS, 0, 1, [0x39, 0x12])).body_water_mass, 0x1239)
+    test.assert_eq(must(value_of(BC_IMPEDANCE, 0, 1, [0x3A, 0x12])).impedance, 0x123A)
+    test.assert_eq(must(value_of(BC_WEIGHT, 0, 1, [0x3B, 0x12])).weight, 0x123B)
+    test.assert_eq(must(value_of(BC_HEIGHT, 0, 1, [0x3C, 0x12])).height, 0x123C)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_every_field_in_the_order_of_the_flags()
+    var rest: [Int] = []
+    for x in stamp_octets()
+        list.push(rest, x)
+    list.push(rest, 7)
+    for k in 2..11
+        list.push(rest, 0x10 * k)
+        list.push(rest, k)
+    let p = must(value_of(BC_FIELD_MASK, 0, 0x0123, rest))
+    test.assert_eq(p.present, BC_FIELD_MASK)
+    test.assert_eq(p.user_id, 7)
+    test.assert_eq(p.basal_metabolism, 0x0220)
+    test.assert_eq(p.muscle_percentage, 0x0330)
+    test.assert_eq(p.muscle_mass, 0x0440)
+    test.assert_eq(p.fat_free_mass, 0x0550)
+    test.assert_eq(p.soft_lean_mass, 0x0660)
+    test.assert_eq(p.body_water_mass, 0x0770)
+    test.assert_eq(p.impedance, 0x0880)
+    test.assert_eq(p.weight, 0x0990)
+    test.assert_eq(p.height, 0x0AA0)
+    // A missing field in the middle shifts the later ones.
+    let some = must(value_of(BC_USER | BC_WEIGHT, 0, 1, [5, 0x0A, 0x00]))
+    test.assert_eq(some.user_id, 5)
+    test.assert_eq(some.weight, 10)
+    test.assert_eq(some.height, 0)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_truncations_and_bad_time_stamps_answer_none()
+    test.assert_eq(bc_decode([]), None)
+    test.assert_eq(bc_decode(octets([0, 0, 1])), None)
+    var rest: [Int] = []
+    for x in stamp_octets()
+        list.push(rest, x)
+    list.push(rest, 7)
+    for k in 2..11
+        list.push(rest, k)
+        list.push(rest, 0)
+    let full = value_of(BC_FIELD_MASK, 0, 1, rest)
+    for k in 0..list.len(full)
+        test.assert_eq(bc_decode(full[:k]), None)
+    test.assert(bc_decode(full) != None)
+    test.assert_eq(bc_decode(value_of(BC_TIME_STAMP, 0, 1, [0, 0, 10, 27, 9, 5, 3])), None)
+    test.assert_eq(bc_decode(value_of(BC_TIME_STAMP, 0, 1, [0xEA, 0x07, 0, 27, 9, 5, 3])), None)
+    test.assert_eq(bc_decode(value_of(BC_TIME_STAMP, 0, 1, [0xEA, 0x07, 10, 0, 9, 5, 3])), None)
+    test.assert_eq(bc_decode(value_of(BC_TIME_STAMP, 0, 1, [0xEA, 0x07, 13, 27, 9, 5, 3])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_a_continuation_joins_its_first_packet()
+    var first_rest: [Int] = []
+    for x in stamp_octets()
+        list.push(first_rest, x)
+    list.push(first_rest, 7)
+    list.push(first_rest, 0x11)
+    list.push(first_rest, 0x00)
+    let first = must(value_of(BC_TIME_STAMP | BC_USER | BC_BASAL_METABOLISM, BC_FLAG_MULTIPLE, 0x0123, first_rest))
+    let cont = must(value_of(BC_WEIGHT | BC_HEIGHT, BC_FLAG_MULTIPLE, 0x0123, [0x88, 0x13, 0xD6, 0x06]))
+    test.assert(bc_continues(first, cont))
+    match bc_merge(first, cont)
+        Some(m) =>
+            test.assert_eq(m.present, BC_TIME_STAMP | BC_USER | BC_BASAL_METABOLISM | BC_WEIGHT | BC_HEIGHT)
+            test.assert_eq(m.multiple, false)
+            test.assert_eq(m.user_id, 7)
+            test.assert_eq(m.basal_metabolism, 0x11)
+            test.assert_eq(m.weight, 0x1388)
+            test.assert_eq(bc_mass_grams(m.weight, false), 25000)
+            test.assert_eq(bc_height_mm(m.height, false), 1750)
+            test.assert_eq(m.time.day as Int, 27)
+        None => test.fail("the merged packet")
+    // Another body fat, a missing Multiple Packet bit, another unit, a continuation with a user, an
+    // overlapping field: none of them continues the first packet.
+    let other = must(value_of(BC_WEIGHT, BC_FLAG_MULTIPLE, 0x0124, [1, 0]))
+    test.assert_eq(bc_merge(first, other), None)
+    let single = must(value_of(BC_WEIGHT, 0, 0x0123, [1, 0]))
+    test.assert_eq(bc_merge(first, single), None)
+    let lb = must(value_of(BC_WEIGHT, BC_FLAG_MULTIPLE | BC_FLAG_IMPERIAL, 0x0123, [1, 0]))
+    test.assert_eq(bc_merge(first, lb), None)
+    let user = must(value_of(BC_USER, BC_FLAG_MULTIPLE, 0x0123, [1]))
+    test.assert_eq(bc_merge(first, user), None)
+    let both = must(value_of(BC_BASAL_METABOLISM, BC_FLAG_MULTIPLE, 0x0123, [1, 0]))
+    test.assert_eq(bc_merge(first, both), None)
+
+// Whether `b` decodes to these features.
+@tier(app)
+fn features_are(b: [u8], support: Int, weight: Int, height: Int) -> Bool
+    match bc_decode_features(b)
+        Some(f) => f.support == support and f.weight_resolution == weight and f.height_resolution == height
+        None => false
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_units_and_the_feature()
+    // 55.11 lb is 25 kg; 68.9 in is 1750 mm.
+    test.assert_eq(bc_mass_grams(5511, true), 24997)
+    test.assert_eq(bc_mass_grams(0, true), 0)
+    test.assert_eq(bc_height_mm(689, true), 1750)
+    test.assert(features_are(octets([0, 0, 0, 0]), 0, 0, 0))
+    // All eleven support bits, weight resolution 7 (bits 11 to 14), height resolution 3 (bits 15 to 17).
+    let v = 0x7FF | (7 << 11) | (3 << 15)
+    test.assert(features_are(octets([v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, 0]), 0x7FF, 7, 3))
+    // The reserved bits 18 to 31 are ignored.
+    test.assert(features_are(octets([0, 0, 0xFC, 0xFF]), 0, 0, 0))
+    test.assert_eq(bc_decode_features(octets([0, 0, 0])), None)
+    test.assert_eq(bc_decode_features(octets([0, 0, 0, 0, 0])), None)
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_session_against_the_analyzer_server_with_a_continuation()
+    if not fixtures.client_engine_present()
+        return
+    var config = body_composition.default_bcs_config()
+    config = body_composition.BcsConfig {
+        features: body_composition.F_SUPPORT_MASK | (7 << body_composition.WEIGHT_RESOLUTION_SHIFT) | (3 << body_composition.HEIGHT_RESOLUTION_SHIFT),
+        changes: true, access: gatt_server.Access.Encrypted, secondary: false }
+    var built = body_composition.server(config)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(body_composition.UUID_BODY_COMPOSITION_SERVICE)
+    var t = both.0
+    var c = bc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, bc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_uuid(c), body_composition.UUID_BODY_COMPOSITION_FEATURE)
+    match bc_decode_features(sensor_client.sc_value(c))
+        Some(f) =>
+            test.assert_eq(f.support, BC_FIELD_MASK)
+            test.assert_eq(f.weight_resolution, 7)
+            test.assert_eq(f.height_resolution, 3)
+        None => test.fail("the features")
+    // The measurement has every field, so it is indicated in two packets.
+    let first_pdus = body_composition.bcs_indicate(var s.db, var s.link, h, config, body_composition.full(), 0)
+    test.assert_eq(list.len(first_pdus), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, first_pdus), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    let a = must(sensor_client.sc_value(c))
+    test.assert_eq(a.multiple, true)
+    test.assert_eq(a.user_id, 7)
+    test.assert_eq(a.time.minutes as Int, 5)
+    let second_pdus = gatt_server.receive(var s.db, var s.link, [0x1E], 1)
+    test.assert_eq(list.len(second_pdus), 1)
+    test.assert_eq(sensor_client.test_deliver(var t, var c, second_pdus), sensor_client.SE_VALUE | sensor_client.SE_INDICATION)
+    let b = must(sensor_client.sc_value(c))
+    test.assert_eq(b.multiple, true)
+    match bc_merge(a, b)
+        Some(m) =>
+            test.assert_eq(m.present, BC_FIELD_MASK)
+            test.assert_eq(m.body_fat, 0x0123)
+            test.assert_eq(m.impedance, 0x7777)
+            test.assert_eq(m.weight, 0x8888)
+            test.assert_eq(m.height, 0x9999)
+        None => test.fail("the two packets of one measurement")
+
+@tier(app)
+@test
+@satisfies("REQ-BLE-PRFC-011")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(body_composition.UUID_BODY_COMPOSITION_SERVICE)
+    var t = both.0
+    var c = bc_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, bc_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

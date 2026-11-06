@@ -1,0 +1,422 @@
+// src/cycling_power_client.nv — the Collector side of the Cycling
+// Power Service (0x1818): the decoders of its characteristics, the Cycling Power
+// Control Point requests and responses, and the client session.
+//
+//   Cycling Power Measurement   0x2A63   `cp_decode`
+//   Cycling Power Feature       0x2A65   `cp_decode_feature`
+//   Sensor Location             0x2A5D   `cp_decode_location`
+//   Cycling Power Vector        0x2A64   `cp_decode_vector`
+//   Cycling Power Control Point 0x2A66   `cp_req_*` build, `cp_decode_response` reads
+//
+// Layout of a measurement ([GSS] 3.65, [CPS] 3.2.1): the flags (two octets) and the
+// instantaneous power (sint16, watts) are always there; then, in the order of the flag
+// bits and each only when its bit is set: pedal power balance (bit 0, one octet, units of
+// 1/2 percent; bit 1 says the reference is the left pedal), accumulated torque (bit 2,
+// two octets, 1/32 newton metre; bit 3 says crank based, else wheel based), wheel
+// revolution data (bit 4, a 32-bit count and a time in 1/2048 second), crank revolution
+// data (bit 5, a 16-bit count and a time in 1/1024 second), extreme force magnitudes
+// (bit 6, two sint16, newtons), extreme torque magnitudes (bit 7, two sint16, 1/32 newton
+// metre), extreme angles (bit 8, a uint24 holding the minimum angle in its upper 12 bits
+// and the maximum in its lower 12 bits, degrees), top dead spot angle (bit 9) and bottom
+// dead spot angle (bit 10, two octets each, degrees), accumulated energy (bit 11, two
+// octets, kilojoules); bit 12 is the offset compensation indicator.  The fields the
+// decoder reads are exactly those the flags name; a value shorter than they need answers
+// `None`, and octets past them are ignored.
+//
+// The decoders allocate nothing and keep no state.  Presence is a bit set (`present`, one
+// bit per flag, tested with `cp_has`) so a measurement is one small struct.  The session
+// runs on `sensor_client.nv`.
+
+use gatt_client
+use links
+use cycling_power
+use sensor_client
+use sensor_control
+use wire
+
+// The bits of `CpMeasurement.present`, those of the flags field.
+const CPM_BALANCE = 0x0001
+const CPM_TORQUE = 0x0004
+const CPM_WHEEL = 0x0010
+const CPM_CRANK = 0x0020
+const CPM_FORCE_EXTREMES = 0x0040
+const CPM_TORQUE_EXTREMES = 0x0080
+const CPM_ANGLE_EXTREMES = 0x0100
+const CPM_TOP_DEAD_SPOT = 0x0200
+const CPM_BOTTOM_DEAD_SPOT = 0x0400
+const CPM_ENERGY = 0x0800
+
+// One decoded measurement.  A field whose bit is not in `present` is 0.  `balance` is in units of
+// 1/2 percent; `torque` in 1/32 newton metre; `wheel_time` in 1/2048 second and `crank_time` in
+// 1/1024 second; the extremes are the maximum and the minimum of a force (newtons) or a torque
+// (1/32 newton metre) as `present` says; angles in degrees; `energy` in kilojoules.
+@value
+struct CpMeasurement
+    present: Int
+    power: Int
+    balance: Int
+    balance_left: Bool
+    torque: Int
+    torque_crank_based: Bool
+    wheel_revs: Int
+    wheel_time: Int
+    crank_revs: Int
+    crank_time: Int
+    extreme_max: Int
+    extreme_min: Int
+    angle_max: Int
+    angle_min: Int
+    top_dead_spot: Int
+    bottom_dead_spot: Int
+    energy: Int
+    offset_compensation: Bool
+
+// Whether `present` holds all the bits of `field`.
+@tier(embedded)
+@no_alloc
+fn cp_has(present: Int, field: Int) -> Bool
+    (present & field) == field
+
+// The measurement in `b`, `None` when `b` is shorter than its flags require.
+@tier(embedded)
+@no_alloc
+fn cp_decode(b: [u8]) -> ?CpMeasurement
+    let n = list.len(b)
+    if n < 4
+        return None
+    let flags = wire.get(b, 0, 2)
+    var at = 4
+    var balance = 0
+    var torque = 0
+    var wheel_revs = 0
+    var wheel_time = 0
+    var crank_revs = 0
+    var crank_time = 0
+    var extreme_max = 0
+    var extreme_min = 0
+    var angle_max = 0
+    var angle_min = 0
+    var top = 0
+    var bottom = 0
+    var energy = 0
+    if (flags & CPM_BALANCE) != 0
+        if n < at + 1
+            return None
+        balance = wire.get(b, at, 1)
+        at = at + 1
+    if (flags & CPM_TORQUE) != 0
+        if n < at + 2
+            return None
+        torque = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & CPM_WHEEL) != 0
+        if n < at + 6
+            return None
+        wheel_revs = wire.get(b, at, 4)
+        wheel_time = wire.get(b, at + 4, 2)
+        at = at + 6
+    if (flags & CPM_CRANK) != 0
+        if n < at + 4
+            return None
+        crank_revs = wire.get(b, at, 2)
+        crank_time = wire.get(b, at + 2, 2)
+        at = at + 4
+    // The force and torque pairs exclude each other ([CPS] 3.2.1.7, 3.2.1.8): a value with both is no measurement.
+    if (flags & CPM_FORCE_EXTREMES) != 0 and (flags & CPM_TORQUE_EXTREMES) != 0
+        return None
+    if (flags & CPM_FORCE_EXTREMES) != 0 or (flags & CPM_TORQUE_EXTREMES) != 0
+        if n < at + 4
+            return None
+        extreme_max = wire.get_signed(b, at, 2)
+        extreme_min = wire.get_signed(b, at + 2, 2)
+        at = at + 4
+    if (flags & CPM_ANGLE_EXTREMES) != 0
+        if n < at + 3
+            return None
+        let v = wire.get(b, at, 3)
+        angle_max = v & 0xFFF
+        angle_min = v >>> 12
+        at = at + 3
+    if (flags & CPM_TOP_DEAD_SPOT) != 0
+        if n < at + 2
+            return None
+        top = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & CPM_BOTTOM_DEAD_SPOT) != 0
+        if n < at + 2
+            return None
+        bottom = wire.get(b, at, 2)
+        at = at + 2
+    if (flags & CPM_ENERGY) != 0
+        if n < at + 2
+            return None
+        energy = wire.get(b, at, 2)
+    Some(CpMeasurement {
+        present: flags & 0x0FFF, power: wire.get_signed(b, 2, 2), balance: balance, balance_left: (flags & 0x0002) != 0,
+        torque: torque, torque_crank_based: (flags & 0x0008) != 0, wheel_revs: wheel_revs, wheel_time: wheel_time,
+        crank_revs: crank_revs, crank_time: crank_time, extreme_max: extreme_max, extreme_min: extreme_min,
+        angle_max: angle_max, angle_min: angle_min, top_dead_spot: top, bottom_dead_spot: bottom, energy: energy,
+        offset_compensation: (flags & 0x1000) != 0 })
+
+// The Feature value in `b` (32 bits), `None` unless `b` is 4 octets.
+@tier(embedded)
+@no_alloc
+fn cp_decode_feature(b: [u8]) -> ?Int
+    if list.len(b) != 4
+        return None
+    Some(wire.get(b, 0, 4))
+
+// Whether the Feature value `f` names the bit `bit` (the `FEATURE_*` constants of the server module).
+@tier(embedded)
+@no_alloc
+fn cp_feature_has(f: Int, bit: Int) -> Bool
+    (f & bit) != 0
+
+// The Feature bits the server module does not name ([GSS] 3.64.1).
+const FEATURE_EXTREME_MAGNITUDES = 0x00000010
+const FEATURE_EXTREME_ANGLES = 0x00000020
+const FEATURE_TOP_BOTTOM_DEAD_SPOT = 0x00000040
+const FEATURE_OFFSET_COMPENSATION = 0x00000200
+const FEATURE_CONTENT_MASKING = 0x00000400
+const FEATURE_MULTIPLE_LOCATIONS = 0x00000800
+const FEATURE_CRANK_LENGTH_ADJUSTMENT = 0x00001000
+const FEATURE_CHAIN_LENGTH_ADJUSTMENT = 0x00002000
+const FEATURE_CHAIN_WEIGHT_ADJUSTMENT = 0x00004000
+const FEATURE_SPAN_LENGTH_ADJUSTMENT = 0x00008000
+const FEATURE_FACTORY_CALIBRATION_DATE = 0x00040000
+const FEATURE_ENHANCED_OFFSET_COMPENSATION = 0x00080000
+
+// The distributed system support of a Feature value (bits 20 and 21): 0 unspecified, 1 not for use in a
+// distributed system, 2 for use in one.
+@tier(embedded)
+@no_alloc
+fn cp_feature_distributed(f: Int) -> Int
+    (f >>> 20) & 3
+
+// The Sensor Location in `b`, `None` unless one octet.
+@tier(embedded)
+@no_alloc
+fn cp_decode_location(b: [u8]) -> ?Int
+    if list.len(b) != 1
+        return None
+    Some(b[0] as Int)
+
+// ── Cycling Power Vector ────────────────────────────────────────────
+
+const VEC_CRANK = 0x01
+const VEC_FIRST_ANGLE = 0x02
+const VEC_FORCE_ARRAY = 0x04
+const VEC_TORQUE_ARRAY = 0x08
+
+// The direction of the instantaneous magnitudes ([GSS] 3.66.1).
+const DIRECTION_UNKNOWN = 0
+const DIRECTION_TANGENTIAL = 1
+const DIRECTION_RADIAL = 2
+const DIRECTION_LATERAL = 3
+
+// One decoded Vector.  The magnitude array (up to 9 sint16 in the value) is read with `cp_vector_at`;
+// `array` says which one: 0 none, `VEC_FORCE_ARRAY` newtons or `VEC_TORQUE_ARRAY` 1/32 newton metre.
+@value
+struct CpVector
+    present: Int
+    crank_revs: Int
+    crank_time: Int
+    first_angle: Int
+    direction: Int
+    array: Int
+    array_at: Int
+    array_count: Int
+
+// The Vector in `b`, `None` when it is short, has both arrays (a sensor measures force or torque, not
+// both), an odd array or more than 9 magnitudes.
+@tier(embedded)
+@no_alloc
+fn cp_decode_vector(b: [u8]) -> ?CpVector
+    let n = list.len(b)
+    if n < 2
+        return None
+    let flags = wire.get(b, 0, 2)
+    var at = 2
+    var crank_revs = 0
+    var crank_time = 0
+    var first_angle = 0
+    if (flags & VEC_CRANK) != 0
+        if n < at + 4
+            return None
+        crank_revs = wire.get(b, at, 2)
+        crank_time = wire.get(b, at + 2, 2)
+        at = at + 4
+    if (flags & VEC_FIRST_ANGLE) != 0
+        if n < at + 2
+            return None
+        first_angle = wire.get(b, at, 2)
+        at = at + 2
+    let force = (flags & VEC_FORCE_ARRAY) != 0
+    let torque = (flags & VEC_TORQUE_ARRAY) != 0
+    if force and torque
+        return None
+    var array = 0
+    var count = 0
+    if force or torque
+        if (n - at) % 2 != 0 or (n - at) / 2 > 9
+            return None
+        array = if force then VEC_FORCE_ARRAY else VEC_TORQUE_ARRAY
+        count = (n - at) / 2
+    Some(CpVector {
+        present: flags & 0x0F, crank_revs: crank_revs, crank_time: crank_time, first_angle: first_angle,
+        direction: (flags >>> 4) & 3, array: array, array_at: at, array_count: count })
+
+// The `k`-th magnitude of the Vector `v` decoded from `b`; 0 past the end.
+@tier(embedded)
+@no_alloc
+fn cp_vector_at(b: [u8], v: CpVector, k: Int) -> Int
+    if k < 0 or k >= v.array_count
+        return 0
+    wire.get_signed(b, v.array_at + 2 * k, 2)
+
+// ── Control Point ───────────────────────────────────────────────────
+//
+// Op codes ([GSS] 3.63.1) beyond the three the server module names.
+const OP_SET_CRANK_LENGTH = 0x04
+const OP_REQUEST_CRANK_LENGTH = 0x05
+const OP_SET_CHAIN_LENGTH = 0x06
+const OP_REQUEST_CHAIN_LENGTH = 0x07
+const OP_SET_CHAIN_WEIGHT = 0x08
+const OP_REQUEST_CHAIN_WEIGHT = 0x09
+const OP_SET_SPAN_LENGTH = 0x0A
+const OP_REQUEST_SPAN_LENGTH = 0x0B
+const OP_START_OFFSET_COMPENSATION = 0x0C
+const OP_MASK_MEASUREMENT_CONTENT = 0x0D
+const OP_REQUEST_SAMPLING_RATE = 0x0E
+const OP_REQUEST_FACTORY_CALIBRATION_DATE = 0x0F
+const OP_START_ENHANCED_OFFSET_COMPENSATION = 0x10
+
+// The result codes of a response ([GSS] 3.63.2).
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_OPERAND = 0x03
+const RESULT_OPERATION_FAILED = 0x04
+
+@tier(app)
+fn cp_request(op: Int, width: Int, v: Int) -> [u8]
+    var out: [u8] = [op as u8]
+    wire.put(var out, v, width)
+    out
+
+// The requests.  Lengths and weights are in the units the characteristic gives: crank length in 1/2
+// millimetre, chain length and span length in millimetres, chain weight in grams.
+@tier(app)
+fn cp_req_set_cumulative(wheel_revolutions: Int) -> [u8]
+    cp_request(cycling_power.OP_SET_CUMULATIVE_VALUE, 4, wheel_revolutions)
+
+@tier(app)
+fn cp_req_update_location(location: Int) -> [u8]
+    cp_request(cycling_power.OP_UPDATE_SENSOR_LOCATION, 1, location)
+
+@tier(app)
+fn cp_req_list_locations() -> [u8]
+    [cycling_power.OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS]
+
+@tier(app)
+fn cp_req_set_crank_length(half_mm: Int) -> [u8]
+    cp_request(OP_SET_CRANK_LENGTH, 2, half_mm)
+
+@tier(app)
+fn cp_req_set_chain_length(mm: Int) -> [u8]
+    cp_request(OP_SET_CHAIN_LENGTH, 2, mm)
+
+@tier(app)
+fn cp_req_set_chain_weight(grams: Int) -> [u8]
+    cp_request(OP_SET_CHAIN_WEIGHT, 2, grams)
+
+@tier(app)
+fn cp_req_set_span_length(mm: Int) -> [u8]
+    cp_request(OP_SET_SPAN_LENGTH, 2, mm)
+
+@tier(app)
+fn cp_req_mask_content(mask: Int) -> [u8]
+    cp_request(OP_MASK_MEASUREMENT_CONTENT, 2, mask)
+
+// A request with no parameter: `OP_REQUEST_CRANK_LENGTH`, `_CHAIN_LENGTH`, `_CHAIN_WEIGHT`, `_SPAN_LENGTH`,
+// `OP_START_OFFSET_COMPENSATION`, `OP_REQUEST_SAMPLING_RATE`, `OP_REQUEST_FACTORY_CALIBRATION_DATE` or
+// `OP_START_ENHANCED_OFFSET_COMPENSATION`.
+@tier(app)
+fn cp_req_plain(op: Int) -> [u8]
+    [op as u8]
+
+// A decoded response: the op code it answers, the result, and where its parameter lies in the value.
+@value
+struct CpResponse
+    request_op: Int
+    result: Int
+    param_at: Int
+    param_len: Int
+
+// The response in `b` (the op code 0x20, the request's op code, the result, the parameter), `None` when
+// `b` is no response.
+@tier(embedded)
+@no_alloc
+fn cp_decode_response(b: [u8]) -> ?CpResponse
+    if list.len(b) < 3 or b[0] as Int != cycling_power.OP_RESPONSE_CODE
+        return None
+    Some(CpResponse { request_op: b[1] as Int, result: b[2] as Int, param_at: 3, param_len: list.len(b) - 3 })
+
+// The parameter of a successful Request Crank Length, Chain Length, Chain Weight, Span Length or Sampling
+// Rate response (two octets, the sampling rate one); `None` when the response is no success or the
+// parameter is too short.
+@tier(embedded)
+@no_alloc
+fn cp_response_value(b: [u8], r: CpResponse) -> ?Int
+    if r.result != RESULT_SUCCESS
+        return None
+    let need = if r.request_op == OP_REQUEST_SAMPLING_RATE then 1 else 2
+    if r.param_len < need
+        return None
+    Some(wire.get(b, r.param_at, need))
+
+// The raw force or torque of a successful Start Offset Compensation response (sint16); for the enhanced
+// procedure the company identifier follows at `param_at + 2` and the manufacturer specific data after it.
+@tier(embedded)
+@no_alloc
+fn cp_response_offset(b: [u8], r: CpResponse) -> ?Int
+    if r.result != RESULT_SUCCESS or r.param_len < 2
+        return None
+    Some(wire.get_signed(b, r.param_at, 2))
+
+// The number of Sensor Locations a successful Request Supported Sensor Locations response lists, and the
+// `k`-th of them.
+@tier(embedded)
+@no_alloc
+fn cp_response_location_count(r: CpResponse) -> Int
+    if r.result == RESULT_SUCCESS then r.param_len else 0
+
+@tier(embedded)
+@no_alloc
+fn cp_response_location_at(b: [u8], r: CpResponse, k: Int) -> Int
+    if k < 0 or k >= cp_response_location_count(r)
+        return -1
+    b[r.param_at + k] as Int
+
+// ── Session ─────────────────────────────────────────────────────────
+
+@tier(app)
+fn cp_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, cycling_power.UUID_CYCLING_POWER_SERVICE)
+
+// Discover the service; read the Feature (required) and the Sensor Location; subscribe to the measurement
+// (required), the Vector (optional) and, by indication, the Control Point (optional).
+@tier(app)
+fn cp_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, cycling_power.UUID_CYCLING_POWER_FEATURE, true)
+    sensor_client.sc_queue_read(var c, 0x2A5D, false)
+    sensor_client.sc_queue_subscribe(var c, cycling_power.UUID_CYCLING_POWER_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, 0x2A64, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, cycling_power.UUID_CYCLING_POWER_CONTROL_POINT, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` (a `cp_req_*` value) to the Control Point; the response arrives as an indication on
+// `UUID_CYCLING_POWER_CONTROL_POINT` that `cp_decode_response` reads.
+@tier(app)
+fn cp_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, cycling_power.UUID_CYCLING_POWER_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

@@ -1,0 +1,915 @@
+// src/cgm.nv — the Continuous Glucose Monitoring Service (0x181F), with
+// which a CGM sensor sends glucose measurements to a collector and is controlled by it.
+//
+// Its builders run at start-up and allocate, so the functions that build lists or
+// records carry `@tier(app)`; the others are `@tier(embedded)` and `@no_alloc`.
+//
+//   CGM Measurement               0x2AA7  Notify; records of Size, Flags, glucose, Time
+//                                         Offset, annunciation, trend, quality, CRC
+//   CGM Feature                   0x2AA8  Read; 24 feature bits, Type-Sample Location,
+//                                         E2E-CRC; Indicate optional
+//   CGM Status                    0x2AA9  Read; Time Offset, 24 status bits, CRC
+//   CGM Session Start Time        0x2AAA  Read and Write; Date Time, time zone, DST, CRC
+//   CGM Session Run Time          0x2AAB  Read; hours, CRC
+//   Record Access Control Point   0x2A52  Indicate and Write; see racp.nv
+//   CGM Specific Ops Control Point 0x2AAC Indicate and Write; see below
+//
+// Security.  Every characteristic requires authentication ([CGMS] Table 3.1, [CGMP]
+// 6.1: security mode 1, level 2 or 3, and the sensor bonds), so `add_cgm_service` takes
+// the access of the service as Authenticated or SecureConnections and refuses the
+// others with `NotPermitted`.
+//
+// E2E-CRC.  When the Feature bit 12 is set the Feature (always six octets, CRC 0xFFFF
+// without E2E), the Measurement records, the Status, the Session Start Time, the
+// Session Run Time and the Specific Ops Control Point carry a CRC-CCITT of seed 0xFFFF
+// over all the other octets ([CGMS] 3.11, `reconnection_configuration.crc16`).  A write
+// of the Session Start Time or of the Specific Ops Control Point without it is
+// answered with Missing CRC (0x80), one with a wrong CRC with Invalid CRC (0x81)
+// ([CGMS] 1.8).  The Record Access Control Point has no CRC ([CGMS] 3.6).
+//
+// The device.  `CgmDevice` holds what the sensor knows: the records, whether a session
+// runs, the Session Start Time the collector wrote, the communication interval, the
+// alert levels, the calibration records and the Record Access Control Point run.  The
+// product feeds it measurements (`cgm_add_measurement`) and the time since the session
+// start (`cgm_set_clock`), and sets the status bits it detects (`cgm_set_alerts`).
+// `cgm_refresh` writes the Status, Session Start Time and Session Run Time values the
+// device state implies; the receive function calls it.
+//
+// Measurements.  Periodic notifications send the records not sent yet, as many whole
+// records to a notification as fit the ATT_MTU ([CGMS] 3.1.1); a requested transfer
+// (Record Access Control Point) sends the selected records the same way and ends with
+// the Success response, and the periodic notifications wait while it runs ([CGMS]
+// 3.8.3).  The Time Offset is the key of a record for the Record Access Control Point
+// ([CGMS] 3.6.3.1).
+//
+// The Specific Ops Control Point.  The service offers the procedures the Feature names:
+// the communication interval, calibration, the patient high and low, hypo, hyper and
+// rate alert levels, Reset Device Specific Alert, and Start and Stop Session when the
+// product offers them.  An Op Code of a feature the sensor lacks is answered Op Code not
+// supported; an operand of the wrong size Invalid Operand; a level outside the sensor's
+// range Parameter out of range ([CGMS] 3.7.2).  The Communication Interval Response
+// carries a uint8 ([CGMS] 3.7.1; GSS Table 3.80 shows a uint16, which the service
+// specification overrides).
+//
+// NOT IMPLEMENTED: the product-side decision of when a level is crossed (the product
+// sets the annunciation bits it detects), and the storage across a power cycle.
+//
+// Specification checked against: Continuous Glucose Monitoring Service 1.0.2 (CGMS),
+// Continuous Glucose Monitoring Profile 1.0.2 (CGMP) and the GATT Specification
+// Supplement v9, Sections 3.39 to 3.44 and 3.177.
+//
+// Satisfies: REQ-BLE-CGMS-001.
+
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use racp
+use reconnection_configuration
+use wire
+
+const UUID_CGM_SERVICE = 0x181F
+const UUID_CGM_MEASUREMENT = 0x2AA7
+const UUID_CGM_FEATURE = 0x2AA8
+const UUID_CGM_STATUS = 0x2AA9
+const UUID_CGM_SESSION_START_TIME = 0x2AAA
+const UUID_CGM_SESSION_RUN_TIME = 0x2AAB
+const UUID_RECORD_ACCESS_CONTROL_POINT = 0x2A52
+const UUID_CGM_SPECIFIC_OPS_CONTROL_POINT = 0x2AAC
+
+// The Application Error Codes of [CGMS] 1.8.
+const ERR_MISSING_CRC = 0x80
+const ERR_INVALID_CRC = 0x81
+
+// The CGM Feature bits ([GSS] Table 3.65).
+const FEATURE_CALIBRATION = 0x000001
+const FEATURE_PATIENT_HIGH_LOW = 0x000002
+const FEATURE_HYPO = 0x000004
+const FEATURE_HYPER = 0x000008
+const FEATURE_RATE = 0x000010
+const FEATURE_DEVICE_SPECIFIC_ALERT = 0x000020
+const FEATURE_SENSOR_MALFUNCTION = 0x000040
+const FEATURE_TEMPERATURE = 0x000080
+const FEATURE_RESULT_HIGH_LOW = 0x000100
+const FEATURE_LOW_BATTERY = 0x000200
+const FEATURE_SENSOR_TYPE_ERROR = 0x000400
+const FEATURE_GENERAL_DEVICE_FAULT = 0x000800
+const FEATURE_E2E_CRC = 0x001000
+const FEATURE_MULTIPLE_BOND = 0x002000
+const FEATURE_MULTIPLE_SESSIONS = 0x004000
+const FEATURE_TREND = 0x008000
+const FEATURE_QUALITY = 0x010000
+const FEATURE_DEFINED_BITS = 0x01FFFF
+
+// The Flags of a measurement record ([GSS] Table 3.71).
+const FLAG_TREND = 0x01
+const FLAG_QUALITY = 0x02
+const FLAG_WARNING = 0x20
+const FLAG_CAL_TEMP = 0x40
+const FLAG_STATUS = 0x80
+
+// The status bits that need no Feature bit: Session stopped (bit 0) and Time
+// synchronization required (bit 8).
+const STATUS_SESSION_STOPPED = 0x000001
+const STATUS_TIME_SYNC_REQUIRED = 0x000100
+
+// The Op Codes of the Specific Ops Control Point ([GSS] Table 3.80).
+const OP_SET_COMMUNICATION_INTERVAL = 0x01
+const OP_GET_COMMUNICATION_INTERVAL = 0x02
+const OP_COMMUNICATION_INTERVAL_RESPONSE = 0x03
+const OP_SET_CALIBRATION = 0x04
+const OP_GET_CALIBRATION = 0x05
+const OP_CALIBRATION_RESPONSE = 0x06
+const OP_SET_PATIENT_HIGH = 0x07
+const OP_GET_PATIENT_HIGH = 0x08
+const OP_PATIENT_HIGH_RESPONSE = 0x09
+const OP_SET_PATIENT_LOW = 0x0A
+const OP_GET_PATIENT_LOW = 0x0B
+const OP_PATIENT_LOW_RESPONSE = 0x0C
+const OP_SET_HYPO = 0x0D
+const OP_GET_HYPO = 0x0E
+const OP_HYPO_RESPONSE = 0x0F
+const OP_SET_HYPER = 0x10
+const OP_GET_HYPER = 0x11
+const OP_HYPER_RESPONSE = 0x12
+const OP_SET_RATE_DECREASE = 0x13
+const OP_GET_RATE_DECREASE = 0x14
+const OP_RATE_DECREASE_RESPONSE = 0x15
+const OP_SET_RATE_INCREASE = 0x16
+const OP_GET_RATE_INCREASE = 0x17
+const OP_RATE_INCREASE_RESPONSE = 0x18
+const OP_RESET_DEVICE_SPECIFIC_ALERT = 0x19
+const OP_START_SESSION = 0x1A
+const OP_STOP_SESSION = 0x1B
+const OP_RESPONSE_CODE = 0x1C
+
+// The Response Code Values ([GSS] Table 3.81).
+const RESULT_SUCCESS = 0x01
+const RESULT_OP_CODE_NOT_SUPPORTED = 0x02
+const RESULT_INVALID_OPERAND = 0x03
+const RESULT_PROCEDURE_NOT_COMPLETED = 0x04
+const RESULT_PARAMETER_OUT_OF_RANGE = 0x05
+
+// The Calibration Data Record is ten octets ([GSS] Table 3.82); the one numbered 0 is the
+// default record.
+const CALIBRATION_SIZE = 10
+
+// The levels the device keeps, in the order of the `levels` list.
+const LEVEL_PATIENT_HIGH = 0
+const LEVEL_PATIENT_LOW = 1
+const LEVEL_HYPO = 2
+const LEVEL_HYPER = 3
+const LEVEL_RATE_DECREASE = 4
+const LEVEL_RATE_INCREASE = 5
+
+// The status bits a Feature allows, the 24-bit field of [GSS] Tables 3.74 to 3.76.
+@tier(embedded)
+@no_alloc
+fn cgm_status_allowed(features: Int) -> Int
+    var allowed = STATUS_SESSION_STOPPED | STATUS_TIME_SYNC_REQUIRED
+    if (features & FEATURE_LOW_BATTERY) != 0
+        allowed = allowed | 0x000002
+    if (features & FEATURE_SENSOR_TYPE_ERROR) != 0
+        allowed = allowed | 0x000004
+    if (features & FEATURE_SENSOR_MALFUNCTION) != 0
+        allowed = allowed | 0x000008
+    if (features & FEATURE_DEVICE_SPECIFIC_ALERT) != 0
+        allowed = allowed | 0x000010
+    if (features & FEATURE_GENERAL_DEVICE_FAULT) != 0
+        allowed = allowed | 0x000020
+    if (features & FEATURE_CALIBRATION) != 0
+        allowed = allowed | 0x004E00
+    if (features & FEATURE_TEMPERATURE) != 0
+        allowed = allowed | 0x003000
+    if (features & FEATURE_PATIENT_HIGH_LOW) != 0
+        allowed = allowed | 0x030000
+    if (features & FEATURE_HYPO) != 0
+        allowed = allowed | 0x040000
+    if (features & FEATURE_HYPER) != 0
+        allowed = allowed | 0x080000
+    if (features & FEATURE_RATE) != 0
+        allowed = allowed | 0x300000
+    if (features & FEATURE_RESULT_HIGH_LOW) != 0
+        allowed = allowed | 0xC00000
+    allowed
+
+// One measurement record.  `annunciation` is the 24-bit Sensor Status Annunciation: the
+// Status octet in bits 0 to 7, the Cal/Temp octet in 8 to 15 and the Warning octet in 16
+// to 23; an octet with no bit set is left out of the record ([CGMS] 3.1.1.5).  `glucose`
+// is a raw SFLOAT in mg/dL, `offset` the minutes since the Session Start Time.
+@value
+struct CgmRecord
+    glucose: Int
+    offset: Int
+    annunciation: Int
+    has_trend: Bool
+    trend: Int
+    has_quality: Bool
+    quality: Int
+
+@tier(embedded)
+@no_alloc
+fn cgm_record(glucose: Int, offset: Int) -> CgmRecord
+    CgmRecord { glucose: glucose, offset: offset, annunciation: 0, has_trend: false, trend: 0, has_quality: false, quality: 0 }
+
+// `r` with the annunciation `annunciation`.
+@tier(embedded)
+@no_alloc
+fn cgm_with_annunciation(r: CgmRecord, annunciation: Int) -> CgmRecord
+    CgmRecord { glucose: r.glucose, offset: r.offset, annunciation: annunciation, has_trend: r.has_trend, trend: r.trend, has_quality: r.has_quality, quality: r.quality }
+
+// `r` with the trend (a raw SFLOAT in mg/dL per minute) and the quality (a raw SFLOAT in percent).
+@tier(embedded)
+@no_alloc
+fn cgm_with_trend_and_quality(r: CgmRecord, trend: Int, quality: Int) -> CgmRecord
+    CgmRecord { glucose: r.glucose, offset: r.offset, annunciation: r.annunciation, has_trend: true, trend: trend, has_quality: true, quality: quality }
+
+// `r` with the trend only.
+@tier(embedded)
+@no_alloc
+fn cgm_with_trend(r: CgmRecord, trend: Int) -> CgmRecord
+    CgmRecord { glucose: r.glucose, offset: r.offset, annunciation: r.annunciation, has_trend: true, trend: trend, has_quality: r.has_quality, quality: r.quality }
+
+@tier(embedded)
+@no_alloc
+fn cgm_sfloat_valid(raw: Int) -> Bool
+    raw >= 0 and raw <= 0xFFFF and wire.sfloat_kind(raw) != wire.KIND_RESERVED
+
+// Whether the sensor with the Feature `features` can send `r`: SFLOATs that are valid,
+// a trend and a quality only when the Feature names them, an offset of 16 bits, and an
+// annunciation of the allowed bits ([CGMS] 3.2.1.1).
+@tier(embedded)
+@no_alloc
+fn cgm_record_valid(features: Int, r: CgmRecord) -> Bool
+    if not cgm_sfloat_valid(r.glucose) or r.offset < 0 or r.offset > 0xFFFF
+        return false
+    if r.annunciation < 0 or (r.annunciation & cgm_status_allowed(features)) != r.annunciation
+        return false
+    if r.has_trend and ((features & FEATURE_TREND) == 0 or not cgm_sfloat_valid(r.trend))
+        return false
+    if r.has_quality and ((features & FEATURE_QUALITY) == 0 or not cgm_sfloat_valid(r.quality))
+        return false
+    true
+
+// The octets of the record `r`: Size, Flags, glucose, Time Offset, the annunciation
+// octets that have a bit set, the trend, the quality and, with E2E-CRC, the CRC.
+@tier(app)
+fn cgm_record_value(features: Int, r: CgmRecord) -> [u8]
+    var flags = 0
+    if r.has_trend
+        flags = flags | FLAG_TREND
+    if r.has_quality
+        flags = flags | FLAG_QUALITY
+    if (r.annunciation & 0xFF0000) != 0
+        flags = flags | FLAG_WARNING
+    if (r.annunciation & 0x00FF00) != 0
+        flags = flags | FLAG_CAL_TEMP
+    if (r.annunciation & 0x0000FF) != 0
+        flags = flags | FLAG_STATUS
+    var out: [u8] = [0, flags as u8]
+    wire.put(var out, r.glucose, 2)
+    wire.put(var out, r.offset, 2)
+    if (r.annunciation & 0x0000FF) != 0
+        wire.put(var out, r.annunciation & 0xFF, 1)
+    if (r.annunciation & 0x00FF00) != 0
+        wire.put(var out, (r.annunciation >>> 8) & 0xFF, 1)
+    if (r.annunciation & 0xFF0000) != 0
+        wire.put(var out, (r.annunciation >>> 16) & 0xFF, 1)
+    if r.has_trend
+        wire.put(var out, r.trend, 2)
+    if r.has_quality
+        wire.put(var out, r.quality, 2)
+    let crc = (features & FEATURE_E2E_CRC) != 0
+    out[0] = (list.len(out) + (if crc then 2 else 0)) as u8
+    if crc
+        wire.put(var out, reconnection_configuration.crc16(out), 2)
+    out
+
+// `value` with the CRC of its octets after them, for a characteristic that has E2E-CRC.
+@tier(app)
+fn cgm_with_crc(features: Int, value: [u8]) -> [u8]
+    var out = value[:]
+    if (features & FEATURE_E2E_CRC) != 0
+        wire.put(var out, reconnection_configuration.crc16(value), 2)
+    out
+
+// The Feature value: the 24 feature bits, the Type-Sample Location octet and the CRC,
+// 0xFFFF for a sensor without E2E-CRC ([CGMS] 3.2.1.3).
+@tier(app)
+fn cgm_feature_value(features: Int, type_sample: Int) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, features, 3)
+    wire.put(var out, type_sample, 1)
+    if (features & FEATURE_E2E_CRC) != 0
+        wire.put(var out, reconnection_configuration.crc16(out), 2)
+    else
+        wire.put(var out, 0xFFFF, 2)
+    out
+
+// What the sensor holds.  The fields without `var` are fixed when the device is made.
+struct CgmDevice
+    var items: [CgmRecord]
+    var running: Bool
+    var start_set: Bool
+    var start_time: wire.DateTime
+    var time_zone: Int
+    var dst: Int
+    var clock: Int
+    var sent_through: Int
+    var interval: Int
+    var alerts: Int
+    var levels: [Int]
+    var calibrations: [[u8]]
+    var run: racp.RacpRun
+    features: Int
+    type_sample: Int
+    capacity: Int
+    run_hours: Int
+    min_interval: Int
+    level_min: Int
+    level_max: Int
+    start_stop: Bool
+
+// A device that starts a session as it is made: nothing stored, the clock at 0, the
+// communication interval at `min_interval` minutes, the levels at their limits.
+// `run_hours` is the expected run time of the session.
+@tier(app)
+fn new_cgm_device(features: Int, type_sample: Int, capacity: Int, run_hours: Int, min_interval: Int, level_min: Int, level_max: Int, start_stop: Bool) -> CgmDevice
+    CgmDevice {
+        items: [], running: true, start_set: false, start_time: wire.date_time_unknown(), time_zone: -128, dst: 255,
+        clock: 0, sent_through: -1, interval: min_interval, alerts: 0,
+        levels: [wire.sfloat(level_max, 0), wire.sfloat(level_min, 0), wire.sfloat(level_min, 0), wire.sfloat(level_max, 0), wire.sfloat(level_max, 0), wire.sfloat(level_max, 0)],
+        calibrations: [], run: racp.racp_run_new(), features: features, type_sample: type_sample, capacity: capacity,
+        run_hours: run_hours, min_interval: min_interval, level_min: level_min, level_max: level_max, start_stop: start_stop }
+
+// Keep the measurement `glucose` (a raw SFLOAT) at the current clock, with the product's
+// annunciation bits.  False (and nothing kept) when the session is stopped or the record
+// is one the service cannot send.  A device at its capacity drops its oldest record.
+@tier(app)
+fn cgm_add_measurement(var dev: CgmDevice, r: CgmRecord) -> Bool
+    let kept = CgmRecord {
+        glucose: r.glucose, offset: dev.clock, annunciation: r.annunciation | dev.alerts, has_trend: r.has_trend, trend: r.trend,
+        has_quality: r.has_quality, quality: r.quality }
+    if not dev.running or dev.capacity < 1 or not cgm_record_valid(dev.features, kept)
+        return false
+    if list.len(dev.items) >= dev.capacity
+        dev.items = dev.items[1:]
+    list.push(dev.items, kept)
+    true
+
+// Set the minutes since the Session Start Time.
+@tier(embedded)
+@no_alloc
+fn cgm_set_clock(var dev: CgmDevice, minutes: Int)
+    dev.clock = minutes
+
+// Set the status bits the sensor detects (Status, Cal/Temp and Warning octets); false for
+// a bit the Feature does not allow.
+@tier(embedded)
+@no_alloc
+fn cgm_set_alerts(var dev: CgmDevice, alerts: Int) -> Bool
+    if alerts < 0 or (alerts & cgm_status_allowed(dev.features)) != alerts
+        return false
+    dev.alerts = alerts
+    true
+
+// The 24 status bits now: the product's bits, Session stopped while no session runs and
+// Time synchronization required while the collector has not written the start time.
+@tier(embedded)
+@no_alloc
+fn cgm_status_bits(dev: CgmDevice) -> Int
+    var all = dev.alerts
+    if not dev.running
+        all = all | STATUS_SESSION_STOPPED
+    if not dev.start_set
+        all = all | STATUS_TIME_SYNC_REQUIRED
+    all
+
+@tier(app)
+fn cgm_status_value(dev: CgmDevice) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, dev.clock, 2)
+    wire.put(var out, cgm_status_bits(dev), 3)
+    cgm_with_crc(dev.features, out)
+
+@tier(app)
+fn cgm_start_time_value(dev: CgmDevice) -> [u8]
+    var out: [u8] = []
+    wire.put_date_time(var out, dev.start_time)
+    wire.put(var out, dev.time_zone, 1)
+    wire.put(var out, dev.dst, 1)
+    cgm_with_crc(dev.features, out)
+
+@tier(app)
+fn cgm_run_time_value(dev: CgmDevice) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, dev.run_hours, 2)
+    cgm_with_crc(dev.features, out)
+
+// What the service has.
+struct CgmConfig
+    access: gatt_server.Access
+    features: Int
+    type_sample: Int
+    feature_indicate: Bool
+    support: racp.RacpSupport
+
+@tier(app)
+fn default_cgm_config() -> CgmConfig
+    CgmConfig {
+        access: gatt_server.Access.Authenticated, features: 0, type_sample: 0x19, feature_indicate: false,
+        support: racp.racp_support_all() }
+
+@value
+struct CgmHandles
+    service: u16
+    measurement: u16
+    measurement_cccd: u16
+    feature: u16
+    feature_cccd: u16
+    status: u16
+    start_time: u16
+    run_time: u16
+    racp: u16
+    racp_cccd: u16
+    ops: u16
+    ops_cccd: u16
+
+@tier(embedded)
+@no_alloc
+fn cgm_access_authenticated(access: gatt_server.Access) -> Bool
+    match access
+        Authenticated => true
+        SecureConnections => true
+        _ => false
+
+// Whether `type_sample` is a Type nibble of 1 to 10 and a Sample Location nibble of 1 to
+// 5 or 15 ([GSS] Tables 3.67 and 3.68).
+@tier(embedded)
+@no_alloc
+fn cgm_type_sample_valid(type_sample: Int) -> Bool
+    let t = type_sample & 0x0F
+    let l = (type_sample >> 4) & 0x0F
+    type_sample >= 0 and type_sample <= 0xFF and t >= 1 and t <= 10 and ((l >= 1 and l <= 5) or l == 15)
+
+// Add the service to `db` after its last attribute, in the order of [CGMS] Table 3.1.
+// `dev` gives the initial values of the Status, Session Start Time and Session Run Time.
+@tier(app)
+fn add_cgm_service(var db: GattDb, config: CgmConfig, dev: CgmDevice) -> Result<CgmHandles, profile_builder.ProfileError>
+    if not cgm_access_authenticated(config.access)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if config.features < 0 or (config.features & 0xFE0000) != 0 or not cgm_type_sample_valid(config.type_sample)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    let both = gatt_server.both_ways(config.access)
+    let read_access = profile_builder.read_only(config.access)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_CGM_SERVICE))!
+    let measurement = profile_builder.add_value(
+        var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(), gatt_server.le16(UUID_CGM_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, both)!
+    var feature_properties = gatt_server.PROP_READ
+    if config.feature_indicate
+        feature_properties = feature_properties | gatt_server.PROP_INDICATE
+    let feature = profile_builder.add_value(
+        var db, feature_properties, read_access, gatt_server.le16(UUID_CGM_FEATURE), cgm_feature_value(config.features, config.type_sample))!
+    var feature_cccd = 0
+    if config.feature_indicate
+        feature_cccd = profile_builder.add_cccd(var db, both)!
+    let status = profile_builder.add_value(var db, gatt_server.PROP_READ, read_access, gatt_server.le16(UUID_CGM_STATUS), cgm_status_value(dev))!
+    let start_time = profile_builder.add_value(
+        var db, gatt_server.PROP_READ | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: config.access, write: config.access },
+        gatt_server.le16(UUID_CGM_SESSION_START_TIME), cgm_start_time_value(dev))!
+    let run_time = profile_builder.add_value(var db, gatt_server.PROP_READ, read_access, gatt_server.le16(UUID_CGM_SESSION_RUN_TIME), cgm_run_time_value(dev))!
+    let control = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.access },
+        gatt_server.le16(UUID_RECORD_ACCESS_CONTROL_POINT), [])!
+    let control_cccd = profile_builder.add_cccd(var db, both)!
+    let ops = profile_builder.add_value(
+        var db, gatt_server.PROP_INDICATE | gatt_server.PROP_WRITE,
+        gatt_server.Permissions { read: gatt_server.Access.Denied, write: config.access },
+        gatt_server.le16(UUID_CGM_SPECIFIC_OPS_CONTROL_POINT), [])!
+    let ops_cccd = profile_builder.add_cccd(var db, both)!
+    Ok(CgmHandles {
+        service: service as u16, measurement: measurement as u16, measurement_cccd: measurement_cccd as u16,
+        feature: feature as u16, feature_cccd: feature_cccd as u16, status: status as u16, start_time: start_time as u16,
+        run_time: run_time as u16, racp: control as u16, racp_cccd: control_cccd as u16, ops: ops as u16, ops_cccd: ops_cccd as u16 })
+
+// Write the Status, Session Start Time and Session Run Time values the device state implies.
+@tier(app)
+fn cgm_refresh(var db: GattDb, handles: CgmHandles, dev: CgmDevice)
+    let _ = gatt_server.set_value(var db, handles.status as Int, cgm_status_value(dev))
+    let _ = gatt_server.set_value(var db, handles.start_time as Int, cgm_start_time_value(dev))
+    let _ = gatt_server.set_value(var db, handles.run_time as Int, cgm_run_time_value(dev))
+
+@tier(embedded)
+@no_alloc
+fn cgm_subscribed(link: AttLink, cccd: Int, bit: Int) -> Bool
+    cccd != 0 and (gatt_server.configuration(link, cccd) & bit) != 0
+
+// The index in the device of the record with the Time Offset `key`, -1 for none.
+@tier(embedded)
+@no_alloc
+fn cgm_find(dev: CgmDevice, key: Int) -> Int
+    for i in 0..list.len(dev.items)
+        if dev.items[i].offset == key
+            return i
+    -1
+
+@tier(app)
+fn cgm_keys(dev: CgmDevice) -> [Int]
+    var keys: [Int] = []
+    for r in dev.items
+        list.push(keys, r.offset)
+    keys
+
+// Send whole records from `order` (indices into the device, oldest first), as many to a
+// notification as the ATT_MTU leaves room for.
+@tier(app)
+fn cgm_notify_records(var db: GattDb, var link: AttLink, handles: CgmHandles, dev: CgmDevice, order: [Int], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let room = gatt_server.mtu_of(link, 0) - 3
+    var packed: [u8] = []
+    for i in order
+        let one = cgm_record_value(dev.features, dev.items[i])
+        if list.len(packed) > 0 and list.len(packed) + list.len(one) > room
+            if gatt_server.set_value(var db, handles.measurement as Int, packed)
+                list.append(out, gatt_server.send_value(var db, var link, handles.measurement as Int, now_ms))
+            packed = []
+        list.append(packed, one)
+    if list.len(packed) > 0 and gatt_server.set_value(var db, handles.measurement as Int, packed)
+        list.append(out, gatt_server.send_value(var db, var link, handles.measurement as Int, now_ms))
+    out
+
+// The periodic notification: the records not sent yet, when the session runs, the
+// communication interval is not 0, the client enabled the notification and no
+// requested transfer is in progress ([CGMS] 3.1.1, 3.8.3).  The records count as sent
+// once they leave.
+@tier(app)
+fn cgm_notify_periodic(var db: GattDb, var link: AttLink, handles: CgmHandles, var dev: CgmDevice, now_ms: Int) -> [[u8]]
+    if not dev.running or dev.interval == 0 or dev.run.active or not cgm_subscribed(link, handles.measurement_cccd as Int, gatt_server.CCC_NOTIFICATION)
+        return []
+    var order: [Int] = []
+    var newest = dev.sent_through
+    for i in 0..list.len(dev.items)
+        if dev.items[i].offset > dev.sent_through
+            list.push(order, i)
+            newest = dev.items[i].offset
+    let out = cgm_notify_records(var db, var link, handles, dev, order, now_ms)
+    if list.len(out) > 0
+        dev.sent_through = newest
+    out
+
+// Send up to `burst` records of the requested transfer and, when the last is out, the
+// Success response.
+@tier(app)
+fn cgm_pump(var db: GattDb, var link: AttLink, handles: CgmHandles, var dev: CgmDevice, burst: Int, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if not dev.run.active
+        return out
+    var order: [Int] = []
+    var taken = 0
+    while taken < burst and list.len(dev.run.pending) > 0
+        let i = cgm_find(dev, racp.racp_next(var dev.run))
+        if i >= 0
+            list.push(order, i)
+        taken = taken + 1
+    list.append(out, cgm_notify_records(var db, var link, handles, dev, order, now_ms))
+    if list.len(dev.run.pending) == 0
+        let done = racp.racp_finish(var dev.run)
+        if gatt_server.set_value(var db, handles.racp as Int, done)
+            list.append(out, gatt_server.send_value(var db, var link, handles.racp as Int, now_ms))
+    out
+
+// The run cannot be completed: the link ended or the response was not confirmed in the ATT
+// transaction timeout ([CGMS] 3.8.1).
+@tier(app)
+fn cgm_abandon(var dev: CgmDevice)
+    racp.racp_abandon(var dev.run)
+
+// ── The Specific Ops Control Point ─────────────────────────────────
+
+@tier(app)
+fn ops_response(features: Int, request_op: Int, code: Int) -> [u8]
+    cgm_with_crc(features, [OP_RESPONSE_CODE as u8, request_op as u8, code as u8])
+
+@tier(app)
+fn ops_level_response(features: Int, op: Int, level: Int) -> [u8]
+    var out: [u8] = [op as u8]
+    wire.put(var out, level, 2)
+    cgm_with_crc(features, out)
+
+// The operand size of the Op Code `op`, -1 for an Op Code that is not a request.
+@tier(embedded)
+@no_alloc
+fn ops_operand_size(op: Int) -> Int
+    if op == OP_SET_COMMUNICATION_INTERVAL
+        return 1
+    if op == OP_SET_CALIBRATION
+        return CALIBRATION_SIZE
+    if op == OP_GET_CALIBRATION
+        return 2
+    if op == OP_SET_PATIENT_HIGH or op == OP_SET_PATIENT_LOW or op == OP_SET_HYPO or op == OP_SET_HYPER or op == OP_SET_RATE_DECREASE or op == OP_SET_RATE_INCREASE
+        return 2
+    if op == OP_GET_COMMUNICATION_INTERVAL or op == OP_GET_PATIENT_HIGH or op == OP_GET_PATIENT_LOW or op == OP_GET_HYPO or op == OP_GET_HYPER
+        return 0
+    if op == OP_GET_RATE_DECREASE or op == OP_GET_RATE_INCREASE or op == OP_RESET_DEVICE_SPECIFIC_ALERT or op == OP_START_SESSION or op == OP_STOP_SESSION
+        return 0
+    -1
+
+// The Feature bit an Op Code needs, 0 for none.
+@tier(embedded)
+@no_alloc
+fn ops_feature(op: Int) -> Int
+    if op == OP_SET_CALIBRATION or op == OP_GET_CALIBRATION
+        return FEATURE_CALIBRATION
+    if op == OP_SET_PATIENT_HIGH or op == OP_GET_PATIENT_HIGH or op == OP_SET_PATIENT_LOW or op == OP_GET_PATIENT_LOW
+        return FEATURE_PATIENT_HIGH_LOW
+    if op == OP_SET_HYPO or op == OP_GET_HYPO
+        return FEATURE_HYPO
+    if op == OP_SET_HYPER or op == OP_GET_HYPER
+        return FEATURE_HYPER
+    if op == OP_SET_RATE_DECREASE or op == OP_GET_RATE_DECREASE or op == OP_SET_RATE_INCREASE or op == OP_GET_RATE_INCREASE
+        return FEATURE_RATE
+    if op == OP_RESET_DEVICE_SPECIFIC_ALERT
+        return FEATURE_DEVICE_SPECIFIC_ALERT
+    0
+
+// The index into `levels` of a set or get Op Code, -1 for another Op Code.
+@tier(embedded)
+@no_alloc
+fn ops_level_index(op: Int) -> Int
+    if op == OP_SET_PATIENT_HIGH or op == OP_GET_PATIENT_HIGH
+        return LEVEL_PATIENT_HIGH
+    if op == OP_SET_PATIENT_LOW or op == OP_GET_PATIENT_LOW
+        return LEVEL_PATIENT_LOW
+    if op == OP_SET_HYPO or op == OP_GET_HYPO
+        return LEVEL_HYPO
+    if op == OP_SET_HYPER or op == OP_GET_HYPER
+        return LEVEL_HYPER
+    if op == OP_SET_RATE_DECREASE or op == OP_GET_RATE_DECREASE
+        return LEVEL_RATE_DECREASE
+    if op == OP_SET_RATE_INCREASE or op == OP_GET_RATE_INCREASE
+        return LEVEL_RATE_INCREASE
+    -1
+
+// The response Op Code of a get Op Code.
+@tier(embedded)
+@no_alloc
+fn ops_level_response_op(op: Int) -> Int
+    if op == OP_GET_PATIENT_HIGH
+        return OP_PATIENT_HIGH_RESPONSE
+    if op == OP_GET_PATIENT_LOW
+        return OP_PATIENT_LOW_RESPONSE
+    if op == OP_GET_HYPO
+        return OP_HYPO_RESPONSE
+    if op == OP_GET_HYPER
+        return OP_HYPER_RESPONSE
+    if op == OP_GET_RATE_DECREASE
+        return OP_RATE_DECREASE_RESPONSE
+    OP_RATE_INCREASE_RESPONSE
+
+@tier(embedded)
+@no_alloc
+fn ops_is_get_level(op: Int) -> Bool
+    op == OP_GET_PATIENT_HIGH or op == OP_GET_PATIENT_LOW or op == OP_GET_HYPO or op == OP_GET_HYPER or op == OP_GET_RATE_DECREASE or op == OP_GET_RATE_INCREASE
+
+// Whether the level `raw` (an SFLOAT in mg/dL or mg/dL/min) is a number inside the range
+// the device accepts.
+@tier(embedded)
+@no_alloc
+fn cgm_level_in_range(dev: CgmDevice, raw: Int) -> Bool
+    if wire.sfloat_kind(raw) != wire.KIND_NUMBER
+        return false
+    let milli = wire.sfloat_scaled(raw, 3)
+    milli >= dev.level_min * 1000 and milli <= dev.level_max * 1000
+
+// The Calibration Data Record `number`: 0xFFFF is the last one, 0 the default one, and a
+// number the device no longer has is empty.
+@tier(app)
+fn cgm_calibration_record(dev: CgmDevice, number: Int) -> [u8]
+    if number == 0
+        var none: [u8] = []
+        wire.put(var none, wire.SFLOAT_NAN, 2)
+        wire.put(var none, 0, 2)
+        wire.put(var none, dev.type_sample, 1)
+        wire.put(var none, 0, 2)
+        wire.put(var none, 0, 2)
+        wire.put(var none, 0, 1)
+        return none
+    let wanted = if number == 0xFFFF then list.len(dev.calibrations) else number
+    if wanted < 1 or wanted > list.len(dev.calibrations)
+        return []
+    dev.calibrations[wanted - 1][:]
+
+// Carry out the request `value` (without its CRC) and answer the value to indicate.
+// Reading a level or the interval answers its response Op Code; every other procedure,
+// and every error, answers a Response Code.
+@tier(app)
+fn cgm_ops_execute(var dev: CgmDevice, value: [u8]) -> [u8]
+    let f = dev.features
+    if list.len(value) == 0
+        return ops_response(f, 0, RESULT_OP_CODE_NOT_SUPPORTED)
+    let op = value[0] as Int
+    let size = ops_operand_size(op)
+    let needs = ops_feature(op)
+    if size < 0 or (needs != 0 and (f & needs) == 0)
+        return ops_response(f, op, RESULT_OP_CODE_NOT_SUPPORTED)
+    if (op == OP_START_SESSION or op == OP_STOP_SESSION) and not dev.start_stop
+        return ops_response(f, op, RESULT_OP_CODE_NOT_SUPPORTED)
+    if list.len(value) - 1 != size
+        return ops_response(f, op, RESULT_INVALID_OPERAND)
+    if op == OP_SET_COMMUNICATION_INTERVAL
+        let minutes = value[1] as Int
+        // 0 disables the periodic communication, 0xFF is the fastest interval ([CGMS] 3.7.2.1).
+        dev.interval = if minutes == 0xFF then dev.min_interval else minutes
+        return ops_response(f, op, RESULT_SUCCESS)
+    if op == OP_GET_COMMUNICATION_INTERVAL
+        return cgm_with_crc(f, [OP_COMMUNICATION_INTERVAL_RESPONSE as u8, dev.interval as u8])
+    if op == OP_SET_CALIBRATION
+        let conc = wire.get(value, 1, 2)
+        if wire.sfloat_kind(conc) != wire.KIND_NUMBER or not cgm_type_sample_valid(value[5] as Int)
+            return ops_response(f, op, RESULT_PARAMETER_OUT_OF_RANGE)
+        var record = value[1:]
+        let number = list.len(dev.calibrations) + 1
+        record[7] = (number & 0xFF) as u8
+        record[8] = ((number >>> 8) & 0xFF) as u8
+        record[9] = 0
+        list.push(dev.calibrations, record)
+        return ops_response(f, op, RESULT_SUCCESS)
+    if op == OP_GET_CALIBRATION
+        let record = cgm_calibration_record(dev, wire.get(value, 1, 2))
+        if list.len(record) == 0
+            return ops_response(f, op, RESULT_PARAMETER_OUT_OF_RANGE)
+        var out: [u8] = [OP_CALIBRATION_RESPONSE as u8]
+        list.append(out, record)
+        return cgm_with_crc(f, out)
+    let level = ops_level_index(op)
+    if level >= 0
+        if ops_is_get_level(op)
+            return ops_level_response(f, ops_level_response_op(op), dev.levels[level])
+        let raw = wire.get(value, 1, 2)
+        if not cgm_level_in_range(dev, raw)
+            return ops_response(f, op, RESULT_PARAMETER_OUT_OF_RANGE)
+        dev.levels[level] = raw
+        return ops_response(f, op, RESULT_SUCCESS)
+    if op == OP_RESET_DEVICE_SPECIFIC_ALERT
+        dev.alerts = dev.alerts & 0xFFFFEF
+        return ops_response(f, op, RESULT_SUCCESS)
+    if op == OP_START_SESSION
+        if dev.running
+            return ops_response(f, op, RESULT_PROCEDURE_NOT_COMPLETED)
+        dev.items = []
+        dev.running = true
+        dev.start_set = false
+        dev.clock = 0
+        dev.sent_through = -1
+        return ops_response(f, op, RESULT_SUCCESS)
+    // Stop Session: already stopped is Op Code not supported ([CGMS] 3.7.2.9).
+    if not dev.running
+        return ops_response(f, op, RESULT_OP_CODE_NOT_SUPPORTED)
+    dev.running = false
+    ops_response(f, op, RESULT_SUCCESS)
+
+// The ATT error a written `value` with E2E-CRC is refused with: Missing CRC when it has
+// no CRC after the `size` octets before it, Invalid CRC when the CRC is wrong, 0 for a
+// good one or a sensor without E2E-CRC.  `size` is the length without the CRC, -1 when
+// unknown (then any value of three octets or more is checked).
+@tier(app)
+fn cgm_crc_error(features: Int, value: [u8], size: Int) -> Int
+    if (features & FEATURE_E2E_CRC) == 0
+        return 0
+    let n = list.len(value)
+    if size >= 0 and n == size
+        return ERR_MISSING_CRC
+    if n < 3 or (size >= 0 and n != size + 2)
+        return if n < 3 then ERR_MISSING_CRC else 0
+    if wire.get(value, n - 2, 2) != reconnection_configuration.crc16(value[0:n - 2])
+        return ERR_INVALID_CRC
+    0
+
+// The value written without its CRC.
+@tier(app)
+fn cgm_strip_crc(features: Int, value: [u8]) -> [u8]
+    if (features & FEATURE_E2E_CRC) == 0 or list.len(value) < 2
+        return value[:]
+    value[0:list.len(value) - 2]
+
+// Whether `b` is a Session Start Time the sensor accepts: a known Date Time, a time zone
+// of -48 to 56 or -128 for unknown, a DST Offset of 0, 2, 4, 8 or 255 for unknown
+// ([CGMS] 3.4.2, 3.4.3).
+@tier(embedded)
+@no_alloc
+fn cgm_start_time_valid(b: [u8]) -> Bool
+    if list.len(b) < 9
+        return false
+    let zone = wire.get_signed(b, 7, 1)
+    let dst = b[8] as Int
+    wire.date_time_known(wire.get_date_time(b, 0)) and ((zone >= -48 and zone <= 56) or zone == -128) and (dst == 0 or dst == 2 or dst == 4 or dst == 8 or dst == 255)
+
+// Answer one ATT PDU.  Writes to the Record Access Control Point, the Specific Ops
+// Control Point and the Session Start Time are evaluated first and carried out once the
+// Write Response is out; everything else is the plain server.  The Procedure Already in
+// Progress (0xFE) and Client Characteristic Configuration descriptor improperly
+// configured (0xFD) errors, and the CRC errors, are answered before the write is
+// accepted.
+@tier(app)
+fn cgm_receive(var db: GattDb, var link: AttLink, handles: CgmHandles, support: racp.RacpSupport, var dev: CgmDevice, pdu: [u8], now_ms: Int) -> [[u8]]
+    if list.len(pdu) < 3 or (pdu[0] as Int) != att.ATT_OP_WRITE_REQ
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let handle = gatt_server.read_le16(pdu, 1)
+    let value = pdu[3:]
+    let for_racp = handle == handles.racp as Int
+    let for_ops = handle == handles.ops as Int
+    let for_start = handle == handles.start_time as Int
+    if not (for_racp or for_ops or for_start)
+        return gatt_server.receive(var db, var link, pdu, now_ms)
+    let access = gatt_server.access_error(db, link, gatt_server.index_of(db, handle), true)
+    if access == 0
+        var refused = 0
+        if for_racp
+            let r = racp.racp_decode(value, support)
+            if dev.run.active and r.op != racp.OP_ABORT_OPERATION
+                refused = att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+            else if not cgm_subscribed(link, handles.racp_cccd as Int, gatt_server.CCC_INDICATION)
+                refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+            else if racp.racp_reports(r) and not cgm_subscribed(link, handles.measurement_cccd as Int, gatt_server.CCC_NOTIFICATION)
+                refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+        if for_ops
+            if not cgm_subscribed(link, handles.ops_cccd as Int, gatt_server.CCC_INDICATION)
+                refused = att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED
+            else if gatt_server.indication_pending(link, handle)
+                refused = att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS
+            else
+                let size = if list.len(value) > 0 then ops_operand_size(value[0] as Int) else -1
+                refused = cgm_crc_error(dev.features, value, if size >= 0 then size + 1 else -1)
+        if for_start
+            refused = cgm_crc_error(dev.features, value, 9)
+            if refused == 0 and not cgm_start_time_valid(cgm_strip_crc(dev.features, value))
+                refused = att.ATT_ERR_VALUE_NOT_ALLOWED
+        if refused != 0
+            return gatt_server.error(att.ATT_OP_WRITE_REQ, handle, refused)
+    var out = gatt_server.receive(var db, var link, pdu, now_ms)
+    if access != 0 or list.len(out) == 0 or (out[0][0] as Int) != att.ATT_OP_WRITE_RSP
+        return out
+    if for_start
+        let body = cgm_strip_crc(dev.features, value)
+        dev.start_time = wire.get_date_time(body, 0)
+        dev.time_zone = wire.get_signed(body, 7, 1)
+        dev.dst = body[8] as Int
+        dev.start_set = true
+        cgm_refresh(var db, handles, dev)
+        return out
+    if for_ops
+        let reply = cgm_ops_execute(var dev, cgm_strip_crc(dev.features, value))
+        cgm_refresh(var db, handles, dev)
+        if gatt_server.set_value(var db, handles.ops as Int, reply)
+            list.append(out, gatt_server.send_value(var db, var link, handles.ops as Int, now_ms))
+        return out
+    let outcome = racp.racp_execute(var dev.run, racp.racp_decode(value, support), cgm_keys(dev))
+    var kept: [CgmRecord] = []
+    for r in dev.items
+        var gone = false
+        for k in outcome.deleted
+            if k == r.offset
+                gone = true
+        if not gone
+            list.push(kept, r)
+    dev.items = kept
+    if list.len(outcome.reply) > 0 and gatt_server.set_value(var db, handles.racp as Int, outcome.reply)
+        list.append(out, gatt_server.send_value(var db, var link, handles.racp as Int, now_ms))
+    out
+
+// Indicate the Feature; none unless the characteristic indicates and the client enabled it.
+@tier(app)
+fn cgm_indicate_feature(var db: GattDb, var link: AttLink, handles: CgmHandles, now_ms: Int) -> [[u8]]
+    if handles.feature_cccd == 0
+        return []
+    gatt_server.send_value(var db, var link, handles.feature as Int, now_ms)
+
+// ── Fixtures that the suites of other modules share ────────────────────
+//
+// The declarations below are named by the suites of other modules (a suite cannot import another suite),
+// so they stay here; they are `@tier(app)` where they build lists, and no device image calls them.
+
+@tier(app)
+fn full_config() -> CgmConfig
+    CgmConfig {
+        access: gatt_server.Access.Authenticated, features: 0x01FFFF & 0xFFEFFF, type_sample: 0x59, feature_indicate: true,
+        support: racp.racp_support_all() }
+
+@tier(app)
+fn device_for(config: CgmConfig) -> CgmDevice
+    new_cgm_device(config.features, config.type_sample, 50, 240, 5, 40, 400, true)
+
+@tier(app)
+fn server(config: CgmConfig, dev: CgmDevice) -> (GattServer, CgmHandles)
+    var s = gatt_server.new_server([], 247)
+    let h = add_cgm_service(var s.db, config, dev)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    gatt_server.set_mtu(var s.link, 0, 247)
+    (s, h)
+
+@tier(app)
+fn sample(glucose: Int) -> CgmRecord
+    cgm_record(wire.sfloat(glucose, 0), 0)

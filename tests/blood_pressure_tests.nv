@@ -1,0 +1,297 @@
+// tests/blood_pressure_tests.nv — the unit tests of src/blood_pressure.nv.
+//
+//   novo test tests/blood_pressure_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use fixtures.{ req, subscribe, read }
+use wire
+use blood_pressure.{ BpsConfig, BpsHandles, BpsMeasurement, FEATURE_BODY_MOVEMENT_DETECTION, FEATURE_CUFF_FIT_DETECTION, FEATURE_E2E_CRC, FEATURE_IRREGULAR_PULSE_DETECTION, FEATURE_MEASUREMENT_POSITION_DETECTION, FEATURE_PULSE_RATE_RANGE_DETECTION, FEATURE_USER_FACING_TIME, STATUS_BODY_MOVEMENT, STATUS_CUFF_TOO_LOOSE, STATUS_IMPROPER_POSITION, STATUS_IRREGULAR_PULSE, STATUS_PULSE_RATE_BELOW_LOWER, STATUS_PULSE_RATE_EXCEEDS_UPPER, STATUS_PULSE_RATE_RANGE, add_bps_service, bps_attribute, bps_classic_valid, bps_cuff_notify, bps_cuff_value, bps_enhanced_cuff_notify, bps_enhanced_cuff_value, bps_enhanced_indicate, bps_enhanced_valid, bps_enhanced_value, bps_features, bps_indicate, bps_indicate_feature, bps_measurement, bps_measurement_value, bps_set_features, bps_status_valid, bps_with_pressures, bps_with_pulse_rate, bps_with_stamp, bps_with_status, bps_with_time, bps_with_user_facing, bps_with_user_id, default_bps_config, full_config }
+
+// A server whose link is encrypted at `level` (2 is encrypted, 3 authenticated).
+@tier(app)
+fn server_at(config: BpsConfig, level: Int) -> (GattServer, BpsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = add_bps_service(var s.db, config)!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, level, 16, true))
+    (s, h)
+
+@tier(app)
+fn server(config: BpsConfig) -> (GattServer, BpsHandles)
+    server_at(config, 3)
+
+// A reading of 120 over 80, mean 93, in mmHg.
+@tier(app)
+fn reading() -> BpsMeasurement
+    bps_measurement(wire.sfloat(120, 0), wire.sfloat(80, 0), wire.sfloat(93, 0), false)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_minimal_service_is_one_indicated_measurement_and_the_feature()
+    let (s, h) = server(default_bps_config())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.feature, 6)
+    test.assert_eq(h.intermediate, 0)
+    test.assert_eq(h.enhanced, 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 6)
+    test.assert_eq(s.db.attributes[0].value, [0x10, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x20, 3, 0, 0x35, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x02, 6, 0, 0x49, 0x2A])
+    test.assert_eq(bps_attribute(s.db, h.feature), [0, 0])
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_full_service_lists_its_characteristics_in_the_table_order()
+    let (s, h) = server(full_config())
+    // Measurement, its descriptor, Intermediate Cuff Pressure and its descriptor,
+    // the Feature and its descriptor, the two Enhanced characteristics and theirs.
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.intermediate, 6)
+    test.assert_eq(h.intermediate_cccd, 7)
+    test.assert_eq(h.feature, 9)
+    test.assert_eq(h.feature_cccd, 10)
+    test.assert_eq(h.enhanced, 12)
+    test.assert_eq(h.enhanced_cccd, 13)
+    test.assert_eq(h.enhanced_intermediate, 15)
+    test.assert_eq(h.enhanced_intermediate_cccd, 16)
+    test.assert_eq(gatt_server.last_handle(s.db), 16)
+    test.assert_eq(s.db.attributes[4].value, [0x10, 6, 0, 0x36, 0x2A])
+    // Read and Indicate: 0x02 | 0x20.
+    test.assert_eq(s.db.attributes[7].value, [0x22, 9, 0, 0x49, 0x2A])
+    test.assert_eq(s.db.attributes[10].value, [0x20, 12, 0, 0x34, 0x2B])
+    test.assert_eq(s.db.attributes[13].value, [0x10, 15, 0, 0x35, 0x2B])
+    test.assert_eq(bps_features(s.db, h), 0x013F)
+
+@tier(app)
+fn config_of(access: gatt_server.Access, features: Int, enhanced: Bool) -> BpsConfig
+    BpsConfig { access: access, features: features, feature_indicate: false, intermediate: false, enhanced: enhanced }
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_measurement_has_flags_the_compound_value_and_the_optional_fields_in_order()
+    test.assert_eq(bps_measurement_value(reading()), [0x00, 0x78, 0x00, 0x50, 0x00, 0x5D, 0x00])
+    let kpa = bps_measurement(wire.sfloat(160, -1), wire.sfloat(107, -1), wire.sfloat(124, -1), true)
+    test.assert_eq(bps_measurement_value(kpa), [0x01, 0xA0, 0xF0, 0x6B, 0xF0, 0x7C, 0xF0])
+    let everything = bps_with_status(bps_with_user_id(bps_with_pulse_rate(
+        bps_with_time(reading(), wire.date_time(2026, 11, 1, 8, 30, 15)), wire.sfloat(72, 0)), 2),
+        STATUS_BODY_MOVEMENT | STATUS_IMPROPER_POSITION)
+    // Flags 0x1E: time stamp, pulse rate, user id and status.
+    test.assert_eq(bps_measurement_value(everything), [
+        0x1E, 0x78, 0x00, 0x50, 0x00, 0x5D, 0x00,
+        0xEA, 0x07, 11, 1, 8, 30, 15, 0x48, 0x00, 2, 0x21, 0x00])
+    // A pressure that is not available is NaN.
+    let unavailable = bps_measurement(wire.SFLOAT_NAN, wire.SFLOAT_NAN, wire.SFLOAT_NAN, false)
+    test.assert_eq(bps_measurement_value(unavailable), [0x00, 0xFF, 0x07, 0xFF, 0x07, 0xFF, 0x07])
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_cuff_pressure_has_the_pressure_first_and_nan_in_the_unused_subfields()
+    test.assert_eq(bps_cuff_value(reading()), [0x00, 0x78, 0x00, 0xFF, 0x07, 0xFF, 0x07])
+    test.assert_eq(bps_enhanced_cuff_value(reading()), [0x00, 0x78, 0x00])
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_an_enhanced_measurement_has_a_uint32_time_stamp_and_a_user_facing_time()
+    let m = bps_with_user_facing(bps_with_pulse_rate(bps_with_stamp(reading(), 0x01020304, true), wire.sfloat(60, 0)), 0x0A0B0C0D)
+    // Flags: time stamp, pulse rate, user facing time, epoch start 2000.
+    test.assert_eq(bps_enhanced_value(m), [
+        0x66, 0x78, 0x00, 0x50, 0x00, 0x5D, 0x00,
+        0x04, 0x03, 0x02, 0x01, 0x3C, 0x00, 0x0D, 0x0C, 0x0B, 0x0A])
+    test.assert_eq(bps_enhanced_cuff_value(m), [0x66, 0x78, 0x00, 0x04, 0x03, 0x02, 0x01, 0x3C, 0x00, 0x0D, 0x0C, 0x0B, 0x0A])
+    // Without the epoch flag the epoch is 1900.
+    let old = bps_with_user_facing(bps_with_pulse_rate(bps_with_stamp(reading(), 0x01020304, false), wire.sfloat(60, 0)), 0x0A0B0C0D)
+    test.assert_eq(bps_enhanced_value(old)[0] as Int, 0x26)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_features_decide_which_status_bits_the_service_may_report()
+    test.assert(bps_status_valid(0, 0))
+    test.assert(not bps_status_valid(0, STATUS_BODY_MOVEMENT))
+    test.assert(bps_status_valid(FEATURE_BODY_MOVEMENT_DETECTION, STATUS_BODY_MOVEMENT))
+    test.assert(not bps_status_valid(0, STATUS_CUFF_TOO_LOOSE))
+    test.assert(bps_status_valid(FEATURE_CUFF_FIT_DETECTION, STATUS_CUFF_TOO_LOOSE))
+    test.assert(not bps_status_valid(0, STATUS_IRREGULAR_PULSE))
+    test.assert(bps_status_valid(FEATURE_IRREGULAR_PULSE_DETECTION, STATUS_IRREGULAR_PULSE))
+    test.assert(not bps_status_valid(0, STATUS_PULSE_RATE_EXCEEDS_UPPER))
+    test.assert(bps_status_valid(FEATURE_PULSE_RATE_RANGE_DETECTION, STATUS_PULSE_RATE_EXCEEDS_UPPER))
+    test.assert(bps_status_valid(FEATURE_PULSE_RATE_RANGE_DETECTION, STATUS_PULSE_RATE_BELOW_LOWER))
+    // Both range bits is the value reserved for future use.
+    test.assert(not bps_status_valid(FEATURE_PULSE_RATE_RANGE_DETECTION, STATUS_PULSE_RATE_RANGE))
+    test.assert(not bps_status_valid(0, STATUS_IMPROPER_POSITION))
+    test.assert(bps_status_valid(FEATURE_MEASUREMENT_POSITION_DETECTION, STATUS_IMPROPER_POSITION))
+    // The reserved bits 6 to 15 are 0.
+    test.assert(not bps_status_valid(0x01FF, 0x0040))
+    test.assert(not bps_status_valid(0x01FF, 0x8000))
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_measurement_that_breaks_a_rule_is_refused()
+    // The reserved SFLOAT and an SFLOAT of more than 16 bits.
+    test.assert(not bps_classic_valid(0, bps_with_pressures(reading(), wire.SFLOAT_RESERVED, 0, 0)))
+    test.assert(not bps_classic_valid(0, bps_with_pressures(reading(), 0, 0, 0x10000)))
+    test.assert(bps_classic_valid(0, bps_with_pressures(reading(), 0, 0, 0)))
+    test.assert(not bps_classic_valid(0, bps_with_pulse_rate(reading(), wire.SFLOAT_RESERVED)))
+    // A time stamp without a month or a day; a year of 0, for a device without one, is fine ([BLS] 3.1.1.3).
+    test.assert(not bps_classic_valid(0, bps_with_time(reading(), wire.date_time(2026, 0, 1, 0, 0, 0))))
+    test.assert(not bps_classic_valid(0, bps_with_time(reading(), wire.date_time(2026, 1, 0, 0, 0, 0))))
+    test.assert(bps_classic_valid(0, bps_with_time(reading(), wire.date_time(0, 1, 1, 0, 0, 0))))
+    // The user id is one octet.
+    test.assert(not bps_classic_valid(0, bps_with_user_id(reading(), 0x100)))
+    test.assert(bps_classic_valid(0, bps_with_user_id(reading(), 0xFF)))
+    // The Enhanced fields do not belong to the classic value, nor the Date Time to the Enhanced.
+    let stamped = bps_with_stamp(reading(), 5, false)
+    test.assert(not bps_classic_valid(0, stamped))
+    test.assert(bps_enhanced_valid(0, stamped))
+    test.assert(not bps_enhanced_valid(0, bps_with_stamp(reading(), 0x100000000, false)))
+    test.assert(not bps_enhanced_valid(0, bps_with_time(reading(), wire.date_time(2026, 1, 1, 0, 0, 0))))
+    // The User Facing Time needs the Feature bit and the time stamp.
+    let facing = bps_with_user_facing(stamped, 7)
+    test.assert(not bps_enhanced_valid(0, facing))
+    test.assert(bps_enhanced_valid(FEATURE_USER_FACING_TIME, facing))
+    test.assert(not bps_enhanced_valid(FEATURE_USER_FACING_TIME, bps_with_user_facing(reading(), 7)))
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_measurement_is_indicated_to_a_subscribed_client_and_the_next_waits_for_the_confirmation()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    // Nothing is sent before the client subscribed; the value is stored.
+    test.assert_eq(list.len(bps_indicate(var s.db, var s.link, h, reading(), 0)), 0)
+    test.assert_eq(bps_attribute(s.db, h.measurement), bps_measurement_value(reading()))
+    subscribe(var s, h.measurement_cccd, 2)
+    let first = bps_indicate(var s.db, var s.link, h, reading(), 0)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0][0] as Int, 0x1D)
+    test.assert_eq(first[0][1] as Int, 3)
+    // The second indication waits for the confirmation of the first.
+    test.assert_eq(list.len(bps_indicate(var s.db, var s.link, h, reading(), 1)), 0)
+    let next = gatt_server.confirmed(var s.link, 0, 2)
+    test.assert_eq(list.len(next), 1)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_refused_measurement_is_neither_stored_nor_indicated()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.measurement_cccd, 2)
+    let bad = bps_with_pressures(reading(), 0, 0, wire.SFLOAT_RESERVED)
+    test.assert_eq(list.len(bps_indicate(var s.db, var s.link, h, bad, 0)), 0)
+    test.assert_eq(bps_attribute(s.db, h.measurement), [])
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_cuff_pressure_is_notified_and_a_service_without_it_sends_nothing()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.intermediate_cccd, 1)
+    let n = bps_cuff_notify(var s.db, var s.link, h, reading(), 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0][0] as Int, 0x1B)
+    test.assert_eq(n[0][1] as Int, 6)
+    // Notifications do not wait for each other.
+    test.assert_eq(list.len(bps_cuff_notify(var s.db, var s.link, h, reading(), 1)), 1)
+    var plain = server(default_bps_config())
+    let none = bps_cuff_notify(var plain.0.db, var plain.0.link, plain.1, reading(), 0)
+    test.assert_eq(list.len(none), 0)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_enhanced_characteristics_send_their_own_values()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.enhanced_cccd, 2)
+    subscribe(var s, h.enhanced_intermediate_cccd, 1)
+    let m = bps_with_stamp(reading(), 1000, false)
+    let ind = bps_enhanced_indicate(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(ind), 1)
+    test.assert_eq(ind[0][1] as Int, 12)
+    test.assert_eq(bps_attribute(s.db, h.enhanced), bps_enhanced_value(m))
+    let ntf = bps_enhanced_cuff_notify(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(ntf[0][1] as Int, 15)
+    // The Date Time of the classic value is not an Enhanced field.
+    let classic = bps_with_time(reading(), wire.date_time(2026, 1, 1, 0, 0, 0))
+    test.assert_eq(list.len(bps_enhanced_indicate(var s.db, var s.link, h, classic, 1)), 0)
+    // A service without them sends nothing.
+    var plain = server(default_bps_config())
+    test.assert_eq(list.len(bps_enhanced_indicate(var plain.0.db, var plain.0.link, plain.1, m, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_feature_is_read_and_changed_and_indicated_to_a_subscribed_client()
+    var built = server(full_config())
+    var s = built.0
+    let h = built.1
+    test.assert_eq(read(var s, h.feature), [0x0B, 0x3F, 0x01])
+    // A Feature the service cannot describe is refused and the value kept.
+    test.assert(not bps_set_features(var s.db, h, 0x0200))
+    test.assert(not bps_set_features(var s.db, h, FEATURE_E2E_CRC))
+    test.assert(bps_set_features(var s.db, h, FEATURE_BODY_MOVEMENT_DETECTION))
+    test.assert_eq(read(var s, h.feature), [0x0B, 0x01, 0x00])
+    test.assert_eq(list.len(bps_indicate_feature(var s.db, var s.link, h, 0)), 0)
+    subscribe(var s, h.feature_cccd, 2)
+    let ind = bps_indicate_feature(var s.db, var s.link, h, 0)
+    test.assert_eq(list.len(ind), 1)
+    // The User Facing Time needs the Enhanced characteristics.
+    var plain = server(default_bps_config())
+    test.assert(not bps_set_features(var plain.0.db, plain.1, FEATURE_USER_FACING_TIME))
+    test.assert_eq(list.len(bps_indicate_feature(var plain.0.db, var plain.0.link, plain.1, 0)), 0)
+
+// The ProfileError `add_bps_service` answers for `config`, none when it adds.
+@tier(app)
+fn add_error(config: BpsConfig) -> ?profile_builder.ProfileError
+    var s = gatt_server.new_server([], 65)
+    match add_bps_service(var s.db, config)
+        Ok(_) => None
+        Err(e) => Some(e)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_every_attribute_needs_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let h = add_bps_service(var s.db, full_config())!
+    // A link without encryption: reads and descriptor writes are refused.
+    test.assert_eq(read(var s, h.feature)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(read(var s, h.measurement_cccd)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.measurement_cccd, [2, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, req(0x12, h.intermediate_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // Nothing is indicated to a client that could not subscribe.
+    test.assert_eq(list.len(bps_indicate(var s.db, var s.link, h, reading(), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_higher_access_is_kept_and_a_lower_one_is_refused()
+    test.assert_eq(add_error(config_of(gatt_server.Access.Authenticated, 0, false)), None)
+    test.assert_eq(add_error(config_of(gatt_server.Access.SecureConnections, 0, false)), None)
+    test.assert_eq(add_error(config_of(gatt_server.Access.Open, 0, false)), Some(profile_builder.ProfileError.NotPermitted))
+    test.assert_eq(add_error(config_of(gatt_server.Access.Denied, 0, false)), Some(profile_builder.ProfileError.NotPermitted))
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_a_configuration_the_service_cannot_describe_is_refused_before_anything_is_added()
+    let encrypted = gatt_server.Access.Encrypted
+    test.assert_eq(add_error(config_of(encrypted, 0x0200, false)), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(config_of(encrypted, FEATURE_E2E_CRC, false)), Some(profile_builder.ProfileError.NotPermitted))
+    test.assert_eq(add_error(config_of(encrypted, FEATURE_USER_FACING_TIME, false)), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(config_of(encrypted, FEATURE_USER_FACING_TIME, true)), None)
+
+@test
+@satisfies("REQ-BLE-BPS-001")
+fn test_the_service_stops_when_the_table_is_full()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    match add_bps_service(var s.db, full_config())
+        Ok(_) => test.fail("no handle is left")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)

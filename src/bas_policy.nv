@@ -1,0 +1,237 @@
+// src/bas_policy.nv — the Battery Service with instances and the
+// product's say in what a client is notified of.
+//
+// Mechanism and policy.  What the Battery Service fixes belongs to the stack
+// and a product cannot change it: the level is one octet from 0 to 100, it is
+// readable and notified through a Client Characteristic Configuration
+// descriptor, a client cannot write it, a level that did not change is not
+// notified, and a device that holds more than one instance (a keyboard and its
+// mouse, the two cells of a pack) gives each instance a Characteristic
+// Presentation Format descriptor whose Description names it with a different
+// value of the Bluetooth SIG name space ("first", "second", ...).  What it
+// leaves to the product is asked of a `BasPolicy`: whether a change is worth a
+// notification to a client, so that a product can notify at every step or only
+// at every five percent or at the level it calls low, and what to do when the
+// level changed.  The default policy notifies every change.
+//
+// A change of the level is made once for the service (`bas_set_level`), and
+// each connection is told on its own (`bas_notify`) with the level last sent
+// to it, kept in `BasLinks`, so a link that subscribed late, or whose policy
+// held a change back, is told the level that is current and not a stale one.
+//
+// The Characteristic Presentation Format, the name space and the descriptions
+// are those of the Assigned Numbers of 2026-10-14; the instance rule is that of
+// Battery Service 1.1, section 3.1.2.1 (a device with several instances gives each
+// Battery Level a Presentation Format whose Description is unique among them).
+// The Battery Service 1.1 characteristics beyond the Battery Level (Battery Level
+// Status, Estimated Service Date, the Energy, Time and Health Status and the
+// Information) are not built.
+//
+// Satisfies: REQ-BLE-PRF-002.
+
+use gatt_server
+use noble_config
+use links
+use battery
+use profile_builder
+
+// The Characteristic Presentation Format of a Battery Level: format uint8
+// (0x04), exponent 0, unit percentage (0x27AD), name space Bluetooth SIG (1).
+const FORMAT_UINT8 = 0x04
+const UNIT_PERCENTAGE = 0x27AD
+const NAME_SPACE_SIG = 0x01
+
+// One instance of the service.  `description` is the Description of its
+// Presentation Format, 0x0001 for "first" upward; `level` the level it starts
+// at; `read` the access a client needs to read the level and `cccd` the access
+// to the configuration descriptor.
+struct BasInstance
+    description: Int
+    level: Int
+    read: gatt_server.Access
+    cccd: gatt_server.Permissions
+
+// An instance that any client reads and subscribes to.
+pub fn open_instance(description: Int, level: Int) -> BasInstance
+    BasInstance { description: description,
+        level: level,
+        read: gatt_server.Access.Open,
+        cccd: gatt_server.open_permissions() }
+
+// Why the service was refused.  NoInstance: the list is empty.  TooMany: more
+// instances than `noble_config.MAX_BAS`.  NeedsDescription: a service with several
+// instances has one with Description 0 (unknown).  SameDescription: two
+// instances share a Description.  NoRoom: the attribute table has no handle
+// left.
+enum BasError
+    NoInstance
+    TooMany
+    NeedsDescription
+    SameDescription
+    NoRoom
+
+impl Error for BasError
+    fn message(self) -> Str
+        match self
+            NoInstance       => "the Battery Service has no instance"
+            TooMany          => "more Battery Service instances than the profile allows"
+            NeedsDescription => "an instance of a service with several instances has no Description"
+            SameDescription  => "two Battery Service instances have the same Description"
+            NoRoom           => "the attribute table has no handle left"
+
+// The handles of every instance, in the order they were given.  `presentation`
+// is the handle of the Presentation Format descriptor of an instance, 0 for the
+// one instance of a service that has only one.
+struct BasHandles
+    batteries: [battery.BatteryHandles]
+    presentation: [Int]
+
+// The questions a product answers for the service.
+trait BasPolicy[e]
+    // Whether to notify the client of `peer` that the level of `instance` is
+    // `level`; `sent` is the level last notified to it, -1 for none.
+    fn notify_level(var self, peer: links.LinkId, instance: Int, sent: Int, level: Int) -> Bool [e]
+    // The level of `instance` changed.
+    fn level_changed(var self, instance: Int, level: Int) [e]
+
+struct DefaultBasPolicy
+    placeholder: Int
+
+// Returns the Battery policy whose answers follow the specification: every change is notified.
+pub fn default_bas_policy() -> DefaultBasPolicy
+    DefaultBasPolicy { placeholder: 0 }
+
+impl BasPolicy[] for DefaultBasPolicy
+    fn notify_level(var self, peer: links.LinkId, instance: Int, sent: Int, level: Int) -> Bool
+        let _ = peer
+        let _ = instance
+        sent != level
+
+    fn level_changed(var self, instance: Int, level: Int)
+        let _ = instance
+        let _ = level
+
+// The value of a Presentation Format descriptor for a Battery Level.
+fn presentation_value(description: Int) -> [u8]
+    [FORMAT_UINT8, 0, (UNIT_PERCENTAGE & 0xFF) as u8, (UNIT_PERCENTAGE >>> 8) as u8, NAME_SPACE_SIG,
+     (description & 0xFF) as u8, ((description >>> 8) & 0xFF) as u8]
+
+// The rule the list of instances must meet, as the error it breaks.
+fn check_instances(instances: [BasInstance]) -> ?BasError
+    let n = list.len(instances)
+    if n == 0
+        return Some(BasError.NoInstance)
+    if n > noble_config.MAX_BAS
+        return Some(BasError.TooMany)
+    if n == 1
+        return None
+    for i in 0..n
+        if instances[i].description == 0
+            return Some(BasError.NeedsDescription)
+        for j in 0..i
+            if instances[j].description == instances[i].description
+                return Some(BasError.SameDescription)
+    None
+
+// Add one Battery Service for each instance, in order, after the last attribute
+// of `db`.  A service of several instances gives each level a Presentation
+// Format descriptor.
+pub fn add_battery_bank(var db: GattDb, instances: [BasInstance]) -> Result<BasHandles, BasError>
+    match check_instances(instances)
+        Some(e) =>
+            return Err(e)
+        None    => ()
+    var batteries: [battery.BatteryHandles] = []
+    var presentation: [Int] = []
+    for instance in instances
+        let config = battery.BatteryConfig { level: instance.level, read: instance.read, cccd: instance.cccd }
+        match battery.add_battery_service(var db, config)
+            Err(_) =>
+                return Err(BasError.NoRoom)
+            Ok(h)  => list.push(batteries, h)
+        if list.len(instances) == 1
+            list.push(presentation, 0)
+        else
+            match profile_builder.add_descriptor(var db, profile_builder.read_only(gatt_server.Access.Open),
+                gatt_server.UUID_CHARACTERISTIC_PRESENTATION_FORMAT, presentation_value(instance.description))
+                Err(_) =>
+                    return Err(BasError.NoRoom)
+                Ok(d)  => list.push(presentation, d)
+    Ok(BasHandles { batteries: batteries, presentation: presentation })
+
+// ── What each connection was told ───────────────────────────────────
+
+// The level last notified to each connection for each instance, -1 for none:
+// `noble_config.MAX_BAS` entries for each of `noble_config.MAX_CONNECTIONS` slots.
+struct BasLinks
+    var sent: [Int]
+
+// Builds the table of the levels last notified: -1 (none) for every connection slot and instance.
+pub fn new_bas_links() -> BasLinks
+    var sent: [Int] = []
+    for _ in 0..noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS
+        list.push(sent, -1)
+    BasLinks { sent: sent }
+
+fn sent_index(slot: Int, instance: Int) -> Int
+    if slot < 0 or slot >= noble_config.MAX_CONNECTIONS or instance < 0 or instance >= noble_config.MAX_BAS
+        return -1
+    slot * noble_config.MAX_BAS + instance
+
+// A connection opened on `slot`: it has been told nothing yet.
+pub fn bas_link_opened(var state: BasLinks, slot: Int)
+    for instance in 0..noble_config.MAX_BAS
+        let at = sent_index(slot, instance)
+        if at >= 0
+            state.sent[at] = -1
+
+// The level last notified on `slot` for `instance`, -1 for none or for a slot
+// or instance the state does not hold.
+fn bas_sent(state: BasLinks, slot: Int, instance: Int) -> Int
+    let at = sent_index(slot, instance)
+    if at < 0
+        -1
+    else
+        state.sent[at]
+
+// ── Changes ─────────────────────────────────────────────────────────
+
+// The level of `instance` in the table, 0 for an instance the service lacks.
+pub fn bas_level(db: GattDb, handles: BasHandles, instance: Int) -> Int
+    if instance < 0 or instance >= list.len(handles.batteries)
+        return 0
+    let i = gatt_server.index_of(db, handles.batteries[instance].level)
+    if i < 0
+        0
+    else
+        db.attributes[i].value[0] as Int
+
+// Store `level` (cut to 0..100) as the level of `instance`.  True when the
+// level changed, and the policy was told.
+pub fn bas_set_level<P: BasPolicy[e]>(var db: GattDb, handles: BasHandles, var policy: P,
+                                      instance: Int, level: Int) -> Bool [e, mutate]
+    if instance < 0 or instance >= list.len(handles.batteries)
+        return false
+    let cut = battery.cut_level(level)
+    if cut == bas_level(db, handles, instance)
+        return false
+    let _ = gatt_server.set_value(var db, handles.batteries[instance].level, [cut as u8])
+    policy.level_changed(instance, cut)
+    true
+
+// The notification to send to the client of `link` after the level of
+// `instance` changed: none when the client has not subscribed, when the level
+// is the one it was last told, or when the policy holds the change back.
+pub fn bas_notify<P: BasPolicy[e]>(var db: GattDb, var link: AttLink, handles: BasHandles,
+                                   var state: BasLinks, var policy: P, peer: links.LinkId,
+                                   instance: Int, now_ms: Int) -> [[u8]] [e, mutate]
+    let at = sent_index(peer.slot, instance)
+    if at < 0 or instance >= list.len(handles.batteries)
+        return []
+    let level = bas_level(db, handles, instance)
+    if state.sent[at] == level or not policy.notify_level(peer, instance, state.sent[at], level)
+        return []
+    let out = gatt_server.send_value(var db, var link, handles.batteries[instance].level, now_ms)
+    if list.len(out) > 0
+        state.sent[at] = level
+    out

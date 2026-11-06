@@ -1,0 +1,91 @@
+// tests/tx_power_client_tests.nv — the unit tests of src/tx_power_client.nv.
+//
+//   novo test tests/tx_power_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use sensor_client
+use tx_power
+use wire
+use tx_power_client.{ tps_client_new, tps_client_read, tps_client_start, tps_decode_level }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_the_defined_range_decodes_as_a_signed_octet()
+    test.assert_eq(tps_decode_level(octets([0])), Some(0))
+    test.assert_eq(tps_decode_level(octets([4])), Some(4))
+    test.assert_eq(tps_decode_level(octets([20])), Some(20))
+    test.assert_eq(tps_decode_level(octets([0xF8])), Some(-8))
+    test.assert_eq(tps_decode_level(octets([0x9C])), Some(-100))
+    test.assert_eq(tps_decode_level(octets([0xFF])), Some(-1))
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_level_outside_minus_100_to_plus_20_is_reserved()
+    var ok = 0
+    for v in 0..256
+        let d = tps_decode_level(octets([v]))
+        let signed = if v > 127 then v - 256 else v
+        let defined = signed >= -100 and signed <= 20
+        test.assert_eq(d != None, defined)
+        if defined
+            ok = ok + 1
+    // -100 to +20 is 121 values.
+    test.assert_eq(ok, 121)
+    test.assert_eq(tps_decode_level(octets([21])), None)
+    test.assert_eq(tps_decode_level(octets([0x9B])), None)
+    // 127 is a sint8 value outside the range.
+    test.assert_eq(tps_decode_level(octets([0x7F])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_level_of_another_length_is_none()
+    test.assert_eq(tps_decode_level([]), None)
+    test.assert_eq(tps_decode_level(octets([0, 0])), None)
+
+@tier(app)
+fn test_server(level: Int) -> (gatt_server.GattServer, tx_power.TpsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = tx_power.add_tps_service(var s.db, tx_power.default_tps_config(level))!
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_session_reads_the_level_and_reads_it_again()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(-12)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(tx_power.UUID_TX_POWER_SERVICE)
+    var t = both.0
+    var c = tps_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, tps_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert((all & sensor_client.SE_VALUE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_handle(var t, c, tx_power.UUID_TX_POWER_LEVEL), h.level as Int)
+    test.assert_eq(sensor_client.sc_uuid(c), tx_power.UUID_TX_POWER_LEVEL)
+    test.assert_eq(tps_decode_level(sensor_client.sc_value(c)), Some(-12))
+    test.assert(tx_power.set_tx_power(var s.db, h, 7))
+    let again = sensor_client.test_pump(var t, var c, var s, tps_client_read(var t, var c, 0), var seen)
+    test.assert((again & sensor_client.SE_VALUE) != 0)
+    test.assert_eq(tps_decode_level(sensor_client.sc_value(c)), Some(7))
+
+@test
+@satisfies("REQ-BLE-PRFC-017")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(tx_power.UUID_TX_POWER_SERVICE)
+    var t = both.0
+    var c = tps_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, tps_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

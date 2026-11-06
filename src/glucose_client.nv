@@ -1,0 +1,303 @@
+// src/glucose_client.nv — the Collector side of the Glucose Service
+// (0x1808): the decoders of its characteristics, the Record Access Control Point
+// requests and responses, and the client session.
+//
+//   Glucose Measurement          0x2A18   decoded by `gl_decode`; notified
+//   Glucose Measurement Context  0x2A34   decoded by `gl_decode_context`; notified
+//   Glucose Feature              0x2A51   decoded by `gl_decode_features`
+//   Record Access Control Point  0x2A52   requests by `gl_request_*`, responses by
+//                                         `gl_decode_response`
+//
+// Layout ([GSS] 3.106 and 3.107): see glucose.nv.  A decoder answers `None` for a value
+// too short for the fields its flags name and for a Base Time that is not a known Date
+// Time ([GLS] 3.1.1.3).  The concentration stays a raw SFLOAT; `gl_milligram_per_decilitre`
+// gives the value in thousandths of mg/dL whatever unit the flag names (1 mmol/L of
+// glucose is 18.0182 mg/dL).  The user-facing time of a record is the Base Time plus the
+// Time Offset ([GLS] 3.1.1.4); `gl_offset_minutes` gives the offset.
+//
+// The session (`gl_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Feature, enable the notification of the measurement and of the context (optional) and
+// the indication of the control point.  The collector then writes a request
+// (`gl_client_write`) and gets the records as notifications followed by the response
+// indication, which `gl_decode_response` reads.  The collector tolerates one record more
+// than it asked for ([GLS] 3.4.3.4).
+//
+// Satisfies: REQ-BLE-PRFC-017.
+
+use gatt_client
+use links
+use glucose
+use racp
+use sensor_client
+use wire
+
+// One decoded Glucose Measurement.
+@value
+struct GlMeasurement
+    sequence: Int
+    base_time: wire.DateTime
+    has_offset: Bool
+    offset: Int
+    has_concentration: Bool
+    concentration: Int
+    mol: Bool
+    sample_type: Int
+    location: Int
+    has_status: Bool
+    status: Int
+    context_follows: Bool
+
+// The measurement in `b`, `None` when it is not a whole one.
+@tier(embedded)
+@no_alloc
+fn gl_decode(b: [u8]) -> ?GlMeasurement
+    if list.len(b) < 10
+        return None
+    let flags = b[0] as Int
+    let base = wire.get_date_time(b, 3)
+    if not wire.date_time_known(base)
+        return None
+    var i = 10
+    let has_offset = (flags & glucose.FLAG_TIME_OFFSET) != 0
+    var offset = 0
+    if has_offset
+        if list.len(b) < i + 2
+            return None
+        offset = wire.get_signed(b, i, 2)
+        i = i + 2
+    let has_conc = (flags & glucose.FLAG_CONCENTRATION) != 0
+    var conc = 0
+    var kind = 0
+    var place = 0
+    if has_conc
+        if list.len(b) < i + 3
+            return None
+        conc = wire.get(b, i, 2)
+        kind = (b[i + 2] as Int) & 0x0F
+        place = ((b[i + 2] as Int) >> 4) & 0x0F
+        i = i + 3
+    let has_status = (flags & glucose.FLAG_SENSOR_STATUS) != 0
+    var status = 0
+    if has_status
+        if list.len(b) < i + 2
+            return None
+        status = wire.get(b, i, 2)
+    Some(GlMeasurement {
+        sequence: wire.get(b, 1, 2), base_time: base, has_offset: has_offset, offset: offset,
+        has_concentration: has_conc, concentration: conc, mol: (flags & glucose.FLAG_MOL_PER_LITRE) != 0,
+        sample_type: kind, location: place, has_status: has_status, status: status,
+        context_follows: (flags & glucose.FLAG_CONTEXT_FOLLOWS) != 0 })
+
+// The Time Offset of `m` in minutes, 0 when the measurement has none.
+@tier(embedded)
+@no_alloc
+fn gl_offset_minutes(m: GlMeasurement) -> Int
+    if m.has_offset then m.offset else 0
+
+@tier(embedded)
+@no_alloc
+fn gl_div_round(n: Int, d: Int) -> Int
+    if n < 0
+        return -((-n + d / 2) / d)
+    (n + d / 2) / d
+
+// The concentration of `m` in thousandths of mg/dL.  A value in kg/L is multiplied by
+// 1e5 (1 kg/L is 1e6 mg in 10 dL) and one in mol/L by 18015.6 (the molar mass of
+// glucose, 180.156 g/mol).  0 for a special value or a measurement without one, which
+// `wire.sfloat_kind` and `has_concentration` tell apart.
+@tier(embedded)
+@no_alloc
+fn gl_milligram_per_decilitre(m: GlMeasurement) -> Int
+    if not m.has_concentration or wire.sfloat_kind(m.concentration) != wire.KIND_NUMBER
+        return 0
+    var value = wire.sfloat_mantissa(m.concentration) * (if m.mol then 18015600 else 100000000)
+    var e = wire.sfloat_exponent(m.concentration)
+    if e > 0
+        for _ in 0..e
+            value = value * 10
+    if e < 0
+        for _ in 0..(-e)
+            value = gl_div_round(value, 10)
+    value
+
+// One decoded Glucose Measurement Context.
+@value
+struct GlContext
+    sequence: Int
+    has_carbohydrate: Bool
+    carbohydrate_id: Int
+    carbohydrate: Int
+    has_meal: Bool
+    meal: Int
+    has_tester_health: Bool
+    tester: Int
+    health: Int
+    has_exercise: Bool
+    duration: Int
+    intensity: Int
+    has_medication: Bool
+    medication_id: Int
+    medication: Int
+    litres: Bool
+    has_hba1c: Bool
+    hba1c: Int
+
+// The context in `b`, `None` when it is not a whole one.  The Extended Flags octet, when
+// the flags name it, is skipped; its bits are reserved ([GLS] 3.2.1.3).
+@tier(embedded)
+@no_alloc
+fn gl_decode_context(b: [u8]) -> ?GlContext
+    if list.len(b) < 3
+        return None
+    let flags = b[0] as Int
+    var i = 3
+    if (flags & 0x80) != 0
+        if list.len(b) < i + 1
+            return None
+        i = i + 1
+    let has_carbs = (flags & glucose.CONTEXT_CARBOHYDRATE) != 0
+    var carb_id = 0
+    var carbs = 0
+    if has_carbs
+        if list.len(b) < i + 3
+            return None
+        carb_id = b[i] as Int
+        carbs = wire.get(b, i + 1, 2)
+        i = i + 3
+    let has_meal = (flags & glucose.CONTEXT_MEAL) != 0
+    var meal = 0
+    if has_meal
+        if list.len(b) < i + 1
+            return None
+        meal = b[i] as Int
+        i = i + 1
+    let has_th = (flags & glucose.CONTEXT_TESTER_HEALTH) != 0
+    var tester = 0
+    var health = 0
+    if has_th
+        if list.len(b) < i + 1
+            return None
+        tester = (b[i] as Int) & 0x0F
+        health = ((b[i] as Int) >> 4) & 0x0F
+        i = i + 1
+    let has_ex = (flags & glucose.CONTEXT_EXERCISE) != 0
+    var duration = 0
+    var intensity = 0
+    if has_ex
+        if list.len(b) < i + 3
+            return None
+        duration = wire.get(b, i, 2)
+        intensity = b[i + 2] as Int
+        i = i + 3
+    let has_med = (flags & glucose.CONTEXT_MEDICATION) != 0
+    var med_id = 0
+    var med = 0
+    if has_med
+        if list.len(b) < i + 3
+            return None
+        med_id = b[i] as Int
+        med = wire.get(b, i + 1, 2)
+        i = i + 3
+    let has_hba1c = (flags & glucose.CONTEXT_HBA1C) != 0
+    var hba1c = 0
+    if has_hba1c
+        if list.len(b) < i + 2
+            return None
+        hba1c = wire.get(b, i, 2)
+    Some(GlContext {
+        sequence: wire.get(b, 1, 2), has_carbohydrate: has_carbs, carbohydrate_id: carb_id, carbohydrate: carbs,
+        has_meal: has_meal, meal: meal, has_tester_health: has_th, tester: tester, health: health,
+        has_exercise: has_ex, duration: duration, intensity: intensity, has_medication: has_med,
+        medication_id: med_id, medication: med, litres: (flags & glucose.CONTEXT_MEDICATION_LITRES) != 0,
+        has_hba1c: has_hba1c, hba1c: hba1c })
+
+// The Feature in `b`: two octets, `None` otherwise.
+@tier(embedded)
+@no_alloc
+fn gl_decode_features(b: [u8]) -> ?Int
+    if list.len(b) != 2
+        return None
+    Some(wire.get(b, 0, 2))
+
+// What a Record Access Control Point indication holds.  `kind` is 0 for a Response
+// Code, 1 for a Number of Stored Records Response; `value` is the count or the
+// Response Code Value and `request_op` the Request Op Code of a Response Code.
+@value
+struct GlResponse
+    kind: Int
+    request_op: Int
+    value: Int
+
+const RESPONSE_CODE = 0
+const RESPONSE_COUNT = 1
+
+// The indication in `b`, `None` when it is neither response.
+@tier(embedded)
+@no_alloc
+fn gl_decode_response(b: [u8]) -> ?GlResponse
+    if list.len(b) == 4 and (b[0] as Int) == racp.OP_RESPONSE_CODE and (b[1] as Int) == 0
+        return Some(GlResponse { kind: RESPONSE_CODE, request_op: b[2] as Int, value: b[3] as Int })
+    if list.len(b) == 4 and (b[0] as Int) == racp.OP_NUMBER_OF_STORED_RECORDS_RESPONSE and (b[1] as Int) == 0
+        return Some(GlResponse { kind: RESPONSE_COUNT, request_op: 0, value: wire.get(b, 2, 2) })
+    None
+
+// A request: `op` with `operator` and, for a filter on the Sequence Number, `lo` (and
+// `hi` for a range).
+@tier(app)
+fn gl_request(op: Int, operator: Int, lo: Int, hi: Int) -> [u8]
+    var out: [u8] = [op as u8, operator as u8]
+    if operator == racp.OPERATOR_LESS_THAN_OR_EQUAL_TO or operator == racp.OPERATOR_GREATER_THAN_OR_EQUAL_TO
+        list.push(out, racp.FILTER_KEY as u8)
+        wire.put(var out, if operator == racp.OPERATOR_LESS_THAN_OR_EQUAL_TO then hi else lo, 2)
+    if operator == racp.OPERATOR_WITHIN_RANGE_OF
+        list.push(out, racp.FILTER_KEY as u8)
+        wire.put(var out, lo, 2)
+        wire.put(var out, hi, 2)
+    out
+
+// Report all stored records.
+@tier(app)
+fn gl_request_report_all() -> [u8]
+    gl_request(racp.OP_REPORT_STORED_RECORDS, racp.OPERATOR_ALL_RECORDS, 0, 0)
+
+// Report the records with a Sequence Number of `first` or more.
+@tier(app)
+fn gl_request_report_from(first: Int) -> [u8]
+    gl_request(racp.OP_REPORT_STORED_RECORDS, racp.OPERATOR_GREATER_THAN_OR_EQUAL_TO, first, 0)
+
+// Report how many records have a Sequence Number of `first` or more.
+@tier(app)
+fn gl_request_count_from(first: Int) -> [u8]
+    gl_request(racp.OP_REPORT_NUMBER_OF_STORED_RECORDS, racp.OPERATOR_GREATER_THAN_OR_EQUAL_TO, first, 0)
+
+// Delete all stored records.
+@tier(app)
+fn gl_request_delete_all() -> [u8]
+    gl_request(racp.OP_DELETE_STORED_RECORDS, racp.OPERATOR_ALL_RECORDS, 0, 0)
+
+// Abort the procedure in progress.
+@tier(app)
+fn gl_request_abort() -> [u8]
+    [racp.OP_ABORT_OPERATION as u8, racp.OPERATOR_NULL as u8]
+
+// A session on `link`.
+@tier(app)
+fn gl_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, glucose.UUID_GLUCOSE_SERVICE)
+
+// Discover the service, read the Feature, enable the notifications of the measurement
+// (required) and of the context (optional) and the indication of the control point
+// (required).
+@tier(app)
+fn gl_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, glucose.UUID_GLUCOSE_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, glucose.UUID_GLUCOSE_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, glucose.UUID_GLUCOSE_MEASUREMENT_CONTEXT, gatt_client.CCCD_NOTIFY, false)
+    sensor_client.sc_queue_subscribe(var c, glucose.UUID_RECORD_ACCESS_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` to the control point.  The session must have finished its plan.
+@tier(app)
+fn gl_client_write(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, glucose.UUID_RECORD_ACCESS_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

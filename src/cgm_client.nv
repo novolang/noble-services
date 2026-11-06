@@ -1,0 +1,265 @@
+// src/cgm_client.nv — the Collector side of the Continuous Glucose
+// Monitoring Service (0x181F): the decoders of its characteristics, the Specific Ops
+// Control Point requests and responses, and the client session.
+//
+//   CGM Measurement                0x2AA7  `cgm_decode_record` reads one record, `cgm_next_record`
+//                                          steps through the records of a notification
+//   CGM Feature                    0x2AA8  `cgm_decode_features`
+//   CGM Status                     0x2AA9  `cgm_decode_status`
+//   CGM Session Start Time         0x2AAA  `cgm_decode_start_time`, written by `cgm_start_time_value`
+//   CGM Session Run Time           0x2AAB  `cgm_decode_run_time`
+//   CGM Specific Ops Control Point 0x2AAC  requests by `cgm_request_*`, responses by `cgm_decode_ops`
+//   Record Access Control Point    0x2A52  as in glucose_client.nv: `gl_request_*`, `gl_decode_response`
+//
+// Layout: see cgm.nv.  A notification of the Measurement holds one or more records, each
+// starting with its Size octet ([GSS] 3.40); `cgm_next_record` answers the record at an
+// offset and the offset after it, or `None` for a record that does not fit, whose Size is
+// below the six octets a record has, or whose CRC is wrong when the Feature names E2E-CRC.
+// The collector reads the Feature first, as the service asks ([CGMS] 3.1), and passes its
+// bits to the decoders.  With E2E-CRC the Status, Start Time, Run Time and the Specific
+// Ops responses carry a CRC, which the decoders check; `cgm_request` adds the CRC to a
+// request.
+//
+// The session (`cgm_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Feature, enable the notification of the Measurement and the indications of the Record
+// Access Control Point and the Specific Ops Control Point.
+//
+// Satisfies: REQ-BLE-PRFC-018.
+
+use gatt_client
+use gatt_server
+use links
+use cgm
+use reconnection_configuration
+use sensor_client
+use wire
+
+// The Feature of a sensor: the 24 bits, the Type-Sample Location octet and whether the
+// CRC (checked) was right.
+@value
+struct CgmFeatures
+    mask: Int
+    type_sample: Int
+
+// The Feature in `b`: six octets with the CRC checked when bit 12 is set, `None` otherwise.
+@tier(app)
+fn cgm_decode_features(b: [u8]) -> ?CgmFeatures
+    if list.len(b) != 6
+        return None
+    let mask = wire.get(b, 0, 3)
+    if (mask & cgm.FEATURE_E2E_CRC) != 0 and wire.get(b, 4, 2) != reconnection_configuration.crc16(b[0:4])
+        return None
+    Some(CgmFeatures { mask: mask, type_sample: b[3] as Int })
+
+// One decoded measurement record.
+@value
+struct CgmMeasurement
+    glucose: Int
+    offset: Int
+    annunciation: Int
+    has_trend: Bool
+    trend: Int
+    has_quality: Bool
+    quality: Int
+
+// The record at `at` in `b` and the offset after it, for a sensor with the Feature
+// `features`.  `None` when the record does not fit its Size, the Size is below the
+// octets its flags name, or the CRC is wrong.
+@tier(app)
+fn cgm_next_record(b: [u8], at: Int, features: Int) -> ?(CgmMeasurement, Int)
+    if at + 6 > list.len(b)
+        return None
+    let size = b[at] as Int
+    if size < 6 or at + size > list.len(b)
+        return None
+    let crc = (features & cgm.FEATURE_E2E_CRC) != 0
+    let end = at + size
+    let body_end = if crc then end - 2 else end
+    if crc and (size < 8 or wire.get(b, body_end, 2) != reconnection_configuration.crc16(b[at:body_end]))
+        return None
+    let flags = b[at + 1] as Int
+    var i = at + 6
+    var annunciation = 0
+    if (flags & cgm.FLAG_STATUS) != 0
+        if i + 1 > body_end
+            return None
+        annunciation = annunciation | (b[i] as Int)
+        i = i + 1
+    if (flags & cgm.FLAG_CAL_TEMP) != 0
+        if i + 1 > body_end
+            return None
+        annunciation = annunciation | ((b[i] as Int) << 8)
+        i = i + 1
+    if (flags & cgm.FLAG_WARNING) != 0
+        if i + 1 > body_end
+            return None
+        annunciation = annunciation | ((b[i] as Int) << 16)
+        i = i + 1
+    let has_trend = (flags & cgm.FLAG_TREND) != 0
+    var trend = 0
+    if has_trend
+        if i + 2 > body_end
+            return None
+        trend = wire.get(b, i, 2)
+        i = i + 2
+    let has_quality = (flags & cgm.FLAG_QUALITY) != 0
+    var quality = 0
+    if has_quality
+        if i + 2 > body_end
+            return None
+        quality = wire.get(b, i, 2)
+        i = i + 2
+    Some((CgmMeasurement {
+        glucose: wire.get(b, at + 2, 2), offset: wire.get(b, at + 4, 2), annunciation: annunciation,
+        has_trend: has_trend, trend: trend, has_quality: has_quality, quality: quality }, end))
+
+// The number of whole records in a notification `b`, -1 when it has a record that does
+// not decode.
+@tier(app)
+fn cgm_record_count(b: [u8], features: Int) -> Int
+    var at = 0
+    var n = 0
+    while at < list.len(b)
+        match cgm_next_record(b, at, features)
+            Some(r) =>
+                at = r.1
+                n = n + 1
+            None => return -1
+    n
+
+// The Status: the Time Offset and the 24 status bits.
+@value
+struct CgmStatus
+    offset: Int
+    mask: Int
+
+// The Status in `b` for a sensor with the Feature `features`.
+@tier(app)
+fn cgm_decode_status(b: [u8], features: Int) -> ?CgmStatus
+    let crc = (features & cgm.FEATURE_E2E_CRC) != 0
+    if list.len(b) != (if crc then 7 else 5)
+        return None
+    if crc and wire.get(b, 5, 2) != reconnection_configuration.crc16(b[0:5])
+        return None
+    Some(CgmStatus { offset: wire.get(b, 0, 2), mask: wire.get(b, 2, 3) })
+
+// The Session Start Time: the Date Time, the time zone in quarter hours (-128 unknown) and
+// the DST Offset (255 unknown).
+@value
+struct CgmStartTime
+    time: wire.DateTime
+    time_zone: Int
+    dst: Int
+
+@tier(app)
+fn cgm_decode_start_time(b: [u8], features: Int) -> ?CgmStartTime
+    let crc = (features & cgm.FEATURE_E2E_CRC) != 0
+    if list.len(b) != (if crc then 11 else 9)
+        return None
+    if crc and wire.get(b, 9, 2) != reconnection_configuration.crc16(b[0:9])
+        return None
+    Some(CgmStartTime { time: wire.get_date_time(b, 0), time_zone: wire.get_signed(b, 7, 1), dst: b[8] as Int })
+
+// The value to write to the Session Start Time.
+@tier(app)
+fn cgm_start_time_value(features: Int, time: wire.DateTime, time_zone: Int, dst: Int) -> [u8]
+    var out: [u8] = []
+    wire.put_date_time(var out, time)
+    wire.put(var out, time_zone, 1)
+    wire.put(var out, dst, 1)
+    cgm.cgm_with_crc(features, out)
+
+// The Session Run Time in hours.
+@tier(app)
+fn cgm_decode_run_time(b: [u8], features: Int) -> ?Int
+    let crc = (features & cgm.FEATURE_E2E_CRC) != 0
+    if list.len(b) != (if crc then 4 else 2)
+        return None
+    if crc and wire.get(b, 2, 2) != reconnection_configuration.crc16(b[0:2])
+        return None
+    Some(wire.get(b, 0, 2))
+
+// A decoded Specific Ops Control Point indication: `op` the Op Code of the response, and
+// `request_op`, `code` of a Response Code, or `value` of a level, the interval or the first
+// two octets of a calibration record; `operand` is the whole operand.
+struct CgmOps
+    op: Int
+    request_op: Int
+    code: Int
+    operand: [u8]
+
+// The indication in `b` for a sensor with the Feature `features`; `None` for a CRC that is
+// wrong or an indication too short.
+@tier(app)
+fn cgm_decode_ops(b: [u8], features: Int) -> ?CgmOps
+    let crc = (features & cgm.FEATURE_E2E_CRC) != 0
+    var body = b[:]
+    if crc
+        if list.len(b) < 3 or wire.get(b, list.len(b) - 2, 2) != reconnection_configuration.crc16(b[0:list.len(b) - 2])
+            return None
+        body = b[0:list.len(b) - 2]
+    if list.len(body) < 1
+        return None
+    let op = body[0] as Int
+    if op == cgm.OP_RESPONSE_CODE
+        if list.len(body) != 3
+            return None
+        return Some(CgmOps { op: op, request_op: body[1] as Int, code: body[2] as Int, operand: [] })
+    Some(CgmOps { op: op, request_op: 0, code: 0, operand: body[1:] })
+
+// The request `op` with `operand` and, with E2E-CRC, its CRC.
+@tier(app)
+fn cgm_request(features: Int, op: Int, operand: [u8]) -> [u8]
+    var out: [u8] = [op as u8]
+    list.append(out, operand)
+    cgm.cgm_with_crc(features, out)
+
+@tier(app)
+fn cgm_request_set_interval(features: Int, minutes: Int) -> [u8]
+    cgm_request(features, cgm.OP_SET_COMMUNICATION_INTERVAL, [minutes as u8])
+
+@tier(app)
+fn cgm_request_get_interval(features: Int) -> [u8]
+    cgm_request(features, cgm.OP_GET_COMMUNICATION_INTERVAL, [])
+
+// Set the level of the Op Code `op` (one of the `OP_SET_` level codes) to the raw SFLOAT `level`.
+@tier(app)
+fn cgm_request_set_level(features: Int, op: Int, level: Int) -> [u8]
+    var operand: [u8] = []
+    wire.put(var operand, level, 2)
+    cgm_request(features, op, operand)
+
+@tier(app)
+fn cgm_request_start_session(features: Int) -> [u8]
+    cgm_request(features, cgm.OP_START_SESSION, [])
+
+@tier(app)
+fn cgm_request_stop_session(features: Int) -> [u8]
+    cgm_request(features, cgm.OP_STOP_SESSION, [])
+
+// A session on `link`.
+@tier(app)
+fn cgm_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, cgm.UUID_CGM_SERVICE)
+
+// Discover the service, read the Feature, enable the notification of the Measurement and
+// the indications of the two control points.
+@tier(app)
+fn cgm_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, cgm.UUID_CGM_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, cgm.UUID_CGM_MEASUREMENT, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_subscribe(var c, cgm.UUID_RECORD_ACCESS_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, cgm.UUID_CGM_SPECIFIC_OPS_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write `request` to the Specific Ops Control Point.
+@tier(app)
+fn cgm_client_write_ops(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, cgm.UUID_CGM_SPECIFIC_OPS_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write `request` to the Record Access Control Point (see `glucose_client.gl_request_*`).
+@tier(app)
+fn cgm_client_write_racp(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, request: [u8], now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, cgm.UUID_RECORD_ACCESS_CONTROL_POINT, request)
+    sensor_client.sc_kick(var t, var c, now_ms)

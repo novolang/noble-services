@@ -1,0 +1,95 @@
+// tests/link_loss_client_tests.nv — the unit tests of src/link_loss_client.nv.
+//
+//   novo test tests/link_loss_client_tests.nv
+
+use std.test
+use fixtures
+use gatt_server
+use link_loss
+use sensor_client
+use wire
+use link_loss_client.{ lls_client_new, lls_client_set_level, lls_client_start, lls_decode_level, lls_level_value }
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    wire.octets(v)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_the_three_levels_decode_and_the_rest_is_reserved()
+    test.assert_eq(lls_decode_level(octets([0])), Some(0))
+    test.assert_eq(lls_decode_level(octets([1])), Some(1))
+    test.assert_eq(lls_decode_level(octets([2])), Some(2))
+    for v in 3..256
+        test.assert_eq(lls_decode_level(octets([v])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_level_of_another_length_is_none()
+    test.assert_eq(lls_decode_level([]), None)
+    test.assert_eq(lls_decode_level(octets([1, 0])), None)
+    test.assert_eq(lls_decode_level(octets([0, 0, 0])), None)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_the_value_to_write()
+    test.assert_eq(lls_level_value(0), Some(octets([0])))
+    test.assert_eq(lls_level_value(1), Some(octets([1])))
+    test.assert_eq(lls_level_value(2), Some(octets([2])))
+    test.assert_eq(lls_level_value(3), None)
+    test.assert_eq(lls_level_value(-1), None)
+
+@tier(app)
+fn test_server(access: gatt_server.Access) -> (gatt_server.GattServer, link_loss.LlsHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = link_loss.add_lls_service(var s.db, link_loss.LlsConfig { access: access })!
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    (s, h)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_session_reads_and_writes_the_level()
+    if not fixtures.client_engine_present()
+        return
+    var built = test_server(gatt_server.Access.Open)
+    var s = built.0
+    let h = built.1
+    let both = sensor_client.test_open(link_loss.UUID_LINK_LOSS_SERVICE)
+    var t = both.0
+    var c = lls_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var s, lls_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_DONE) != 0)
+    test.assert((all & sensor_client.SE_VALUE) != 0)
+    test.assert_eq((all & sensor_client.SE_FAILED), 0)
+    test.assert_eq(sensor_client.sc_handle(var t, c, link_loss.UUID_ALERT_LEVEL), h.level as Int)
+    test.assert_eq(lls_decode_level(sensor_client.sc_value(c)), Some(0))
+    let w = sensor_client.test_pump(var t, var c, var s, lls_client_set_level(var t, var c, 2, 0), var seen)
+    test.assert((w & sensor_client.SE_DONE) != 0)
+    test.assert_eq(link_loss.link_loss_level(s.db, h), 2)
+    // The level reads back through a second plan step.
+    let r = sensor_client.test_pump(var t, var c, var s, lls_client_start(var t, var c, 0), var seen)
+    test.assert((r & sensor_client.SE_VALUE) != 0)
+    test.assert_eq(lls_decode_level(sensor_client.sc_value(c)), Some(2))
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_reserved_level_is_not_written()
+    let both = sensor_client.test_open(link_loss.UUID_LINK_LOSS_SERVICE)
+    var t = both.0
+    var c = lls_client_new(sensor_client.test_link())
+    let step = lls_client_set_level(var t, var c, 7, 0)
+    test.assert((step.event & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(list.len(step.pdus), 0)
+
+@test
+@satisfies("REQ-BLE-PRFC-016")
+fn test_a_peer_without_the_service_ends_the_plan_not_found()
+    var empty = gatt_server.new_server([], 65)
+    let both = sensor_client.test_open(link_loss.UUID_LINK_LOSS_SERVICE)
+    var t = both.0
+    var c = lls_client_new(sensor_client.test_link())
+    var seen: [Int] = []
+    let all = sensor_client.test_pump(var t, var c, var empty, lls_client_start(var t, var c, 0), var seen)
+    test.assert((all & sensor_client.SE_FAILED) != 0)
+    test.assert_eq(sensor_client.sc_status(c), sensor_client.SC_NOT_FOUND)

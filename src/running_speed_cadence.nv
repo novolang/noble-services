@@ -1,0 +1,204 @@
+// src/running_speed_cadence.nv — the Running Speed and Cadence
+// Service (0x1814).
+//
+// A foot pod or a watch reports the speed, the cadence and optionally the
+// stride length and the distance of a walker or runner. The service holds,
+// in the order the builder adds them:
+//
+//   RSC Measurement          0x2A53   Notify, with a Client Characteristic
+//                                     Configuration descriptor
+//   RSC Feature              0x2A54   Read; what the sensor measures
+//   Sensor Location          0x2A5D   Read; required with the Multiple
+//                                     Sensor Location feature
+//   SC Control Point         0x2A55   Write, Indicate, with a descriptor;
+//                                     present exactly when the sensor
+//                                     supports a procedure
+//
+// The control point has the procedures and the responses of the Cycling
+// Speed and Cadence control point (`cycling_speed_cadence`); Set Cumulative
+// Value sets the total distance, in units of 1/10 metre. The Running Speed
+// and Cadence Service defines its Error Codes: 0x81 for a client that has not
+// enabled indications, 0x80 for a write while an indication is unconfirmed.
+// A measurement leaves out the stride length, the total distance and the
+// walking or running status unless the Feature value names them.
+//
+// The Running Speed and Cadence Service Specification 1.0.1 and its test
+// specification give the flags of the measurement, the Feature bits and their
+// 2 octets, the Error Codes, the opcodes and response values below, the
+// total distance as a 32-bit count of decimetres and the 1-octet Sensor
+// Location. They leave the other field widths and units and the Sensor
+// Location values to the characteristic definitions, which this module was
+// not compared with.
+
+use gatt_server
+use profile_builder
+use sensor_control
+use wire
+
+const UUID_RUNNING_SPEED_AND_CADENCE_SERVICE = 0x1814
+const UUID_RSC_MEASUREMENT = 0x2A53
+const UUID_RSC_FEATURE = 0x2A54
+const UUID_SC_CONTROL_POINT = 0x2A55
+
+// The bits of the RSC Feature value.
+const FEATURE_INSTANTANEOUS_STRIDE_LENGTH = 0x0001
+const FEATURE_TOTAL_DISTANCE = 0x0002
+const FEATURE_WALKING_OR_RUNNING_STATUS = 0x0004
+const FEATURE_CALIBRATION_PROCEDURE = 0x0008
+const FEATURE_MULTIPLE_SENSOR_LOCATIONS = 0x0010
+
+// The bits of the RSC Feature value the service defines, 0 to 4; the rest
+// are reserved and read as 0.
+const FEATURE_DEFINED_BITS = 0x001F
+
+// The bits of the flags octet of a measurement.
+const FLAG_STRIDE_LENGTH = 0x01
+const FLAG_TOTAL_DISTANCE = 0x02
+const FLAG_RUNNING = 0x04
+
+// The opcodes of the SC Control Point and the code of a response.
+const OP_SET_CUMULATIVE_VALUE = 0x01
+const OP_START_SENSOR_CALIBRATION = 0x02
+const OP_UPDATE_SENSOR_LOCATION = 0x03
+const OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS = 0x04
+const OP_RESPONSE_CODE = 0x10
+
+// One measurement. `speed` is in units of 1/256 metre per second and
+// `cadence` in steps per minute, one octet. `stride_length`, in units of
+// 1/100 metre, and `total_distance`, in units of 1/10 metre, are in the value
+// when `has_stride_length` and `has_total_distance` are set. `running` is
+// the walking or running status: false walking, true running.
+struct RscMeasurement
+    speed: Int
+    cadence: Int
+    has_stride_length: Bool
+    stride_length: Int
+    has_total_distance: Bool
+    total_distance: Int
+    running: Bool
+
+// The value of a measurement.
+fn rsc_measurement_value(m: RscMeasurement) -> [u8]
+    var flags = 0
+    if m.has_stride_length
+        flags = flags | FLAG_STRIDE_LENGTH
+    if m.has_total_distance
+        flags = flags | FLAG_TOTAL_DISTANCE
+    if m.running
+        flags = flags | FLAG_RUNNING
+    var out: [u8] = [flags as u8]
+    wire.put(var out, wire.clamp(m.speed, 0, 0xFFFF), 2)
+    wire.put(var out, wire.clamp(m.cadence, 0, 0xFF), 1)
+    if m.has_stride_length
+        wire.put(var out, wire.clamp(m.stride_length, 0, 0xFFFF), 2)
+    if m.has_total_distance
+        wire.put(var out, wire.clamp(m.total_distance, 0, 0xFFFFFFFF), 4)
+    out
+
+// `m` with every optional field the Feature value `feature` does not name
+// left out: its flag is 0.
+fn limited_to_feature(m: RscMeasurement, feature: Int) -> RscMeasurement
+    RscMeasurement {
+        speed: m.speed, cadence: m.cadence,
+        has_stride_length: m.has_stride_length and (feature & FEATURE_INSTANTANEOUS_STRIDE_LENGTH) != 0,
+        stride_length: m.stride_length,
+        has_total_distance: m.has_total_distance and (feature & FEATURE_TOTAL_DISTANCE) != 0,
+        total_distance: m.total_distance,
+        running: m.running and (feature & FEATURE_WALKING_OR_RUNNING_STATUS) != 0 }
+
+// The configuration of the service; the fields are those of
+// `CscConfig`, with the RSC Feature value in `feature`, of which the
+// reserved bits are dropped. `location` is required with the Multiple Sensor
+// Location feature, and `control_point` is true exactly when the feature
+// names the total distance, the calibration or the multiple locations. The
+// accesses are at security level 3 or below and none is `Denied`;
+// `add_rsc_service` answers `NotPermitted` otherwise.
+struct RscConfig
+    feature: Int
+    location: sensor_control.SensorLocation
+    control_point: Bool
+    read: gatt_server.Access
+    measurement_cccd: gatt_server.Permissions
+    control_point_write: gatt_server.Access
+    control_point_cccd: gatt_server.Permissions
+
+// A sensor open to any client, with the control point.
+fn default_rsc_config(feature: Int, location: sensor_control.SensorLocation) -> RscConfig
+    RscConfig {
+        feature: feature, location: location, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), control_point_write: gatt_server.Access.Open,
+        control_point_cccd: gatt_server.open_permissions() }
+
+// The handles of the service. `location`, `control_point` and
+// `control_point_cccd` are 0 for what is not present. `feature_bits` is the
+// Feature value the service holds.
+struct RscHandles
+    feature_bits: Int
+    service: Int
+    measurement: Int
+    measurement_cccd: Int
+    feature: Int
+    location: Int
+    control_point: Int
+    control_point_cccd: Int
+
+// Add the service after the last attribute of `server`.
+fn add_rsc_service(var db: GattDb, config: RscConfig) -> Result<RscHandles, profile_builder.ProfileError>
+    let feature_bits = config.feature & FEATURE_DEFINED_BITS
+    let has_procedure = (feature_bits & (FEATURE_TOTAL_DISTANCE | FEATURE_CALIBRATION_PROCEDURE | FEATURE_MULTIPLE_SENSOR_LOCATIONS)) != 0
+    if has_procedure != config.control_point
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if (feature_bits & FEATURE_MULTIPLE_SENSOR_LOCATIONS) != 0 and config.location == sensor_control.SensorLocation.Absent
+        return Err(profile_builder.ProfileError.NotPermitted)
+    if not sensor_control.accesses_conform(config.read, config.measurement_cccd, config.control_point, config.control_point_write, config.control_point_cccd)
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_RUNNING_SPEED_AND_CADENCE_SERVICE))!
+    let measurement = profile_builder.add_value(var db, gatt_server.PROP_NOTIFY, profile_builder.notify_only(),
+        gatt_server.le16(UUID_RSC_MEASUREMENT), [])!
+    let measurement_cccd = profile_builder.add_cccd(var db, config.measurement_cccd)!
+    let feature = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.read),
+        gatt_server.le16(UUID_RSC_FEATURE), [(feature_bits & 0xFF) as u8, ((feature_bits >>> 8) & 0xFF) as u8])!
+    let location = sensor_control.add_location(var db, config.location, config.read)!
+    var control_point = 0
+    var control_point_cccd = 0
+    if config.control_point
+        let added = sensor_control.add_control_point(var db, UUID_SC_CONTROL_POINT, config.control_point_write, config.control_point_cccd)!
+        control_point = added.0
+        control_point_cccd = added.1
+    Ok(RscHandles {
+        feature_bits: feature_bits, service: service, measurement: measurement, measurement_cccd: measurement_cccd, feature: feature,
+        location: location, control_point: control_point, control_point_cccd: control_point_cccd })
+
+// Store `m`, limited to the fields the Feature value names, as the
+// measurement and answer the notification PDUs: the notification when the
+// client enabled it, none otherwise.
+fn rsc_notify(var db: GattDb, var link: AttLink, handles: RscHandles, m: RscMeasurement, now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_value(var db, handles.measurement, rsc_measurement_value(limited_to_feature(m, handles.feature_bits)))
+    gatt_server.send_value(var db, var link, handles.measurement, now_ms)
+
+// The response value to the request written to the control point.
+fn rsc_control_point_response(var state: sensor_control.ScState, request: [u8]) -> [u8]
+    if list.len(request) == 0
+        return sensor_control.response(OP_RESPONSE_CODE, 0, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+    let op = request[0] as Int
+    let parameter = request[1:]
+    match op
+        OP_SET_CUMULATIVE_VALUE => sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.set_cumulative(var state, parameter), [])
+        OP_START_SENSOR_CALIBRATION => sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.start_calibration(var state), [])
+        OP_UPDATE_SENSOR_LOCATION =>
+            let r = sensor_control.update_location(var state, parameter)
+            sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+        OP_REQUEST_SUPPORTED_SENSOR_LOCATIONS =>
+            let r = sensor_control.list_locations(state)
+            sensor_control.response(OP_RESPONSE_CODE, op, r.0, r.1)
+        _ => sensor_control.response(OP_RESPONSE_CODE, op, sensor_control.RESULT_OP_CODE_NOT_SUPPORTED, [])
+
+// Answer the request the client wrote to the control point: apply it to
+// `state`, keep the Sensor Location in step and answer the indication PDUs.
+// Call it once for each write, when `gatt_server.take_changed` names the
+// control point.
+fn rsc_handle_control_point(var db: GattDb, var link: AttLink, handles: RscHandles, var state: sensor_control.ScState, now_ms: Int) -> [[u8]]
+    if handles.control_point == 0
+        return []
+    let reply = rsc_control_point_response(var state, sensor_control.written(db, handles.control_point))
+    sensor_control.respond(var db, var link, handles.control_point, handles.location, state, reply, now_ms)

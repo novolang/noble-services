@@ -1,0 +1,212 @@
+// tests/heart_rate_tests.nv — the unit tests of src/heart_rate.nv.
+//
+//   novo test tests/heart_rate_tests.nv
+
+use std.test
+use att
+use gatt_server
+use profile_builder
+use wire
+use heart_rate.{ BodySensorLocation, ERR_CONTROL_POINT_NOT_SUPPORTED, HeartRateConfig, HeartRateHandles, HeartRateMeasurement, SensorContact, add_heart_rate_service, default_heart_rate_config, heart_rate_measurement_value, heart_rate_notify, heart_rate_reset_requested, rr_interval }
+
+fn added(var s: GattServer, config: HeartRateConfig) -> HeartRateHandles
+    match add_heart_rate_service(var s.db, config)
+        Ok(h) => h
+        Err(_) =>
+            test.fail("the service is added")
+            HeartRateHandles { service: 0, measurement: 0, measurement_cccd: 0, location: 0, control_point: 0 }
+
+fn full_config(location: BodySensorLocation) -> HeartRateConfig
+    HeartRateConfig {
+        location: location, control_point: true, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open }
+
+fn measurement(rate: Int, contact: SensorContact, energy: Int, rr: [Int]) -> HeartRateMeasurement
+    HeartRateMeasurement { heart_rate: rate, contact: contact, energy_expended: energy, rr_intervals: rr }
+
+fn request(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+@test
+fn test_measurement_flags_and_fields()
+    // One octet, no contact feature, nothing else.
+    test.assert_eq(heart_rate_measurement_value(measurement(72, SensorContact.NotSupported, -1, []), 20), [0x00, 72])
+    // Contact detected and not detected sit in bits 1 and 2.
+    test.assert_eq(heart_rate_measurement_value(measurement(72, SensorContact.Detected, -1, []), 20), [0x06, 72])
+    test.assert_eq(heart_rate_measurement_value(measurement(72, SensorContact.NotDetected, -1, []), 20), [0x04, 72])
+    // Above 255 the value takes two octets and bit 0.
+    test.assert_eq(heart_rate_measurement_value(measurement(300, SensorContact.NotSupported, -1, []), 20), [0x01, 0x2C, 0x01])
+    // Energy expended, bit 3.
+    test.assert_eq(heart_rate_measurement_value(measurement(60, SensorContact.NotSupported, 0x0102, []), 20), [0x08, 60, 0x02, 0x01])
+    // RR-Intervals, bit 4, two octets each.
+    test.assert_eq(heart_rate_measurement_value(measurement(60, SensorContact.NotSupported, -1, [1024, 512]), 20), [0x10, 60, 0x00, 0x04, 0x00, 0x02])
+    // All of it.
+    test.assert_eq(heart_rate_measurement_value(measurement(300, SensorContact.Detected, 5, [1000]), 20), [0x1F, 0x2C, 0x01, 5, 0, 0xE8, 0x03])
+
+@test
+fn test_rr_intervals_that_do_not_fit_are_left_out()
+    let m = measurement(60, SensorContact.NotSupported, 7, [1, 2, 3, 4, 5, 6])
+    // 1 flag, 1 value and 2 energy leave 16 of 20 octets: all six fit.
+    test.assert_eq(list.len(heart_rate_measurement_value(m, 20)), 4 + 12)
+    // With room for 8 octets two intervals are kept.
+    let small = heart_rate_measurement_value(m, 8)
+    test.assert_eq(list.len(small), 8)
+    test.assert_eq(small[0] as Int, 0x18)
+    // With no room left for an interval the flag is clear.
+    let none = heart_rate_measurement_value(m, 4)
+    test.assert_eq(none[0] as Int, 0x08)
+    test.assert_eq(list.len(none), 4)
+
+@test
+fn test_energy_expended_needs_the_control_point()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, default_heart_rate_config(BodySensorLocation.Chest))
+    let m = measurement(70, SensorContact.NotSupported, 9, [])
+    let _ = gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)
+    // No control point: the field and its flag are left out.
+    test.assert_eq(heart_rate_notify(var s.db, var s.link, h, m, 0)[0], [0x1B, 0x03, 0x00, 0x00, 70])
+    // With the control point the field is sent.
+    var c = gatt_server.new_server([], 65)
+    let hc = added(var c, full_config(BodySensorLocation.Chest))
+    let _ = gatt_server.receive(var c.db, var c.link, request(0x12, hc.measurement_cccd, [1, 0]), 0)
+    test.assert_eq(heart_rate_notify(var c.db, var c.link, hc, m, 0)[0], [0x1B, 0x03, 0x00, 0x08, 70, 9, 0])
+
+@test
+fn test_energy_expended_stays_at_the_maximum()
+    test.assert_eq(heart_rate_measurement_value(measurement(60, SensorContact.NotSupported, 70000, []), 20), [0x08, 60, 0xFF, 0xFF])
+
+@test
+fn test_rr_interval_counts_for_a_default_mtu()
+    let many = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    // ATT_MTU 23 leaves 20 octets: 8 and 9 RR-Intervals with a 1-octet value
+    // and 7 and 8 with a 2-octet value, with and without energy expended.
+    test.assert_eq(list.len(heart_rate_measurement_value(measurement(60, SensorContact.NotSupported, 1, many), 20)), 4 + 16)
+    test.assert_eq(list.len(heart_rate_measurement_value(measurement(60, SensorContact.NotSupported, -1, many), 20)), 2 + 18)
+    test.assert_eq(list.len(heart_rate_measurement_value(measurement(300, SensorContact.NotSupported, 1, many), 20)), 5 + 14)
+    test.assert_eq(list.len(heart_rate_measurement_value(measurement(300, SensorContact.NotSupported, -1, many), 20)), 3 + 16)
+
+fn is_refused(config: HeartRateConfig) -> Bool
+    var s = gatt_server.new_server([], 65)
+    match add_heart_rate_service(var s.db, config)
+        Ok(_) => false
+        Err(e) => e == profile_builder.ProfileError.NotPermitted
+
+@test
+fn test_a_denied_access_is_refused()
+    let open = gatt_server.open_permissions()
+    let denied = gatt_server.Access.Denied
+    let no_subscription = HeartRateConfig {
+        location: BodySensorLocation.Chest, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: denied }, reset_write: gatt_server.Access.Open }
+    test.assert(is_refused(no_subscription))
+    let no_read_cccd = HeartRateConfig {
+        location: BodySensorLocation.Chest, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: denied, write: gatt_server.Access.Open }, reset_write: gatt_server.Access.Open }
+    test.assert(is_refused(no_read_cccd))
+    let no_location = HeartRateConfig {
+        location: BodySensorLocation.Chest, control_point: false, read: denied, measurement_cccd: open, reset_write: gatt_server.Access.Open }
+    test.assert(is_refused(no_location))
+    let no_reset = HeartRateConfig {
+        location: BodySensorLocation.Chest, control_point: true, read: gatt_server.Access.Open, measurement_cccd: open, reset_write: denied }
+    test.assert(is_refused(no_reset))
+    // A location that is not there needs no read access.
+    let absent = HeartRateConfig {
+        location: BodySensorLocation.Absent, control_point: false, read: denied, measurement_cccd: open, reset_write: denied }
+    test.assert(not is_refused(absent))
+
+@test
+fn test_rr_interval_units()
+    test.assert_eq(rr_interval(1000), 1024)
+    test.assert_eq(rr_interval(500), 512)
+
+@test
+fn test_layout_and_properties()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, full_config(BodySensorLocation.Wrist))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.location, 6)
+    test.assert_eq(h.control_point, 8)
+    test.assert_eq(gatt_server.group_end(s.db, 0), 8)
+    test.assert_eq(s.db.attributes[0].value, [0x0D, 0x18])
+    test.assert_eq(s.db.attributes[1].value, [0x10, 0x03, 0x00, 0x37, 0x2A])
+    test.assert_eq(s.db.attributes[4].value, [0x02, 0x06, 0x00, 0x38, 0x2A])
+    test.assert_eq(s.db.attributes[6].value, [0x08, 0x08, 0x00, 0x39, 0x2A])
+    // The optional characteristics are left out.
+    var bare = gatt_server.new_server([], 65)
+    let b = added(var bare, default_heart_rate_config(BodySensorLocation.Absent))
+    test.assert_eq(b.location, 0)
+    test.assert_eq(b.control_point, 0)
+    test.assert_eq(gatt_server.last_handle(bare.db), 4)
+
+@test
+fn test_notification_round_trip()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, full_config(BodySensorLocation.Chest))
+    let m = measurement(80, SensorContact.Detected, -1, [900])
+    test.assert_eq(list.len(heart_rate_notify(var s.db, var s.link, h, m, 0)), 0)
+    let on = gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)
+    test.assert_eq(on[0], [0x13])
+    let ntf = heart_rate_notify(var s.db, var s.link, h, m, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(ntf[0], [0x1B, 0x03, 0x00, 0x16, 80, 0x84, 0x03])
+    // The measurement is neither read nor written by the client.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.measurement, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement, [1]), 0)[0][4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    // The location reads as the Chest.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 1])
+
+@test
+fn test_control_point_accepts_only_the_reset()
+    var s = gatt_server.new_server([], 65)
+    let h = added(var s, full_config(BodySensorLocation.Other))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1]), 0)[0], [0x13])
+    test.assert(heart_rate_reset_requested(h, gatt_server.take_changed(var s.link)))
+    test.assert_eq(heart_rate_reset_requested(h, []), false)
+    // Another value is refused, as is a longer one.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [2]), 0)[0][4] as Int, ERR_CONTROL_POINT_NOT_SUPPORTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [0]), 0)[0][4] as Int, ERR_CONTROL_POINT_NOT_SUPPORTED)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1, 1]), 0)[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(list.len(gatt_server.take_changed(var s.link)), 0)
+    // The control point is not readable.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.control_point, []), 0)[0][4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    // A server without it never reports a reset.
+    var bare = gatt_server.new_server([], 65)
+    let b = added(var bare, default_heart_rate_config(BodySensorLocation.Other))
+    test.assert_eq(heart_rate_reset_requested(b, [4]), false)
+
+@test
+fn test_permissions_of_each_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let config = HeartRateConfig {
+        location: BodySensorLocation.Foot, control_point: true, read: gatt_server.Access.Authenticated,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted },
+        reset_write: gatt_server.Access.SecureConnections }
+    let h = added(var s, config)
+    // The descriptor reads on any link and is written once encrypted.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.measurement_cccd, []), 0)[0], [0x0B, 0, 0])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(false, 1, 0, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.measurement_cccd, [1, 0]), 0)[0], [0x13])
+    // The location needs authentication and the control point Secure Connections.
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x0A, h.location, []), 0)[0], [0x0B, 6])
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 4, 16, true))
+    test.assert_eq(gatt_server.receive(var s.db, var s.link, request(0x12, h.control_point, [1]), 0)[0], [0x13])
+    // Authorization is the application's.
+    var z = gatt_server.new_server([], 65)
+    let hz = added(var z, HeartRateConfig {
+        location: BodySensorLocation.Hand, control_point: true, read: gatt_server.Access.Authorized,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Authorized, write: gatt_server.Access.Authorized },
+        reset_write: gatt_server.Access.Authorized })
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.location, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.control_point, [1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)

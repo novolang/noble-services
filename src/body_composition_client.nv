@@ -1,0 +1,226 @@
+// src/body_composition_client.nv — the Collector side of the Body
+// Composition Service (0x181B): the decoders of its characteristics and the client
+// session.
+//
+//   Body Composition Feature       0x2A9B   decoded by `bc_decode_features`; read, and
+//                                           indicated when the features change
+//   Body Composition Measurement   0x2A9C   decoded by `bc_decode`; indicated
+//
+// Layout of a measurement ([GSS] 3.46 and [BCS] 3.2): the two-octet flags (bit 0 the
+// units, SI when clear and imperial when set; bits 1 to 11 the presence of the fields
+// below, in that order; bit 12 the Multiple Packet Measurement bit; bits 13 to 15 reserved
+// and ignored), the Body Fat Percentage as a uint16 in 0.1 percent (0xFFFF for an
+// unsuccessful measurement), then the fields whose flag is set: the time stamp (a
+// seven-octet Date Time), the User ID (one octet), the Basal Metabolism (kilojoules), the
+// Muscle Percentage (0.1 percent), the Muscle Mass, the Fat Free Mass, the Soft Lean Mass
+// and the Body Water Mass (0.005 kg, or 0.01 lb), the Impedance (0.1 ohm), the Weight
+// (0.005 kg, or 0.01 lb) and the Height (0.001 m, or 0.1 in), all uint16 but the first two.
+//
+// Over the default ATT_MTU the fields that do not fit go into a second indication, the
+// continuation, which has the same flags bit 12, the same Body Fat Percentage and neither the
+// time stamp nor the User ID ([BCS] 3.2.1).  `bc_decode` decodes one indication into a
+// `BcPacket`; `bc_merge` joins the first packet and its continuation into one packet.  The
+// `present` mask of a packet has bit k for the field k of the list above (bit 0 the time
+// stamp, bit 10 the Height); a field that is not present is 0.
+//
+// The Feature ([GSS] 3.45) is a uint32: bits 0 to 10 the support of the same eleven fields,
+// bits 11 to 14 the Weight and Mass Measurement Resolution (0 to 7, as the Weight Scale
+// Feature), bits 15 to 17 the Height Measurement Resolution (0 to 3); the other bits are
+// reserved and ignored.
+//
+// A decoder answers `None` for a value too short for the fields its flags name and for a
+// time stamp that is not a Date Time with a known year, month and day.  It allocates
+// nothing and keeps no state.  Octets after the fields are not read.
+//
+// The session (`bc_client_*`) runs on `sensor_client.nv`: discover the service by its UUID,
+// read the Feature, enable the indication of the measurement and of the Feature.  A Body
+// Composition Service that a Weight Scale includes is a secondary service, which the
+// session does not discover.
+//
+// Satisfies: REQ-BLE-PRFC-011.
+
+use gatt_client
+use links
+use body_composition
+use sensor_client
+use wire
+
+// The Body Fat Percentage of a measurement that did not succeed.
+const BC_UNSUCCESSFUL = 0xFFFF
+
+// The bits of the `present` mask and of the support field of the Feature.
+const BC_TIME_STAMP = 0x001
+const BC_USER = 0x002
+const BC_BASAL_METABOLISM = 0x004
+const BC_MUSCLE_PERCENTAGE = 0x008
+const BC_MUSCLE_MASS = 0x010
+const BC_FAT_FREE_MASS = 0x020
+const BC_SOFT_LEAN_MASS = 0x040
+const BC_BODY_WATER_MASS = 0x080
+const BC_IMPEDANCE = 0x100
+const BC_WEIGHT = 0x200
+const BC_HEIGHT = 0x400
+const BC_FIELD_MASK = 0x7FF
+
+// The number of fields after the Body Fat Percentage.
+const BC_FIELDS = 11
+
+// The flag bits that are not the presence of a field.
+const BC_FLAG_IMPERIAL = 0x0001
+const BC_FLAG_MULTIPLE = 0x1000
+
+// One decoded packet.  `present` says which fields it holds; the others are 0.
+@value
+struct BcPacket
+    imperial: Bool
+    multiple: Bool
+    body_fat: Int
+    present: Int
+    time: wire.DateTime
+    user_id: Int
+    basal_metabolism: Int
+    muscle_percentage: Int
+    muscle_mass: Int
+    fat_free_mass: Int
+    soft_lean_mass: Int
+    body_water_mass: Int
+    impedance: Int
+    weight: Int
+    height: Int
+
+// The decoded Body Composition Feature.
+@value
+struct BcFeatures
+    support: Int
+    weight_resolution: Int
+    height_resolution: Int
+
+// The size in octets of the field `k` (0 to 10).
+@tier(embedded)
+@no_alloc
+fn bc_size(k: Int) -> Int
+    if k == 0
+        return 7
+    if k == 1
+        return 1
+    2
+
+// The offset of the field `k` in a value whose presence mask is `present`.
+@tier(embedded)
+@no_alloc
+fn bc_offset(present: Int, k: Int) -> Int
+    var at = 4
+    for j in 0..k
+        if (present & (1 << j)) != 0
+            at = at + bc_size(j)
+    at
+
+// The 16-bit field `k` of `b` when `present` holds it, 0 otherwise.
+@tier(embedded)
+@no_alloc
+fn bc_word(b: [u8], present: Int, k: Int) -> Int
+    if (present & (1 << k)) == 0
+        return 0
+    wire.get(b, bc_offset(present, k), 2)
+
+// The packet in `b`, `None` when `b` is not a whole packet.
+@tier(embedded)
+@no_alloc
+fn bc_decode(b: [u8]) -> ?BcPacket
+    if list.len(b) < 4
+        return None
+    let flags = wire.get(b, 0, 2)
+    let present = (flags >>> 1) & BC_FIELD_MASK
+    if list.len(b) < bc_offset(present, BC_FIELDS)
+        return None
+    var stamp = wire.date_time_unknown()
+    if (present & BC_TIME_STAMP) != 0
+        stamp = wire.get_date_time(b, bc_offset(present, 0))
+        if not wire.date_time_known(stamp)
+            return None
+    var user = 0
+    if (present & BC_USER) != 0
+        user = b[bc_offset(present, 1)] as Int
+    Some(BcPacket {
+        imperial: (flags & BC_FLAG_IMPERIAL) != 0, multiple: (flags & BC_FLAG_MULTIPLE) != 0,
+        body_fat: wire.get(b, 2, 2), present: present, time: stamp, user_id: user,
+        basal_metabolism: bc_word(b, present, 2), muscle_percentage: bc_word(b, present, 3),
+        muscle_mass: bc_word(b, present, 4), fat_free_mass: bc_word(b, present, 5),
+        soft_lean_mass: bc_word(b, present, 6), body_water_mass: bc_word(b, present, 7),
+        impedance: bc_word(b, present, 8), weight: bc_word(b, present, 9), height: bc_word(b, present, 10) })
+
+// Whether the measurement did not succeed.
+@tier(embedded)
+@no_alloc
+fn bc_unsuccessful(p: BcPacket) -> Bool
+    p.body_fat == BC_UNSUCCESSFUL
+
+// Whether `cont` continues `first`: both have the Multiple Packet bit, the same units and Body Fat
+// Percentage, the continuation has neither the time stamp nor the User ID, and no field is in both.
+@tier(embedded)
+@no_alloc
+fn bc_continues(first: BcPacket, cont: BcPacket) -> Bool
+    first.multiple and cont.multiple and first.imperial == cont.imperial and first.body_fat == cont.body_fat
+        and (cont.present & (BC_TIME_STAMP | BC_USER)) == 0 and (first.present & cont.present) == 0
+
+// `first` joined with its continuation `cont`, `None` unless `cont` continues `first`.  The result
+// has the fields of both and the Multiple Packet bit cleared.
+@tier(embedded)
+@no_alloc
+fn bc_merge(first: BcPacket, cont: BcPacket) -> ?BcPacket
+    if not bc_continues(first, cont)
+        return None
+    Some(BcPacket {
+        imperial: first.imperial, multiple: false, body_fat: first.body_fat, present: first.present | cont.present,
+        time: first.time, user_id: first.user_id,
+        basal_metabolism: first.basal_metabolism + cont.basal_metabolism,
+        muscle_percentage: first.muscle_percentage + cont.muscle_percentage,
+        muscle_mass: first.muscle_mass + cont.muscle_mass, fat_free_mass: first.fat_free_mass + cont.fat_free_mass,
+        soft_lean_mass: first.soft_lean_mass + cont.soft_lean_mass,
+        body_water_mass: first.body_water_mass + cont.body_water_mass, impedance: first.impedance + cont.impedance,
+        weight: first.weight + cont.weight, height: first.height + cont.height })
+
+// Whether the packet holds the field with the bit `bit` of the `present` mask.
+@tier(embedded)
+@no_alloc
+fn bc_has(p: BcPacket, bit: Int) -> Bool
+    (p.present & bit) != 0
+
+// The weight or mass `raw` in grams: 0.005 kg for SI, 0.01 lb for imperial.
+@tier(embedded)
+@no_alloc
+fn bc_mass_grams(raw: Int, imperial: Bool) -> Int
+    if imperial
+        return (raw * 45359237 + 5000000) / 10000000
+    raw * 5
+
+// The height `raw` in millimetres: 0.001 m for SI, 0.1 in for imperial.
+@tier(embedded)
+@no_alloc
+fn bc_height_mm(raw: Int, imperial: Bool) -> Int
+    if imperial
+        return (raw * 254 + 50) / 100
+    raw
+
+// The Feature in `b`, `None` unless it is four octets.
+@tier(embedded)
+@no_alloc
+fn bc_decode_features(b: [u8]) -> ?BcFeatures
+    if list.len(b) != 4
+        return None
+    let v = wire.get(b, 0, 4)
+    Some(BcFeatures { support: v & BC_FIELD_MASK, weight_resolution: (v >>> 11) & 0xF, height_resolution: (v >>> 15) & 0x7 })
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn bc_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, body_composition.UUID_BODY_COMPOSITION_SERVICE)
+
+// Discover the service, read the Feature (required), enable the indication of the measurement
+// (required) and of the Feature (optional).
+@tier(app)
+fn bc_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, body_composition.UUID_BODY_COMPOSITION_FEATURE, true)
+    sensor_client.sc_queue_subscribe(var c, body_composition.UUID_BODY_COMPOSITION_MEASUREMENT, gatt_client.CCCD_INDICATE, true)
+    sensor_client.sc_queue_subscribe(var c, body_composition.UUID_BODY_COMPOSITION_FEATURE, gatt_client.CCCD_INDICATE, false)
+    sensor_client.sc_start(var t, var c, now_ms)

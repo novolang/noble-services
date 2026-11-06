@@ -1,0 +1,245 @@
+// tests/bas_policy_tests.nv — the unit tests of src/bas_policy.nv.
+//
+//   novo test tests/bas_policy_tests.nv
+
+use std.test
+use gatt_server
+use noble_config
+use links
+use battery
+use profile_builder
+use bas_policy.{ BasError, BasHandles, BasInstance, BasPolicy, add_battery_bank, bas_level, bas_link_opened, bas_notify, bas_sent, bas_set_level, default_bas_policy, new_bas_links, open_instance }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+// What a build answered: the handles, and the error when it failed.
+struct BuiltBank
+    handles: BasHandles
+    error: ?BasError
+
+fn empty_bank() -> BasHandles
+    BasHandles { batteries: [], presentation: [] }
+
+fn build_bank(var db: GattDb, instances: [BasInstance]) -> BuiltBank
+    match add_battery_bank(var db, instances)
+        Ok(h) => BuiltBank { handles: h, error: None }
+        Err(e) => BuiltBank { handles: empty_bank(), error: Some(e) }
+
+fn bank(var s: GattServer, instances: [BasInstance]) -> BasHandles
+    let b = build_bank(var s.db, instances)
+    test.assert_eq(b.error, None)
+    b.handles
+
+fn peer() -> links.LinkId
+    links.link_id(0, 1)
+
+fn subscribe(var s: GattServer, handle: Int)
+    let r = gatt_server.receive(var s.db, var s.link, octets([0x12, handle & 0xFF, handle >>> 8, 1, 0]), 0)
+    test.assert(gatt_server.same_bytes(r[0], octets([0x13])))
+
+// A policy that notifies at every fifth percent, and always at 0, and counts
+// the changes.
+struct EveryFifth
+    var changes: Int
+
+impl BasPolicy[] for EveryFifth
+    fn notify_level(var self, peer: links.LinkId, instance: Int, sent: Int, level: Int) -> Bool
+        let _ = peer
+        let _ = instance
+        level == 0 or sent < 0 or sent - level >= 5 or level - sent >= 5
+
+    fn level_changed(var self, instance: Int, level: Int)
+        let _ = instance
+        let _ = level
+        self.changes = self.changes + 1
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_one_instance_is_the_service_of_battery_nv()
+    var s = gatt_server.new_server([], 65)
+    let h = bank(var s, [open_instance(0, 87)])
+    test.assert_eq(list.len(h.batteries), 1)
+    test.assert_eq(h.batteries[0].service, 1)
+    test.assert_eq(h.batteries[0].level, 3)
+    test.assert_eq(h.batteries[0].cccd, 4)
+    test.assert_eq(h.presentation[0], 0)
+    test.assert_eq(gatt_server.last_handle(s.db), 4)
+    test.assert_eq(bas_level(s.db, h, 0), 87)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_several_instances_each_carry_a_presentation_format()
+    if noble_config.MAX_BAS < 2
+        return
+    var s = gatt_server.new_server([], 65)
+    let h = bank(var s, [open_instance(1, 90), open_instance(2, 40)])
+    test.assert_eq(list.len(h.batteries), 2)
+    test.assert_eq(h.batteries[0].service, 1)
+    test.assert_eq(h.presentation[0], 5)
+    test.assert_eq(h.batteries[1].service, 6)
+    test.assert_eq(h.batteries[1].level, 8)
+    test.assert_eq(h.presentation[1], 10)
+    // The descriptor is the seventh octet group of the Presentation Format: uint8,
+    // exponent 0, percentage, Bluetooth SIG name space, the Description.
+    let first = gatt_server.index_of(s.db, h.presentation[0])
+    test.assert(gatt_server.same_bytes(s.db.attributes[first].value, octets([0x04, 0x00, 0xAD, 0x27, 0x01, 0x01, 0x00])))
+    let second = gatt_server.index_of(s.db, h.presentation[1])
+    test.assert(gatt_server.same_bytes(s.db.attributes[second].value, octets([0x04, 0x00, 0xAD, 0x27, 0x01, 0x02, 0x00])))
+    test.assert_eq(s.db.attributes[first].permissions, gatt_server.PERM_READ)
+    // A client reads it, and each service is found by its UUID.
+    let read = gatt_server.receive(var s.db, var s.link, octets([0x0A, h.presentation[1] & 0xFF, 0]), 0)
+    test.assert(gatt_server.same_bytes(read[0], octets([0x0B, 0x04, 0x00, 0xAD, 0x27, 0x01, 0x02, 0x00])))
+    let found = gatt_server.receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x0F, 0x18]), 0)
+    test.assert(gatt_server.same_bytes(found[0], octets([0x07, 0x01, 0x00, 0x05, 0x00, 0x06, 0x00, 0x0A, 0x00])))
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_the_stack_refuses_a_list_of_instances_that_breaks_a_rule()
+    if noble_config.MAX_BAS < 2
+        return
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(build_bank(var s.db, []).error, Some(BasError.NoInstance))
+    test.assert_eq(build_bank(var s.db, [open_instance(1, 1), open_instance(2, 1), open_instance(3, 1), open_instance(4, 1), open_instance(5, 1)]).error,
+        Some(BasError.TooMany))
+    test.assert_eq(build_bank(var s.db, [open_instance(1, 1), open_instance(0, 1)]).error, Some(BasError.NeedsDescription))
+    test.assert_eq(build_bank(var s.db, [open_instance(2, 1), open_instance(2, 1)]).error, Some(BasError.SameDescription))
+    // Nothing was added by any of them.
+    test.assert_eq(list.len(s.db.attributes), 0)
+    // One instance needs no Description.
+    test.assert_eq(build_bank(var s.db, [open_instance(0, 1)]).error, None)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_the_bank_stops_when_the_table_is_full()
+    if noble_config.MAX_BAS < 2
+        return
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFF, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_bank(var s.db, [open_instance(0, 1)]).error, Some(BasError.NoRoom))
+    // Room for the first instance but not for the second.
+    var tight = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var tight.db, false, gatt_server.le16(0xAA00)), 1)
+    tight.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFA, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_bank(var tight.db, [open_instance(1, 1), open_instance(2, 1)]).error, Some(BasError.NoRoom))
+    // Room for the first service and its level but not for its descriptor.
+    var late = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var late.db, false, gatt_server.le16(0xAA00)), 1)
+    late.db.attributes[0] = gatt_server.GattAttribute {
+        handle: 0xFFFB, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    test.assert_eq(build_bank(var late.db, [open_instance(1, 1), open_instance(2, 1)]).error, Some(BasError.NoRoom))
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_a_change_is_notified_once_to_a_client_that_subscribed()
+    var s = gatt_server.new_server([], 65)
+    let h = bank(var s, [open_instance(0, 80)])
+    var state = new_bas_links()
+    var policy = default_bas_policy()
+    // Not subscribed: the change is stored, nobody is told, the link is not marked.
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 79))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 0)
+    test.assert_eq(bas_sent(state, 0, 0), -1)
+    subscribe(s, h.batteries[0].cccd)
+    // Told the level that is current, once.
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 78))
+    let ntf = bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert(gatt_server.same_bytes(ntf[0], octets([0x1B, h.batteries[0].level, 0, 78])))
+    test.assert_eq(bas_sent(state, 0, 0), 78)
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 0)
+    // The same level again changes nothing; an out-of-range level is cut.
+    test.assert(not bas_set_level(var s.db, h, var policy, 0, 78))
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 300))
+    test.assert_eq(bas_level(s.db, h, 0), 100)
+    // A new connection on the slot has been told nothing.
+    bas_link_opened(var state, 0)
+    test.assert_eq(bas_sent(state, 0, 0), -1)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_the_policy_decides_which_changes_are_worth_a_notification()
+    if noble_config.MAX_BAS < 2
+        return
+    var s = gatt_server.new_server([], 65)
+    let h = bank(var s, [open_instance(1, 60), open_instance(2, 30)])
+    var state = new_bas_links()
+    var policy = EveryFifth { changes: 0 }
+    subscribe(s, h.batteries[0].cccd)
+    subscribe(s, h.batteries[1].cccd)
+    // The first notification of a link is sent.
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 59))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 1)
+    // Two single steps are held back, the fifth is sent with the level that is current.
+    for level in [58, 57, 56, 55]
+        test.assert(bas_set_level(var s.db, h, var policy, 0, level))
+        test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), if level == 54 then 1 else 0)
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 54))
+    let ntf = bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)
+    test.assert_eq(list.len(ntf), 1)
+    test.assert_eq(ntf[0][3] as Int, 54)
+    // The other instance keeps its own record, and the policy hears of every change.
+    test.assert_eq(bas_sent(state, 0, 0), 54)
+    test.assert_eq(bas_sent(state, 0, 1), -1)
+    test.assert_eq(policy.changes, 6)
+    // A level of 0 is always sent.
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 53))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 0)
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 0))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 1)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_an_instance_a_slot_or_a_service_that_is_not_there_is_ignored()
+    var s = gatt_server.new_server([], 65)
+    let h = bank(var s, [open_instance(0, 50)])
+    var state = new_bas_links()
+    var policy = default_bas_policy()
+    test.assert(not bas_set_level(var s.db, h, var policy, 1, 10))
+    test.assert(not bas_set_level(var s.db, h, var policy, -1, 10))
+    test.assert_eq(bas_level(s.db, h, 1), 0)
+    test.assert_eq(bas_level(s.db, h, -1), 0)
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 1, 0)), 0)
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, links.link_id(noble_config.MAX_CONNECTIONS, 1), 0, 0)), 0)
+    test.assert_eq(bas_sent(state, noble_config.MAX_CONNECTIONS, 0), -1)
+    test.assert_eq(bas_sent(state, 0, noble_config.MAX_BAS), -1)
+    bas_link_opened(var state, noble_config.MAX_CONNECTIONS)
+    // A handle the table does not hold reads as 0.
+    var other = gatt_server.new_server([], 65)
+    test.assert_eq(bas_level(other.db, h, 0), 0)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_an_encrypted_level_is_notified_only_on_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let instance = BasInstance {
+        description: 0, level: 50, read: gatt_server.Access.Encrypted,
+        cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Encrypted } }
+    let h = bank(var s, [instance])
+    var state = new_bas_links()
+    var policy = default_bas_policy()
+    gatt_server.set_configuration(var s.link, h.batteries[0].cccd, gatt_server.CCC_NOTIFICATION)
+    test.assert(bas_set_level(var s.db, h, var policy, 0, 49))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 0)
+    test.assert_eq(bas_sent(state, 0, 0), -1)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 0, 0)), 1)
+
+@test
+@satisfies("REQ-BLE-PRF-002")
+fn test_an_error_names_its_reason()
+    for e in [BasError.NoInstance, BasError.TooMany, BasError.NeedsDescription, BasError.SameDescription, BasError.NoRoom]
+        test.assert(str.len(e.message()) > 10)
+    var policy = default_bas_policy()
+    test.assert(policy.notify_level(peer(), 0, -1, 10))
+    test.assert(not policy.notify_level(peer(), 0, 10, 10))
+    policy.level_changed(0, 10)

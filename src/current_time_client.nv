@@ -1,0 +1,208 @@
+// src/current_time_client.nv — the Collector side of the Current Time
+// Service (0x1805): the decoders of its characteristics, the builders of the values a
+// client writes, and the client session.
+//
+//   Current Time             0x2A2B   `ct_decode_time` reads, `ct_time_value` builds; read,
+//                                     notified, optionally written
+//   Local Time Information   0x2A0F   `ct_decode_local` reads, `ct_local_value` builds; read,
+//                                     optionally written
+//   Reference Time Info.     0x2A14   `ct_decode_reference`; read
+//
+// Layout ([GSS] 3.62, 3.70 to 3.73, 3.76, 3.90, 3.178, 3.220, 3.228 and 3.232): Current Time
+// is Exact Time 256 (a Date Time of seven octets, the Day of Week, the Fractions256) and the
+// Adjust Reason octet (bit 0 manual update, bit 1 external reference update, bit 2 change of
+// time zone, bit 3 change of DST offset; the other bits reserved and ignored).  Local Time
+// Information is the Time Zone (a sint8 in 15-minute steps from -48 to +56, -128 for unknown)
+// and the DST Offset (0 standard time, 2 half an hour, 4 daylight time, 8 double daylight
+// time, 255 unknown).  Reference Time Information is the Time Source (0 unknown, 1 network
+// time protocol, 2 GPS, 3 radio time signal, 4 manual, 5 atomic clock, 6 cellular network),
+// the Time Accuracy (125 ms steps, 254 for larger than that, 255 unknown) and the Days and
+// the Hours Since Update (0 to 254 days and 0 to 23 hours, or 255 and 255 for an update more
+// than 254 days old).
+//
+// A decoder answers `None` for a value of the wrong length and for a field outside its
+// range.  A year, month or day of 0 in the Date Time is "not known" and decodes.  It
+// allocates nothing and keeps no state.
+//
+// The session (`ct_client_*`) runs on `sensor_client.nv`: discover the service, read the
+// Current Time, enable its notification, read the Local Time Information and the Reference
+// Time Information where the peer has them.  `ct_client_set_time` and `ct_client_set_local`
+// write the time or the zone the peer is to take; a peer that does not offer the Write
+// property answers the write with an error the session reports as a failed step.
+//
+// Satisfies: REQ-BLE-PRFC-014.
+
+use gatt_client
+use links
+use current_time
+use sensor_client
+use wire
+
+// The values of the "unknown" fields.
+const CT_ZONE_UNKNOWN = -128
+const CT_DST_UNKNOWN = 255
+const CT_ACCURACY_UNKNOWN = 255
+const CT_ACCURACY_LARGE = 254
+
+// The sizes of the values, in octets.
+const CT_TIME_SIZE = 10
+const CT_LOCAL_SIZE = 2
+const CT_REFERENCE_SIZE = 4
+
+// The bits of the Adjust Reason.
+const CT_REASON_MANUAL = 0x01
+const CT_REASON_EXTERNAL = 0x02
+const CT_REASON_TIME_ZONE = 0x04
+const CT_REASON_DST = 0x08
+const CT_REASON_MASK = 0x0F
+
+// One decoded Current Time.  `day_of_week` is 0 for unknown, 1 Monday to 7 Sunday; `fractions`
+// counts 1/256 s; `reason` holds the defined Adjust Reason bits.
+@value
+struct CtTime
+    time: wire.DateTime
+    day_of_week: Int
+    fractions: Int
+    reason: Int
+
+// One decoded Local Time Information.
+@value
+struct CtLocal
+    zone: Int
+    dst: Int
+
+// One decoded Reference Time Information.
+@value
+struct CtReference
+    source: Int
+    accuracy: Int
+    days: Int
+    hours: Int
+
+// The Current Time in `b`, `None` unless it is ten octets with a Date Time and a Day of Week in range.
+@tier(embedded)
+@no_alloc
+fn ct_decode_time(b: [u8]) -> ?CtTime
+    if list.len(b) != CT_TIME_SIZE
+        return None
+    let stamp = wire.get_date_time(b, 0)
+    let dow = b[7] as Int
+    if not wire.date_time_valid(stamp) or dow > 7
+        return None
+    Some(CtTime { time: stamp, day_of_week: dow, fractions: b[8] as Int, reason: (b[9] as Int) & CT_REASON_MASK })
+
+// The milliseconds of the Fractions256 `fractions`, rounded down.
+@tier(embedded)
+@no_alloc
+fn ct_fractions_ms(fractions: Int) -> Int
+    fractions * 1000 / 256
+
+// The value to write to Current Time for `t`.
+@tier(app)
+fn ct_time_value(t: CtTime) -> [u8]
+    var out: [u8] = []
+    wire.put_date_time(var out, t.time)
+    wire.put(var out, wire.clamp(t.day_of_week, 0, 7), 1)
+    wire.put(var out, wire.clamp(t.fractions, 0, 255), 1)
+    wire.put(var out, t.reason & CT_REASON_MASK, 1)
+    out
+
+// The Local Time Information in `b`, `None` unless it is two octets with a zone and a DST Offset in range.
+@tier(embedded)
+@no_alloc
+fn ct_decode_local(b: [u8]) -> ?CtLocal
+    if list.len(b) != CT_LOCAL_SIZE
+        return None
+    let zone = wire.get_signed(b, 0, 1)
+    let dst = b[1] as Int
+    if zone != CT_ZONE_UNKNOWN and (zone < -48 or zone > 56)
+        return None
+    if dst != 0 and dst != 2 and dst != 4 and dst != 8 and dst != CT_DST_UNKNOWN
+        return None
+    Some(CtLocal { zone: zone, dst: dst })
+
+// The offset of the zone `l` from UTC in minutes, 0 when the zone is unknown.
+@tier(embedded)
+@no_alloc
+fn ct_zone_minutes(l: CtLocal) -> Int
+    if l.zone == CT_ZONE_UNKNOWN
+        return 0
+    l.zone * 15
+
+// The DST Offset of `l` in minutes (0, 30, 60 or 120), -1 when it is unknown.
+@tier(embedded)
+@no_alloc
+fn ct_dst_minutes(l: CtLocal) -> Int
+    if l.dst == CT_DST_UNKNOWN
+        return -1
+    l.dst * 15
+
+// The value to write to Local Time Information for a zone in 15-minute steps and a DST Offset.
+@tier(app)
+fn ct_local_value(l: CtLocal) -> [u8]
+    var out: [u8] = []
+    wire.put(var out, l.zone, 1)
+    wire.put(var out, l.dst, 1)
+    out
+
+// The Reference Time Information in `b`, `None` unless it is four octets with a known Time Source and a time
+// since the update in range.
+@tier(embedded)
+@no_alloc
+fn ct_decode_reference(b: [u8]) -> ?CtReference
+    if list.len(b) != CT_REFERENCE_SIZE
+        return None
+    let source = b[0] as Int
+    let days = b[2] as Int
+    let hours = b[3] as Int
+    if source > 6
+        return None
+    if days == 255
+        if hours != 255
+            return None
+    else if hours > 23
+        return None
+    Some(CtReference { source: source, accuracy: b[1] as Int, days: days, hours: hours })
+
+// The accuracy of `r` in milliseconds: -1 when unknown, -2 when larger than 31 750 ms.
+@tier(embedded)
+@no_alloc
+fn ct_accuracy_ms(r: CtReference) -> Int
+    if r.accuracy == CT_ACCURACY_UNKNOWN
+        return -1
+    if r.accuracy == CT_ACCURACY_LARGE
+        return -2
+    r.accuracy * 125
+
+// Whether the last update was more than 254 days ago (days and hours both 255).
+@tier(embedded)
+@no_alloc
+fn ct_reference_stale(r: CtReference) -> Bool
+    r.days == 255
+
+// A session on `link`: the table row is the program's.
+@tier(app)
+fn ct_client_new(link: links.LinkId) -> sensor_client.SensorClient
+    sensor_client.sc_new(link, current_time.UUID_CURRENT_TIME_SERVICE)
+
+// Discover the service, read the Current Time (required) and enable its notification (required), read the
+// Local Time Information and the Reference Time Information (optional).
+@tier(app)
+fn ct_client_start(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_read(var c, current_time.UUID_CURRENT_TIME, true)
+    sensor_client.sc_queue_subscribe(var c, current_time.UUID_CURRENT_TIME, gatt_client.CCCD_NOTIFY, true)
+    sensor_client.sc_queue_read(var c, current_time.UUID_LOCAL_TIME_INFORMATION, false)
+    sensor_client.sc_queue_read(var c, current_time.UUID_REFERENCE_TIME_INFORMATION, false)
+    sensor_client.sc_start(var t, var c, now_ms)
+
+// Write the time `t` to the Current Time characteristic.  The session must have finished its plan.
+@tier(app)
+fn ct_client_set_time(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, time: CtTime, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, current_time.UUID_CURRENT_TIME, ct_time_value(time))
+    sensor_client.sc_kick(var t, var c, now_ms)
+
+// Write the zone and DST Offset `l` to the Local Time Information characteristic.
+@tier(app)
+fn ct_client_set_local(var t: gatt_client.ClientTable, var c: sensor_client.SensorClient, l: CtLocal, now_ms: Int) -> sensor_client.ScStep
+    sensor_client.sc_queue_write(var c, current_time.UUID_LOCAL_TIME_INFORMATION, ct_local_value(l))
+    sensor_client.sc_kick(var t, var c, now_ms)

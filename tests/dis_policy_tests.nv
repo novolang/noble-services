@@ -1,0 +1,273 @@
+// tests/dis_policy_tests.nv — the unit tests of src/dis_policy.nv.
+//
+//   novo test tests/dis_policy_tests.nv
+
+use std.test
+use att
+use gatt_server
+use noble_services_config
+use device_information
+use profile_builder
+use dis_policy.{ all_kinds, DisError, DisKind, DisPolicy, Firmware, Hardware, Manufacturer, Model, PnpId, Serial, Software, SystemId, add_device_information_policy, check_information, dis_update, handle_of, information_policy, no_handles, uuid_of, valid_utf8 }
+
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+fn text(s: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(s)
+        list.push(out, str.byte_at(s, i) as u8)
+    out
+
+fn read_value(var s: GattServer, handle: Int) -> [u8]
+    let out = gatt_server.receive(var s.db, var s.link, octets([0x0A, handle & 0xFF, handle >>> 8]), 0)
+    test.assert_eq(list.len(out), 1)
+    out[0][:]
+
+// `info` with the value of `kind` replaced.
+fn replaced(info: DeviceInformation, kind: DisKind, value: [u8]) -> DeviceInformation
+    DeviceInformation {
+        read: info.read,
+        manufacturer: (if kind == DisKind.Manufacturer then value else info.manufacturer),
+        model: (if kind == DisKind.Model then value else info.model),
+        serial: (if kind == DisKind.Serial then value else info.serial),
+        hardware: (if kind == DisKind.Hardware then value else info.hardware),
+        firmware: (if kind == DisKind.Firmware then value else info.firmware),
+        software: (if kind == DisKind.Software then value else info.software),
+        system_id: (if kind == DisKind.SystemId then value else info.system_id),
+        pnp_id: (if kind == DisKind.PnpId then value else info.pnp_id) }
+
+fn product() -> DeviceInformation
+    DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: text("Novo"), model: text("N-1"), serial: text("SN0042"), hardware: [],
+        firmware: text("1.2.3"), software: [], system_id: [],
+        pnp_id: device_information.pnp_id_value(device_information.PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100) }
+
+fn full() -> DeviceInformation
+    DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: text("Novo"), model: text("N-1"), serial: text("SN0042"), hardware: text("rev B"),
+        firmware: text("1.2.3"), software: text("2.0"), system_id: device_information.system_id_value(0x0102030405, 0xA1B2C3),
+        pnp_id: device_information.pnp_id_value(device_information.PNP_SOURCE_BLUETOOTH_SIG, 0x0059, 1, 1) }
+
+// A policy that serves `info` and keeps the serial number for an encrypted link.
+struct SerialInPrivate
+    info: DeviceInformation
+
+impl DisPolicy[] for SerialInPrivate
+    fn value(var self, kind: DisKind) -> [u8]
+        match kind
+            Manufacturer => self.info.manufacturer[:]
+            Model        => self.info.model[:]
+            Serial       => self.info.serial[:]
+            Hardware     => self.info.hardware[:]
+            Firmware     => self.info.firmware[:]
+            Software     => self.info.software[:]
+            SystemId     => self.info.system_id[:]
+            PnpId        => self.info.pnp_id[:]
+
+    fn access(var self, kind: DisKind) -> gatt_server.Access
+        if kind == DisKind.Serial
+            gatt_server.Access.Encrypted
+        else
+            gatt_server.Access.Open
+
+// A policy that holds nothing.
+struct NothingToSay
+    placeholder: Int
+
+impl DisPolicy[] for NothingToSay
+    fn value(var self, kind: DisKind) -> [u8]
+        let _ = kind
+        []
+
+    fn access(var self, kind: DisKind) -> gatt_server.Access
+        let _ = kind
+        gatt_server.Access.Open
+
+// What a build answered: the handles, and the error when it failed.
+struct Built
+    handles: DeviceInformationHandles
+    error: ?DisError
+
+fn build<P: DisPolicy[e]>(var db: GattDb, var policy: P) -> Built [e]
+    match add_device_information_policy(var db, var policy)
+        Ok(h)  => Built { handles: h, error: None }
+        Err(e) => Built { handles: no_handles(), error: Some(e) }
+
+fn built(var s: GattServer, info: DeviceInformation) -> DeviceInformationHandles
+    let b = build(var s.db, SerialInPrivate { info: info })
+    test.assert_eq(b.error, None)
+    b.handles
+
+// A table whose first service ends at the handle `last`, which leaves room for
+// few attributes.
+fn nearly_full(last: Int) -> GattServer
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
+    s.db.attributes[0] = gatt_server.GattAttribute {
+        handle: last, type_uuid: gatt_server.le16(gatt_server.UUID_PRIMARY_SERVICE), value: gatt_server.le16(0xAA00),
+        max_len: 2, permissions: gatt_server.PERM_READ, key_size: 0, tester: false, included: 0, per_link: false }
+    s
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_the_policy_builds_the_same_service_as_the_plain_builder()
+    var a = gatt_server.new_server([], 65)
+    var b = gatt_server.new_server([], 65)
+    let _ = device_information.add_device_information_service(var a.db, product())
+    let by_policy = built(var b, product())
+    test.assert_eq(by_policy.service, 1)
+    test.assert_eq(by_policy.manufacturer, 3)
+    test.assert_eq(by_policy.model, 5)
+    test.assert_eq(by_policy.serial, 7)
+    test.assert_eq(by_policy.hardware, 0)
+    test.assert_eq(by_policy.firmware, 9)
+    test.assert_eq(by_policy.software, 0)
+    test.assert_eq(by_policy.system_id, 0)
+    test.assert_eq(by_policy.pnp_id, 11)
+    test.assert_eq(gatt_server.last_handle(a.db), gatt_server.last_handle(b.db))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_every_characteristic_is_built_in_the_order_of_the_plain_builder()
+    var s = gatt_server.new_server([], 65)
+    let h = built(var s, full())
+    test.assert_eq(h.service, 1)
+    test.assert_eq(handle_of(h, DisKind.Manufacturer), 3)
+    test.assert_eq(handle_of(h, DisKind.Model), 5)
+    test.assert_eq(handle_of(h, DisKind.Serial), 7)
+    test.assert_eq(handle_of(h, DisKind.Hardware), 9)
+    test.assert_eq(handle_of(h, DisKind.Firmware), 11)
+    test.assert_eq(handle_of(h, DisKind.Software), 13)
+    test.assert_eq(handle_of(h, DisKind.SystemId), 15)
+    test.assert_eq(handle_of(h, DisKind.PnpId), 17)
+    test.assert(gatt_server.same_bytes(read_value(s, h.system_id)[1:], device_information.system_id_value(0x0102030405, 0xA1B2C3)))
+    test.assert(gatt_server.same_bytes(read_value(s, h.model)[1:], text("N-1")))
+    // The policy of a `DeviceInformation` serves its values at its access.
+    var plain = gatt_server.new_server([], 65)
+    let by_info = build(var plain.db, information_policy(full()))
+    test.assert_eq(by_info.error, None)
+    test.assert_eq(by_info.handles.pnp_id, 17)
+    // UUIDs of the kinds the other tests do not name.
+    test.assert_eq(uuid_of(DisKind.SystemId), 0x2A23)
+    test.assert_eq(uuid_of(DisKind.Hardware), 0x2A27)
+    test.assert_eq(uuid_of(DisKind.Software), 0x2A28)
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_the_policy_chooses_the_access_of_each_characteristic()
+    var s = gatt_server.new_server([], 65)
+    let h = built(var s, product())
+    test.assert(gatt_server.same_bytes(read_value(s, h.model)[1:], text("N-1")))
+    test.assert_eq(read_value(s, h.serial)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert(gatt_server.same_bytes(read_value(s, h.serial)[1:], text("SN0042")))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_utf8_is_checked_by_the_rules_of_rfc_3629()
+    test.assert(valid_utf8(text("Novo")))
+    test.assert(valid_utf8(octets([0xC3, 0xA6])))
+    test.assert(valid_utf8(octets([0xE2, 0x82, 0xAC])))
+    test.assert(valid_utf8(octets([0xF0, 0x9F, 0x98, 0x80])))
+    // An overlong form, a surrogate, a scalar value above U+10FFFF, a stray
+    // continuation octet and a sequence cut short.
+    test.assert(not valid_utf8(octets([0xC0, 0x80])))
+    test.assert(not valid_utf8(octets([0xE0, 0x80, 0x80])))
+    test.assert(not valid_utf8(octets([0xED, 0xA0, 0x80])))
+    test.assert(not valid_utf8(octets([0xF0, 0x80, 0x80, 0x80])))
+    test.assert(not valid_utf8(octets([0xF4, 0x90, 0x80, 0x80])))
+    test.assert(not valid_utf8(octets([0xF5, 0x80, 0x80, 0x80])))
+    test.assert(not valid_utf8(octets([0x80])))
+    test.assert(not valid_utf8(octets([0xC3])))
+    test.assert(not valid_utf8(octets([0xE2, 0x82])))
+    test.assert(not valid_utf8(octets([0xF0, 0x9F, 0x98])))
+    test.assert(not valid_utf8(octets([0xE2, 0x41, 0xAC])))
+    test.assert(not valid_utf8(octets([0xC3, 0x41])))
+    test.assert(not valid_utf8(octets([0xF0, 0x9F, 0x41, 0x80])))
+    test.assert(not valid_utf8(octets([0xF0, 0x9F, 0x98, 0x41])))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_the_stack_refuses_a_value_that_breaks_a_rule_of_the_service()
+    let bad_text = replaced(product(), DisKind.Model, octets([0xC0, 0x80]))
+    test.assert_eq(check_information(bad_text), Some(DisError.NotUtf8))
+    test.assert_eq(check_information(replaced(product(), DisKind.SystemId, octets([1, 2, 3]))),
+        Some(DisError.BadSystemId))
+    test.assert_eq(check_information(replaced(product(), DisKind.PnpId, octets([2, 1, 0]))),
+        Some(DisError.BadPnpId))
+    test.assert_eq(check_information(replaced(product(), DisKind.PnpId, device_information.pnp_id_value(3, 1, 1, 1))),
+        Some(DisError.BadPnpId))
+    var many: [u8] = []
+    for _ in 0..noble_services_config.MAX_DIS_OCTETS + 1
+        list.push(many, 'x')
+    test.assert_eq(check_information(replaced(product(), DisKind.Serial, many)), Some(DisError.TooLong))
+    test.assert_eq(check_information(product()), None)
+    test.assert_eq(check_information(full()), None)
+    // A refused set of values adds nothing.
+    var s = gatt_server.new_server([], 65)
+    let refused = build(var s.db, information_policy(bad_text))
+    test.assert_eq(refused.error, Some(DisError.NotUtf8))
+    test.assert_eq(list.len(s.db.attributes), 0)
+    // A service of no characteristic is refused, since a bare declaration tells a
+    // client nothing.
+    var silent = NothingToSay { placeholder: 0 }
+    test.assert_eq(silent.access(DisKind.Model), gatt_server.Access.Open)
+    let nothing = build(var s.db, var silent)
+    test.assert_eq(nothing.error, Some(DisError.Empty))
+    test.assert_eq(check_information(device_information.empty_device_information()), Some(DisError.Empty))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_the_service_stops_when_the_table_is_full()
+    // No handle is left for the service.
+    var s = nearly_full(0xFFFF)
+    test.assert_eq(build(var s.db, information_policy(product())).error, Some(DisError.NoRoom))
+    // Room for the service but not for every characteristic.
+    var tight = nearly_full(0xFFF8)
+    test.assert_eq(build(var tight.db, information_policy(product())).error, Some(DisError.NoRoom))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_a_value_changed_after_the_build_is_read_at_the_next_read()
+    var s = gatt_server.new_server([], 65)
+    let h = built(var s, product())
+    test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, text("1.2.4")), None)
+    test.assert(gatt_server.same_bytes(read_value(s, h.firmware)[1:], text("1.2.4")))
+    // The characteristic is not there, the value is empty, the string is not
+    // UTF-8, the value is longer than the profile allows, the handles belong to
+    // another table.
+    test.assert_eq(dis_update(var s.db, h, DisKind.Hardware, text("B")), Some(DisError.Absent))
+    test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, []), Some(DisError.Absent))
+    test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, octets([0xFF])), Some(DisError.NotUtf8))
+    var many: [u8] = []
+    for _ in 0..noble_services_config.MAX_DIS_OCTETS + 1
+        list.push(many, 'x')
+    test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, many), Some(DisError.TooLong))
+    var other = gatt_server.new_server([], 65)
+    test.assert_eq(dis_update(var other.db, h, DisKind.Firmware, text("1.2.5")), Some(DisError.Absent))
+    test.assert(gatt_server.same_bytes(read_value(s, h.firmware)[1:], text("1.2.4")))
+
+@test
+@satisfies("REQ-BLE-PRF-001")
+fn test_an_error_names_its_reason()
+    for e in [DisError.Empty,
+    DisError.TooLong,
+    DisError.NotUtf8,
+    DisError.BadSystemId,
+    DisError.BadPnpId,
+    DisError.Absent,
+    DisError.NoRoom]
+        test.assert(str.len(e.message()) > 10)
+
+@test
+fn test_all_kinds_lists_the_eight_characteristics_in_the_order_the_service_holds_them()
+    let kinds = all_kinds()
+    test.assert_eq(list.len(kinds), 8)
+    test.assert(kinds[0] == Manufacturer)
+    test.assert(kinds[1] == Model)
+    test.assert(kinds[6] == SystemId)
+    test.assert(kinds[7] == PnpId)

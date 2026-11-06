@@ -1,0 +1,373 @@
+// tests/user_data_tests.nv — the unit tests of src/user_data.nv.
+//
+//   novo test tests/user_data_tests.nv
+
+use std.test
+use att
+use gatt_server
+use links
+use profile_builder
+use sensor_control
+use fixtures.{ req, peer }
+use wire
+use user_data.{ ERR_USER_DATA_ACCESS_NOT_PERMITTED, OP_CONSENT, OP_DELETE_USERS, OP_DELETE_USER_DATA, OP_LIST_ALL_USERS, OP_REGISTER_NEW_USER, RESULT_INVALID_PARAMETER, RESULT_OPERATION_FAILED, RESULT_USER_NOT_AUTHORIZED, UdsHandles, UdsPolicy, UdsState, ack, add_uds_service, control_value, default_uds_config, new_uds_state, receive_default, register_user, registered_segments, registered_user_data, server, test_characteristics, uds_disconnected, uds_end_update, uds_has_consent, uds_receive, uds_set_name, uds_set_value, uds_unlock, uds_user_count }
+
+// Write `value` to the control point, confirm the indication and answer the
+// response value.
+@tier(app)
+fn command(var s: GattServer, h: UdsHandles, var st: UdsState, value: [Int]) -> [u8]
+    let out = receive_default(var s, h, var st, req(0x12, h.control_point, value), 0)
+    let _ = ack(var s)
+    control_value(s.db, h.control_point)
+
+@tier(app)
+fn read_value(var s: GattServer, h: UdsHandles, var st: UdsState, handle: Int) -> [u8]
+    let out = receive_default(var s, h, var st, req(0x0A, handle, []), 0)
+    out[0][1:list.len(out[0])]
+
+// Register a user with `code`; the User Index assigned.
+@tier(app)
+fn registered(var s: GattServer, h: UdsHandles, var st: UdsState, code: Int) -> Int
+    let r = command(var s, h, var st, [OP_REGISTER_NEW_USER, code & 0xFF, code >>> 8])
+    r[3] as Int
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_service_has_the_mandatory_characteristics_and_the_given_ones()
+    let (s, h) = server(default_uds_config(test_characteristics()))
+    test.assert_eq(h.service, 1)
+    test.assert_eq(h.increment, 3)
+    test.assert_eq(h.user_index, 6)
+    test.assert_eq(h.control_point, 8)
+    test.assert_eq(h.registered, 11)
+    test.assert_eq(list.len(h.characteristics), 2)
+    // Read, Write and Notify; Read; Write and Indicate; Indicate; Read and Write.
+    test.assert_eq(s.db.attributes[h.increment - 2].value, [0x1A, 3, 0, 0x99, 0x2A])
+    test.assert_eq(s.db.attributes[h.user_index - 2].value, [0x02, 6, 0, 0x9A, 0x2A])
+    test.assert_eq(s.db.attributes[h.control_point - 2].value, [0x28, 8, 0, 0x9F, 0x2A])
+    test.assert_eq(s.db.attributes[h.registered - 2].value, [0x20, 11, 0, 0x37, 0x2B])
+    test.assert_eq(s.db.attributes[h.characteristics[0] - 2].value, wire.octets([0x0A, h.characteristics[0] & 0xFF, 0, 0x8A, 0x2A]))
+    test.assert_eq(control_value(s.db, h.user_index), [0xFF])
+    test.assert_eq(control_value(s.db, h.increment), [0, 0, 0, 0])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_a_service_with_no_characteristic_or_no_user_is_refused()
+    var s = gatt_server.new_server([], 65)
+    match add_uds_service(var s.db, default_uds_config([]))
+        Ok(_) => test.fail("at least one UDS Characteristic")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+    var c = default_uds_config(test_characteristics())
+    c.max_users = 0
+    match add_uds_service(var s.db, c)
+        Ok(_) => test.fail("at least one user")
+        Err(e) => test.assert_eq(e, profile_builder.ProfileError.InvalidValue)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_attributes_need_an_encrypted_link()
+    var s = gatt_server.new_server([], 65)
+    let h = add_uds_service(var s.db, default_uds_config(test_characteristics()))!
+    let r = gatt_server.receive(var s.db, var s.link, req(0x0A, h.user_index, []), 0)
+    test.assert_eq(r[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_a_new_user_gets_the_lowest_index_and_consent_loads_the_data()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    test.assert_eq(registered(var s, h, var st, 1234), 0)
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 0x39, 0x05]), [0x20, 1, 1, 1])
+    test.assert_eq(uds_user_count(st), 2)
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 0xD2, 0x04]), [0x20, 2, 1])
+    test.assert_eq(read_value(var s, h, var st, h.user_index), [0])
+    test.assert_eq(read_value(var s, h, var st, h.characteristics[0]), [0x41])
+    // A write by the client is the user's own and survives a change of user.
+    let w = receive_default(var s, h, var st, req(0x12, h.characteristics[1], [0x34, 0x12]), 0)
+    test.assert_eq(w[0], [0x13])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 1, 0x39, 0x05]), [0x20, 2, 1])
+    test.assert_eq(read_value(var s, h, var st, h.user_index), [1])
+    test.assert_eq(read_value(var s, h, var st, h.characteristics[1]), [0, 0])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 0xD2, 0x04]), [0x20, 2, 1])
+    test.assert_eq(read_value(var s, h, var st, h.characteristics[1]), [0x34, 0x12])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_without_consent_a_uds_characteristic_is_not_permitted()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let r = receive_default(var s, h, var st, req(0x0A, h.characteristics[0], []), 0)
+    test.assert_eq(r[0], wire.octets([0x01, 0x0A, h.characteristics[0] & 0xFF, 0, 0x80]))
+    let w = receive_default(var s, h, var st, req(0x12, h.characteristics[0], [0x42]), 0)
+    test.assert_eq(w[0][4] as Int, ERR_USER_DATA_ACCESS_NOT_PERMITTED)
+    let d = receive_default(var s, h, var st, req(0x12, h.increment, [1, 0, 0, 0]), 0)
+    test.assert_eq(d[0][4] as Int, ERR_USER_DATA_ACCESS_NOT_PERMITTED)
+    // The Database Change Increment reads 0 and the User Index Unknown User.
+    test.assert_eq(read_value(var s, h, var st, h.increment), [0, 0, 0, 0])
+    test.assert_eq(read_value(var s, h, var st, h.user_index), [0xFF])
+    // A write command is dropped without an answer.
+    test.assert_eq(list.len(receive_default(var s, h, var st, req(0x52, h.characteristics[0], [0x42]), 0)), 0)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_consent_fails_for_a_wrong_code_and_locks_after_the_attempts()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 1234)
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 1, 0]), [0x20, 2, RESULT_USER_NOT_AUTHORIZED])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 2, 0]), [0x20, 2, RESULT_USER_NOT_AUTHORIZED])
+    // The third failure reaches the limit: Operation Failed, and so does the right code.
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 3, 0]), [0x20, 2, RESULT_OPERATION_FAILED])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 0xD2, 0x04]), [0x20, 2, RESULT_OPERATION_FAILED])
+    test.assert(not uds_has_consent(st))
+    test.assert(uds_unlock(var st, 0))
+    test.assert(not uds_unlock(var st, 9))
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 0xD2, 0x04]), [0x20, 2, 1])
+    test.assert(uds_has_consent(st))
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_a_malformed_request_is_an_invalid_parameter_and_an_unknown_op_code_is_not_supported()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    // A Consent Code above 9999 (0x270F), a missing code, Unknown User as the index.
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 0x10, 0x27]), [0x20, 1, 3])
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 1]), [0x20, 1, 3])
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 0x0F, 0x27]), [0x20, 1, 1, 0])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0xFF, 1, 0]), [0x20, 2, 3])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 0x10, 0x27]), [0x20, 2, 3])
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0]), [0x20, 2, 3])
+    // A user nobody registered does not authorize.
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 7, 1, 0]), [0x20, 2, RESULT_USER_NOT_AUTHORIZED])
+    // Op Codes 0x00, 0x06, 0x1F, 0x20 and 0x21 are not supported.
+    test.assert_eq(command(var s, h, var st, [0x00]), [0x20, 0, 2])
+    test.assert_eq(command(var s, h, var st, [0x06]), [0x20, 6, 2])
+    test.assert_eq(command(var s, h, var st, [0x1F]), [0x20, 0x1F, 2])
+    test.assert_eq(command(var s, h, var st, [0x20]), [0x20, 0x20, 2])
+    test.assert_eq(command(var s, h, var st, [0x21]), [0x20, 0x21, 2])
+
+// A policy that registers no one and counts the questions.
+@value
+struct Declining
+    asked: Int
+
+impl UdsPolicy[] for Declining
+    @tier(app)
+    fn register_user(var self, _peer: links.LinkId) -> Bool
+        self.asked = self.asked + 1
+        false
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_a_policy_that_declines_makes_register_operation_failed_and_registers_no_user()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    var no = Declining { asked: 0 }
+    let out = uds_receive(var s.db, var s.link, h, var st, var no, peer(), req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 1, 0]), 0)
+    test.assert_eq(out[0][0] as Int, 0x13)
+    let _ = ack(var s)
+    test.assert_eq(control_value(s.db, h.control_point), [0x20, 1, RESULT_OPERATION_FAILED])
+    test.assert_eq(no.asked, 1)
+    test.assert_eq(uds_user_count(st), 0)
+    // A code out of range is an invalid parameter and the policy is not asked.
+    let bad = uds_receive(var s.db, var s.link, h, var st, var no, peer(), req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 0x10, 0x27]), 0)
+    test.assert_eq(bad[0][0] as Int, 0x13)
+    let _ = ack(var s)
+    test.assert_eq(control_value(s.db, h.control_point), [0x20, 1, RESULT_INVALID_PARAMETER])
+    test.assert_eq(no.asked, 1)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_register_with_no_space_is_operation_failed()
+    var config = default_uds_config(test_characteristics())
+    config.max_users = 1
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 1, 0]), [0x20, 1, 1, 0])
+    test.assert_eq(command(var s, h, var st, [OP_REGISTER_NEW_USER, 2, 0]), [0x20, 1, RESULT_OPERATION_FAILED])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_delete_user_data_needs_consent_and_ends_it()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 7)
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USER_DATA]), [0x20, 3, RESULT_USER_NOT_AUTHORIZED])
+    let _ = command(var s, h, var st, [OP_CONSENT, 0, 7, 0])
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USER_DATA]), [0x20, 3, 1])
+    test.assert_eq(read_value(var s, h, var st, h.user_index), [0xFF])
+    test.assert_eq(uds_user_count(st), 0)
+    // The user is gone with the consent code.
+    test.assert_eq(command(var s, h, var st, [OP_CONSENT, 0, 7, 0]), [0x20, 2, RESULT_USER_NOT_AUTHORIZED])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_delete_users_removes_one_or_all_and_refuses_an_unknown_index()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 1)
+    let _ = registered(var s, h, var st, 2)
+    let _ = registered(var s, h, var st, 3)
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USERS, 1]), [0x20, 5, 1, 1])
+    test.assert_eq(uds_user_count(st), 2)
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USERS, 1]), [0x20, 5, RESULT_INVALID_PARAMETER])
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USERS]), [0x20, 5, RESULT_INVALID_PARAMETER])
+    // The freed index is the next one assigned.
+    test.assert_eq(registered(var s, h, var st, 4), 1)
+    test.assert_eq(command(var s, h, var st, [OP_DELETE_USERS, 0xFF]), [0x20, 5, 1, 0xFF])
+    test.assert_eq(uds_user_count(st), 0)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_control_point_needs_indications_and_waits_for_the_confirmation()
+    let config = default_uds_config(test_characteristics())
+    var s = gatt_server.new_server([], 65)
+    let h = add_uds_service(var s.db, config)!
+    var st = new_uds_state(config)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    let r = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 1, 0]), 0)
+    test.assert_eq(r[0][4] as Int, 0xFD)
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point_cccd, [2, 0]), 0)
+    let ok = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 1, 0]), 0)
+    test.assert_eq(ok[0], [0x13])
+    test.assert_eq(ok[1], wire.octets([0x1D, h.control_point & 0xFF, 0, 0x20, 1, 1, 0]))
+    let busy = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 2, 0]), 0)
+    test.assert_eq(busy[0][4] as Int, 0xFE)
+    let _ = ack(var s)
+    test.assert_eq(receive_default(var s, h, var st, req(0x12, h.control_point, [OP_REGISTER_NEW_USER, 2, 0]), 0)[0], [0x13])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_list_all_users_indicates_each_user_then_the_count()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 1)
+    let _ = registered(var s, h, var st, 2)
+    test.assert(uds_set_name(var st, 0, wire.text("Ann Lee")))
+    test.assert(not uds_set_name(var st, 9, wire.text("x")))
+    let out = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_LIST_ALL_USERS]), 0)
+    test.assert_eq(out[0], [0x13])
+    // Segmentation Header: first and last, number 0; flags: name present; index 0; "Ann Lee".
+    test.assert_eq(out[1], wire.octets([0x1D, h.registered & 0xFF, 0, 0x03, 0x01, 0x00, 0x41, 0x6E, 0x6E, 0x20, 0x4C, 0x65, 0x65]))
+    // The next indication follows the confirmation: user 1 without a name, number 1.
+    let second = ack(var s)
+    test.assert_eq(second[0], wire.octets([0x1D, h.registered & 0xFF, 0, 0x07, 0x00, 0x01]))
+    let third = ack(var s)
+    test.assert_eq(third[0], wire.octets([0x1D, h.control_point & 0xFF, 0, 0x20, 4, 1, 2]))
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_a_long_name_is_cut_and_sent_in_segments()
+    var config = default_uds_config(test_characteristics())
+    config.name_max = 70
+    var (s, h) = server(config)
+    gatt_server.set_mtu(var s.link, 0, 65)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 1)
+    var name: [u8] = []
+    for k in 0..80
+        list.push(name, (0x41 + (k % 26)) as u8)
+    test.assert(uds_set_name(var st, 0, name))
+    // Flags (name present, truncated), index and 70 octets of name make 72; 61 fit in one segment.
+    let data = registered_user_data(st, 0)
+    test.assert_eq(list.len(data), 72)
+    test.assert_eq(data[0] as Int, 3)
+    let out = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_LIST_ALL_USERS]), 0)
+    // First segment: First = 1, Last = 0, number 0 -> 0x01; second: First = 0, Last = 1, number 1 -> 0x06.
+    test.assert_eq(out[1][3] as Int, 0x01)
+    test.assert_eq(list.len(out[1]), 3 + 1 + 61)
+    let second = ack(var s)
+    test.assert_eq(second[0][3] as Int, 0x06)
+    test.assert_eq(list.len(second[0]), 3 + 1 + 11)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_rolling_segment_number_wraps_after_63()
+    let config = default_uds_config(test_characteristics())
+    var st = new_uds_state(config)
+    st.rolling = 63
+    let a = registered_segments(var st, [1, 2, 3], 7)
+    // ATT_MTU 7 leaves 3 octets: one segment, number 63, First and Last.
+    test.assert_eq(a[0], wire.octets([(63 << 2) | 3, 1, 2, 3]))
+    test.assert_eq(st.rolling, 0)
+    let b = registered_segments(var st, [1, 2, 3, 4], 7)
+    test.assert_eq(b[0], [0x01, 1, 2, 3])
+    test.assert_eq(b[1], wire.octets([(1 << 2) | 2, 4]))
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_list_all_users_without_the_indication_subscription_is_refused()
+    let config = default_uds_config(test_characteristics())
+    var s = gatt_server.new_server([], 65)
+    let h = add_uds_service(var s.db, config)!
+    var st = new_uds_state(config)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 3, 16, true))
+    let _ = gatt_server.receive(var s.db, var s.link, req(0x12, h.control_point_cccd, [2, 0]), 0)
+    let r = receive_default(var s, h, var st, req(0x12, h.control_point, [OP_LIST_ALL_USERS]), 0)
+    test.assert_eq(r[0][4] as Int, 0xFD)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_without_the_registered_user_characteristic_list_all_users_is_not_supported()
+    var config = default_uds_config(test_characteristics())
+    config.registered_user = false
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    test.assert_eq(h.registered, 0)
+    test.assert_eq(command(var s, h, var st, [OP_LIST_ALL_USERS]), [0x20, 4, 2])
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_increment_follows_an_update_of_the_device_once_and_not_one_of_the_client()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 5)
+    let _ = command(var s, h, var st, [OP_CONSENT, 0, 5, 0])
+    // Two values of one update: one increment, one notification.
+    test.assert(uds_set_value(var s.db, h, var st, 0, 0, [0x42]))
+    test.assert(uds_set_value(var s.db, h, var st, 0, 1, [9, 0]))
+    test.assert_eq(read_value(var s, h, var st, h.increment), [0, 0, 0, 0])
+    let n = uds_end_update(var s.db, var s.link, h, var st, 0, 0)
+    test.assert_eq(list.len(n), 1)
+    test.assert_eq(n[0], wire.octets([0x1B, h.increment & 0xFF, 0, 1, 0, 0, 0]))
+    test.assert_eq(read_value(var s, h, var st, h.characteristics[0]), [0x42])
+    // The client writes the increment itself: no notification, the value stored for the user.
+    let w = receive_default(var s, h, var st, req(0x12, h.increment, [7, 0, 0, 0]), 0)
+    test.assert_eq(list.len(w), 1)
+    test.assert_eq(w[0], [0x13])
+    test.assert_eq(st.increments[0], 7)
+    // The value must be four octets.
+    let bad = receive_default(var s, h, var st, req(0x12, h.increment, [7, 0]), 0)
+    test.assert_eq(bad[0][4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    // An update of a user without consent counts but is not notified; an unknown user or value is false.
+    let _ = registered(var s, h, var st, 6)
+    test.assert(uds_set_value(var s.db, h, var st, 1, 0, [0x43]))
+    test.assert_eq(list.len(uds_end_update(var s.db, var s.link, h, var st, 1, 0)), 0)
+    test.assert_eq(st.increments[1], 1)
+    test.assert(not uds_set_value(var s.db, h, var st, 9, 0, [0x43]))
+    test.assert(not uds_set_value(var s.db, h, var st, 0, 5, [0x43]))
+    test.assert_eq(list.len(uds_end_update(var s.db, var s.link, h, var st, 9, 0)), 0)
+
+@test
+@satisfies("REQ-BLE-UDS-001")
+fn test_the_consent_ends_with_the_connection()
+    let config = default_uds_config(test_characteristics())
+    var (s, h) = server(config)
+    var st = new_uds_state(config)
+    let _ = registered(var s, h, var st, 5)
+    let _ = command(var s, h, var st, [OP_CONSENT, 0, 5, 0])
+    test.assert(uds_has_consent(st))
+    uds_disconnected(var s.db, h, var st)
+    test.assert(not uds_has_consent(st))
+    test.assert_eq(control_value(s.db, h.user_index), [0xFF])
+    let r = receive_default(var s, h, var st, req(0x0A, h.characteristics[0], []), 0)
+    test.assert_eq(r[0][4] as Int, ERR_USER_DATA_ACCESS_NOT_PERMITTED)

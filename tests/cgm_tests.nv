@@ -1,0 +1,375 @@
+// tests/cgm_tests.nv — the unit tests of src/cgm.nv.
+//
+//   novo test tests/cgm_tests.nv
+
+use std.test
+use att
+use gatt_server
+use fixtures.{ req, subscribe, read }
+use profile_builder
+use racp
+use reconnection_configuration
+use wire
+use cgm.{ CgmConfig, CgmDevice, CgmHandles, ERR_INVALID_CRC, ERR_MISSING_CRC, FEATURE_CALIBRATION, FEATURE_LOW_BATTERY, FEATURE_TREND, RESULT_INVALID_OPERAND, STATUS_SESSION_STOPPED, STATUS_TIME_SYNC_REQUIRED, add_cgm_service, cgm_abandon, cgm_add_measurement, cgm_feature_value, cgm_notify_periodic, cgm_ops_execute, cgm_pump, cgm_receive, cgm_record, cgm_record_valid, cgm_record_value, cgm_refresh, cgm_set_alerts, cgm_set_clock, cgm_status_bits, cgm_with_annunciation, cgm_with_trend, cgm_with_trend_and_quality, default_cgm_config, device_for, full_config, sample, server }
+
+@tier(app)
+fn crc_config() -> CgmConfig
+    CgmConfig {
+        access: gatt_server.Access.Authenticated, features: 0x01FFFF, type_sample: 0x59, feature_indicate: true,
+        support: racp.racp_support_all() }
+
+@tier(app)
+fn ready(config: CgmConfig, dev: CgmDevice) -> (GattServer, CgmHandles)
+    var built = server(config, dev)
+    var s = built.0
+    let h = built.1
+    subscribe(var s, h.measurement_cccd as Int, 1)
+    subscribe(var s, h.racp_cccd as Int, 2)
+    subscribe(var s, h.ops_cccd as Int, 2)
+    (s, h)
+
+@tier(app)
+fn write_to(var s: GattServer, var dev: CgmDevice, h: CgmHandles, config: CgmConfig, handle: Int, value: [u8]) -> [[u8]]
+    var pdu: [u8] = [0x12, (handle & 0xFF) as u8, (handle >>> 8) as u8]
+    list.append(pdu, value)
+    cgm_receive(var s.db, var s.link, h, config.support, var dev, pdu, 0)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_service_lists_its_characteristics_in_the_table_order()
+    let config = full_config()
+    let (s, h) = server(config, device_for(config))
+    test.assert_eq(h.measurement, 3)
+    test.assert_eq(h.measurement_cccd, 4)
+    test.assert_eq(h.feature, 6)
+    test.assert_eq(h.feature_cccd, 7)
+    test.assert_eq(h.status, 9)
+    test.assert_eq(h.start_time, 11)
+    test.assert_eq(h.run_time, 13)
+    test.assert_eq(h.racp, 15)
+    test.assert_eq(h.racp_cccd, 16)
+    test.assert_eq(h.ops, 18)
+    test.assert_eq(h.ops_cccd, 19)
+    test.assert_eq(gatt_server.last_handle(s.db), 19)
+    test.assert_eq(s.db.attributes[1].value, [0x10, 3, 0, 0xA7, 0x2A])
+    // Read, Write: 0x0A.
+    test.assert_eq(s.db.attributes[9].value, [0x0A, 11, 0, 0xAA, 0x2A])
+    test.assert_eq(s.db.attributes[16].value, [0x28, 18, 0, 0xAC, 0x2A])
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_feature_is_six_octets_with_ffff_without_e2e_and_a_crc_with_it()
+    test.assert_eq(cgm_feature_value(0x00001, 0x19), [0x01, 0x00, 0x00, 0x19, 0xFF, 0xFF])
+    let with_crc = cgm_feature_value(0x1001, 0x19)
+    test.assert_eq(list.len(with_crc), 6)
+    test.assert_eq(wire.get(with_crc, 4, 2), reconnection_configuration.crc16([0x01, 0x10, 0x00, 0x19]))
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_a_record_has_size_flags_glucose_offset_and_only_the_annunciation_octets_with_a_bit()
+    let plain = cgm_record(wire.sfloat(110, 0), 15)
+    test.assert_eq(cgm_record_value(0, plain), [6, 0x00, 0x6E, 0x00, 0x0F, 0x00])
+    // Warning (bit 17) alone: the Warning flag and one octet.
+    let warn = cgm_with_annunciation(plain, 0x020000)
+    test.assert_eq(cgm_record_value(0x0002, warn), [7, 0x20, 0x6E, 0x00, 0x0F, 0x00, 0x02])
+    // Status, Cal/Temp and Warning octets in that order, then trend and quality.
+    let all = cgm_with_trend_and_quality(cgm_with_annunciation(plain, 0x020101), wire.sfloat(1, 0), wire.sfloat(95, 0))
+    test.assert_eq(cgm_record_value(0x018003, all), [13, 0xE3, 0x6E, 0x00, 0x0F, 0x00, 0x01, 0x01, 0x02, 0x01, 0x00, 0x5F, 0x00])
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_with_e2e_the_record_carries_a_crc_over_the_other_fields_and_its_size()
+    let r = cgm_record(wire.sfloat(110, 0), 15)
+    let v = cgm_record_value(0x1000, r)
+    test.assert_eq(list.len(v), 8)
+    test.assert_eq(v[0] as Int, 8)
+    test.assert_eq(wire.get(v, 6, 2), reconnection_configuration.crc16(v[0:6]))
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_a_record_that_breaks_a_rule_is_refused()
+    let r = cgm_record(wire.sfloat(110, 0), 15)
+    test.assert(cgm_record_valid(0, r))
+    test.assert(not cgm_record_valid(0, cgm_record(wire.SFLOAT_RESERVED, 0)))
+    test.assert(not cgm_record_valid(0, cgm_record(wire.sfloat(1, 0), 0x10000)))
+    // The trend and the quality need their Feature bits.
+    test.assert(not cgm_record_valid(0, cgm_with_trend(r, 0)))
+    test.assert(cgm_record_valid(FEATURE_TREND, cgm_with_trend(r, 0)))
+    test.assert(not cgm_record_valid(FEATURE_TREND, cgm_with_trend_and_quality(r, 0, 0)))
+    // The annunciation bits need theirs: battery low is Status bit 1, calibration required Cal/Temp bit 11.
+    test.assert(not cgm_record_valid(0, cgm_with_annunciation(r, 0x000002)))
+    test.assert(cgm_record_valid(FEATURE_LOW_BATTERY, cgm_with_annunciation(r, 0x000002)))
+    test.assert(not cgm_record_valid(0, cgm_with_annunciation(r, 0x000800)))
+    test.assert(cgm_record_valid(FEATURE_CALIBRATION, cgm_with_annunciation(r, 0x000800)))
+    // Session stopped and Time synchronization are always allowed; the reserved bits never.
+    test.assert(cgm_record_valid(0, cgm_with_annunciation(r, 0x000101)))
+    test.assert(not cgm_record_valid(0x01FFFF, cgm_with_annunciation(r, 0x000040)))
+    test.assert(not cgm_record_valid(0x01FFFF, cgm_with_annunciation(r, 0x008000)))
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_periodic_notifications_send_the_new_records_packed_to_the_mtu()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    for m in 0..3
+        cgm_set_clock(var dev, m * 5)
+        test.assert(cgm_add_measurement(var dev, sample(100 + m)))
+    let first = cgm_notify_periodic(var s.db, var s.link, h, var dev, 0)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(list.len(first[0]), 3 + 18)
+    // Nothing new: nothing sent.
+    test.assert_eq(list.len(cgm_notify_periodic(var s.db, var s.link, h, var dev, 1)), 0)
+    // A small MTU splits the records over notifications.
+    cgm_set_clock(var dev, 15)
+    test.assert(cgm_add_measurement(var dev, sample(120)))
+    cgm_set_clock(var dev, 20)
+    test.assert(cgm_add_measurement(var dev, sample(121)))
+    gatt_server.set_mtu(var s.link, 0, 12)
+    let split = cgm_notify_periodic(var s.db, var s.link, h, var dev, 2)
+    test.assert_eq(list.len(split), 2)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_periodic_notifications_wait_for_a_disabled_interval_a_stopped_session_and_a_transfer()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    test.assert(cgm_add_measurement(var dev, sample(100)))
+    dev.interval = 0
+    test.assert_eq(list.len(cgm_notify_periodic(var s.db, var s.link, h, var dev, 0)), 0)
+    dev.interval = 5
+    let _ = write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x01])
+    test.assert_eq(list.len(cgm_notify_periodic(var s.db, var s.link, h, var dev, 0)), 0)
+    cgm_abandon(var dev)
+    dev.running = false
+    test.assert_eq(list.len(cgm_notify_periodic(var s.db, var s.link, h, var dev, 0)), 0)
+    // A stopped session keeps no new measurement.
+    test.assert(not cgm_add_measurement(var dev, sample(101)))
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_report_stored_records_by_time_offset_ends_with_success()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    for m in 0..5
+        cgm_set_clock(var dev, m * 5)
+        test.assert(cgm_add_measurement(var dev, sample(100 + m)))
+    let counted = write_to(var s, dev, h, config, h.racp as Int, [0x04, 0x03, 0x01, 10, 0])
+    test.assert_eq(counted[1][5] as Int, 3)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let w = write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x04, 0x01, 5, 0, 15, 0])
+    test.assert_eq(w, [[0x13]])
+    let sent = cgm_pump(var s.db, var s.link, h, var dev, 10, 0)
+    test.assert_eq(list.len(sent), 2)
+    test.assert_eq(list.len(sent[0]), 3 + 18)
+    test.assert_eq(sent[1][0] as Int, 0x1D)
+    test.assert_eq(sent[1][6] as Int, 1)
+    test.assert_eq(dev.run.active, false)
+    // Filter Type 0x02 (User Facing Time) is not allowed in this service: Operand not supported.
+    let _ = gatt_server.confirmed(var s.link, 0, 2)
+    let unsupported = write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x03, 0x02, 5, 0])
+    test.assert_eq(unsupported[0], [0x13])
+    test.assert_eq(unsupported[1][6] as Int, 9)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_control_point_errors_use_the_common_codes()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = server(config, dev)
+    var s = built.0
+    let h = built.1
+    for m in 0..3
+        cgm_set_clock(var dev, m)
+        test.assert(cgm_add_measurement(var dev, sample(100)))
+    // Nothing subscribed: 0xFD.
+    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    subscribe(var s, h.racp_cccd as Int, 2)
+    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    subscribe(var s, h.measurement_cccd as Int, 1)
+    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0], [0x13])
+    // A second procedure while the first runs: 0xFE.
+    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    // The specific ops control point needs its own descriptor.
+    test.assert_eq(write_to(var s, dev, h, config, h.ops as Int, [0x02])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_communication_interval_is_set_read_disabled_and_set_to_the_fastest()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    let ops = h.ops as Int
+    let set = write_to(var s, dev, h, config, ops, [0x01, 10])
+    test.assert_eq(set[0], [0x13])
+    test.assert_eq(set[1][3], 0x1C)
+    test.assert_eq(set[1][4] as Int, 0x01)
+    test.assert_eq(set[1][5] as Int, 1)
+    test.assert_eq(dev.interval, 10)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let got = write_to(var s, dev, h, config, ops, [0x02])
+    test.assert_eq(got[1][3], 0x03)
+    test.assert_eq(got[1][4] as Int, 10)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let _ = write_to(var s, dev, h, config, ops, [0x01, 0])
+    test.assert_eq(dev.interval, 0)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    let _ = write_to(var s, dev, h, config, ops, [0x01, 0xFF])
+    test.assert_eq(dev.interval, 5)
+    let _ = gatt_server.confirmed(var s.link, 0, 1)
+    // The wrong operand size is Invalid Operand.
+    let bad = write_to(var s, dev, h, config, ops, [0x01])
+    test.assert_eq(bad[1][5] as Int, RESULT_INVALID_OPERAND)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_levels_are_set_inside_their_range_and_read_back_with_the_response_op_code()
+    let config = full_config()
+    var dev = device_for(config)
+    let ok = cgm_ops_execute(var dev, [0x07, 0xB8, 0x00])
+    test.assert_eq(ok, [0x1C, 0x07, 0x01])
+    test.assert_eq(cgm_ops_execute(var dev, [0x08]), [0x09, 0xB8, 0x00])
+    // 400 mg/dL is the limit; above it is out of range, NaN is too.
+    test.assert_eq(cgm_ops_execute(var dev, [0x07, 0x91, 0x01]), [0x1C, 0x07, 0x05])
+    test.assert_eq(cgm_ops_execute(var dev, [0x0A, 0xFF, 0x07]), [0x1C, 0x0A, 0x05])
+    test.assert_eq(cgm_ops_execute(var dev, [0x0D, 0x3C, 0x00]), [0x1C, 0x0D, 0x01])
+    test.assert_eq(cgm_ops_execute(var dev, [0x0E]), [0x0F, 0x3C, 0x00])
+    test.assert_eq(cgm_ops_execute(var dev, [0x11])[0] as Int, 0x12)
+    test.assert_eq(cgm_ops_execute(var dev, [0x14])[0] as Int, 0x15)
+    test.assert_eq(cgm_ops_execute(var dev, [0x17])[0] as Int, 0x18)
+    test.assert_eq(cgm_ops_execute(var dev, [0x0B])[0] as Int, 0x0C)
+    // A sensor without the alerts does not offer the Op Codes.
+    var plain = device_for(default_cgm_config())
+    test.assert_eq(cgm_ops_execute(var plain, [0x07, 0xB8, 0x00]), [0x1C, 0x07, 0x02])
+    test.assert_eq(cgm_ops_execute(var plain, [0x19]), [0x1C, 0x19, 0x02])
+    test.assert_eq(cgm_ops_execute(var plain, [0x1F]), [0x1C, 0x1F, 0x02])
+    test.assert_eq(cgm_ops_execute(var plain, []), [0x1C, 0x00, 0x02])
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_calibration_records_are_numbered_and_read_back()
+    let config = full_config()
+    var dev = device_for(config)
+    // Glucose 100 mg/dL, time 30, type-sample 0x59, next calibration 60, record number and status ignored.
+    let set = cgm_ops_execute(var dev, [0x04, 0x64, 0x00, 30, 0, 0x59, 60, 0, 9, 9, 9])
+    test.assert_eq(set, [0x1C, 0x04, 0x01])
+    let one = cgm_ops_execute(var dev, [0x05, 1, 0])
+    test.assert_eq(one, [0x06, 0x64, 0x00, 30, 0, 0x59, 60, 0, 1, 0, 0])
+    test.assert_eq(cgm_ops_execute(var dev, [0x05, 0xFF, 0xFF]), one)
+    // Record 0 is the default one, a number the device does not have is out of range.
+    let none = cgm_ops_execute(var dev, [0x05, 0, 0])
+    test.assert_eq(none[1] as Int, 0xFF)
+    test.assert_eq(none[2] as Int, 0x07)
+    test.assert_eq(cgm_ops_execute(var dev, [0x05, 7, 0]), [0x1C, 0x05, 0x05])
+    // A NaN calibration or a Type-Sample Location out of its table is out of range.
+    test.assert_eq(cgm_ops_execute(var dev, [0x04, 0xFF, 0x07, 30, 0, 0x59, 60, 0, 0, 0, 0]), [0x1C, 0x04, 0x05])
+    test.assert_eq(cgm_ops_execute(var dev, [0x04, 0x64, 0x00, 30, 0, 0x00, 60, 0, 0, 0, 0]), [0x1C, 0x04, 0x05])
+    test.assert_eq(cgm_ops_execute(var dev, [0x04, 0x64]), [0x1C, 0x04, 0x03])
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_start_and_stop_session_and_reset_the_device_specific_alert()
+    let config = full_config()
+    var dev = device_for(config)
+    test.assert(cgm_add_measurement(var dev, sample(100)))
+    // Stop, then Stop again is Op Code not supported ([CGMS] 3.7.2.9).
+    test.assert_eq(cgm_ops_execute(var dev, [0x1B]), [0x1C, 0x1B, 0x01])
+    test.assert((cgm_status_bits(dev) & STATUS_SESSION_STOPPED) != 0)
+    test.assert_eq(cgm_ops_execute(var dev, [0x1B]), [0x1C, 0x1B, 0x02])
+    // Start deletes the data of the old session.
+    test.assert_eq(cgm_ops_execute(var dev, [0x1A]), [0x1C, 0x1A, 0x01])
+    test.assert_eq(list.len(dev.items), 0)
+    test.assert_eq(cgm_ops_execute(var dev, [0x1A]), [0x1C, 0x1A, 0x04])
+    test.assert(cgm_set_alerts(var dev, 0x000010))
+    test.assert_eq(cgm_ops_execute(var dev, [0x19]), [0x1C, 0x19, 0x01])
+    test.assert_eq(dev.alerts, 0)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_session_start_time_is_written_checked_and_read_back_and_clears_the_time_sync_bit()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    test.assert((cgm_status_bits(dev) & STATUS_TIME_SYNC_REQUIRED) != 0)
+    let good = wire.octets([0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])
+    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, good)[0], [0x13])
+    test.assert_eq(dev.start_set, true)
+    test.assert_eq(read(var s, h.start_time as Int), [0x0B, 0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])
+    test.assert_eq((cgm_status_bits(dev) & STATUS_TIME_SYNC_REQUIRED), 0)
+    test.assert_eq(wire.get(read(var s, h.status as Int), 3, 3) & 0x100, 0)
+    // A time zone, a DST offset or a date out of their tables is refused, the value kept.
+    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 100, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 3])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 0, 1, 8, 30, 0, 4, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_with_e2e_a_write_needs_the_right_crc()
+    let config = crc_config()
+    var dev = device_for(config)
+    var built = ready(config, dev)
+    var s = built.0
+    let h = built.1
+    let ops = h.ops as Int
+    // Missing CRC (0x80) and Invalid CRC (0x81), [CGMS] 1.8.
+    test.assert_eq(write_to(var s, dev, h, config, ops, [0x01, 10])[0][4] as Int, ERR_MISSING_CRC)
+    let crc = reconnection_configuration.crc16([0x01, 10])
+    test.assert_eq(write_to(var s, dev, h, config, ops, wire.octets([0x01, 10, (crc & 0xFF) ^ 1, crc >>> 8]))[0][4] as Int, ERR_INVALID_CRC)
+    let accepted = write_to(var s, dev, h, config, ops, wire.octets([0x01, 10, crc & 0xFF, crc >>> 8]))
+    test.assert_eq(accepted[0], [0x13])
+    // The response carries a CRC over its other octets.
+    let response = accepted[1]
+    test.assert_eq(list.len(response), 3 + 3 + 2)
+    test.assert_eq(wire.get(response, 6, 2), reconnection_configuration.crc16([0x1C, 0x01, 0x01]))
+    test.assert_eq(dev.interval, 10)
+    // The start time and the Status, Start Time and Run Time values have one too.
+    test.assert_eq(list.len(read(var s, h.status as Int)), 1 + 7)
+    test.assert_eq(list.len(read(var s, h.run_time as Int)), 1 + 4)
+    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])[0][4] as Int, ERR_MISSING_CRC)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_status_and_run_time_follow_the_device()
+    let config = full_config()
+    var dev = device_for(config)
+    var built = server(config, dev)
+    var s = built.0
+    let h = built.1
+    cgm_set_clock(var dev, 90)
+    test.assert(cgm_set_alerts(var dev, 0x000200))
+    cgm_refresh(var s.db, h, dev)
+    // Time Offset 90, the Time synchronization bit (0x100) and the calibration-not-allowed bit (0x200).
+    test.assert_eq(read(var s, h.status as Int), [0x0B, 90, 0, 0x00, 0x03, 0x00])
+    test.assert_eq(read(var s, h.run_time as Int), [0x0B, 240, 0])
+    // A bit the Feature does not allow is refused.
+    var plain = device_for(default_cgm_config())
+    test.assert(not cgm_set_alerts(var plain, 0x000002))
+
+@tier(app)
+fn add_error(config: CgmConfig) -> ?profile_builder.ProfileError
+    var s = gatt_server.new_server([], 65)
+    match add_cgm_service(var s.db, config, device_for(config))
+        Ok(_) => None
+        Err(e) => Some(e)
+
+@test
+@satisfies("REQ-BLE-CGMS-001")
+fn test_the_service_needs_authentication_and_a_described_feature()
+    let all = racp.racp_support_all()
+    test.assert_eq(add_error(CgmConfig { access: gatt_server.Access.Encrypted, features: 0, type_sample: 0x19, feature_indicate: false, support: all }), Some(profile_builder.ProfileError.NotPermitted))
+    test.assert_eq(add_error(CgmConfig { access: gatt_server.Access.SecureConnections, features: 0, type_sample: 0x19, feature_indicate: false, support: all }), None)
+    test.assert_eq(add_error(CgmConfig { access: gatt_server.Access.Authenticated, features: 0x020000, type_sample: 0x19, feature_indicate: false, support: all }), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(CgmConfig { access: gatt_server.Access.Authenticated, features: 0, type_sample: 0x00, feature_indicate: false, support: all }), Some(profile_builder.ProfileError.InvalidValue))
+    test.assert_eq(add_error(CgmConfig { access: gatt_server.Access.Authenticated, features: 0, type_sample: 0x1B, feature_indicate: false, support: all }), Some(profile_builder.ProfileError.InvalidValue))
