@@ -21,6 +21,7 @@ implementation.
 | `current_time`, `link_loss`, `tx_power`, `bond_management`, `reconnection_configuration` | the services of a connection: time, link loss alerts, transmit power, the bonds of a device and the reconnection parameters |
 | `object_transfer`, `object_channel`, `object_list`, `object_store`, `object_transfer_client` | the Object Transfer Service, the channel the objects move through, the list of objects, the store a product supplies, and the client |
 | `nordic_uart` | the Nordic UART Service |
+| `ranging_data`, `ranging_service`, `ranging_client`, `ranging_profile` | the Ranging Service (RAS 1.0, UUID 0x185B) and the Ranging Profile (RAP 1.0): the Ranging Data Body of one Channel Sounding procedure and its segments, the server with Real-time and On-demand Ranging Data, the control point, Ranging Data Ready and Overwritten, the client that discovers, subscribes, reassembles and acknowledges, and the pairing of the peer's data with the Host's own result for the estimator `cs-ranging` |
 | `sensor_control`, `sensor_client` | what the sensor services share: the control point and the client session of the sensor clients |
 | `<service>_client` | the Collector side of the service of the same name |
 | `services_budget` | the RAM the keys of this package's schema add up to |

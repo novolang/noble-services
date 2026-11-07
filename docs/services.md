@@ -33,6 +33,11 @@ No module of `noble` imports a module of this package, and the services import n
    channel, `object_list` is the list of objects, `object_store` declares the store a product supplies and holds an in-memory
    store, and `object_transfer_client` is the client.
 7. **Nordic UART.**  `nordic_uart` is the Nordic UART Service.
+8. **Ranging.**  `ranging_data` is the Ranging Data Body of one Channel Sounding procedure, cut into the segments of Real-time and
+   On-demand Ranging Data and put together again; `ranging_service` is the Ranging Service (0x185B) of RAS 1.0 on the server side;
+   `ranging_client` is the Ranging Requester's session over `sensor_client`; `ranging_profile` holds the procedures RAP 1.0 adds
+   (the Responder, the Requester's checks and the pairing of the two results).  The server stores bodies on the heap, up to
+   `max_bodies`; Set_Filter is not supported.  `planning/BLE-CS-HOST.md` has the state of each characteristic.
 
 Every `<service>_client` module is the Collector side of the service of the same name.
 

@@ -1,0 +1,295 @@
+// src/ranging_data.nv — the Ranging Data of the Ranging Service (RAS 1.0, Section 3.2): the body that holds the results of one Channel Sounding procedure, its
+// segmentation into the values of the Real-time and On-demand Ranging Data characteristics, and the reassembly of the segments.
+//
+// A Ranging Data Body (Table 3.6) is a Ranging Header of 4 octets and, for each CS subevent, a Subevent Header of 8 octets followed by the steps of the
+// subevent.  The steps are the Step_Mode octet of the event (bits 0 and 1 the mode, bit 7 set for an aborted step) and the step data as the HCI event carries
+// it; the body holds neither the channel nor the length of a step, so a reader derives the length from the mode, the role of the device that produced
+// the data, the RTT type and the antenna paths (`hci_cs.cs_step_data_len`).
+//
+//   Ranging Header     Ranging Counter (the lower 12 bits of the Procedure_Counter) in bits 0 to 11 and the Config_ID in bits 12 to 15 of a 16-bit value,
+//                      Selected TX power (1 octet, dBm), Antenna Paths Mask (bits 0 to 3 for the paths 1 to 4)
+//   Subevent Header    Start ACL Connection Event (2), Frequency Compensation (2), Ranging Done Status in bits 0 to 3 and Subevent Done Status in bits 4 to 7,
+//                      Ranging Abort Reason in bits 0 to 3 and Subevent Abort Reason in bits 4 to 7, Reference Power Level (1), Number Of Steps Reported (1)
+//
+// The segmentation (Section 3.2.2) cuts the body into segments of `ATT_MTU - 4` octets; each segment is a header octet, whose bit 0 says first segment, bit 1
+// last segment and bits 2 to 7 hold the Rolling Segment Counter, and the octets.  The counter is 0 for the first segment of a procedure and rolls over after 63.
+//
+// This module holds no state but the reassembly record; the server (`ranging_service`) and the client (`ranging_client`) own the rest.
+
+use hci_cs
+
+// ── The body ────────────────────────────────────────────────────────
+
+pub const RAS_RANGING_HEADER_OCTETS = 4
+pub const RAS_SUBEVENT_HEADER_OCTETS = 8
+
+// The Ranging Header: `ranging_counter` is the 12 bits, `selected_tx_power` is in dBm and `antenna_paths_mask` has one bit for each path.
+pub @value
+struct RasHeader
+    ranging_counter: Int
+    config_id: Int
+    selected_tx_power: Int
+    antenna_paths_mask: Int
+
+// The Antenna Paths Mask of `n_ap` paths, 1 to 4.
+pub @tier(embedded)
+@no_alloc
+fn ras_antenna_paths_mask(n_ap: Int) -> Int
+    if n_ap <= 0
+        0
+    else if n_ap >= 4
+        0xF
+    else
+        (1 << n_ap) - 1
+
+// The number of paths a mask names.
+pub @tier(embedded)
+@no_alloc
+fn ras_antenna_paths(mask: Int) -> Int
+    ((mask >>> 0) & 1) + ((mask >>> 1) & 1) + ((mask >>> 2) & 1) + ((mask >>> 3) & 1)
+
+// The Ranging Counter of a Procedure_Counter: its lower 12 bits.
+pub @tier(embedded)
+@no_alloc
+fn ras_ranging_counter(procedure_counter: Int) -> Int
+    procedure_counter & 0xFFF
+
+@tier(app)
+fn put16(var out: [u8], v: Int)
+    list.push(out, v as u8)
+    list.push(out, (v >>> 8) as u8)
+
+// The Ranging Data Body of the procedure `res`, whose subevents are all complete, produced with `tx_power` dBm selected for the procedure.  A subevent that
+// the Controller left partial is written as it stands, with Subevent Done Status 0xF (aborted), since the body has no partial status.
+pub @tier(app)
+fn ras_body_build(res: hci_cs.HciCsProcResult, tx_power: Int) -> [u8]
+    var out: [u8] = []
+    put16(var out, ras_ranging_counter(res.procedure_counter) | ((res.config_id & 0xF) << 12))
+    list.push(out, tx_power as u8)
+    list.push(out, ras_antenna_paths_mask(res.num_antenna_paths) as u8)
+    for k in 0..res.n_sub
+        let h = res.subs[k]
+        put16(var out, h.start_acl_event)
+        put16(var out, h.frequency_compensation)
+        let sub_done = if h.done == hci_cs.CS_DONE_PARTIAL then hci_cs.CS_DONE_ABORTED else h.done
+        list.push(out, ((h.procedure_done & 0xF) | ((sub_done & 0xF) << 4)) as u8)
+        list.push(out, ((h.abort_procedure & 0xF) | ((h.abort_subevent & 0xF) << 4)) as u8)
+        list.push(out, h.reference_power as u8)
+        list.push(out, h.count as u8)
+        for i in h.first..(h.first + h.count)
+            let s = res.steps[i]
+            list.push(out, ((s.mode & 3) | (if s.aborted then 0x80 else 0)) as u8)
+            for b in hci_cs.cs_step_data_octets(s)
+                list.push(out, b)
+    out
+
+// The Ranging Header of `body`, false when it is shorter than the header.
+pub @tier(embedded)
+fn ras_header_read(body: [u8], var out: RasHeader) -> Bool
+    if list.len(body) < RAS_RANGING_HEADER_OCTETS
+        return false
+    let v = (body[0] as Int) | ((body[1] as Int) << 8)
+    out.ranging_counter = v & 0xFFF
+    out.config_id = (v >>> 12) & 0xF
+    out.selected_tx_power = hci_cs.cs_s8(body[2] as Int)
+    out.antenna_paths_mask = body[3] as Int
+    true
+
+// Read a Ranging Data Body into `out`.  `producer_initiator` says whether the device that produced the data held the initiator role (its mode 0 steps hold the
+// frequency offset); `pct` whether the configuration's RTT type holds a sounding sequence and the Controllers report the two terms.  The steps carry no
+// channel (`channel` -1).  False when the body is cut, has more subevents or steps than Core allows, names a mode beyond 3 or a status Table 3.8 reserves.
+pub @tier(embedded)
+fn ras_body_parse(body: [u8], producer_initiator: Bool, pct: Bool, var hdr: RasHeader, var out: hci_cs.HciCsProcResult) -> Bool
+    if not ras_header_read(body, var hdr)
+        return false
+    let n = list.len(body)
+    let n_ap = ras_antenna_paths(hdr.antenna_paths_mask)
+    hci_cs.cs_proc_clear(var out)
+    out.config_id = hdr.config_id
+    out.procedure_counter = hdr.ranging_counter
+    out.num_antenna_paths = n_ap
+    var p = RAS_RANGING_HEADER_OCTETS
+    var last_done = 0
+    while p < n
+        if p + RAS_SUBEVENT_HEADER_OCTETS > n or out.n_sub >= hci_cs.CS_SUBEVENTS_PER_PROCEDURE
+            return false
+        let sd = (body[p + 4] as Int) >>> 4
+        let rd = (body[p + 4] as Int) & 0xF
+        if (rd != 0 and rd != 1 and rd != 0xF) or (sd != 0 and sd != 0xF)
+            return false
+        let steps = body[p + 7] as Int
+        let sub = out.n_sub
+        out.subs[sub] = hci_cs.HciCsSubHead { start_acl_event: (body[p] as Int) | ((body[p + 1] as Int) << 8),
+            frequency_compensation: (body[p + 2] as Int) | ((body[p + 3] as Int) << 8), reference_power: hci_cs.cs_s8(body[p + 6] as Int),
+            procedure_done: rd, done: sd, abort_procedure: (body[p + 5] as Int) & 0xF, abort_subevent: (body[p + 5] as Int) >>> 4,
+            first: out.n_steps, count: 0 }
+        out.n_sub = sub + 1
+        last_done = rd
+        p = p + RAS_SUBEVENT_HEADER_OCTETS
+        for _ in 0..steps
+            if p >= n or out.n_steps >= hci_cs.CS_STEPS_PER_PROCEDURE
+                return false
+            let mode = (body[p] as Int) & 3
+            let aborted = ((body[p] as Int) & 0x80) != 0
+            if ((body[p] as Int) & 0x7C) != 0
+                return false
+            p = p + 1
+            let len = if aborted then 0 else hci_cs.cs_step_data_len(mode, producer_initiator, pct, n_ap)
+            if p + len > n
+                return false
+            if not hci_cs.cs_step_data_read(body, p, len, mode, n_ap, var out.steps[out.n_steps])
+                return false
+            if aborted
+                out.steps[out.n_steps].aborted = true
+            out.steps[out.n_steps].channel = -1
+            out.n_steps = out.n_steps + 1
+            out.subs[sub].count = out.subs[sub].count + 1
+            p = p + len
+    out.complete = last_done != hci_cs.CS_DONE_PARTIAL and out.n_sub > 0
+    out.aborted = last_done == hci_cs.CS_DONE_ABORTED
+    true
+
+// ── The segmentation ────────────────────────────────────────────────
+
+pub const SEGMENT_FIRST = 0x01
+pub const SEGMENT_LAST = 0x02
+
+// The octets of data in a segment for an ATT_MTU: ATT_MTU - 4 (the ATT notification header of 3 and the segmentation header of 1).
+pub @tier(embedded)
+@no_alloc
+fn ras_segment_octets(att_mtu: Int) -> Int
+    if att_mtu > 4
+        att_mtu - 4
+    else
+        1
+
+// The number of segments of a body of `body_octets`: at least 1.
+pub @tier(embedded)
+@no_alloc
+fn ras_segment_count(body_octets: Int, att_mtu: Int) -> Int
+    let per = ras_segment_octets(att_mtu)
+    if body_octets <= 0
+        1
+    else
+        (body_octets + per - 1) / per
+
+// The value of segment `k` (counted from 0) of `body` for an ATT_MTU: the header and up to `ATT_MTU - 4` octets.  The Rolling Segment Counter is `k` modulo 64.
+pub @tier(app)
+fn ras_segment(body: [u8], att_mtu: Int, k: Int) -> [u8]
+    let per = ras_segment_octets(att_mtu)
+    let count = ras_segment_count(list.len(body), att_mtu)
+    var header = ((k % 64) << 2)
+    if k == 0
+        header = header | SEGMENT_FIRST
+    if k == count - 1
+        header = header | SEGMENT_LAST
+    var out: [u8] = [header as u8]
+    let from = k * per
+    let to = if from + per < list.len(body) then from + per else list.len(body)
+    for i in from..to
+        list.push(out, body[i])
+    out
+
+// ── The reassembly ──────────────────────────────────────────────────
+
+// The reassembly of the segments of one body, as a client keeps it.  `slots` holds the data of each segment by its position (empty for one not received),
+// `have` whether it arrived; `next` is the Rolling Segment Counter the next segment should carry, `count` the segments the body has once the last one arrived
+// (0 before), `seg_octets` the data octets of a segment that is not the last (the length of the first one received), `gaps` the Rolling Segment Counters the
+// stream skipped.
+pub struct RasReassembly
+    var slots: [[u8]]
+    var have: [Bool]
+    var next: Int
+    var count: Int
+    var seg_octets: Int
+    var started: Bool
+    var bad: Bool
+
+pub @tier(app)
+fn ras_reassembly_new() -> RasReassembly
+    RasReassembly { slots: [], have: [], next: 0, count: 0, seg_octets: 0, started: false, bad: false }
+
+pub @tier(app)
+fn ras_reassembly_clear(var r: RasReassembly)
+    r.slots = []
+    r.have = []
+    r.next = 0
+    r.count = 0
+    r.seg_octets = 0
+    r.started = false
+    r.bad = false
+
+// Take one segment value (the header octet and the data).  A segment with the First bit starts a new body.  Segments that arrive with the counter beyond
+// the expected one leave empty places (the lost segments); one that fills such a place (a retransmission) is placed by its counter.  Returns false for an empty
+// value, and for a body whose first segment never arrived while a later one did (`bad`).
+pub @tier(app)
+fn ras_reassembly_add(var r: RasReassembly, value: [u8]) -> Bool
+    if list.len(value) < 1
+        return false
+    let h = value[0] as Int
+    let idx = h >>> 2
+    let first = (h & SEGMENT_FIRST) != 0
+    let last = (h & SEGMENT_LAST) != 0
+    let data = value[1:]
+    if first
+        ras_reassembly_clear(var r)
+        r.started = true
+        r.seg_octets = list.len(data)
+    if not r.started
+        // The first segment was lost, or this stream never began.
+        r.bad = true
+        return false
+    // The position of the segment: the next one in order, a later one with the segments between lost, or a lost one retransmitted.
+    var pos = list.len(r.slots)
+    var found = false
+    if idx != r.next
+        // Look for an empty place with this counter among the received positions.
+        for k in 0..list.len(r.slots)
+            if not found and not r.have[k] and (k % 64) == idx
+                pos = k
+                found = true
+        if not found
+            // A gap: the places between `next` and `idx` are lost segments.
+            let skip = (idx - r.next + 64) % 64
+            for _ in 0..skip
+                list.push(r.slots, [])
+                list.push(r.have, false)
+            pos = list.len(r.slots)
+    if not found
+        list.push(r.slots, data[:])
+        list.push(r.have, true)
+        r.next = (idx + 1) % 64
+    else
+        r.slots[pos] = data[:]
+        r.have[pos] = true
+    if last
+        r.count = list.len(r.slots)
+    true
+
+// The positions of the segments not received, once the last has arrived; the counters are the positions modulo 64.
+pub @tier(app)
+fn ras_reassembly_missing(r: RasReassembly) -> [Int]
+    var out: [Int] = []
+    for k in 0..list.len(r.slots)
+        if not r.have[k]
+            list.push(out, k)
+    out
+
+// Whether every segment of the body arrived.
+pub @tier(app)
+fn ras_reassembly_complete(r: RasReassembly) -> Bool
+    if r.count == 0 or r.bad
+        return false
+    for k in 0..r.count
+        if not r.have[k]
+            return false
+    true
+
+// The body, once complete.
+pub @tier(app)
+fn ras_reassembly_body(r: RasReassembly) -> [u8]
+    var out: [u8] = []
+    for k in 0..list.len(r.slots)
+        for b in r.slots[k]
+            list.push(out, b)
+    out

@@ -1,0 +1,125 @@
+// src/ranging_profile.nv — the Ranging Profile (RAP 1.0): the Ranging Responder (RRSP) and the Ranging Requester (RREQ) over the Ranging Service.
+//
+// RAP names two roles.  The RRSP is a GATT server that offers the Ranging Service; the RREQ is a GATT client that reads the RRSP's ranging data and, with the
+// results of its own Controller, computes a distance.  The roles are independent of the Channel Sounding roles of the Controllers and of the ACL roles (RAP 2.3).
+//
+// This module holds the procedures RAP adds to RAS:
+//
+//   RRSP    the service is offered with an MTU of at least 247 octets in view (`RAP_MTU_MIN`), the Ranging Service UUID goes into the advertising data of a
+//           Peripheral (`rrsp_advertising_data`, RAP 3.1.1), the result of each procedure the Host's Controller ran goes to the service (`rrsp_on_result`), the writes of
+//           the control point are answered (`rrsp_on_write`), and the data of a client that did not acknowledge is deleted after 10 seconds (`rrsp_tick`, RAP 3.2.1)
+//   RREQ    the security level the application needs is checked against the two capability records (`rreq_level_ok`, RAP 4.2: the application ends the connection
+//           when it is not met), the service is discovered and subscribed (`RasClient`), the timeouts of RAP 4.4 and 4.5.4 are kept by the client, and the body
+//           the RRSP sent is paired with the RREQ's own result of the same procedure (`rap_pair`)
+//
+// The pairing is the point of the profile: the estimator needs the step data of both devices of one procedure, step for step.  The two sets are the same
+// steps in the same order in each subevent (the Controllers plan them from the same random bit generator), so the pair holds the RREQ's result, with its channels, and the
+// RRSP's, decoded from the Ranging Data Body, which carries no channel.  `rap_pair` checks that the Ranging Counter and the Config_ID agree and that the modes of
+// the common steps do; the estimator (`orbit/cs-ranging`) takes the pair.
+//
+// What is not here: the Enhanced ATT bearer (RAP 2.2 allows it, the RAS client uses bearer 0), the exchange of the ATT_MTU (the program asks the GATT client engine
+// for 247 octets or more when it opens the link), and the DIS or any other service.
+
+use gatt_server
+use hci_cs
+use ranging_data
+use ranging_service
+use ranging_client
+use cs_gap
+
+// The MTU RAP asks both roles to support, in octets (RAP 3.1.2, 4.1).
+pub const RAP_MTU_MIN = 247
+
+// ── The Ranging Responder ───────────────────────────────────────────
+
+// The responder: the service's handles and the state of the one client.
+pub struct RangingResponder
+    srv: ranging_service.RasServer
+    h: ranging_service.RasHandles
+
+// Add the Ranging Service to `db` and start the responder's state.
+pub @tier(app)
+fn rrsp_new(var db: GattDb, config: ranging_service.RasConfig) -> Result<RangingResponder, profile_builder.ProfileError>
+    let h = ranging_service.add_ranging_service(var db, config)!
+    Ok(RangingResponder { srv: ranging_service.ras_server_new(config), h: h })
+
+// The AD structure to put in the advertising data of a Peripheral RRSP: the Complete List of 16-bit Service UUIDs with the Ranging Service (RAP 3.1.1).
+pub @tier(app)
+fn rrsp_advertising_data() -> [u8]
+    [3, 0x03, (ranging_service.UUID_RANGING_SERVICE & 0xFF) as u8, (ranging_service.UUID_RANGING_SERVICE >>> 8) as u8]
+
+// The result of a procedure the Host's Controller ran, with the Selected_TX_Power of the Procedure Enable Complete event: the PDUs to send to the client.
+pub @tier(app)
+fn rrsp_on_result(var r: RangingResponder, var db: GattDb, var link: AttLink, res: hci_cs.HciCsProcResult, tx_power: Int, now_ms: Int) -> [[u8]]
+    ranging_service.ras_procedure_result(var r.srv, var db, var link, r.h, res, tx_power, now_ms)
+
+// The writes the client made since the last call, taken from the link: the PDUs to send in answer.  A program that serves other services takes the changed
+// handles itself and calls `ras_handle_control_point`.
+pub @tier(app)
+fn rrsp_on_write(var r: RangingResponder, var db: GattDb, var link: AttLink, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let changed = gatt_server.take_changed(var link)
+    if ranging_service.ras_control_point_written(r.h, changed)
+        for p in ranging_service.ras_handle_control_point(var r.srv, var db, var link, r.h, now_ms)
+            list.push(out, p[:])
+    out
+
+// The clock reaches `now_ms`: the Ranging Counter of the data deleted for want of an acknowledgement, -1 for none.
+pub @tier(app)
+fn rrsp_tick(var r: RangingResponder, now_ms: Int) -> Int
+    ranging_service.ras_tick(var r.srv, now_ms)
+
+// ── The Ranging Requester ───────────────────────────────────────────
+
+// Whether the application's security level (1 to 4; [Vol 3] Part C, Section 10.11.1) is met by the capability records of the two Controllers.  The application ends
+// the ACL connection when it is not (RAP 4.2).
+pub @tier(embedded)
+@no_alloc
+fn rreq_level_ok(level: Int, local: hci_cs.HciCsCaps, remote: hci_cs.HciCsCaps) -> Bool
+    cs_gap.cs_level_met(level, local, remote)
+
+// A pair of results of one procedure: `local` the RREQ's own with the channels, `peer` the RRSP's decoded from its Ranging Data Body, `hdr` the Ranging Header of the
+// body.  `common` is the number of steps both have.
+pub @value
+struct RapPair
+    hdr: ranging_data.RasHeader
+    local: hci_cs.HciCsProcResult
+    peer: hci_cs.HciCsProcResult
+    common: Int
+
+pub @tier(embedded)
+fn rap_pair_new() -> RapPair
+    RapPair { hdr: ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }, local: hci_cs.cs_proc_result_new(),
+              peer: hci_cs.cs_proc_result_new(), common: 0 }
+
+// The statuses of `rap_pair`.
+pub const PAIR_OK = 0
+pub const PAIR_BODY_UNREADABLE = 1
+pub const PAIR_COUNTER_MISMATCH = 2
+pub const PAIR_STEPS_MISMATCH = 3
+
+// Pair `local` with `body`, the Ranging Data Body the RRSP sent for the same procedure.  `peer_initiator` says whether the RRSP held the initiator role, `pct`
+// whether the configuration's RTT type has a sounding sequence.  PAIR_COUNTER_MISMATCH when the Ranging Counter or the Config_ID of the body is not that of `local`;
+// PAIR_STEPS_MISMATCH when the mode of a step the two have in common differs.  The steps pair subevent by subevent.
+pub @tier(embedded)
+fn rap_pair(local: hci_cs.HciCsProcResult, body: [u8], peer_initiator: Bool, pct: Bool, var out: RapPair) -> Int
+    if not ranging_data.ras_body_parse(body, peer_initiator, pct, var out.hdr, var out.peer)
+        return PAIR_BODY_UNREADABLE
+    if out.hdr.ranging_counter != ranging_data.ras_ranging_counter(local.procedure_counter) or out.hdr.config_id != local.config_id
+        return PAIR_COUNTER_MISMATCH
+    out.local = local
+    // The two results pair subevent by subevent on the steps both have: a Controller may run fewer steps in a subevent than its peer.
+    var common = 0
+    let subs = if local.n_sub < out.peer.n_sub then local.n_sub else out.peer.n_sub
+    for t in 0..subs
+        let la = local.subs[t]
+        let pa = out.peer.subs[t]
+        let n = if la.count < pa.count then la.count else pa.count
+        for i in 0..n
+            if local.steps[la.first + i].mode != out.peer.steps[pa.first + i].mode
+                out.common = common
+                return PAIR_STEPS_MISMATCH
+            out.peer.steps[pa.first + i].channel = local.steps[la.first + i].channel
+        common = common + n
+    out.common = common
+    PAIR_OK

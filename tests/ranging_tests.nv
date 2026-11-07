@@ -1,0 +1,921 @@
+// tests/ranging_tests.nv — the Ranging Service and Profile: the ranging data body, its segmentation and reassembly, the server, the client and the profile's pairing.
+//
+// The client and the server run against each other in memory: the PDUs one answers go to the other, as the tests of the other service clients do.  Nothing here
+// touches a radio or a Controller; the results come from Subevent Result events built by hand.
+//
+//   novo test tests/ranging_tests.nv
+
+use std.test
+use fixtures
+use gatt_client
+use gatt_server
+use hci_cs
+use sensor_client
+use ranging_data
+use ranging_service
+use ranging_client
+use ranging_profile
+
+// ── Fixtures ────────────────────────────────────────────────────────
+
+@tier(app)
+fn cat(a: [Int], b: [Int]) -> [Int]
+    var out: [Int] = []
+    for v in a
+        list.push(out, v)
+    for v in b
+        list.push(out, v)
+    out
+
+@tier(app)
+fn meta(sub: Int, p: [Int]) -> [u8]
+    var e: [u8] = [0x3E, (list.len(p) + 1) as u8, sub as u8]
+    for v in p
+        list.push(e, v as u8)
+    e
+
+// The mode 2 step data of one path at the channel `ch`, with a tone of I = `i`, Q = `q` in both slots (the second is the extension slot).
+@tier(app)
+fn tone_step(ch: Int, i: Int, q: Int) -> [Int]
+    let pct = (i & 0xFFF) | ((q & 0xFFF) << 12)
+    [2, ch, 9, 5, pct & 0xFF, (pct >>> 8) & 0xFF, (pct >>> 16) & 0xFF, 0x00, 0, 0, 0, 0x23]
+
+// A Subevent Result event for the procedure `counter` of a device holding the initiator role (`initiator`) or the reflector role: one mode 0 step and `n` tone steps
+// on the channels 4, 6, 8, ...  With `done` the last event of the procedure.
+@tier(app)
+fn result_event(counter: Int, initiator: Bool, n: Int, done: Bool) -> [u8]
+    var steps: [Int] = if initiator
+        [0, 4, 5, 0x00, 0xD8, 0x01, 0x96, 0x00]
+    else
+        [0, 4, 3, 0x00, 0xD8, 0x01]
+    for k in 0..n
+        steps = cat(steps, tone_step(6 + 2 * k, 100 + k, -50 - k))
+    let pdone = if done then 0 else 1
+    meta(0x31, cat([0x41, 0x00, 0, 0x34, 0x12, counter & 0xFF, counter >>> 8, 0xF0, 0x2E, 0xE2, pdone, 0, 0, 1, n + 1], steps))
+
+@tier(app)
+fn result_of(counter: Int, initiator: Bool, n: Int) -> hci_cs.HciCsProcResult
+    var res = hci_cs.cs_proc_result_new()
+    var ev = hci_cs.cs_result_event_new()
+    test.assert_eq(hci_cs.cs_read_result(result_event(counter, initiator, n, true), var ev), true)
+    test.assert_eq(hci_cs.cs_proc_add(var res, ev), 0)
+    test.assert_eq(res.complete, true)
+    res
+
+@tier(app)
+fn open_config() -> ranging_service.RasConfig
+    ranging_service.RasConfig { realtime: true, access: gatt_server.Access.Open, max_bodies: 2 }
+
+// ── The body ────────────────────────────────────────────────────────
+
+@test
+fn test_the_ranging_header_packs_the_counter_and_the_config()
+    let res = result_of(0x1234, false, 2)
+    let body = ranging_data.ras_body_build(res, -4)
+    var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+    test.assert_eq(ranging_data.ras_header_read(body, var hdr), true)
+    // The lower 12 bits of the counter 0x1234, the Config_ID 0.
+    test.assert_eq(hdr.ranging_counter, 0x234)
+    test.assert_eq(hdr.config_id, 0)
+    test.assert_eq(hdr.selected_tx_power, -4)
+    test.assert_eq(hdr.antenna_paths_mask, 1)
+    test.assert_eq(body[0:2], [0x34, 0x02])
+    test.assert_eq(ranging_data.ras_header_read(body[0:3], var hdr), false)
+
+@test
+fn test_the_antenna_paths_mask_has_a_bit_for_each_path()
+    test.assert_eq(ranging_data.ras_antenna_paths_mask(1), 1)
+    test.assert_eq(ranging_data.ras_antenna_paths_mask(3), 7)
+    test.assert_eq(ranging_data.ras_antenna_paths_mask(4), 0xF)
+    test.assert_eq(ranging_data.ras_antenna_paths(0xB), 3)
+
+@test
+fn test_a_body_has_a_subevent_header_and_steps_without_channel_or_length()
+    let res = result_of(7, false, 2)
+    let body = ranging_data.ras_body_build(res, 0)
+    // 4 octets of header, 8 of subevent header, a reflector's mode 0 step (1 + 3), two mode 2 steps (1 + 9 each).
+    test.assert_eq(list.len(body), 4 + 8 + 4 + 20)
+    // Start ACL connection event 0x1234, Frequency Compensation 0x2EF0, Ranging Done 0 and Subevent Done 0, Abort Reasons 0, Reference Power -30, 3 steps.
+    test.assert_eq(body[4:12], [0x34, 0x12, 0xF0, 0x2E, 0x00, 0x00, 0xE2, 3])
+    // The mode octets.
+    test.assert_eq(body[12], 0)
+    test.assert_eq(body[16], 2)
+
+@test
+fn test_a_body_read_back_gives_the_steps_it_was_built_from()
+    let res = result_of(7, false, 3)
+    let body = ranging_data.ras_body_build(res, 3)
+    var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+    var back = hci_cs.cs_proc_result_new()
+    test.assert_eq(ranging_data.ras_body_parse(body, false, false, var hdr, var back), true)
+    test.assert_eq(hdr.selected_tx_power, 3)
+    test.assert_eq(back.procedure_counter, 7)
+    test.assert_eq(back.n_sub, 1)
+    test.assert_eq(back.n_steps, 4)
+    test.assert_eq(back.complete, true)
+    test.assert_eq(back.subs[0].start_acl_event, 0x1234)
+    test.assert_eq(back.subs[0].frequency_compensation, 0x2EF0)
+    test.assert_eq(back.subs[0].reference_power, -30)
+    test.assert_eq(back.steps[0].mode, 0)
+    test.assert_eq(back.steps[0].has_ffo, false)
+    test.assert_eq(back.steps[0].channel, -1)
+    for k in 0..3
+        let s = back.steps[1 + k]
+        test.assert_eq(s.mode, 2)
+        test.assert_eq(s.slots, 2)
+        test.assert_eq(hci_cs.cs_pct_i(s.pct[0]), 100 + k)
+        test.assert_eq(hci_cs.cs_pct_q(s.pct[0]), -50 - k)
+        test.assert_eq(s.permutation, 5)
+        test.assert_eq(hci_cs.cs_tq_extension(s.tq[1]), 2)
+    // An initiator's mode 0 step holds the frequency offset.
+    let ini = ranging_data.ras_body_build(result_of(7, true, 1), 0)
+    test.assert_eq(ranging_data.ras_body_parse(ini, true, false, var hdr, var back), true)
+    test.assert_eq(back.steps[0].has_ffo, true)
+    test.assert_eq(hci_cs.cs_s15(back.steps[0].ffo), 150)
+    // Read as the reflector's the same octets do not fit.
+    test.assert_eq(ranging_data.ras_body_parse(ini, false, false, var hdr, var back), false)
+
+@test
+fn test_an_aborted_step_is_a_mode_octet_with_bit_7_and_no_data()
+    var res = hci_cs.cs_proc_result_new()
+    var ev = hci_cs.cs_result_event_new()
+    let steps = cat([0, 4, 3, 0x00, 0xD8, 0x01], [2, 12, 0])
+    test.assert_eq(hci_cs.cs_read_result(meta(0x31, cat([0x41, 0x00, 0, 0x34, 0x12, 9, 0, 0xF0, 0x2E, 0xE2, 0, 0, 0, 1, 2], steps)), var ev), true)
+    test.assert_eq(hci_cs.cs_proc_add(var res, ev), 0)
+    let body = ranging_data.ras_body_build(res, 0)
+    test.assert_eq(list.len(body), 4 + 8 + 4 + 1)
+    test.assert_eq(body[16], 0x82)
+    var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+    var back = hci_cs.cs_proc_result_new()
+    test.assert_eq(ranging_data.ras_body_parse(body, false, false, var hdr, var back), true)
+    test.assert_eq(back.steps[1].aborted, true)
+    test.assert_eq(back.steps[1].mode, 2)
+
+@test
+fn test_a_body_that_breaks_a_rule_is_refused()
+    let body = ranging_data.ras_body_build(result_of(7, false, 2), 0)
+    var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+    var back = hci_cs.cs_proc_result_new()
+    // Cut at every length short of whole: refused, never read past the end.
+    var refused = 0
+    for n in 0..list.len(body)
+        if not ranging_data.ras_body_parse(body[0:n], false, false, var hdr, var back)
+            refused = refused + 1
+    // The cuts at a subevent boundary are whole bodies of fewer subevents; every other cut is refused.
+    test.assert(refused >= list.len(body) - 2)
+    var bad = body[:]
+    bad[12] = 0x04
+    test.assert_eq(ranging_data.ras_body_parse(bad, false, false, var hdr, var back), false)
+    var bad2 = body[:]
+    bad2[8] = 0x02
+    test.assert_eq(ranging_data.ras_body_parse(bad2, false, false, var hdr, var back), false)
+
+// ── The segmentation ────────────────────────────────────────────────
+
+@test
+fn test_a_body_is_cut_into_segments_of_the_mtu_less_four()
+    test.assert_eq(ranging_data.ras_segment_octets(23), 19)
+    test.assert_eq(ranging_data.ras_segment_count(0, 23), 1)
+    test.assert_eq(ranging_data.ras_segment_count(19, 23), 1)
+    test.assert_eq(ranging_data.ras_segment_count(20, 23), 2)
+    test.assert_eq(ranging_data.ras_segment_count(5000, 247), 21)
+
+@test
+fn test_the_segment_header_marks_first_last_and_counts_from_zero()
+    var body: [u8] = []
+    for i in 0..45
+        list.push(body, i as u8)
+    // 45 octets in segments of 19: three, the last with 7.
+    test.assert_eq(ranging_data.ras_segment_count(45, 23), 3)
+    let a = ranging_data.ras_segment(body, 23, 0)
+    let b = ranging_data.ras_segment(body, 23, 1)
+    let c = ranging_data.ras_segment(body, 23, 2)
+    test.assert_eq(a[0], 0x01)
+    test.assert_eq(b[0], 0x04)
+    test.assert_eq(c[0], 0x0A)
+    test.assert_eq(list.len(a), 20)
+    test.assert_eq(list.len(c), 8)
+    // A body in one segment is both first and last.
+    test.assert_eq(ranging_data.ras_segment(body[0:10], 23, 0)[0], 0x03)
+
+@test
+fn test_the_rolling_segment_counter_rolls_over_after_63()
+    var body: [u8] = []
+    for _ in 0..70
+        list.push(body, 0)
+    // One octet a segment at the smallest MTU: 70 segments.
+    test.assert_eq(ranging_data.ras_segment_count(70, 5), 70)
+    test.assert_eq(ranging_data.ras_segment(body, 5, 63)[0], 63 << 2)
+    test.assert_eq(ranging_data.ras_segment(body, 5, 64)[0], 0)
+    test.assert_eq(ranging_data.ras_segment(body, 5, 65)[0], 1 << 2)
+    test.assert_eq(ranging_data.ras_segment(body, 5, 69)[0], (5 << 2) | 0x02)
+
+@tier(app)
+fn segments_of(body: [u8], mtu: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for k in 0..ranging_data.ras_segment_count(list.len(body), mtu)
+        list.push(out, ranging_data.ras_segment(body, mtu, k))
+    out
+
+@tier(app)
+fn counted_body(n: Int) -> [u8]
+    var body: [u8] = []
+    for i in 0..n
+        list.push(body, (i % 251) as u8)
+    body
+
+@test
+fn test_segments_in_order_reassemble_the_body()
+    let body = counted_body(300)
+    var r = ranging_data.ras_reassembly_new()
+    for s in segments_of(body, 23)
+        test.assert_eq(ranging_data.ras_reassembly_add(var r, s), true)
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), true)
+    test.assert_eq(ranging_data.ras_reassembly_body(r), body)
+    test.assert_eq(list.len(ranging_data.ras_reassembly_missing(r)), 0)
+
+@test
+fn test_more_than_64_segments_reassemble_across_the_rollover()
+    let body = counted_body(150)
+    var r = ranging_data.ras_reassembly_new()
+    for s in segments_of(body, 6)
+        let _ = ranging_data.ras_reassembly_add(var r, s)
+    test.assert_eq(r.count, 75)
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), true)
+    test.assert_eq(ranging_data.ras_reassembly_body(r), body)
+
+@test
+fn test_a_lost_segment_is_missing_until_it_is_retransmitted()
+    let body = counted_body(300)
+    let segs = segments_of(body, 23)
+    var r = ranging_data.ras_reassembly_new()
+    for k in 0..list.len(segs)
+        if k != 4 and k != 5
+            let _ = ranging_data.ras_reassembly_add(var r, segs[k])
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), false)
+    test.assert_eq(ranging_data.ras_reassembly_missing(r), [4, 5])
+    // The retransmissions carry their own counters and fill the places.
+    let _ = ranging_data.ras_reassembly_add(var r, segs[5])
+    test.assert_eq(ranging_data.ras_reassembly_missing(r), [4])
+    let _ = ranging_data.ras_reassembly_add(var r, segs[4])
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), true)
+    test.assert_eq(ranging_data.ras_reassembly_body(r), body)
+
+@test
+fn test_a_lost_last_segment_leaves_the_count_unknown()
+    let body = counted_body(100)
+    let segs = segments_of(body, 23)
+    var r = ranging_data.ras_reassembly_new()
+    for k in 0..(list.len(segs) - 1)
+        let _ = ranging_data.ras_reassembly_add(var r, segs[k])
+    test.assert_eq(r.count, 0)
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), false)
+    // The next counter expected is the lost segment's.
+    test.assert_eq(r.next, list.len(segs) - 1)
+    let _ = ranging_data.ras_reassembly_add(var r, segs[list.len(segs) - 1])
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), true)
+    test.assert_eq(ranging_data.ras_reassembly_body(r), body)
+
+@test
+fn test_a_lost_first_segment_is_a_bad_stream()
+    let segs = segments_of(counted_body(100), 23)
+    var r = ranging_data.ras_reassembly_new()
+    test.assert_eq(ranging_data.ras_reassembly_add(var r, segs[1]), false)
+    test.assert_eq(r.bad, true)
+    let _ = ranging_data.ras_reassembly_add(var r, segs[2])
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), false)
+    // A new first segment starts again.
+    for s in segs
+        let _ = ranging_data.ras_reassembly_add(var r, s)
+    test.assert_eq(ranging_data.ras_reassembly_complete(r), true)
+    test.assert_eq(ranging_data.ras_reassembly_add(var r, []), false)
+
+// ── The server ──────────────────────────────────────────────────────
+
+@tier(app)
+fn server_with(config: ranging_service.RasConfig) -> (gatt_server.GattServer, ranging_service.RasHandles)
+    var s = gatt_server.new_server([], 65)
+    let h = ranging_service.add_ranging_service(var s.db, config)!
+    (s, h)
+
+@test
+fn test_the_service_holds_the_characteristics_in_the_order_of_the_specification()
+    var built = server_with(open_config())
+    let s = built.0
+    let h = built.1
+    test.assert_eq(h.features, h.service + 2)
+    test.assert_eq(h.realtime, h.features + 2)
+    test.assert_eq(h.realtime_cccd, h.realtime + 1)
+    test.assert_eq(h.ondemand, h.realtime_cccd + 2)
+    test.assert_eq(h.control_point, h.ondemand_cccd + 2)
+    test.assert_eq(h.ready, h.control_point_cccd + 2)
+    test.assert_eq(h.overwritten, h.ready_cccd + 2)
+    test.assert_eq(gatt_server.handle_of_type(s.db, gatt_server.le16(ranging_service.UUID_RAS_FEATURES)), h.features)
+    test.assert_eq(gatt_server.handle_of_type(s.db, gatt_server.le16(ranging_service.UUID_RAS_CONTROL_POINT)), h.control_point)
+    test.assert_eq(ranging_service.UUID_RANGING_SERVICE, 0x185B)
+
+@test
+fn test_ras_features_names_the_procedures_the_server_supports()
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    // Real-time, Retrieve Lost Ranging Data Segments and Abort Operation; no filter.
+    test.assert_eq(fixtures.read(var s, h.features)[1:], [0x07, 0, 0, 0])
+    var no_rt = server_with(ranging_service.RasConfig { realtime: false, access: gatt_server.Access.Open, max_bodies: 1 })
+    test.assert_eq(fixtures.read(var no_rt.0, no_rt.1.features)[1:], [0x06, 0, 0, 0])
+    test.assert_eq(no_rt.1.realtime, 0)
+
+@test
+fn test_a_configuration_that_denies_the_client_is_refused()
+    var db = gatt_server.new_server([], 65).db
+    match ranging_service.add_ranging_service(var db, ranging_service.RasConfig { realtime: true, access: gatt_server.Access.Denied, max_bodies: 2 })
+        Ok(_) => test.assert_eq(true, false)
+        Err(_) => test.assert_eq(true, true)
+    match ranging_service.add_ranging_service(var db, ranging_service.RasConfig { realtime: true, access: gatt_server.Access.Open, max_bodies: 0 })
+        Ok(_) => test.assert_eq(true, false)
+        Err(_) => test.assert_eq(true, true)
+
+@test
+fn test_the_default_service_needs_an_encrypted_link()
+    var built = server_with(ranging_service.default_ras_config())
+    var s = built.0
+    let h = built.1
+    let r = gatt_server.receive(var s.db, var s.link, fixtures.req(0x0A, h.features, []), 0)
+    test.assert_eq(r[0][0], 0x01)
+    test.assert_eq(r[0][4], 0x05)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    test.assert_eq(fixtures.read(var s, h.features)[0], 0x0B)
+
+@test
+fn test_the_ready_indication_names_the_counter_of_a_stored_procedure()
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    var srv = ranging_service.ras_server_new(open_config())
+    fixtures.subscribe(var s, h.ondemand_cccd, 2)
+    fixtures.subscribe(var s, h.ready_cccd, 2)
+    let pdus = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 2), 0, 0)
+    test.assert_eq(list.len(pdus), 1)
+    // An indication (0x1D) of the Ranging Data Ready value handle with the counter.
+    test.assert_eq(pdus[0][0], 0x1D)
+    test.assert_eq(pdus[0][1] as Int | ((pdus[0][2] as Int) << 8), h.ready)
+    test.assert_eq(pdus[0][3:], [0x34, 0x02])
+    test.assert_eq(ranging_service.ras_stored(srv), [0x234])
+
+@tier(app)
+fn write_cp(var s: gatt_server.GattServer, h: ranging_service.RasHandles, value: [Int]) -> [[u8]]
+    // A Write Command (0x52): the control point has no Write Request.
+    let r = gatt_server.receive(var s.db, var s.link, fixtures.req(0x52, h.control_point, value), 0)
+    test.assert_eq(list.len(r), 0)
+    r
+
+@tier(app)
+fn cp_response(var srv: ranging_service.RasServer, var s: gatt_server.GattServer, h: ranging_service.RasHandles, value: [Int], now_ms: Int) -> [[u8]]
+    let _ = write_cp(var s, h, value)
+    let changed = gatt_server.take_changed(var s.link)
+    test.assert_eq(ranging_service.ras_control_point_written(h, changed), true)
+    ranging_service.ras_handle_control_point(var srv, var s.db, var s.link, h, now_ms)
+
+// The server and a client that enabled the on-demand mode and the indications on the control point and the data.
+@tier(app)
+fn on_demand_server() -> (gatt_server.GattServer, ranging_service.RasHandles, ranging_service.RasServer)
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    fixtures.subscribe(var s, h.ondemand_cccd, 2)
+    fixtures.subscribe(var s, h.ready_cccd, 2)
+    fixtures.subscribe(var s, h.overwritten_cccd, 2)
+    fixtures.subscribe(var s, h.control_point_cccd, 2)
+    (s, h, ranging_service.ras_server_new(open_config()))
+
+// Confirm the indication at the head of the queue until nothing more is sent; every PDU the server sent is returned.
+@tier(app)
+fn confirm_all(var s: gatt_server.GattServer, first: [[u8]]) -> [[u8]]
+    var all: [[u8]] = []
+    var pending = first[:]
+    for _ in 0..80
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for p in pending
+            list.push(all, p[:])
+            if p[0] == 0x1D
+                for q in gatt_server.receive(var s.db, var s.link, [0x1E], 0)
+                    list.push(next, q[:])
+        pending = next
+    all
+
+@test
+fn test_get_ranging_data_sends_the_segments_then_the_complete_response()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let body = ranging_data.ras_body_build(result_of(0x234, false, 3), 0)
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 3), 0, 0))
+    let first = cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 100)
+    let all = confirm_all(var s, first)
+    // The default MTU is 23: segments of 19 octets, then the control point.
+    let n = ranging_data.ras_segment_count(list.len(body), 23)
+    test.assert_eq(list.len(all), n + 1)
+    var got = ranging_data.ras_reassembly_new()
+    for k in 0..n
+        test.assert_eq(all[k][0], 0x1D)
+        test.assert_eq(all[k][1] as Int | ((all[k][2] as Int) << 8), h.ondemand)
+        test.assert_eq(all[k][3] as Int, ranging_data.ras_segment(body, 23, k)[0] as Int)
+        test.assert_eq(ranging_data.ras_reassembly_add(var got, all[k][3:]), true)
+    test.assert_eq(ranging_data.ras_reassembly_body(got), body)
+    test.assert_eq(all[n][1] as Int | ((all[n][2] as Int) << 8), h.control_point)
+    // Complete Ranging Data Response with the counter.
+    test.assert_eq(all[n][3:], [0x00, 0x34, 0x02])
+    test.assert_eq(srv.awaiting_ack, 0x234)
+
+@test
+fn test_ack_deletes_the_data_and_an_unknown_counter_has_no_records()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 2), 0, 0))
+    let _ = confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 0))
+    let ack = confirm_all(var s, cp_response(var srv, var s, h, [0x01, 0x34, 0x02], 10))
+    // Response Code (0x02) Success (0x01).
+    test.assert_eq(ack[0][3:], [0x02, 0x01])
+    test.assert_eq(list.len(ranging_service.ras_stored(srv)), 0)
+    test.assert_eq(srv.awaiting_ack, -1)
+    // The data is gone: both commands now find nothing.
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 20))[0][3:], [0x02, 0x08])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x01, 0x34, 0x02], 30))[0][3:], [0x02, 0x08])
+
+@test
+fn test_retrieve_lost_segments_sends_them_again_with_their_counters()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let body = ranging_data.ras_body_build(result_of(0x234, false, 10), 0)
+    let n = ranging_data.ras_segment_count(list.len(body), 23)
+    test.assert(n >= 6)
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 10), 0, 0))
+    let _ = confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 0))
+    let r = confirm_all(var s, cp_response(var srv, var s, h, [0x02, 0x34, 0x02, 2, 3], 5))
+    test.assert_eq(list.len(r), 3)
+    test.assert_eq(r[0][3], ranging_data.ras_segment(body, 23, 2)[0])
+    test.assert_eq(r[1][3], ranging_data.ras_segment(body, 23, 3)[0])
+    // Complete Lost Ranging Data Segment Response: the counter, the first and the last segment index.
+    test.assert_eq(r[2][3:], [0x01, 0x34, 0x02, 2, 3])
+    // 0xFF as the last index stands for the last segment sent.
+    let tail = confirm_all(var s, cp_response(var srv, var s, h, [0x02, 0x34, 0x02, n - 1, 0xFF], 6))
+    test.assert_eq(list.len(tail), 2)
+    // Beyond the transfer, and for a counter that was not fetched.
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x02, 0x34, 0x02, n, n], 7))[0][3:], [0x02, 0x08])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x02, 0x35, 0x02, 0, 0], 8))[0][3:], [0x02, 0x03])
+
+@test
+fn test_retrieve_lost_needs_the_get_for_the_same_counter_first()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 6), 0, 0))
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x02, 0x34, 0x02, 0, 0], 5))[0][3:], [0x02, 0x03])
+
+@test
+fn test_the_control_point_answers_what_it_does_not_take()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    // Set_Filter: not supported.  Another op code: not supported.  A wrong length: invalid parameter.  Abort: success.
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x04, 0x01, 0x00], 0))[0][3:], [0x02, 0x02])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x09], 0))[0][3:], [0x02, 0x02])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x34], 0))[0][3:], [0x02, 0x03])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x03], 0))[0][3:], [0x02, 0x01])
+    test.assert_eq(confirm_all(var s, cp_response(var srv, var s, h, [0x03, 0x00], 0))[0][3:], [0x02, 0x03])
+    test.assert_eq(srv.aborted, true)
+
+@test
+fn test_a_command_while_indications_are_pending_is_answered_server_busy()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 6), 0, 0))
+    // The segments are sent and not confirmed: a second Get finds the server busy.
+    let first = cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 0)
+    test.assert_eq(list.len(first) >= 1, true)
+    let busy = cp_response(var srv, var s, h, [0x00, 0x34, 0x02], 1)
+    test.assert_eq(list.len(busy), 0)
+    let all = confirm_all(var s, first)
+    // The Server Busy response is queued behind the transfer.
+    var found = false
+    for p in all
+        if list.len(p) == 5 and p[3] == 0x02 and p[4] == 0x07
+            found = true
+    test.assert_eq(found, true)
+
+@test
+fn test_a_procedure_stored_over_the_limit_deletes_the_oldest_and_announces_it()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(1, false, 1), 0, 0))
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(2, false, 1), 0, 0))
+    test.assert_eq(ranging_service.ras_stored(srv), [1, 2])
+    // The third has no room: the first, unread, is overwritten, and the client hears of it before the new Ready.
+    let all = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(3, false, 1), 0, 0))
+    test.assert_eq(list.len(all), 2)
+    test.assert_eq(all[0][1] as Int | ((all[0][2] as Int) << 8), h.overwritten)
+    test.assert_eq(all[0][3:], [1, 0])
+    test.assert_eq(all[1][1] as Int | ((all[1][2] as Int) << 8), h.ready)
+    test.assert_eq(all[1][3:], [3, 0])
+    test.assert_eq(ranging_service.ras_stored(srv), [2, 3])
+    // A body that was fetched is deleted without the announcement.
+    let _ = confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x02, 0x00], 0))
+    let again = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(4, false, 1), 0, 0))
+    test.assert_eq(list.len(again), 1)
+    test.assert_eq(again[0][3:], [4, 0])
+    test.assert_eq(ranging_service.ras_stored(srv), [3, 4])
+
+@test
+fn test_the_server_deletes_what_the_client_did_not_acknowledge_after_ten_seconds()
+    var built = on_demand_server()
+    var s = built.0
+    let h = built.1
+    var srv = built.2
+    let _ = confirm_all(var s, ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(5, false, 1), 0, 0))
+    let _ = confirm_all(var s, cp_response(var srv, var s, h, [0x00, 0x05, 0x00], 1000))
+    test.assert_eq(ranging_service.ras_tick(var srv, 5000), -1)
+    test.assert_eq(ranging_service.ras_tick(var srv, 11000), -1)
+    test.assert_eq(ranging_service.ras_tick(var srv, 11001), 5)
+    test.assert_eq(list.len(ranging_service.ras_stored(srv)), 0)
+    // A closed link flushes everything.
+    let _ = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(6, false, 1), 0, 0)
+    ranging_service.ras_flush(var srv)
+    test.assert_eq(list.len(ranging_service.ras_stored(srv)), 0)
+
+@test
+fn test_a_realtime_client_gets_the_segments_as_the_procedure_ends()
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    var srv = ranging_service.ras_server_new(open_config())
+    fixtures.subscribe(var s, h.realtime_cccd, 1)
+    test.assert_eq(ranging_service.ras_mode(s.db, s.link, h), ranging_service.RAS_MODE_REALTIME)
+    let body = ranging_data.ras_body_build(result_of(0x42, false, 2), 0)
+    let pdus = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x42, false, 2), 0, 0)
+    test.assert_eq(list.len(pdus), ranging_data.ras_segment_count(list.len(body), 23))
+    // Notifications (0x1B) of the real-time characteristic; nothing is stored.
+    test.assert_eq(pdus[0][0], 0x1B)
+    test.assert_eq(pdus[0][1] as Int | ((pdus[0][2] as Int) << 8), h.realtime)
+    test.assert_eq(list.len(ranging_service.ras_stored(srv)), 0)
+    // The control point answers Procedure Not Completed to a Get_Ranging_Data in this mode.
+    fixtures.subscribe(var s, h.control_point_cccd, 2)
+    let r = cp_response(var srv, var s, h, [0x00, 0x42, 0x00], 0)
+    test.assert_eq(r[0][3:], [0x02, 0x06])
+
+@test
+fn test_on_demand_wins_when_both_modes_are_enabled()
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    fixtures.subscribe(var s, h.realtime_cccd, 1)
+    fixtures.subscribe(var s, h.ondemand_cccd, 2)
+    test.assert_eq(ranging_service.ras_mode(s.db, s.link, h), ranging_service.RAS_MODE_ONDEMAND)
+
+// ── The client against the server ───────────────────────────────────
+
+// Carry PDUs between the client and the server until neither has more; the events the client saw are or-ed together.  `drop` is the position, among the
+// server's data PDUs of the on-demand characteristic, of one to lose on the way (-1 for none).
+@tier(app)
+fn exchange(var t: gatt_client.ClientTable, var c: ranging_client.RasClient, var s: gatt_server.GattServer, h: ranging_service.RasHandles,
+            from_client: [[u8]], from_server: [[u8]], drop: Int, now_ms: Int) -> Int [mutate]
+    var events = 0
+    var to_server = from_client[:]
+    var to_client = from_server[:]
+    var data_seen = 0
+    for _ in 0..200
+        if list.len(to_server) == 0 and list.len(to_client) == 0
+            break
+        var next_server: [[u8]] = []
+        var next_client: [[u8]] = []
+        for p in to_server
+            for a in gatt_server.receive(var s.db, var s.link, p[:], now_ms)
+                list.push(next_client, a[:])
+        for p in to_client
+            var lost = false
+            if (p[0] == 0x1B or p[0] == 0x1D) and ((p[1] as Int) | ((p[2] as Int) << 8)) == h.ondemand
+                if data_seen == drop
+                    lost = true
+                data_seen = data_seen + 1
+            if not lost
+                let step = ranging_client.ras_client_on_pdu(var t, var c, p[:], now_ms)
+                events = events | step.event
+                for q in step.pdus
+                    list.push(next_server, q[:])
+        to_server = next_server
+        to_client = next_client
+    events
+
+// A client and a server with the setup done.
+@tier(app)
+fn paired(realtime: Bool) -> (gatt_client.ClientTable, ranging_client.RasClient, gatt_server.GattServer, ranging_service.RasHandles, ranging_service.RasServer)
+    var built = server_with(open_config())
+    var s = built.0
+    let h = built.1
+    var t = gatt_client.new_table()
+    test.assert(gatt_client.open(var t, sensor_client.test_link()))
+    var c = ranging_client.ras_client_new(sensor_client.test_link(), realtime)
+    let first = ranging_client.ras_client_start(var t, var c, 0)
+    let ev = exchange(var t, var c, var s, h, first.pdus, [], -1, 0) | first.event
+    test.assert((ev & ranging_client.RE_SETUP) != 0)
+    test.assert_eq(ev & ranging_client.RE_ERROR, 0)
+    (t, c, s, h, ranging_service.ras_server_new(open_config()))
+
+@test
+fn test_the_client_discovers_reads_the_features_and_subscribes()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    test.assert_eq(p.1.features, 0x07)
+    test.assert_eq(ranging_client.ras_client_supports(p.1, ranging_service.RAS_FEATURE_RETRIEVE_LOST), true)
+    test.assert_eq(ranging_client.ras_client_supports(p.1, ranging_service.RAS_FEATURE_FILTER), false)
+    test.assert_eq(ranging_service.ras_mode(p.2.db, p.2.link, p.3), ranging_service.RAS_MODE_ONDEMAND)
+    test.assert_eq(gatt_server.configuration(p.2.link, p.3.ready_cccd), 2)
+    test.assert_eq(gatt_server.configuration(p.2.link, p.3.overwritten_cccd), 2)
+    test.assert_eq(gatt_server.configuration(p.2.link, p.3.control_point_cccd), 2)
+
+@test
+fn test_a_ready_indication_makes_the_client_write_get_ranging_data()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    var s = p.2
+    let h = p.3
+    var srv = p.4
+    let sent = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, result_of(0x234, false, 6), -4, 10)
+    let ev = exchange(var t, var c, var s, h, [], sent, -1, 10)
+    test.assert((ev & ranging_client.RE_DATA_READY) != 0)
+    test.assert_eq(ev & ranging_client.RE_ERROR, 0)
+    test.assert_eq(c.ready_counter, 0x234)
+    // The Get_Ranging_Data for that counter is the write the server took.
+    let changed = gatt_server.take_changed(var s.link)
+    test.assert_eq(ranging_service.ras_control_point_written(h, changed), true)
+    test.assert_eq(ranging_service.written(s.db, s.link, h.control_point), [0x00, 0x34, 0x02])
+
+// The server handles the writes the client made: the Get_Ranging_Data after the Ready, and the ACK after the body.
+@tier(app)
+fn serve(var t: gatt_client.ClientTable, var c: ranging_client.RasClient, var s: gatt_server.GattServer, h: ranging_service.RasHandles,
+         var srv: ranging_service.RasServer, first: [[u8]], drop: Int, now_ms: Int) -> Int [mutate]
+    var events = exchange(var t, var c, var s, h, [], first, drop, now_ms)
+    for _ in 0..8
+        let changed = gatt_server.take_changed(var s.link)
+        if not ranging_service.ras_control_point_written(h, changed)
+            break
+        let out = ranging_service.ras_handle_control_point(var srv, var s.db, var s.link, h, now_ms)
+        events = events | exchange(var t, var c, var s, h, [], out, drop, now_ms)
+    events
+
+@test
+fn test_a_full_on_demand_session_with_the_server_handling_the_writes()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    var s = p.2
+    let h = p.3
+    var srv = p.4
+    let res = result_of(0x234, false, 8)
+    let body = ranging_data.ras_body_build(res, -4)
+    let sent = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, res, -4, 10)
+    let ev = serve(var t, var c, var s, h, var srv, sent, -1, 10)
+    test.assert((ev & ranging_client.RE_BODY) != 0)
+    test.assert((ev & ranging_client.RE_ACKED) != 0)
+    test.assert_eq(ev & ranging_client.RE_ERROR, 0)
+    test.assert_eq(ranging_client.ras_client_body(c), body)
+    test.assert_eq(list.len(ranging_service.ras_stored(srv)), 0)
+    // The body reads as the reflector's ranging data.
+    var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+    var back = hci_cs.cs_proc_result_new()
+    test.assert_eq(ranging_client.ras_client_take_result(c, false, false, var hdr, var back), true)
+    test.assert_eq(hdr.selected_tx_power, -4)
+    test.assert_eq(back.n_steps, 9)
+
+@test
+fn test_the_client_asks_for_a_lost_segment_and_gets_the_whole_body()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    var s = p.2
+    let h = p.3
+    var srv = p.4
+    // The data notified rather than indicated, so that a segment can be lost without stalling the server.
+    gatt_server.set_configuration(var s.link, h.ondemand_cccd, 1)
+    let res = result_of(0x55, false, 8)
+    let body = ranging_data.ras_body_build(res, 0)
+    let sent = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, res, 0, 10)
+    let ev = serve(var t, var c, var s, h, var srv, sent, 2, 10)
+    test.assert((ev & ranging_client.RE_BODY) != 0)
+    test.assert_eq(ev & ranging_client.RE_ERROR, 0)
+    test.assert_eq(ranging_client.ras_client_body(c), body)
+    test.assert_eq(c.retrieves, 1)
+
+@test
+fn test_a_realtime_session_gets_the_body_without_asking()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(true)
+    var t = p.0
+    var c = p.1
+    var s = p.2
+    let h = p.3
+    var srv = p.4
+    test.assert_eq(ranging_service.ras_mode(s.db, s.link, h), ranging_service.RAS_MODE_REALTIME)
+    let res = result_of(0x66, false, 5)
+    let body = ranging_data.ras_body_build(res, 0)
+    let sent = ranging_service.ras_procedure_result(var srv, var s.db, var s.link, h, res, 0, 10)
+    let ev = exchange(var t, var c, var s, h, [], sent, -1, 10)
+    test.assert((ev & ranging_client.RE_BODY) != 0)
+    test.assert_eq(ranging_client.ras_client_body(c), body)
+    test.assert_eq(c.body_counter, 0x66)
+
+@test
+fn test_a_transfer_that_stalls_ends_with_a_timeout_and_an_abort()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    var s = p.2
+    let h = p.3
+    let first = ranging_client.ras_client_get(var t, var c, 9, 100)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(first[0][0], 0x52)
+    let early = ranging_client.ras_client_tick(var t, var c, 5000)
+    test.assert_eq(early.event & ranging_client.RE_ERROR, 0)
+    let late = ranging_client.ras_client_tick(var t, var c, 5101)
+    test.assert((late.event & ranging_client.RE_ERROR) != 0)
+    test.assert_eq(c.error, ranging_client.RC_TIMEOUT)
+    // The Abort_Operation went out as a Write Command to the control point.
+    test.assert_eq(list.len(late.pdus), 1)
+    test.assert_eq(late.pdus[0][3], 0x03)
+
+@test
+fn test_responses_of_the_server_are_classified_as_rap_asks()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    // Procedure Not Completed goes to the application, not as a fatal error; Invalid Parameter closes the link.
+    let h = p.3
+    let ind = fn_cp_indication(h, [0x02, 0x06])
+    let a = ranging_client.ras_client_on_pdu(var t, var c, ind, 0)
+    test.assert((a.event & ranging_client.RE_ERROR) != 0)
+    test.assert_eq(c.error, 6)
+    test.assert_eq(c.fatal, false)
+    let b = ranging_client.ras_client_on_pdu(var t, var c, fn_cp_indication(h, [0x02, 0x03]), 0)
+    test.assert((b.event & ranging_client.RE_ERROR) != 0)
+    test.assert_eq(c.fatal, true)
+    // A Response Code Value reserved for future use is ignored.
+    c.fatal = false
+    c.error = 0
+    let r = ranging_client.ras_client_on_pdu(var t, var c, fn_cp_indication(h, [0x02, 0x20]), 0)
+    test.assert_eq(r.event & ranging_client.RE_ERROR, 0)
+
+@tier(app)
+fn fn_cp_indication(h: ranging_service.RasHandles, value: [Int]) -> [u8]
+    var pdu: [u8] = [0x1D, (h.control_point & 0xFF) as u8, (h.control_point >>> 8) as u8]
+    for v in value
+        list.push(pdu, v as u8)
+    pdu
+
+@test
+fn test_an_overwritten_indication_reaches_the_application()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    let h = p.3
+    var pdu: [u8] = [0x1D, (h.overwritten & 0xFF) as u8, (h.overwritten >>> 8) as u8, 0x34, 0x02]
+    let step = ranging_client.ras_client_on_pdu(var t, var c, pdu, 0)
+    test.assert((step.event & ranging_client.RE_OVERWRITTEN) != 0)
+    test.assert_eq(c.overwritten_counter, 0x234)
+
+@test
+fn test_a_peer_without_the_service_ends_the_session_not_found()
+    var empty = gatt_server.new_server([], 65)
+    var t = gatt_client.new_table()
+    test.assert(gatt_client.open(var t, sensor_client.test_link()))
+    var c = ranging_client.ras_client_new(sensor_client.test_link(), false)
+    let first = ranging_client.ras_client_start(var t, var c, 0)
+    var all = first.event
+    var pending = first.pdus[:]
+    for _ in 0..30
+        if list.len(pending) == 0
+            break
+        var next: [[u8]] = []
+        for p in pending
+            for a in gatt_server.receive(var empty.db, var empty.link, p[:], 0)
+                let step = ranging_client.ras_client_on_pdu(var t, var c, a[:], 0)
+                all = all | step.event
+                for q in step.pdus
+                    list.push(next, q[:])
+        pending = next
+    test.assert((all & ranging_client.RE_ERROR) != 0)
+    test.assert_eq(c.error, sensor_client.SC_NOT_FOUND)
+
+// ── The profile ─────────────────────────────────────────────────────
+
+@test
+fn test_the_responder_adds_the_service_and_advertises_its_uuid()
+    var s = gatt_server.new_server([], 65)
+    let r = ranging_profile.rrsp_new(var s.db, open_config())!
+    test.assert_eq(gatt_server.handle_of_type(s.db, gatt_server.le16(ranging_service.UUID_RAS_FEATURES)), r.h.features)
+    // A Complete List of 16-bit Service UUIDs with 0x185B.
+    test.assert_eq(ranging_profile.rrsp_advertising_data(), [3, 0x03, 0x5B, 0x18])
+    test.assert_eq(ranging_profile.RAP_MTU_MIN, 247)
+
+@test
+fn test_the_responder_answers_the_writes_the_link_took()
+    var s = gatt_server.new_server([], 65)
+    var r = ranging_profile.rrsp_new(var s.db, open_config())!
+    fixtures.subscribe(var s, r.h.ondemand_cccd, 2)
+    fixtures.subscribe(var s, r.h.ready_cccd, 2)
+    fixtures.subscribe(var s, r.h.control_point_cccd, 2)
+    let ready = ranging_profile.rrsp_on_result(var r, var s.db, var s.link, result_of(0x234, false, 2), 0, 0)
+    test.assert_eq(list.len(ready), 1)
+    let _ = confirm_all(var s, ready)
+    let _ = write_cp(var s, r.h, [0x00, 0x34, 0x02])
+    let out = confirm_all(var s, ranging_profile.rrsp_on_write(var r, var s.db, var s.link, 5))
+    test.assert(list.len(out) >= 2)
+    // Nothing more was written.
+    test.assert_eq(list.len(ranging_profile.rrsp_on_write(var r, var s.db, var s.link, 6)), 0)
+    test.assert_eq(ranging_profile.rrsp_tick(var r, 5000), -1)
+    test.assert_eq(ranging_profile.rrsp_tick(var r, 16000), 0x234)
+
+@test
+fn test_the_two_results_of_a_procedure_are_paired_step_for_step()
+    let local = result_of(0x234, true, 4)
+    let body = ranging_data.ras_body_build(result_of(0x234, false, 4), -2)
+    var pair = ranging_profile.rap_pair_new()
+    test.assert_eq(ranging_profile.rap_pair(local, body, false, false, var pair), ranging_profile.PAIR_OK)
+    test.assert_eq(pair.common, 5)
+    test.assert_eq(pair.hdr.selected_tx_power, -2)
+    // The peer's steps take the channels of the local ones.
+    test.assert_eq(pair.peer.steps[0].channel, 4)
+    test.assert_eq(pair.peer.steps[1].channel, 6)
+    test.assert_eq(pair.peer.steps[4].channel, 12)
+    test.assert_eq(pair.peer.steps[2].mode, 2)
+
+@test
+fn test_a_pair_is_refused_for_another_procedure_or_other_steps()
+    let local = result_of(0x234, true, 4)
+    var pair = ranging_profile.rap_pair_new()
+    // Another Ranging Counter.
+    test.assert_eq(ranging_profile.rap_pair(local, ranging_data.ras_body_build(result_of(0x235, false, 4), 0), false, false, var pair), ranging_profile.PAIR_COUNTER_MISMATCH)
+    // A body that does not read.
+    test.assert_eq(ranging_profile.rap_pair(local, [1, 2, 3], false, false, var pair), ranging_profile.PAIR_BODY_UNREADABLE)
+    // A peer with fewer steps pairs on the steps both have.
+    test.assert_eq(ranging_profile.rap_pair(local, ranging_data.ras_body_build(result_of(0x234, false, 2), 0), false, false, var pair), ranging_profile.PAIR_OK)
+    test.assert_eq(pair.common, 3)
+
+@test
+fn test_the_requester_checks_the_level_against_the_two_records()
+    let none = hci_cs.cs_caps_none()
+    test.assert_eq(ranging_profile.rreq_level_ok(1, none, none), true)
+    test.assert_eq(ranging_profile.rreq_level_ok(2, none, none), false)
+
+@tier(app)
+fn result_of_two(initiator: Bool, first: Int, second: Int) -> hci_cs.HciCsProcResult
+    var res = hci_cs.cs_proc_result_new()
+    var ev = hci_cs.cs_result_event_new()
+    test.assert_eq(hci_cs.cs_read_result(result_event(0x234, initiator, first, false), var ev), true)
+    test.assert_eq(hci_cs.cs_proc_add(var res, ev), 0)
+    test.assert_eq(hci_cs.cs_read_result(result_event(0x234, initiator, second, true), var ev), true)
+    test.assert_eq(hci_cs.cs_proc_add(var res, ev), 0)
+    res
+
+@test
+fn test_the_pair_is_made_subevent_by_subevent()
+    // The local Controller ran 4 tone steps in each of two subevents, the peer only 2 in the first.
+    let local = result_of_two(true, 4, 4)
+    let body = ranging_data.ras_body_build(result_of_two(false, 2, 4), 0)
+    var pair = ranging_profile.rap_pair_new()
+    test.assert_eq(ranging_profile.rap_pair(local, body, false, false, var pair), ranging_profile.PAIR_OK)
+    test.assert_eq(pair.local.n_sub, 2)
+    test.assert_eq(pair.peer.n_sub, 2)
+    // The mode 0 step and 2 tones of the first subevent, the mode 0 step and 4 of the second.
+    test.assert_eq(pair.common, 3 + 5)
+    // The peer's second subevent starts at its fourth step and takes the channels of the local second subevent, which starts at its sixth.
+    test.assert_eq(pair.peer.subs[1].first, 3)
+    test.assert_eq(pair.local.subs[1].first, 5)
+    test.assert_eq(pair.peer.steps[3].channel, pair.local.steps[5].channel)
+    test.assert_eq(pair.peer.steps[7].channel, pair.local.steps[9].channel)

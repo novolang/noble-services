@@ -1,0 +1,398 @@
+// src/ranging_service.nv — the Ranging Service (0x185B), server side: RAS 1.0.
+//
+// A device that runs Channel Sounding offers the step data its Controller reported to a peer's Host, which computes a distance from its own data and the
+// peer's.  The service holds, in the order the builder adds them:
+//
+//   RAS Features                 0x2C14   Read                              which of the optional procedures the server supports
+//   Real-time Ranging Data       0x2C15   Indicate, Notify, with a CCCD     the ranging data of a procedure as it ends (optional)
+//   On-demand Ranging Data       0x2C16   Indicate, Notify, with a CCCD     the ranging data the client asked for with Get_Ranging_Data
+//   RAS Control Point            0x2C17   Write Without Response, Indicate, with a CCCD
+//   Ranging Data Ready           0x2C18   Indicate, Notify, Read, with a CCCD   the Ranging Counter of a procedure whose data is stored
+//   Ranging Data Overwritten     0x2C19   Indicate, Notify, Read, with a CCCD   the Ranging Counter of data that was overwritten unread
+//
+// What is built, and what is not (RAS 1.0):
+//
+//   Real-time Ranging Data      built: the body of a procedure is segmented and sent when the procedure completes; the data is deleted once it is sent
+//   On-demand Ranging Data      built: the server stores the bodies of up to `max_bodies` procedures, announces each with Ranging Data Ready, sends one on
+//                               Get_Ranging_Data and deletes it on ACK_Ranging_Data
+//   Retrieve Lost Ranging Data Segments   built (feature bit 1)
+//   Abort Operation             built (feature bit 2)
+//   Filter Ranging Data         NOT IMPLEMENTED: feature bit 3 is clear and Set_Filter is answered with Op Code Not Supported
+//   Ranging Data Overwritten    built: a body deleted unread to make room is announced; real-time data is not announced (RAS 3.2.3.1)
+//   a client enabling both modes (RAS 2.7)   NOT IMPLEMENTED as a refusal of the CCCD write: the server uses the on-demand mode when both are enabled
+//   Ranging Data Ready or Overwritten with both indications and notifications enabled   they are sent as notifications (RAS asks for indications)
+//
+// The module holds no ATT state of its own: the segments and responses are values of the characteristics of the `GattDb` that `gatt_server.send_value`
+// sends as notifications or indications, so the order the specification asks for (the data, then the Complete Ranging Data Response) is the order of the
+// PDUs the functions return.  The server keeps its stored bodies in `RasServer`; this is storage on the heap (a body is 1.5 to 5.5 KB), not a fixed
+// buffer, and `max_bodies` bounds it.  A device image that cannot take that holds the body in its own buffer and calls `ras_segment` of `ranging_data`.
+//
+// The security of every attribute is the `access` of the configuration (Encrypted by default: RAS Table 3.1 asks for encryption).  The functions that return
+// PDUs answer the list to send on the link, as the other services do; the program calls `gatt_server.confirmed` for each Handle Value Confirmation
+// as usual.  This is the shape `NOBLE-HOST-API-SKETCH.md` section 3.13 moves onto a `Service`: the handles are `RasHandles`, the state `RasServer`, the
+// events `ras_procedure_result` (a procedure completed), `ras_control_point_written` (a write) and `ras_tick` (a clock).
+
+use gatt_server
+use profile_builder
+use hci_cs
+use ranging_data
+
+pub const UUID_RANGING_SERVICE = 0x185B
+pub const UUID_RAS_FEATURES = 0x2C14
+pub const UUID_REALTIME_RANGING_DATA = 0x2C15
+pub const UUID_ONDEMAND_RANGING_DATA = 0x2C16
+pub const UUID_RAS_CONTROL_POINT = 0x2C17
+pub const UUID_RANGING_DATA_READY = 0x2C18
+pub const UUID_RANGING_DATA_OVERWRITTEN = 0x2C19
+
+// The RAS Features bits (Table 3.3).
+pub const RAS_FEATURE_REALTIME = 0x01
+pub const RAS_FEATURE_RETRIEVE_LOST = 0x02
+pub const RAS_FEATURE_ABORT = 0x04
+pub const RAS_FEATURE_FILTER = 0x08
+
+// The op codes of the control point (Tables 3.10 and 3.11).
+pub const RAS_OP_GET_RANGING_DATA = 0x00
+pub const RAS_OP_ACK_RANGING_DATA = 0x01
+pub const RAS_OP_RETRIEVE_LOST_SEGMENTS = 0x02
+pub const RAS_OP_ABORT = 0x03
+pub const RAS_OP_SET_FILTER = 0x04
+
+// The responses on the control point.
+pub const RAS_RSP_COMPLETE_RANGING_DATA = 0x00
+pub const RAS_RSP_COMPLETE_LOST_SEGMENT = 0x01
+pub const RAS_RSP_CODE = 0x02
+
+// The Response Code Values (Table 3.12).
+pub const RAS_RV_SUCCESS = 0x01
+pub const RAS_RV_OP_CODE_NOT_SUPPORTED = 0x02
+pub const RAS_RV_INVALID_PARAMETER = 0x03
+pub const RAS_RV_SUCCESS_PERSISTED = 0x04
+pub const RAS_RV_ABORT_UNSUCCESSFUL = 0x05
+pub const RAS_RV_PROCEDURE_NOT_COMPLETED = 0x06
+pub const RAS_RV_SERVER_BUSY = 0x07
+pub const RAS_RV_NO_RECORDS_FOUND = 0x08
+
+// The ATT application error codes of RAS (Table 2.1): a CCCD not configured as the service requires, and a write that cannot be fulfilled.
+pub const RAS_ERR_CCCD_IMPROPERLY_CONFIGURED = 0xFD
+pub const RAS_ERR_WRITE_REQUEST_REJECTED = 0xFC
+
+// The times of RAP 3.2.1 and RAS 3.3.4 in milliseconds: the wait for ACK_Ranging_Data after a Complete Ranging Data Response, and how long the server keeps
+// data the client did not acknowledge.
+pub const RAS_ACK_TIMEOUT_MS = 5000
+pub const RAS_RETAIN_TIMEOUT_MS = 10000
+
+// The mode a client enabled with the Client Characteristic Configuration descriptors.
+pub const RAS_MODE_NONE = 0
+pub const RAS_MODE_REALTIME = 1
+pub const RAS_MODE_ONDEMAND = 2
+
+// The configuration of the service.  `realtime` adds the Real-time Ranging Data characteristic and sets feature bit 0; `access` is the access a client needs to read the
+// readable characteristics and to write the descriptors and the control point; `max_bodies` is the procedures whose data the server stores for on-demand
+// retrieval (at least 1, RAS 2.7.2.1).
+pub struct RasConfig
+    realtime: Bool
+    access: gatt_server.Access
+    max_bodies: Int
+
+// A server with the Real-time Ranging Data characteristic, encryption required, and room for two procedures.
+pub @tier(app)
+fn default_ras_config() -> RasConfig
+    RasConfig { realtime: true, access: gatt_server.Access.Encrypted, max_bodies: 2 }
+
+// The handles of the service.  `realtime` and `realtime_cccd` are 0 when the characteristic is absent.
+pub struct RasHandles
+    service: Int
+    features: Int
+    realtime: Int
+    realtime_cccd: Int
+    ondemand: Int
+    ondemand_cccd: Int
+    control_point: Int
+    control_point_cccd: Int
+    ready: Int
+    ready_cccd: Int
+    overwritten: Int
+    overwritten_cccd: Int
+
+// The value of RAS Features for a configuration.
+pub @tier(app)
+fn ras_features_value(config: RasConfig) -> [u8]
+    let bits = (if config.realtime then RAS_FEATURE_REALTIME else 0) | RAS_FEATURE_RETRIEVE_LOST | RAS_FEATURE_ABORT
+    [bits as u8, 0, 0, 0]
+
+fn granted(access: gatt_server.Access) -> Bool
+    match access
+        Denied => false
+        _ => true
+
+// Add the service after the last attribute of `db`.  NotPermitted for an access that denies a client what the service needs.
+pub @tier(app)
+fn add_ranging_service(var db: GattDb, config: RasConfig) -> Result<RasHandles, profile_builder.ProfileError>
+    if not granted(config.access) or config.max_bodies < 1
+        return Err(profile_builder.ProfileError.NotPermitted)
+    let service = profile_builder.start_service(var db, gatt_server.le16(UUID_RANGING_SERVICE))!
+    let features = profile_builder.add_value(var db, gatt_server.PROP_READ, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_RAS_FEATURES), ras_features_value(config))!
+    let both = gatt_server.PROP_INDICATE | gatt_server.PROP_NOTIFY
+    var realtime = 0
+    var realtime_cccd = 0
+    if config.realtime
+        realtime = profile_builder.add_value(var db, both, profile_builder.notify_only(), gatt_server.le16(UUID_REALTIME_RANGING_DATA), [])!
+        realtime_cccd = profile_builder.add_cccd(var db, gatt_server.both_ways(config.access))!
+        let _ = gatt_server.make_per_link(var db, realtime)
+    let ondemand = profile_builder.add_value(var db, both, profile_builder.notify_only(), gatt_server.le16(UUID_ONDEMAND_RANGING_DATA), [])!
+    let ondemand_cccd = profile_builder.add_cccd(var db, gatt_server.both_ways(config.access))!
+    let _ = gatt_server.make_per_link(var db, ondemand)
+    let control_point = profile_builder.add_value(var db, gatt_server.PROP_WRITE_WO_RESP | gatt_server.PROP_INDICATE,
+        profile_builder.write_only(config.access), gatt_server.le16(UUID_RAS_CONTROL_POINT), [])!
+    let control_point_cccd = profile_builder.add_cccd(var db, gatt_server.both_ways(config.access))!
+    let _ = gatt_server.make_per_link(var db, control_point)
+    let ready = profile_builder.add_value(var db, both | gatt_server.PROP_READ, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_RANGING_DATA_READY), [0, 0])!
+    let ready_cccd = profile_builder.add_cccd(var db, gatt_server.both_ways(config.access))!
+    let _ = gatt_server.make_per_link(var db, ready)
+    let overwritten = profile_builder.add_value(var db, both | gatt_server.PROP_READ, profile_builder.read_only(config.access),
+        gatt_server.le16(UUID_RANGING_DATA_OVERWRITTEN), [0, 0])!
+    let overwritten_cccd = profile_builder.add_cccd(var db, gatt_server.both_ways(config.access))!
+    let _ = gatt_server.make_per_link(var db, overwritten)
+    Ok(RasHandles { service: service, features: features, realtime: realtime, realtime_cccd: realtime_cccd, ondemand: ondemand, ondemand_cccd: ondemand_cccd,
+        control_point: control_point, control_point_cccd: control_point_cccd, ready: ready, ready_cccd: ready_cccd, overwritten: overwritten,
+        overwritten_cccd: overwritten_cccd })
+
+// ── The state of a client ───────────────────────────────────────────
+
+// What the server keeps for one client: the bodies stored for on-demand retrieval, oldest first, with the Ranging Counter of each and whether the client has
+// fetched it; the counter of the body last sent by Get_Ranging_Data (which Retrieve_Lost_Ranging_Data_Segments may name), the octets of data in the segments
+// of that transfer, the counter the client has yet to acknowledge with the time the Complete Ranging Data Response went out, and the values of Ranging Data Ready
+// and Overwritten.
+pub struct RasServer
+    max_bodies: Int
+    var counters: [Int]
+    var bodies: [[u8]]
+    var fetched: [Bool]
+    var last_sent: Int
+    var last_mtu: Int
+    var last_segments: Int
+    var awaiting_ack: Int
+    var complete_at_ms: Int
+    var ready_value: Int
+    var overwritten_value: Int
+    var aborted: Bool
+
+pub @tier(app)
+fn ras_server_new(config: RasConfig) -> RasServer
+    RasServer { max_bodies: config.max_bodies, counters: [], bodies: [], fetched: [], last_sent: -1, last_mtu: 0, last_segments: 0, awaiting_ack: -1,
+                complete_at_ms: 0, ready_value: 0, overwritten_value: 0, aborted: false }
+
+// The mode the client enabled, from its descriptors: on-demand wins when both are enabled (RAS asks for a refusal of the write instead).
+pub @tier(app)
+fn ras_mode(db: GattDb, link: AttLink, h: RasHandles) -> Int
+    if gatt_server.configuration(link, h.ondemand_cccd) != 0
+        return RAS_MODE_ONDEMAND
+    if h.realtime_cccd != 0 and gatt_server.configuration(link, h.realtime_cccd) != 0
+        return RAS_MODE_REALTIME
+    RAS_MODE_NONE
+
+fn find(srv: RasServer, counter: Int) -> Int
+    for k in 0..list.len(srv.counters)
+        if srv.counters[k] == counter
+            return k
+    -1
+
+fn drop_at(var srv: RasServer, k: Int)
+    var c: [Int] = []
+    var b: [[u8]] = []
+    var f: [Bool] = []
+    for i in 0..list.len(srv.counters)
+        if i != k
+            list.push(c, srv.counters[i])
+            list.push(b, srv.bodies[i][:])
+            list.push(f, srv.fetched[i])
+    srv.counters = c
+    srv.bodies = b
+    srv.fetched = f
+
+fn counter_value(counter: Int) -> [u8]
+    [(counter & 0xFF) as u8, ((counter >>> 8) & 0x0F) as u8]
+
+// Send `value` as the value of the characteristic `handle`: stored for this link, and answered as the notification or indication the client enabled.
+fn send(var db: GattDb, var link: AttLink, handle: Int, value: [u8], now_ms: Int) -> [[u8]]
+    let _ = gatt_server.set_link_value(db, var link, handle, value)
+    gatt_server.send_value(var db, var link, handle, now_ms)
+
+// The segments `from` to `to` (counted from 0) of `body` as the PDUs for the characteristic `handle`.
+fn send_segments(var db: GattDb, var link: AttLink, handle: Int, body: [u8], mtu: Int, from: Int, to: Int, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for k in from..(to + 1)
+        for p in send(var db, var link, handle, ranging_data.ras_segment(body, mtu, k), now_ms)
+            list.push(out, p[:])
+    out
+
+fn append_all(var out: [[u8]], more: [[u8]])
+    for p in more
+        list.push(out, p[:])
+
+// ── A procedure completes ───────────────────────────────────────────
+
+// The Host of the server has the result `res` of a procedure its Controller ran (`cs_gap.cs_gap_take_result`), with `tx_power` the Selected_TX_Power of the
+// Procedure Enable Complete event.  The server builds the Ranging Data Body and, for a client in the real-time mode, sends it in segments at once; otherwise it
+// stores the body (deleting the oldest when it holds `max_bodies`, and announcing a body deleted unread with Ranging Data Overwritten) and announces the new one with
+// Ranging Data Ready.  The PDUs to send are returned.
+pub @tier(app)
+fn ras_procedure_result(var srv: RasServer, var db: GattDb, var link: AttLink, h: RasHandles, res: hci_cs.HciCsProcResult, tx_power: Int, now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let body = ranging_data.ras_body_build(res, tx_power)
+    let counter = ranging_data.ras_ranging_counter(res.procedure_counter)
+    let mtu = gatt_server.mtu_of(link, 0)
+    if ras_mode(db, link, h) == RAS_MODE_REALTIME
+        // Real-time data is sent as it is and deleted; an unread overwrite is not announced.
+        srv.aborted = false
+        let count = ranging_data.ras_segment_count(list.len(body), mtu)
+        append_all(var out, send_segments(var db, var link, h.realtime, body, mtu, 0, count - 1, now_ms))
+        return out
+    let old = find(srv, counter)
+    if old >= 0
+        drop_at(var srv, old)
+    if list.len(srv.counters) >= srv.max_bodies
+        let gone = srv.counters[0]
+        let was_unread = not srv.fetched[0]
+        drop_at(var srv, 0)
+        if gone == srv.awaiting_ack
+            srv.awaiting_ack = -1
+        if was_unread
+            srv.overwritten_value = gone
+            append_all(var out, send(var db, var link, h.overwritten, counter_value(gone), now_ms))
+    list.push(srv.counters, counter)
+    list.push(srv.bodies, body[:])
+    list.push(srv.fetched, false)
+    srv.ready_value = counter
+    append_all(var out, send(var db, var link, h.ready, counter_value(counter), now_ms))
+    out
+
+// ── The control point ───────────────────────────────────────────────
+
+// Whether the handles the program took from `gatt_server.take_changed` name the control point.
+pub @tier(app)
+fn ras_control_point_written(h: RasHandles, changed: [Int]) -> Bool
+    for x in changed
+        if x == h.control_point
+            return true
+    false
+
+fn written(db: GattDb, link: AttLink, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else gatt_server.value_at(db, link, i)
+
+fn response_code(var db: GattDb, var link: AttLink, h: RasHandles, code: Int, now_ms: Int) -> [[u8]]
+    send(var db, var link, h.control_point, [RAS_RSP_CODE as u8, code as u8], now_ms)
+
+fn counter_param(req: [u8]) -> Int
+    (req[1] as Int) | ((req[2] as Int) << 8)
+
+// Answer the request the client wrote to the control point (RAS 3.3): the PDUs to send.  Call it for each write, when `ras_control_point_written` says so.
+//
+//   Get_Ranging_Data(counter)         the body in On-demand Ranging Data segments, then Complete Ranging Data Response (counter); No Records Found for an
+//                                     unknown counter; Server Busy while indications of an earlier transfer are not yet confirmed
+//   ACK_Ranging_Data(counter)         the body is deleted and the response is Success; No Records Found for an unknown counter
+//   Retrieve_Lost_Ranging_Data_Segments(counter, first, last)   the segments in On-demand Ranging Data again with their counters, then Complete Lost Ranging
+//                                     Data Segment Response; last 0xFF stands for the last segment sent; Invalid Parameter unless Get_Ranging_Data for the same
+//                                     counter came first
+//   Abort_Operation                   the transfer in progress is dropped and the response is Success
+//   Set_Filter and any other op code  Op Code Not Supported
+//   a parameter of the wrong length   Invalid Parameter
+//
+// A client that enabled the real-time mode may write nothing but the filter (RAS 3.2.3.1): the server answers Procedure Not Completed.
+pub @tier(app)
+fn ras_handle_control_point(var srv: RasServer, var db: GattDb, var link: AttLink, h: RasHandles, now_ms: Int) -> [[u8]]
+    let req = written(db, link, h.control_point)
+    if list.len(req) == 0
+        return response_code(var db, var link, h, RAS_RV_INVALID_PARAMETER, now_ms)
+    let op = req[0] as Int
+    if op != RAS_OP_ABORT and (gatt_server.indication_pending(link, h.ondemand) or gatt_server.indication_pending(link, h.control_point))
+        return response_code(var db, var link, h, RAS_RV_SERVER_BUSY, now_ms)
+    if op == RAS_OP_ABORT
+        if list.len(req) != 1
+            return response_code(var db, var link, h, RAS_RV_INVALID_PARAMETER, now_ms)
+        srv.aborted = true
+        srv.awaiting_ack = -1
+        return response_code(var db, var link, h, RAS_RV_SUCCESS, now_ms)
+    if op == RAS_OP_SET_FILTER
+        return response_code(var db, var link, h, RAS_RV_OP_CODE_NOT_SUPPORTED, now_ms)
+    if op != RAS_OP_GET_RANGING_DATA and op != RAS_OP_ACK_RANGING_DATA and op != RAS_OP_RETRIEVE_LOST_SEGMENTS
+        return response_code(var db, var link, h, RAS_RV_OP_CODE_NOT_SUPPORTED, now_ms)
+    if ras_mode(db, link, h) == RAS_MODE_REALTIME
+        return response_code(var db, var link, h, RAS_RV_PROCEDURE_NOT_COMPLETED, now_ms)
+    let want = if op == RAS_OP_RETRIEVE_LOST_SEGMENTS then 5 else 3
+    if list.len(req) != want
+        return response_code(var db, var link, h, RAS_RV_INVALID_PARAMETER, now_ms)
+    let counter = counter_param(req)
+    let k = find(srv, counter)
+    var out: [[u8]] = []
+    if op == RAS_OP_GET_RANGING_DATA
+        if k < 0
+            return response_code(var db, var link, h, RAS_RV_NO_RECORDS_FOUND, now_ms)
+        srv.aborted = false
+        let mtu = gatt_server.mtu_of(link, 0)
+        let count = ranging_data.ras_segment_count(list.len(srv.bodies[k]), mtu)
+        append_all(var out, send_segments(var db, var link, h.ondemand, srv.bodies[k][:], mtu, 0, count - 1, now_ms))
+        srv.fetched[k] = true
+        srv.last_sent = counter
+        srv.last_mtu = mtu
+        srv.last_segments = count
+        srv.awaiting_ack = counter
+        srv.complete_at_ms = now_ms
+        append_all(var out, send(var db, var link, h.control_point, [RAS_RSP_COMPLETE_RANGING_DATA as u8, req[1], req[2]], now_ms))
+        return out
+    if op == RAS_OP_ACK_RANGING_DATA
+        if k < 0
+            return response_code(var db, var link, h, RAS_RV_NO_RECORDS_FOUND, now_ms)
+        drop_at(var srv, k)
+        if srv.awaiting_ack == counter
+            srv.awaiting_ack = -1
+        if srv.last_sent == counter
+            srv.last_sent = -1
+        return response_code(var db, var link, h, RAS_RV_SUCCESS, now_ms)
+    // Retrieve_Lost_Ranging_Data_Segments.
+    if srv.last_sent != counter or k < 0
+        return response_code(var db, var link, h, RAS_RV_INVALID_PARAMETER, now_ms)
+    let first = req[3] as Int
+    var last = req[4] as Int
+    if last == 0xFF
+        last = (srv.last_segments - 1) % 64
+    // The segments of the transfer are counted from 0; a counter above 63 is the first occurrence.
+    if first > last or last >= srv.last_segments or first >= srv.last_segments
+        return response_code(var db, var link, h, RAS_RV_NO_RECORDS_FOUND, now_ms)
+    append_all(var out, send_segments(var db, var link, h.ondemand, srv.bodies[k][:], srv.last_mtu, first, last, now_ms))
+    append_all(var out, send(var db, var link, h.control_point, [RAS_RSP_COMPLETE_LOST_SEGMENT as u8, req[1], req[2], first as u8, last as u8], now_ms))
+    srv.complete_at_ms = now_ms
+    out
+
+// The clock reaches `now_ms`.  Data the client fetched and did not acknowledge within 10 seconds of the Complete Ranging Data Response is deleted (RAP 3.2.1).
+// The result is the Ranging Counter of the body deleted, -1 for none.
+pub @tier(app)
+fn ras_tick(var srv: RasServer, now_ms: Int) -> Int
+    if srv.awaiting_ack < 0
+        return -1
+    if now_ms - srv.complete_at_ms <= RAS_RETAIN_TIMEOUT_MS
+        return -1
+    let counter = srv.awaiting_ack
+    let k = find(srv, counter)
+    srv.awaiting_ack = -1
+    if k >= 0
+        drop_at(var srv, k)
+    counter
+
+// The client's link closed: everything pending is flushed (RAS 2.7).
+pub @tier(app)
+fn ras_flush(var srv: RasServer)
+    srv.counters = []
+    srv.bodies = []
+    srv.fetched = []
+    srv.last_sent = -1
+    srv.awaiting_ack = -1
+
+// The Ranging Counters stored, oldest first.
+pub @tier(app)
+fn ras_stored(srv: RasServer) -> [Int]
+    srv.counters[:]

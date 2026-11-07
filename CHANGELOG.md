@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+The Ranging Service and the Ranging Profile: `ranging_data` (the Ranging Data Body of a Channel Sounding procedure, its segmentation and its reassembly), `ranging_service` (the server: RAS Features, Real-time and On-demand Ranging Data, the control point with Get_Ranging_Data, ACK_Ranging_Data, Retrieve_Lost_Ranging_Data_Segments and Abort_Operation, Ranging Data Ready and Ranging Data Overwritten), `ranging_client` (discover, read the features, subscribe, ask for the data, reassemble, ask for lost segments, acknowledge, with the timeouts of RAP) and `ranging_profile` (the Ranging Responder and Requester procedures, and the pairing of the peer's data with the Host's own result of the same procedure).  Set_Filter is not supported and RAS Features bit 3 is clear.
+
 ## 0.1.0
 
 First release.  The generic GATT services and profiles of the noble Bluetooth

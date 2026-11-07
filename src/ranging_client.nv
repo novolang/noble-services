@@ -1,0 +1,343 @@
+// src/ranging_client.nv — the client of the Ranging Service: discover the service, read RAS Features, subscribe, ask for the ranging data of a procedure, reassemble
+// its segments and acknowledge it.  It is the Ranging Requester's side of RAS 1.0 and RAP 1.0, Section 4.
+//
+// The session runs over `sensor_client` for the discovery, the reads and the subscriptions and writes the control point with Write Commands itself (the
+// characteristic has no Write Request).  The module is sans I/O in the way `sensor_client` is: the program owns the `ClientTable`, moves the PDUs that the calls
+// answer, and calls `ras_client_tick` with its clock.
+//
+// The order of the on-demand mode (the default):
+//
+//   1  discover the service by UUID 0x185B, its characteristics and descriptors; read RAS Features
+//   2  enable indications on On-demand Ranging Data, Ranging Data Ready, Ranging Data Overwritten and the RAS Control Point (RAP 4.4.2, 4.4.3, 4.4.4)
+//   3  a Ranging Data Ready indication names a Ranging Counter; the session writes Get_Ranging_Data (RAP 4.4.3)
+//   4  the On-demand Ranging Data values arrive as segments (RAS 3.2.2) and are reassembled; the Complete Ranging Data Response ends the transfer
+//   5  a body whose segments are all there is the result, and the session writes ACK_Ranging_Data; with segments missing it writes
+//      Retrieve_Lost_Ranging_Data_Segments for them when the server supports it (RAP 4.4.2.1), up to three times
+//
+// In the real-time mode (`realtime` when the server supports it) the session enables indications on Real-time Ranging Data only and the body is complete when the
+// last segment arrives.  The RAP timeouts are kept: no first segment 5 seconds after Get_Ranging_Data, none within 1 second of the previous one, no Ranging Data
+// Ready within 5 seconds of the procedure's start (`ras_client_expect`); a timeout writes Abort_Operation where the server supports it and ends the transfer
+// with `RC_TIMEOUT`.
+//
+// What the session reports (the bits of `RasStep.event`):
+//
+//   RE_SETUP       the plan is done: the service is discovered, the features read, the subscriptions in place
+//   RE_FEATURES    RAS Features arrived (`c.features`)
+//   RE_DATA_READY  a Ranging Data Ready arrived (`c.ready_counter`)
+//   RE_BODY        a body is complete (`ras_client_body`, `ras_client_take_result`)
+//   RE_ACKED       the server acknowledged the ACK_Ranging_Data with a success
+//   RE_OVERWRITTEN a Ranging Data Overwritten arrived (`c.overwritten_counter`): the data of that procedure is gone
+//   RE_ERROR       the plan or a transfer failed (`c.error`: an ATT status, a Response Code Value of the server or one of the `RC_*` codes)
+//
+// RAP 4.5.4.2 splits the responses of the server: Abort Unsuccessful and Procedure Not Completed go to the application; the other codes are an error of one of the
+// two devices and the application closes the link (`c.fatal`).
+
+use gatt_client
+use gatt_server
+use links
+use sensor_client
+use ranging_data
+use ranging_service
+use hci_cs
+
+pub const RE_NONE = 0
+pub const RE_SETUP = 1
+pub const RE_FEATURES = 2
+pub const RE_DATA_READY = 4
+pub const RE_BODY = 8
+pub const RE_ACKED = 16
+pub const RE_OVERWRITTEN = 32
+pub const RE_ERROR = 64
+
+// The codes the client adds to the statuses of the ATT engine and the Response Code Values of the server.
+pub const RC_TIMEOUT = 0x500
+pub const RC_SEGMENTS_LOST = 0x501
+pub const RC_BAD_BODY = 0x502
+pub const RC_NOT_SUPPORTED = 0x503
+pub const RC_MALFORMED = 0x504
+
+// The RAP timeouts in milliseconds: the first segment after Get_Ranging_Data (RAP 4.5.4.1), a segment after the previous one, and Ranging Data Ready after the
+// start of the procedure (RAP 4.4.3.1).
+pub const RAP_FIRST_SEGMENT_MS = 5000
+pub const RAP_NEXT_SEGMENT_MS = 1000
+pub const RAP_READY_MS = 5000
+
+// The phases of a transfer.
+const PH_IDLE = 0
+const PH_GETTING = 1
+const PH_LOST = 2
+const PH_ACKING = 3
+
+// The most times the client asks for lost segments of one body.
+const RETRIEVE_MAX = 3
+
+// A session.  `realtime` is the mode asked for; `features` the RAS Features value (-1 before it is read); `auto_get` makes the session write Get_Ranging_Data when
+// Ranging Data Ready arrives and `auto_ack` write ACK_Ranging_Data when a body is complete.
+pub struct RasClient
+    sc: sensor_client.SensorClient
+    realtime: Bool
+    var features: Int
+    var auto_get: Bool
+    var auto_ack: Bool
+    var phase: Int
+    var ra: ranging_data.RasReassembly
+    var body: [u8]
+    var body_counter: Int
+    var ready_counter: Int
+    var overwritten_counter: Int
+    var transfer_counter: Int
+    var retrieves: Int
+    var error: Int
+    var fatal: Bool
+    var deadline_ms: Int
+    var timeout_next: Bool
+    var setup: Bool
+
+// What a call answers: the events that happened (`RE_*`) and the ATT PDUs to send.
+pub struct RasStep
+    var event: Int
+    var pdus: [[u8]]
+
+pub @tier(app)
+fn ras_client_new(link: links.LinkId, realtime: Bool) -> RasClient
+    RasClient { sc: sensor_client.sc_new(link, ranging_service.UUID_RANGING_SERVICE), realtime: realtime, features: -1, auto_get: true, auto_ack: true, phase: PH_IDLE,
+                ra: ranging_data.ras_reassembly_new(), body: [], body_counter: -1, ready_counter: -1, overwritten_counter: -1, transfer_counter: -1, retrieves: 0,
+                error: 0, fatal: false, deadline_ms: -1, timeout_next: false, setup: false }
+
+// Whether the server supports a feature bit of RAS Features.
+pub @tier(app)
+fn ras_client_supports(c: RasClient, bit: Int) -> Bool
+    c.features >= 0 and (c.features & bit) != 0
+
+@tier(app)
+fn step_of(event: Int, pdus: [[u8]]) -> RasStep
+    RasStep { event: event, pdus: pdus[:] }
+
+// Start the session: discover, read RAS Features and subscribe.  With `realtime` the subscription is to Real-time Ranging Data only.
+pub @tier(app)
+fn ras_client_start(var t: gatt_client.ClientTable, var c: RasClient, now_ms: Int) -> RasStep
+    sensor_client.sc_queue_read(var c.sc, ranging_service.UUID_RAS_FEATURES, true)
+    if c.realtime
+        sensor_client.sc_queue_subscribe(var c.sc, ranging_service.UUID_REALTIME_RANGING_DATA, gatt_client.CCCD_INDICATE, true)
+    else
+        sensor_client.sc_queue_subscribe(var c.sc, ranging_service.UUID_ONDEMAND_RANGING_DATA, gatt_client.CCCD_INDICATE, true)
+        sensor_client.sc_queue_subscribe(var c.sc, ranging_service.UUID_RANGING_DATA_READY, gatt_client.CCCD_INDICATE, true)
+        sensor_client.sc_queue_subscribe(var c.sc, ranging_service.UUID_RANGING_DATA_OVERWRITTEN, gatt_client.CCCD_INDICATE, true)
+        sensor_client.sc_queue_subscribe(var c.sc, ranging_service.UUID_RAS_CONTROL_POINT, gatt_client.CCCD_INDICATE, true)
+    let s = sensor_client.sc_start(var t, var c.sc, now_ms)
+    step_of(events_of(var c, s.event), s.pdus[:])
+
+// The ATT engine's events as the client's.
+@tier(app)
+fn events_of(var c: RasClient, sc_event: Int) -> Int
+    var e = RE_NONE
+    if (sc_event & sensor_client.SE_FAILED) != 0
+        c.error = sensor_client.sc_status(c.sc)
+        e = e | RE_ERROR
+    if (sc_event & sensor_client.SE_DONE) != 0 and not c.setup
+        c.setup = true
+        e = e | RE_SETUP
+    e
+
+// Write `data` to the control point as a Write Command; the PDUs to send.
+@tier(app)
+fn write_control_point(var t: gatt_client.ClientTable, var c: RasClient, data: [u8], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    let handle = sensor_client.sc_handle(var t, c.sc, ranging_service.UUID_RAS_CONTROL_POINT)
+    if handle <= 0
+        return out
+    let q = gatt_client.begin_write_command(var t, c.sc.link, 0, handle, sensor_client.payload_of(data), list.len(data))
+    if q < 0
+        return out
+    for _ in 0..4
+        var buf: gatt_client.ClientPdu = Vec.new()
+        let kind = gatt_client.take_tx(var t, c.sc.link, 0, now_ms, var buf)
+        if kind == gatt_client.TX_NONE
+            break
+        var pdu: [u8] = []
+        for k in 0..buf.len()
+            list.push(pdu, buf[k])
+        list.push(out, pdu)
+    out
+
+// Write Get_Ranging_Data for `counter` and start the clock of the transfer (RAP 4.5.4.1).
+pub @tier(app)
+fn ras_client_get(var t: gatt_client.ClientTable, var c: RasClient, counter: Int, now_ms: Int) -> [[u8]]
+    ranging_data.ras_reassembly_clear(var c.ra)
+    c.phase = PH_GETTING
+    c.transfer_counter = counter
+    c.retrieves = 0
+    c.deadline_ms = now_ms + RAP_FIRST_SEGMENT_MS
+    c.timeout_next = false
+    write_control_point(var t, var c, [ranging_service.RAS_OP_GET_RANGING_DATA as u8, (counter & 0xFF) as u8, ((counter >>> 8) & 0xFF) as u8], now_ms)
+
+// Write ACK_Ranging_Data for `counter`.
+pub @tier(app)
+fn ras_client_ack(var t: gatt_client.ClientTable, var c: RasClient, counter: Int, now_ms: Int) -> [[u8]]
+    c.phase = PH_ACKING
+    c.deadline_ms = -1
+    write_control_point(var t, var c, [ranging_service.RAS_OP_ACK_RANGING_DATA as u8, (counter & 0xFF) as u8, ((counter >>> 8) & 0xFF) as u8], now_ms)
+
+// Write Abort_Operation, where the server supports it.
+pub @tier(app)
+fn ras_client_abort(var t: gatt_client.ClientTable, var c: RasClient, now_ms: Int) -> [[u8]]
+    c.phase = PH_IDLE
+    c.deadline_ms = -1
+    if not ras_client_supports(c, ranging_service.RAS_FEATURE_ABORT)
+        return []
+    write_control_point(var t, var c, [ranging_service.RAS_OP_ABORT as u8], now_ms)
+
+// Start the clock for the Ranging Data Ready that the procedure just started should bring (RAP 4.4.3.1).
+pub @tier(app)
+fn ras_client_expect(var c: RasClient, now_ms: Int)
+    c.deadline_ms = now_ms + RAP_READY_MS
+    c.timeout_next = true
+
+@tier(app)
+fn counter_of(v: [u8]) -> Int
+    ((v[0] as Int) | ((v[1] as Int) << 8)) & 0x0FFF
+
+@tier(app)
+fn fail(var c: RasClient, code: Int, fatal: Bool) -> Int
+    c.error = code
+    c.fatal = fatal
+    c.phase = PH_IDLE
+    c.deadline_ms = -1
+    RE_ERROR
+
+// A body is complete: keep it, and acknowledge it when the session does that.
+@tier(app)
+fn finish_body(var t: gatt_client.ClientTable, var c: RasClient, var out: [[u8]], now_ms: Int) -> Int
+    c.body = ranging_data.ras_reassembly_body(c.ra)
+    c.body_counter = c.transfer_counter
+    c.deadline_ms = -1
+    if c.realtime
+        c.phase = PH_IDLE
+    else if c.auto_ack
+        for p in ras_client_ack(var t, var c, c.transfer_counter, now_ms)
+            list.push(out, p[:])
+    RE_BODY
+
+// Write Retrieve_Lost_Ranging_Data_Segments for the segments still missing: the first missing one to the last, or 0xFF when the last segment is itself missing.
+@tier(app)
+fn retrieve_lost(var t: gatt_client.ClientTable, var c: RasClient, var out: [[u8]], now_ms: Int) -> Int
+    let missing = ranging_data.ras_reassembly_missing(c.ra)
+    if not ras_client_supports(c, ranging_service.RAS_FEATURE_RETRIEVE_LOST) or c.retrieves >= RETRIEVE_MAX
+        return fail(var c, RC_SEGMENTS_LOST, false)
+    var first = c.ra.next
+    var last = 0xFF
+    if list.len(missing) > 0
+        first = missing[0] % 64
+        last = missing[list.len(missing) - 1] % 64
+        if c.ra.count == 0
+            last = 0xFF
+    c.retrieves = c.retrieves + 1
+    c.phase = PH_LOST
+    c.deadline_ms = now_ms + RAP_FIRST_SEGMENT_MS
+    let n = c.transfer_counter
+    for p in write_control_point(var t, var c, [ranging_service.RAS_OP_RETRIEVE_LOST_SEGMENTS as u8, (n & 0xFF) as u8, ((n >>> 8) & 0xFF) as u8, first as u8, last as u8], now_ms)
+        list.push(out, p[:])
+    RE_NONE
+
+// A segment of data arrived on a characteristic of the ranging data.
+@tier(app)
+fn on_segment(var c: RasClient, value: [u8], now_ms: Int) -> Int
+    if not ranging_data.ras_reassembly_add(var c.ra, value)
+        return RE_NONE
+    c.deadline_ms = now_ms + RAP_NEXT_SEGMENT_MS
+    c.timeout_next = false
+    RE_NONE
+
+// The control point's indication: the response to a command.
+@tier(app)
+fn on_control_point(var t: gatt_client.ClientTable, var c: RasClient, v: [u8], var out: [[u8]], now_ms: Int) -> Int
+    if list.len(v) < 1
+        return fail(var c, RC_MALFORMED, false)
+    let op = v[0] as Int
+    if op == ranging_service.RAS_RSP_COMPLETE_RANGING_DATA or op == ranging_service.RAS_RSP_COMPLETE_LOST_SEGMENT
+        if (op == ranging_service.RAS_RSP_COMPLETE_RANGING_DATA and list.len(v) != 3) or (op == ranging_service.RAS_RSP_COMPLETE_LOST_SEGMENT and list.len(v) != 5)
+            return fail(var c, RC_MALFORMED, false)
+        // A Complete Lost Ranging Data Segment Response answers a request this client made; otherwise it is ignored (RAP 4.5.2.2).
+        if op == ranging_service.RAS_RSP_COMPLETE_LOST_SEGMENT and c.phase != PH_LOST
+            return RE_NONE
+        if ranging_data.ras_reassembly_complete(c.ra)
+            return finish_body(var t, var c, var out, now_ms)
+        return retrieve_lost(var t, var c, var out, now_ms)
+    if op == ranging_service.RAS_RSP_CODE
+        if list.len(v) != 2
+            return fail(var c, RC_MALFORMED, false)
+        let code = v[1] as Int
+        if code == ranging_service.RAS_RV_SUCCESS or code == ranging_service.RAS_RV_SUCCESS_PERSISTED
+            if c.phase == PH_ACKING
+                c.phase = PH_IDLE
+                return RE_ACKED
+            return RE_NONE
+        // Abort Unsuccessful and Procedure Not Completed go to the application; the other codes mean an error of one of the devices (RAP 4.5.4.2).
+        let forwarded = code == ranging_service.RAS_RV_ABORT_UNSUCCESSFUL or code == ranging_service.RAS_RV_PROCEDURE_NOT_COMPLETED
+        if code >= 0x09
+            // A Response Code Value Reserved for Future Use is ignored.
+            return RE_NONE
+        return fail(var c, code, not forwarded)
+    RE_NONE
+
+// Take a PDU received on the link.  The ATT engine's events and the ranging data's become the `RasStep.event`; the PDUs are what the program sends next.
+pub @tier(app)
+fn ras_client_on_pdu(var t: gatt_client.ClientTable, var c: RasClient, pdu: [u8], now_ms: Int) -> RasStep
+    let s = sensor_client.sc_on_pdu(var t, var c.sc, pdu, now_ms)
+    var event = events_of(var c, s.event)
+    var out: [[u8]] = []
+    for p in s.pdus
+        list.push(out, p[:])
+    if (s.event & sensor_client.SE_VALUE) != 0
+        let u = sensor_client.sc_uuid(c.sc)
+        let v = sensor_client.sc_value(c.sc)
+        if u == ranging_service.UUID_RAS_FEATURES and list.len(v) == 4
+            c.features = (v[0] as Int) | ((v[1] as Int) << 8) | ((v[2] as Int) << 16) | ((v[3] as Int) << 24)
+            event = event | RE_FEATURES
+        else if (u == ranging_service.UUID_ONDEMAND_RANGING_DATA and not c.realtime) or (u == ranging_service.UUID_REALTIME_RANGING_DATA and c.realtime)
+            event = event | on_segment(var c, v, now_ms)
+            if c.realtime and ranging_data.ras_reassembly_complete(c.ra)
+                var hdr = ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }
+                let _ = ranging_data.ras_header_read(ranging_data.ras_reassembly_body(c.ra), var hdr)
+                c.transfer_counter = hdr.ranging_counter
+                event = event | finish_body(var t, var c, var out, now_ms)
+        else if u == ranging_service.UUID_RANGING_DATA_READY and list.len(v) == 2
+            c.ready_counter = counter_of(v)
+            c.deadline_ms = -1
+            event = event | RE_DATA_READY
+            if c.auto_get and c.phase == PH_IDLE
+                for p in ras_client_get(var t, var c, c.ready_counter, now_ms)
+                    list.push(out, p[:])
+        else if u == ranging_service.UUID_RANGING_DATA_OVERWRITTEN and list.len(v) == 2
+            c.overwritten_counter = counter_of(v)
+            event = event | RE_OVERWRITTEN
+        else if u == ranging_service.UUID_RAS_CONTROL_POINT
+            event = event | on_control_point(var t, var c, v, var out, now_ms)
+    step_of(event, out)
+
+// The clock reaches `now_ms`.  A transfer that ran past its deadline is aborted (Abort_Operation where supported) and ends with `RC_TIMEOUT`.
+pub @tier(app)
+fn ras_client_tick(var t: gatt_client.ClientTable, var c: RasClient, now_ms: Int) -> RasStep
+    let s = sensor_client.sc_tick(var t, var c.sc, now_ms)
+    var event = events_of(var c, s.event)
+    var out: [[u8]] = []
+    for p in s.pdus
+        list.push(out, p[:])
+    if c.deadline_ms >= 0 and now_ms > c.deadline_ms
+        for p in ras_client_abort(var t, var c, now_ms)
+            list.push(out, p[:])
+        event = event | fail(var c, RC_TIMEOUT, false)
+    step_of(event, out)
+
+// The body of the last complete transfer.
+pub @tier(app)
+fn ras_client_body(c: RasClient) -> [u8]
+    c.body[:]
+
+// Read the last body as the peer's ranging data: `producer_initiator` says whether the server held the initiator role in the configuration, `pct` whether the
+// configuration's RTT type has a sounding sequence.  False when there is no body or it does not read.
+pub @tier(app)
+fn ras_client_take_result(c: RasClient, producer_initiator: Bool, pct: Bool, var hdr: ranging_data.RasHeader, var out: hci_cs.HciCsProcResult) -> Bool
+    if c.body_counter < 0
+        return false
+    ranging_data.ras_body_parse(c.body, producer_initiator, pct, var hdr, var out)
