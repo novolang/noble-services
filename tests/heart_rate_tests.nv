@@ -7,7 +7,9 @@ use att
 use gatt_server
 use profile_builder
 use wire
-use heart_rate.{ BodySensorLocation, ERR_CONTROL_POINT_NOT_SUPPORTED, HeartRateConfig, HeartRateHandles, HeartRateMeasurement, SensorContact, add_heart_rate_service, default_heart_rate_config, heart_rate_measurement_value, heart_rate_notify, heart_rate_reset_requested, rr_interval }
+use host.{ host_blank, host_config }
+use noble
+use heart_rate.{ BodySensorLocation, ERR_CONTROL_POINT_NOT_SUPPORTED, HeartRateConfig, HeartRateHandles, HeartRateMeasurement, SensorContact, add_heart_rate_service, heart_rate_service, default_heart_rate_config, heart_rate_measurement_value, heart_rate_notify, heart_rate_reset_requested, rr_interval }
 
 fn added(var s: GattServer, config: HeartRateConfig) -> HeartRateHandles
     match add_heart_rate_service(var s.db, config)
@@ -210,3 +212,102 @@ fn test_permissions_of_each_characteristic()
     test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x0A, hz.location, []), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
     test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.measurement_cccd, [1, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
     test.assert_eq(gatt_server.receive(var z.db, var z.link, request(0x12, hz.control_point, [1]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+
+// ── The service as a value of the Adapter's list ────────────────────
+
+@test
+fn test_the_service_value_adds_the_characteristics_the_configuration_names()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    let before = list.len(h.link.db.attributes)
+    var svc = heart_rate_service(full_config(BodySensorLocation.Wrist))
+    test.assert_eq(svc.attach(var h), 0)
+    // The service; the measurement (declaration, value, descriptor); the location (declaration, value); the control point
+    // (declaration, value).
+    test.assert_eq(list.len(h.link.db.attributes), before + 8)
+    test.assert(svc.measurement.cccd != 0)
+    test.assert_eq(h.link.db.attributes[svc.location.handle as Int - 1].value[0] as Int, 2)
+    // A configuration without the location and the control point adds the measurement alone.
+    var h2 = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    let before2 = list.len(h2.link.db.attributes)
+    var plain = heart_rate_service(HeartRateConfig {
+        location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
+    test.assert_eq(plain.attach(var h2), 0)
+    test.assert_eq(list.len(h2.link.db.attributes), before2 + 4)
+    // A configuration that denies the client the descriptor is refused.
+    var h3 = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var denied = heart_rate_service(HeartRateConfig {
+        location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Denied }, reset_write: gatt_server.Access.Open })
+    test.assert_eq(denied.attach(var h3), noble.E_BAD_ARGUMENT)
+
+@test
+fn test_a_reported_measurement_is_notified_to_every_subscriber_once()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var svc = heart_rate_service(full_config(BodySensorLocation.Chest))
+    test.assert_eq(svc.attach(var h), 0)
+    var out: noble.Outbox = Vec.new()
+    svc.tick(0, var out)
+    test.assert_eq(out.len(), 0)
+    svc.report(measurement(72, SensorContact.Detected, 5, [1024]))
+    svc.tick(10, var out)
+    test.assert_eq(out.len(), 1)
+    match out[0]
+        NotifyAll(attr, v) =>
+            test.assert_eq(attr.handle, svc.measurement.handle)
+            test.assert_eq(v.len(), 6)
+            test.assert_eq(v[0] as Int, 0x1E)
+            test.assert_eq(v[1] as Int, 72)
+        _ => test.fail("the measurement is notified to all")
+    svc.tick(20, var out)
+    test.assert_eq(out.len(), 1)
+
+@test
+fn test_the_energy_is_left_out_when_the_service_has_no_control_point()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var svc = heart_rate_service(HeartRateConfig {
+        location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
+        measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
+    test.assert_eq(svc.attach(var h), 0)
+    var out: noble.Outbox = Vec.new()
+    svc.report(measurement(72, SensorContact.NotSupported, 5, []))
+    svc.tick(0, var out)
+    match out[0]
+        NotifyAll(attr, v) =>
+            test.assert_eq(v.len(), 2)
+            test.assert_eq(v[0] as Int, 0)
+        _ => test.fail("the measurement is notified to all")
+
+@test
+fn test_the_control_point_resets_the_energy_and_refuses_what_the_service_does_not_know()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var svc = heart_rate_service(full_config(BodySensorLocation.Absent))
+    test.assert_eq(svc.attach(var h), 0)
+    let conn = noble.no_conn()
+    let cp = svc.control.handle
+    var out: noble.Outbox = Vec.new()
+    // A write to another attribute is not the service's.
+    var one: noble.Value = Vec.new()
+    let _ = one.push(1)
+    test.assert(not svc.on_event(noble.Event.AttrWrite(conn, 9, 0, one), var out))
+    test.assert_eq(out.len(), 0)
+    // 1 resets, and the request is read once.
+    test.assert(svc.on_event(noble.Event.AttrWrite(conn, cp, 0, one), var out))
+    test.assert(svc.energy_reset_requested())
+    test.assert(not svc.energy_reset_requested())
+    // Another opcode is refused with 0x80, a longer value with Invalid Attribute Value Length.
+    var two: noble.Value = Vec.new()
+    let _ = two.push(2)
+    test.assert(svc.on_event(noble.Event.AttrWrite(conn, cp, 0, two), var out))
+    var long: noble.Value = Vec.new()
+    let _ = long.push(1)
+    let _ = long.push(1)
+    test.assert(svc.on_event(noble.Event.AttrWrite(conn, cp, 0, long), var out))
+    test.assert(not svc.energy_reset_requested())
+    test.assert_eq(out.len(), 3)
+    match out[1]
+        Respond(c, attr, code, v) => test.assert_eq(code, ERR_CONTROL_POINT_NOT_SUPPORTED)
+        _ => test.fail("answered")
+    match out[2]
+        Respond(c, attr, code, v) => test.assert_eq(code, noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH)
+        _ => test.fail("answered")

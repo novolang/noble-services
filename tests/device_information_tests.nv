@@ -6,7 +6,10 @@ use std.test
 use att
 use gatt_server
 use profile_builder
-use device_information.{ DeviceInformation, DeviceInformationHandles, PNP_SOURCE_BLUETOOTH_SIG, PNP_SOURCE_USB_IF, add_device_information_service, empty_device_information, pnp_id_value, system_id_value }
+use host.{ host_blank, host_config }
+use noble
+use noble_config
+use device_information.{ device_information_service, DeviceInformation, DeviceInformationHandles, PNP_SOURCE_BLUETOOTH_SIG, PNP_SOURCE_USB_IF, add_device_information_service, empty_device_information, pnp_id_value, system_id_value }
 
 fn octets(v: [Int]) -> [u8]
     var out: [u8] = []
@@ -150,3 +153,38 @@ fn test_every_value_takes_the_access_chosen()
     test.assert_eq(gatt_server.receive(var sc.db, var sc.link, octets([0x0A, hs.model, 0]), 0)[0][4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
     gatt_server.set_security(var sc.link, gatt_server.link_security(true, 4, 16, true))
     test.assert(gatt_server.same_bytes(read_value(sc, hs.model), text("N-1")))
+
+// ── The service as a value of the Adapter's list ────────────────────
+
+@test
+fn test_the_service_value_stores_the_values_in_the_hosts_database_and_leaves_out_the_empty_ones()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    let before = list.len(h.link.db.attributes)
+    let info = DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: text("Novo"), model: [], serial: [], hardware: [], firmware: [], software: [],
+        system_id: [], pnp_id: pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100) }
+    var svc = device_information_service(info)
+    test.assert_eq(svc.attach(var h), 0)
+    // The service declaration, then a declaration and a value for each of the two characteristics.
+    test.assert_eq(list.len(h.link.db.attributes), before + 5)
+    // The handle of an attribute is its index plus one: the last value is the PnP ID, the value before its declaration the name.
+    let last = gatt_server.last_handle(h.link.db)
+    test.assert(gatt_server.same_bytes(h.link.db.attributes[last - 3].value, text("Novo")))
+    test.assert(gatt_server.same_bytes(h.link.db.attributes[last - 1].value, pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100)))
+    // The service takes no event and has nothing to queue in a turn.
+    var out: noble.Outbox = Vec.new()
+    test.assert(not svc.on_event(noble.Event.Ready, var out))
+    svc.tick(0, var out)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_value_longer_than_the_api_carries_stops_the_attach_with_no_room()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var long: [u8] = []
+    for k in 0..(noble_config.ATT_VALUE_BYTES + 1)
+        list.push(long, 65)
+    let info = DeviceInformation {
+        read: gatt_server.Access.Open, manufacturer: [], model: long, serial: [], hardware: [], firmware: [], software: [],
+        system_id: [], pnp_id: [] }
+    var svc = device_information_service(info)
+    test.assert_eq(svc.attach(var h), noble.E_NO_ROOM)

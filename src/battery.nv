@@ -12,9 +12,17 @@
 //
 // `add_battery_service` adds the service to a `GattServer` and answers the
 // handles; `set_battery_level` stores a new level and answers the
-// notification PDU when the client asked for it.
+// notification PDU when the client asked for it.  These two are the face the
+// BTP session of orbit/ble calls.
+//
+// `battery_service` is the other face: a value that implements `noble.Service`,
+// for a product that hands the Adapter of the package noble a list of services
+// (`noble.plug`).  The product keeps the value and calls `set_level` on it; the
+// pump asks the service for a read of the level, and the service notifies every
+// subscriber when the level has changed.
 
 use gatt_server
+use noble
 use profile_builder
 
 const UUID_BATTERY_SERVICE = 0x180F
@@ -79,3 +87,68 @@ fn set_battery_level(var db: GattDb, var link: AttLink, handles: BatteryHandles,
                      now_ms: Int) -> [[u8]]
     let _ = gatt_server.set_value(var db, handles.level, [cut_level(level) as u8])
     gatt_server.send_value(var db, var link, handles.level, now_ms)
+
+// ── The service as a value of the Adapter's list ───────────────────────────
+
+// The service as `noble.plug` takes it.  A struct and not a `@value` struct: the Adapter holds it behind `dyn`, which needs the
+// tag of a plain struct, and the product keeps the same value to call `set_level` on it.  `sent` is the level a client last
+// heard of, so `tick` notifies once for each change.
+struct BatteryService
+    var attr: noble.Attr
+    var level: Int
+    var sent: Int
+
+// A Battery Service that reports `level`, cut to 100.
+@tier(embedded)
+pub fn battery_service(level: Int) -> BatteryService
+    let l = cut_level(level)
+    BatteryService { attr: noble.Attr { handle: 0, props: 0, cccd: 0 }, level: l, sent: l }
+
+impl BatteryService
+    // The new level, cut to 100.  A client that reads gets it at once; a subscriber is notified in the next turn of the pump.
+    @tier(embedded)
+    fn set_level(var self, level: Int)
+        self.level = cut_level(level)
+
+// The one octet of the level, as a value of the API.
+@tier(embedded)
+fn level_value(level: Int) -> noble.Value
+    var v: noble.Value = Vec.new()
+    let _ = v.push(level as u8)
+    v
+
+impl noble.Service[] for BatteryService
+    // The service, with Battery Level readable by any client and notified to those that subscribe.  The level is answered from
+    // the module's state (`bind_event`), so the Host holds no copy to keep up to date.
+    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): `attach` answers an
+    // `Int`, 0 or the code of the `Status` that stopped it, and not the `Status` itself.
+    @tier(embedded)
+    fn attach(var self, var h: noble.Host) -> Int [mutate]
+        let s = h.add_service(noble.uuid16(UUID_BATTERY_SERVICE))
+        if not s.status.is_ok()
+            return s.status.code as Int
+        let c = h.add_char(noble.uuid16(UUID_BATTERY_LEVEL), noble.PROP_READ | noble.PROP_NOTIFY,
+            noble.Permissions { read: noble.Access.Open, write: noble.Access.Denied }, noble.Access.Open, 1)
+        if not c.status.is_ok()
+            return c.status.code as Int
+        self.attr = c.attr
+        h.bind_event(c.attr).code as Int
+
+    // A read of Battery Level is answered with the level; no other event is the service's.
+    @tier(embedded)
+    fn on_event(var self, ev: noble.Event, var out: noble.Outbox) -> Bool [mutate]
+        match ev
+            AttrRead(conn, attr, svc) =>
+                if attr != self.attr.handle
+                    return false
+                let _ = out.push(noble.Out.Respond(conn, attr, 0, level_value(self.level)))
+                true
+            _ => false
+
+    // A level that changed since the last turn is notified to every subscriber.
+    @tier(embedded)
+    fn tick(var self, now_ms: Int, var out: noble.Outbox) [mutate]
+        if self.level == self.sent
+            return
+        self.sent = self.level
+        let _ = out.push(noble.Out.NotifyAll(self.attr, level_value(self.level)))

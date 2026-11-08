@@ -6,7 +6,9 @@ use std.test
 use att
 use gatt_server
 use profile_builder
-use battery.{ BatteryConfig, BatteryHandles, add_battery_service, default_battery_config, secured_battery_config, set_battery_level }
+use host.{ host_blank, host_config }
+use noble
+use battery.{ BatteryConfig, BatteryHandles, add_battery_service, battery_service, default_battery_config, secured_battery_config, set_battery_level }
 
 fn fixture() -> GattServer
     var s = gatt_server.new_server([], 65)
@@ -145,3 +147,50 @@ fn test_battery_service_stops_when_the_table_is_full()
     match add_battery_service(var s.db, default_battery_config(1))
         Ok(_) => test.fail("no handle is left")
         Err(e) => test.assert_eq(e, profile_builder.ProfileError.NoRoom)
+
+// ── The service as a value of the Adapter's list ────────────────────
+
+@test
+fn test_the_service_value_adds_the_service_answers_a_read_and_notifies_a_change_once()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    let before = list.len(h.link.db.attributes)
+    var b = battery_service(87)
+    test.assert_eq(b.attach(var h), 0)
+    // The service, the characteristic declaration, its value and the descriptor, after the attributes the Host holds.
+    test.assert_eq(list.len(h.link.db.attributes), before + 4)
+    test.assert_eq(b.attr.handle as Int, gatt_server.last_handle(h.link.db) - 1)
+    test.assert_eq(b.attr.cccd as Int, gatt_server.last_handle(h.link.db))
+    // A read of the level is answered from the module's state.
+    var out: noble.Outbox = Vec.new()
+    let conn = noble.no_conn()
+    test.assert(b.on_event(noble.Event.AttrRead(conn, b.attr.handle, 0), var out))
+    test.assert_eq(out.len(), 1)
+    match out[0]
+        Respond(c, attr, code, v) =>
+            test.assert_eq(code, 0)
+            test.assert_eq(v.len(), 1)
+            test.assert_eq(v[0] as Int, 87)
+        _ => test.fail("the read is answered")
+    // A read of another attribute is not the service's.
+    var other: noble.Outbox = Vec.new()
+    test.assert(not b.on_event(noble.Event.AttrRead(conn, 9, 0), var other))
+    test.assert_eq(other.len(), 0)
+
+@test
+fn test_a_level_that_changed_is_notified_to_every_subscriber_once_and_cut_to_a_percentage()
+    var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+    var b = battery_service(87)
+    test.assert_eq(b.attach(var h), 0)
+    var out: noble.Outbox = Vec.new()
+    b.tick(0, var out)
+    test.assert_eq(out.len(), 0)
+    b.set_level(250)
+    b.tick(10, var out)
+    test.assert_eq(out.len(), 1)
+    match out[0]
+        NotifyAll(attr, v) =>
+            test.assert_eq(attr.handle, b.attr.handle)
+            test.assert_eq(v[0] as Int, 100)
+        _ => test.fail("the change is notified to all")
+    b.tick(20, var out)
+    test.assert_eq(out.len(), 1)

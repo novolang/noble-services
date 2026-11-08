@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+`battery`, `device_information`, `heart_rate`: each module gains a value that implements `noble.Service`, for a product that hands the Adapter of the package noble a list of services: `battery_service(level)` (`set_level` on the value the product keeps; a read of the level is answered from it and a change is notified to every subscriber once), `device_information_service(info)` (the values of a `DeviceInformation` are stored in the Host's database at `attach`; a value longer than `att_value_bytes` stops the attach with `E_NO_ROOM`) and `heart_rate_service(config)` (`report(m)` queues a measurement for the next turn, `energy_reset_requested()` reads the control point's reset once; the notification has room for the 20 octets of the default ATT MTU).  The functions of each module for the BTP session of orbit/ble are unchanged.  The other services of the package are NOT YET ported to `Service`.
+
 The Ranging Service and the Ranging Profile: `ranging_data` (the Ranging Data Body of a Channel Sounding procedure, its segmentation and its reassembly), `ranging_service` (the server: RAS Features, Real-time and On-demand Ranging Data, the control point with Get_Ranging_Data, ACK_Ranging_Data, Retrieve_Lost_Ranging_Data_Segments and Abort_Operation, Ranging Data Ready and Ranging Data Overwritten), `ranging_client` (discover, read the features, subscribe, ask for the data, reassemble, ask for lost segments, acknowledge, with the timeouts of RAP) and `ranging_profile` (the Ranging Responder and Requester procedures, and the pairing of the peer's data with the Host's own result of the same procedure).  Set_Filter is not supported and RAS Features bit 3 is clear.
 
 ## 0.1.0

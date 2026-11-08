@@ -19,9 +19,17 @@
 // the application's choice, since the service sets no security permission.
 //
 // `heart_rate_measurement_value` builds the value of a measurement and
-// `heart_rate_notify` stores it and answers the notification.
+// `heart_rate_notify` stores it and answers the notification.  These are the
+// face the BTP session of orbit/ble calls.
+//
+// `heart_rate_service` is the other face: a value that implements
+// `noble.Service`, for a product that hands the Adapter of the package noble a
+// list of services (`noble.plug`).  The product keeps the value, calls
+// `report` on it with each measurement and asks `energy_reset_requested` after
+// a turn; the service notifies every subscriber in the next turn of the pump.
 
 use gatt_server
+use noble
 use profile_builder
 use wire
 
@@ -206,3 +214,120 @@ fn heart_rate_reset_requested(handles: HeartRateHandles, changed: [Int]) -> Bool
         if h == handles.control_point
             return true
     false
+
+// ── The service as a value of the Adapter's list ───────────────────────────
+
+// The room a notification has before the product's link has exchanged an MTU: the default ATT MTU of 23 less the 3 octets of the
+// notification header.
+const DEFAULT_NOTIFICATION_ROOM = 20
+
+// The service as `noble.plug` takes it.  A struct and not a `@value` struct, since the Adapter holds it behind `dyn` and the
+// product keeps the same value.  `pending` is the measurement not yet notified, `fresh` whether there is one, and `reset` whether
+// a client wrote the control point since the product last asked.
+struct HeartRateService
+    var config: HeartRateConfig
+    var measurement: noble.Attr
+    var location: noble.Attr
+    var control: noble.Attr
+    var pending: HeartRateMeasurement
+    var fresh: Bool
+    var reset: Bool
+
+// A Heart Rate Service with the configuration `config`.
+@tier(embedded)
+pub fn heart_rate_service(config: HeartRateConfig) -> HeartRateService
+    let blank = noble.Attr { handle: 0, props: 0, cccd: 0 }
+    HeartRateService { config: config, measurement: blank, location: blank, control: blank,
+        pending: HeartRateMeasurement { heart_rate: 0, contact: SensorContact.NotSupported, energy_expended: -1, rr_intervals: [] },
+        fresh: false, reset: false }
+
+impl HeartRateService
+    // The measurement to notify in the next turn of the pump.  A second call before the turn replaces the first.
+    @tier(embedded)
+    fn report(var self, m: HeartRateMeasurement)
+        self.pending = m
+        self.fresh = true
+
+    // Whether a client asked to reset the energy expended since this was last called; reading it clears it.
+    @tier(embedded)
+    fn energy_reset_requested(var self) -> Bool
+        let r = self.reset
+        self.reset = false
+        r
+
+impl noble.Service[] for HeartRateService
+    // The measurement (notify), the Body Sensor Location when the configuration has one (read, stored in the Host) and the control
+    // point when it has one (write, served by `on_event`).
+    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): `attach` answers an
+    // `Int`, 0 or the code of the `Status` that stopped it, and not the `Status` itself.
+    @tier(embedded)
+    fn attach(var self, var h: noble.Host) -> Int [mutate]
+        if not accesses_usable(self.config)
+            return noble.E_BAD_ARGUMENT
+        let s = h.add_service(noble.uuid16(UUID_HEART_RATE_SERVICE))
+        if not s.status.is_ok()
+            return s.status.code as Int
+        let m = h.add_char(noble.uuid16(UUID_HEART_RATE_MEASUREMENT), noble.PROP_NOTIFY,
+            noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied },
+            noble.access_from_gatt(self.config.measurement_cccd.write), 0)
+        if not m.status.is_ok()
+            return m.status.code as Int
+        self.measurement = m.attr
+        let v = body_sensor_location_value(self.config.location)
+        if v >= 0
+            let l = h.add_char(noble.uuid16(UUID_BODY_SENSOR_LOCATION), noble.PROP_READ,
+                noble.Permissions { read: noble.access_from_gatt(self.config.read), write: noble.Access.Denied }, noble.Access.Denied, 0)
+            if not l.status.is_ok()
+                return l.status.code as Int
+            self.location = l.attr
+            var octet: noble.Value = Vec.new()
+            let _ = octet.push(v as u8)
+            let stored = h.set_value(l.attr, octet)
+            if not stored.is_ok()
+                return stored.code as Int
+        if self.config.control_point
+            let c = h.add_char(noble.uuid16(UUID_HEART_RATE_CONTROL_POINT), noble.PROP_WRITE,
+                noble.Permissions { read: noble.Access.Denied, write: noble.access_from_gatt(self.config.reset_write) }, noble.Access.Denied, 1)
+            if not c.status.is_ok()
+                return c.status.code as Int
+            self.control = c.attr
+            return h.bind_event(c.attr).code as Int
+        0
+
+    // A write of the control point: 1 resets the energy expended; another first octet is refused with Error Code 0x80 and a value
+    // of more than one octet with Invalid Attribute Value Length.  No other event is the service's.
+    @tier(embedded)
+    fn on_event(var self, ev: noble.Event, var out: noble.Outbox) -> Bool [mutate]
+        match ev
+            AttrWrite(conn, attr, svc, value) =>
+                if not self.config.control_point or attr != self.control.handle
+                    return false
+                let empty: noble.Value = Vec.new()
+                var code = 0
+                if value.len() != 1
+                    code = noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH
+                else if (value[0] as Int) != CONTROL_POINT_RESET_ENERGY
+                    code = ERR_CONTROL_POINT_NOT_SUPPORTED
+                else
+                    self.reset = true
+                let _ = out.push(noble.Out.Respond(conn, attr, code, empty))
+                true
+            _ => false
+
+    // A measurement the product reported is notified to every subscriber.  The energy expended is left out when the service has no
+    // control point to reset it.
+    @tier(embedded)
+    fn tick(var self, now_ms: Int, var out: noble.Outbox) [mutate]
+        if not self.fresh
+            return
+        self.fresh = false
+        let m = self.pending
+        let sent = if self.config.control_point
+            m
+        else
+            HeartRateMeasurement { heart_rate: m.heart_rate, contact: m.contact, energy_expended: -1, rr_intervals: m.rr_intervals }
+        let octets = heart_rate_measurement_value(sent, DEFAULT_NOTIFICATION_ROOM)
+        var v: noble.Value = Vec.new()
+        for i in 0..list.len(octets)
+            let _ = v.push(octets[i])
+        let _ = out.push(noble.Out.NotifyAll(self.measurement, v))
