@@ -11,20 +11,12 @@ use object_transfer
 use wire
 use object_channel.{ ots_poll }
 
-// workaround(a-generic-call-on-a-struct-field-of-a-var-parameter-does-not-close-in-a-small-package): `ots_poll` is generic over the
-// store, and with `var r.repo` as the argument the compiler cannot close the parameter when the package is as small as this one
-// (the same call builds in `orbit/ble`, which holds the audio roles too).  A helper that takes the store as a parameter of its
-// concrete type closes it.
-@tier(app)
-fn poll_channel(config: object_transfer.OtsConfig, var coc: l2cap_coc.CocState, var shared: object_transfer.OtsShared, var repo: object_store.MemoryStore, identity: Int, now_ms: Int) -> [l2cap_coc.CocOut] [mutate]
-    ots_poll(config, var coc, var shared, var repo, identity, now_ms)
-
 // The packets of a client's channel, one peer of the rig: `who` is 0 or 1.
 @tier(app)
 fn poll(var r: object_transfer.Rig, who: Int) -> [l2cap_coc.CocOut] [mutate]
     if who == 0
-        return poll_channel(r.config, var r.a.coc, var r.shared, var r.repo, 1, r.now)
-    poll_channel(r.config, var r.b.coc, var r.shared, var r.repo, 2, r.now)
+        return ots_poll(r.config, var r.a.coc, var r.shared, var r.repo, 1, r.now)
+    ots_poll(r.config, var r.b.coc, var r.shared, var r.repo, 2, r.now)
 
 // The octets of the SDUs in the K-frames `frames` (the SDU Length fields taken
 // off), for a client that reads them.
