@@ -17,7 +17,7 @@
 //
 // `battery_service` is the other face: a value that implements `noble.Service`,
 // for a product that hands the Adapter of the package noble a list of services
-// (`noble.plug`).  The product keeps the value and calls `set_level` on it; the
+// (`Adapter.plug`).  The product keeps the value and calls `set_level` on it; the
 // pump asks the service for a read of the level, and the service notifies every
 // subscriber when the level has changed.
 
@@ -90,7 +90,7 @@ fn set_battery_level(var db: GattDb, var link: AttLink, handles: BatteryHandles,
 
 // ── The service as a value of the Adapter's list ───────────────────────────
 
-// The service as `noble.plug` takes it.  A struct and not a `@value` struct: the Adapter holds it behind `dyn`, which needs the
+// The service as `Adapter.plug` takes it.  A struct and not a `@value` struct: the Adapter holds it behind `dyn`, which needs the
 // tag of a plain struct, and the product keeps the same value to call `set_level` on it.  `sent` is the level a client last
 // heard of, so `tick` notifies once for each change.
 struct BatteryService
@@ -120,19 +120,17 @@ fn level_value(level: Int) -> noble.Value
 impl noble.Service[] for BatteryService
     // The service, with Battery Level readable by any client and notified to those that subscribe.  The level is answered from
     // the module's state (`bind_event`), so the Host holds no copy to keep up to date.
-    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): `attach` answers an
-    // `Int`, 0 or the code of the `Status` that stopped it, and not the `Status` itself.
     @tier(embedded)
-    fn attach(var self, var h: noble.Host) -> Int [mutate]
+    fn attach(var self, var h: noble.Host) -> noble.Status [mutate]
         let s = h.add_service(noble.uuid16(UUID_BATTERY_SERVICE))
         if not s.status.is_ok()
-            return s.status.code as Int
+            return s.status
         let c = h.add_char(noble.uuid16(UUID_BATTERY_LEVEL), noble.PROP_READ | noble.PROP_NOTIFY,
             noble.Permissions { read: noble.Access.Open, write: noble.Access.Denied }, noble.Access.Open, 1)
         if not c.status.is_ok()
-            return c.status.code as Int
+            return c.status
         self.attr = c.attr
-        h.bind_event(c.attr).code as Int
+        h.bind_event(c.attr)
 
     // A read of Battery Level is answered with the level; no other event is the service's.
     @tier(embedded)

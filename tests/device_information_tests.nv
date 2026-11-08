@@ -164,7 +164,7 @@ fn test_the_service_value_stores_the_values_in_the_hosts_database_and_leaves_out
         read: gatt_server.Access.Open, manufacturer: text("Novo"), model: [], serial: [], hardware: [], firmware: [], software: [],
         system_id: [], pnp_id: pnp_id_value(PNP_SOURCE_USB_IF, 0x1915, 0x520F, 0x0100) }
     var svc = device_information_service(info)
-    test.assert_eq(svc.attach(var h), 0)
+    test.assert(svc.attach(var h).is_ok())
     // The service declaration, then a declaration and a value for each of the two characteristics.
     test.assert_eq(list.len(h.link.db.attributes), before + 5)
     // The handle of an attribute is its index plus one: the last value is the PnP ID, the value before its declaration the name.
@@ -187,4 +187,4 @@ fn test_a_value_longer_than_the_api_carries_stops_the_attach_with_no_room()
         read: gatt_server.Access.Open, manufacturer: [], model: long, serial: [], hardware: [], firmware: [], software: [],
         system_id: [], pnp_id: [] }
     var svc = device_information_service(info)
-    test.assert_eq(svc.attach(var h), noble.E_NO_ROOM)
+    test.assert(svc.attach(var h).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))

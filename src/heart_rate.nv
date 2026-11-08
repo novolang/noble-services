@@ -24,7 +24,7 @@
 //
 // `heart_rate_service` is the other face: a value that implements
 // `noble.Service`, for a product that hands the Adapter of the package noble a
-// list of services (`noble.plug`).  The product keeps the value, calls
+// list of services (`Adapter.plug`).  The product keeps the value, calls
 // `report` on it with each measurement and asks `energy_reset_requested` after
 // a turn; the service notifies every subscriber in the next turn of the pump.
 
@@ -221,7 +221,7 @@ fn heart_rate_reset_requested(handles: HeartRateHandles, changed: [Int]) -> Bool
 // notification header.
 const DEFAULT_NOTIFICATION_ROOM = 20
 
-// The service as `noble.plug` takes it.  A struct and not a `@value` struct, since the Adapter holds it behind `dyn` and the
+// The service as `Adapter.plug` takes it.  A struct and not a `@value` struct, since the Adapter holds it behind `dyn` and the
 // product keeps the same value.  `pending` is the measurement not yet notified, `fresh` whether there is one, and `reset` whether
 // a client wrote the control point since the product last asked.
 struct HeartRateService
@@ -258,41 +258,39 @@ impl HeartRateService
 impl noble.Service[] for HeartRateService
     // The measurement (notify), the Body Sensor Location when the configuration has one (read, stored in the Host) and the control
     // point when it has one (write, served by `on_event`).
-    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): `attach` answers an
-    // `Int`, 0 or the code of the `Status` that stopped it, and not the `Status` itself.
     @tier(embedded)
-    fn attach(var self, var h: noble.Host) -> Int [mutate]
+    fn attach(var self, var h: noble.Host) -> noble.Status [mutate]
         if not accesses_usable(self.config)
-            return noble.E_BAD_ARGUMENT
+            return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
         let s = h.add_service(noble.uuid16(UUID_HEART_RATE_SERVICE))
         if not s.status.is_ok()
-            return s.status.code as Int
+            return s.status
         let m = h.add_char(noble.uuid16(UUID_HEART_RATE_MEASUREMENT), noble.PROP_NOTIFY,
             noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied },
             noble.access_from_gatt(self.config.measurement_cccd.write), 0)
         if not m.status.is_ok()
-            return m.status.code as Int
+            return m.status
         self.measurement = m.attr
         let v = body_sensor_location_value(self.config.location)
         if v >= 0
             let l = h.add_char(noble.uuid16(UUID_BODY_SENSOR_LOCATION), noble.PROP_READ,
                 noble.Permissions { read: noble.access_from_gatt(self.config.read), write: noble.Access.Denied }, noble.Access.Denied, 0)
             if not l.status.is_ok()
-                return l.status.code as Int
+                return l.status
             self.location = l.attr
             var octet: noble.Value = Vec.new()
             let _ = octet.push(v as u8)
             let stored = h.set_value(l.attr, octet)
             if not stored.is_ok()
-                return stored.code as Int
+                return stored
         if self.config.control_point
             let c = h.add_char(noble.uuid16(UUID_HEART_RATE_CONTROL_POINT), noble.PROP_WRITE,
                 noble.Permissions { read: noble.Access.Denied, write: noble.access_from_gatt(self.config.reset_write) }, noble.Access.Denied, 1)
             if not c.status.is_ok()
-                return c.status.code as Int
+                return c.status
             self.control = c.attr
-            return h.bind_event(c.attr).code as Int
-        0
+            return h.bind_event(c.attr)
+        noble.ok()
 
     // A write of the control point: 1 resets the energy expended; another first octet is refused with Error Code 0x80 and a value
     // of more than one octet with Invalid Attribute Value Length.  No other event is the service's.

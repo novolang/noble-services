@@ -220,7 +220,7 @@ fn test_the_service_value_adds_the_characteristics_the_configuration_names()
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     let before = list.len(h.link.db.attributes)
     var svc = heart_rate_service(full_config(BodySensorLocation.Wrist))
-    test.assert_eq(svc.attach(var h), 0)
+    test.assert(svc.attach(var h).is_ok())
     // The service; the measurement (declaration, value, descriptor); the location (declaration, value); the control point
     // (declaration, value).
     test.assert_eq(list.len(h.link.db.attributes), before + 8)
@@ -232,20 +232,20 @@ fn test_the_service_value_adds_the_characteristics_the_configuration_names()
     var plain = heart_rate_service(HeartRateConfig {
         location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
         measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
-    test.assert_eq(plain.attach(var h2), 0)
+    test.assert(plain.attach(var h2).is_ok())
     test.assert_eq(list.len(h2.link.db.attributes), before2 + 4)
     // A configuration that denies the client the descriptor is refused.
     var h3 = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     var denied = heart_rate_service(HeartRateConfig {
         location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
         measurement_cccd: gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_server.Access.Denied }, reset_write: gatt_server.Access.Open })
-    test.assert_eq(denied.attach(var h3), noble.E_BAD_ARGUMENT)
+    test.assert(denied.attach(var h3).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
 
 @test
 fn test_a_reported_measurement_is_notified_to_every_subscriber_once()
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     var svc = heart_rate_service(full_config(BodySensorLocation.Chest))
-    test.assert_eq(svc.attach(var h), 0)
+    test.assert(svc.attach(var h).is_ok())
     var out: noble.Outbox = Vec.new()
     svc.tick(0, var out)
     test.assert_eq(out.len(), 0)
@@ -268,7 +268,7 @@ fn test_the_energy_is_left_out_when_the_service_has_no_control_point()
     var svc = heart_rate_service(HeartRateConfig {
         location: BodySensorLocation.Absent, control_point: false, read: gatt_server.Access.Open,
         measurement_cccd: gatt_server.open_permissions(), reset_write: gatt_server.Access.Open })
-    test.assert_eq(svc.attach(var h), 0)
+    test.assert(svc.attach(var h).is_ok())
     var out: noble.Outbox = Vec.new()
     svc.report(measurement(72, SensorContact.NotSupported, 5, []))
     svc.tick(0, var out)
@@ -282,7 +282,7 @@ fn test_the_energy_is_left_out_when_the_service_has_no_control_point()
 fn test_the_control_point_resets_the_energy_and_refuses_what_the_service_does_not_know()
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     var svc = heart_rate_service(full_config(BodySensorLocation.Absent))
-    test.assert_eq(svc.attach(var h), 0)
+    test.assert(svc.attach(var h).is_ok())
     let conn = noble.no_conn()
     let cp = svc.control.handle
     var out: noble.Outbox = Vec.new()

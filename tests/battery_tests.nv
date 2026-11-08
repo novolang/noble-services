@@ -155,7 +155,7 @@ fn test_the_service_value_adds_the_service_answers_a_read_and_notifies_a_change_
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     let before = list.len(h.link.db.attributes)
     var b = battery_service(87)
-    test.assert_eq(b.attach(var h), 0)
+    test.assert(b.attach(var h).is_ok())
     // The service, the characteristic declaration, its value and the descriptor, after the attributes the Host holds.
     test.assert_eq(list.len(h.link.db.attributes), before + 4)
     test.assert_eq(b.attr.handle as Int, gatt_server.last_handle(h.link.db) - 1)
@@ -180,7 +180,7 @@ fn test_the_service_value_adds_the_service_answers_a_read_and_notifies_a_change_
 fn test_a_level_that_changed_is_notified_to_every_subscriber_once_and_cut_to_a_percentage()
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     var b = battery_service(87)
-    test.assert_eq(b.attach(var h), 0)
+    test.assert(b.attach(var h).is_ok())
     var out: noble.Outbox = Vec.new()
     b.tick(0, var out)
     test.assert_eq(out.len(), 0)
