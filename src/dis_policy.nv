@@ -7,7 +7,7 @@
 // ID Source is 1 (Bluetooth SIG) or 2 (USB Implementer's Forum), every value is
 // read-only and none has a Client Characteristic Configuration descriptor.
 // `check_information` refuses a value that breaks one of those rules, and one
-// longer than `noble_services_config.MAX_DIS_OCTETS`.  What the service leaves to the product
+// longer than `noble_services.CONFIG.MAX_DIS_OCTETS`.  What the service leaves to the product
 // is asked of a `DisPolicy`: which characteristics the service holds (a value
 // that is empty leaves its characteristic out), what each one says, and the
 // access a client needs to read it, so a serial number can wait for an
@@ -23,7 +23,7 @@
 // Satisfies: REQ-BLE-PRF-001.
 
 use gatt_server
-use noble_services_config
+use noble_services.CONFIG
 use device_information
 use profile_builder
 
@@ -39,7 +39,7 @@ enum DisKind
     PnpId
 
 // Why a value or the service was refused.  Empty: the policy holds no value at
-// all.  TooLong: a value above `noble_services_config.MAX_DIS_OCTETS`.  NotUtf8: a string that
+// all.  TooLong: a value above `noble_services.CONFIG.MAX_DIS_OCTETS`.  NotUtf8: a string that
 // is not well-formed UTF-8.  BadSystemId: a System ID that is not eight octets.
 // BadPnpId: a PnP ID that is not seven octets or whose Vendor ID Source is not
 // 1 or 2.  Absent: an update of a characteristic the service does not hold.
@@ -130,7 +130,7 @@ fn uuid_of(kind: DisKind) -> Int
 fn check_value(kind: DisKind, value: [u8]) -> ?DisError
     if list.len(value) == 0
         return None
-    if list.len(value) > noble_services_config.MAX_DIS_OCTETS
+    if list.len(value) > noble_services.CONFIG.MAX_DIS_OCTETS
         return Some(DisError.TooLong)
     match kind
         SystemId =>
@@ -245,7 +245,7 @@ fn handle_of(h: DeviceInformationHandles, kind: DisKind) -> Int
 
 // Replace the value of `kind` after the service was built.  The characteristic
 // must exist in `db` (`Absent`) and the value meet its rule and
-// `noble_services_config.MAX_DIS_OCTETS`; an empty value is refused as `Absent`, since a
+// `noble_services.CONFIG.MAX_DIS_OCTETS`; an empty value is refused as `Absent`, since a
 // characteristic is not taken out of a built service.
 pub fn dis_update(var db: GattDb, handles: DeviceInformationHandles, kind: DisKind, value: [u8]) -> ?DisError
     let handle = handle_of(handles, kind)

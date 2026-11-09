@@ -4,7 +4,7 @@
 
 use std.test
 use gatt_server
-use noble_config
+use noble.CONFIG
 use links
 use battery
 use profile_builder
@@ -73,7 +73,7 @@ fn test_one_instance_is_the_service_of_battery_nv()
 @test
 @satisfies("REQ-BLE-PRF-002")
 fn test_several_instances_each_carry_a_presentation_format()
-    if noble_config.MAX_BAS < 2
+    if noble.CONFIG.MAX_BAS < 2
         return
     var s = gatt_server.new_server([], 65)
     let h = bank(var s, [open_instance(1, 90), open_instance(2, 40)])
@@ -99,7 +99,7 @@ fn test_several_instances_each_carry_a_presentation_format()
 @test
 @satisfies("REQ-BLE-PRF-002")
 fn test_the_stack_refuses_a_list_of_instances_that_breaks_a_rule()
-    if noble_config.MAX_BAS < 2
+    if noble.CONFIG.MAX_BAS < 2
         return
     var s = gatt_server.new_server([], 65)
     test.assert_eq(build_bank(var s.db, []).error, Some(BasError.NoInstance))
@@ -115,7 +115,7 @@ fn test_the_stack_refuses_a_list_of_instances_that_breaks_a_rule()
 @test
 @satisfies("REQ-BLE-PRF-002")
 fn test_the_bank_stops_when_the_table_is_full()
-    if noble_config.MAX_BAS < 2
+    if noble.CONFIG.MAX_BAS < 2
         return
     var s = gatt_server.new_server([], 65)
     test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 1)
@@ -168,7 +168,7 @@ fn test_a_change_is_notified_once_to_a_client_that_subscribed()
 @test
 @satisfies("REQ-BLE-PRF-002")
 fn test_the_policy_decides_which_changes_are_worth_a_notification()
-    if noble_config.MAX_BAS < 2
+    if noble.CONFIG.MAX_BAS < 2
         return
     var s = gatt_server.new_server([], 65)
     let h = bank(var s, [open_instance(1, 60), open_instance(2, 30)])
@@ -209,10 +209,10 @@ fn test_an_instance_a_slot_or_a_service_that_is_not_there_is_ignored()
     test.assert_eq(bas_level(s.db, h, 1), 0)
     test.assert_eq(bas_level(s.db, h, -1), 0)
     test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, peer(), 1, 0)), 0)
-    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, links.link_id(noble_config.MAX_CONNECTIONS, 1), 0, 0)), 0)
-    test.assert_eq(bas_sent(state, noble_config.MAX_CONNECTIONS, 0), -1)
-    test.assert_eq(bas_sent(state, 0, noble_config.MAX_BAS), -1)
-    bas_link_opened(var state, noble_config.MAX_CONNECTIONS)
+    test.assert_eq(list.len(bas_notify(var s.db, var s.link, h, var state, var policy, links.link_id(noble.CONFIG.MAX_CONNECTIONS, 1), 0, 0)), 0)
+    test.assert_eq(bas_sent(state, noble.CONFIG.MAX_CONNECTIONS, 0), -1)
+    test.assert_eq(bas_sent(state, 0, noble.CONFIG.MAX_BAS), -1)
+    bas_link_opened(var state, noble.CONFIG.MAX_CONNECTIONS)
     // A handle the table does not hold reads as 0.
     var other = gatt_server.new_server([], 65)
     test.assert_eq(bas_level(other.db, h, 0), 0)

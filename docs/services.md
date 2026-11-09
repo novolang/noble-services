@@ -53,7 +53,7 @@ The schema is the `[config.<key>]` tables of `novo.toml`: `max_dis_octets` is th
 Information Service, `max_hid_reports` and `max_hid_map_octets` size the HID Service, and `max_profiles_btp` is the switch
 the BTP session of `orbit/ble` turns on when it holds the three services.  The number of Battery Service instances,
 `max_bas`, multiplies `max_connections` and a cost formula reads only the keys of its own schema, so `max_bas` is a key of
-the `[noble]` section and the sources read it as `noble_config.MAX_BAS`.  It moves to this schema when a formula can read the
+the `[noble]` section and the sources read it as `noble.CONFIG.MAX_BAS`.  It moves to this schema when a formula can read the
 keys of another package.
 
 `services_budget` adds up the storage of the keys of this schema and holds the sum to the total `novo config explain`

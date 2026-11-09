@@ -3,16 +3,16 @@
 //   novo test tests/services_budget_tests.nv
 
 use std.test
-use noble_services_config
+use noble_services.CONFIG
 use services_budget.{ PRF_BTP_FIXED, PRF_REPORT_HANDLES, profiles_btp_bytes, total_bytes }
 
 // The storage of the modules and the checks of services_budget.nv hold under every profile: a test that names them makes a build of this file read them.
 @test
 fn test_the_storage_equals_the_schema_total()
-    test.assert_eq(total_bytes(), noble_services_config.budget_bytes())
+    test.assert_eq(total_bytes(), noble_services.CONFIG.budget_bytes())
 
 @test
 @satisfies("REQ-BLE-PRF-005")
 fn test_the_btp_profile_services_are_there_where_the_profile_asks_for_them()
     // The limit is 1 for the BTP face and 0 for none, so the face is one state or nothing.
-    test.assert_eq(profiles_btp_bytes(), if noble_services_config.MAX_PROFILES_BTP then PRF_BTP_FIXED + noble_services_config.MAX_HID_REPORTS * PRF_REPORT_HANDLES else 0)
+    test.assert_eq(profiles_btp_bytes(), if noble_services.CONFIG.MAX_PROFILES_BTP then PRF_BTP_FIXED + noble_services.CONFIG.MAX_HID_REPORTS * PRF_REPORT_HANDLES else 0)

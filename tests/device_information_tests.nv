@@ -8,7 +8,7 @@ use gatt_server
 use profile_builder
 use host.{ host_blank, host_config }
 use noble
-use noble_config
+use noble.CONFIG
 use device_information.{ device_information_service, DeviceInformation, DeviceInformationHandles, PNP_SOURCE_BLUETOOTH_SIG, PNP_SOURCE_USB_IF, add_device_information_service, empty_device_information, pnp_id_value, system_id_value }
 
 fn octets(v: [Int]) -> [u8]
@@ -181,7 +181,7 @@ fn test_the_service_value_stores_the_values_in_the_hosts_database_and_leaves_out
 fn test_a_value_longer_than_the_api_carries_stops_the_attach_with_no_room()
     var h = host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
     var long: [u8] = []
-    for k in 0..(noble_config.ATT_VALUE_BYTES + 1)
+    for k in 0..(noble.CONFIG.ATT_VALUE_BYTES + 1)
         list.push(long, 65)
     let info = DeviceInformation {
         read: gatt_server.Access.Open, manufacturer: [], model: long, serial: [], hardware: [], firmware: [], software: [],

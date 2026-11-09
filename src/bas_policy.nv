@@ -30,7 +30,7 @@
 // Satisfies: REQ-BLE-PRF-002.
 
 use gatt_server
-use noble_config
+use noble.CONFIG
 use links
 use battery
 use profile_builder
@@ -59,7 +59,7 @@ pub fn open_instance(description: Int, level: Int) -> BasInstance
         cccd: gatt_server.open_permissions() }
 
 // Why the service was refused.  NoInstance: the list is empty.  TooMany: more
-// instances than `noble_config.MAX_BAS`.  NeedsDescription: a service with several
+// instances than `noble.CONFIG.MAX_BAS`.  NeedsDescription: a service with several
 // instances has one with Description 0 (unknown).  SameDescription: two
 // instances share a Description.  NoRoom: the attribute table has no handle
 // left.
@@ -121,7 +121,7 @@ fn check_instances(instances: [BasInstance]) -> ?BasError
     let n = list.len(instances)
     if n == 0
         return Some(BasError.NoInstance)
-    if n > noble_config.MAX_BAS
+    if n > noble.CONFIG.MAX_BAS
         return Some(BasError.TooMany)
     if n == 1
         return None
@@ -162,25 +162,25 @@ pub fn add_battery_bank(var db: GattDb, instances: [BasInstance]) -> Result<BasH
 // ── What each connection was told ───────────────────────────────────
 
 // The level last notified to each connection for each instance, -1 for none:
-// `noble_config.MAX_BAS` entries for each of `noble_config.MAX_CONNECTIONS` slots.
+// `noble.CONFIG.MAX_BAS` entries for each of `noble.CONFIG.MAX_CONNECTIONS` slots.
 struct BasLinks
     var sent: [Int]
 
 // Builds the table of the levels last notified: -1 (none) for every connection slot and instance.
 pub fn new_bas_links() -> BasLinks
     var sent: [Int] = []
-    for _ in 0..noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS
+    for _ in 0..noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_BAS
         list.push(sent, -1)
     BasLinks { sent: sent }
 
 fn sent_index(slot: Int, instance: Int) -> Int
-    if slot < 0 or slot >= noble_config.MAX_CONNECTIONS or instance < 0 or instance >= noble_config.MAX_BAS
+    if slot < 0 or slot >= noble.CONFIG.MAX_CONNECTIONS or instance < 0 or instance >= noble.CONFIG.MAX_BAS
         return -1
-    slot * noble_config.MAX_BAS + instance
+    slot * noble.CONFIG.MAX_BAS + instance
 
 // A connection opened on `slot`: it has been told nothing yet.
 pub fn bas_link_opened(var state: BasLinks, slot: Int)
-    for instance in 0..noble_config.MAX_BAS
+    for instance in 0..noble.CONFIG.MAX_BAS
         let at = sent_index(slot, instance)
         if at >= 0
             state.sent[at] = -1

@@ -41,7 +41,7 @@ The sizes of the tables are keys of the package configuration.  A consumer write
 config file for the Device Information Service (`max_dis_octets`) and the HID Service (`max_hid_reports`,
 `max_hid_map_octets`, `max_profiles_btp`).  The number of Battery Service instances, `max_bas`, stays in the `[noble]`
 section, because its storage is a product of `max_connections` and a cost formula reads only the keys of its own schema.  The
-build writes the keys as `noble_services_config.MAX_DIS_OCTETS` and `noble_config.MAX_BAS`, and `novo config explain`
+build writes the keys as `noble_services.CONFIG.MAX_DIS_OCTETS` and `noble.CONFIG.MAX_BAS`, and `novo config explain`
 prints the storage they imply.  `configs/` holds the profiles this package's tests run under.
 
 The package depends on `noble`.  No module of `noble` imports a module of this package, and the services

@@ -5,7 +5,7 @@
 use std.test
 use att
 use gatt_server
-use noble_services_config
+use noble_services.CONFIG
 use device_information
 use profile_builder
 use dis_policy.{ all_kinds, DisError, DisKind, DisPolicy, Firmware, Hardware, Manufacturer, Model, PnpId, Serial, Software, SystemId, add_device_information_policy, check_information, dis_update, handle_of, information_policy, no_handles, uuid_of, valid_utf8 }
@@ -202,7 +202,7 @@ fn test_the_stack_refuses_a_value_that_breaks_a_rule_of_the_service()
     test.assert_eq(check_information(replaced(product(), DisKind.PnpId, device_information.pnp_id_value(3, 1, 1, 1))),
         Some(DisError.BadPnpId))
     var many: [u8] = []
-    for _ in 0..noble_services_config.MAX_DIS_OCTETS + 1
+    for _ in 0..noble_services.CONFIG.MAX_DIS_OCTETS + 1
         list.push(many, 'x')
     test.assert_eq(check_information(replaced(product(), DisKind.Serial, many)), Some(DisError.TooLong))
     test.assert_eq(check_information(product()), None)
@@ -244,7 +244,7 @@ fn test_a_value_changed_after_the_build_is_read_at_the_next_read()
     test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, []), Some(DisError.Absent))
     test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, octets([0xFF])), Some(DisError.NotUtf8))
     var many: [u8] = []
-    for _ in 0..noble_services_config.MAX_DIS_OCTETS + 1
+    for _ in 0..noble_services.CONFIG.MAX_DIS_OCTETS + 1
         list.push(many, 'x')
     test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, many), Some(DisError.TooLong))
     var other = gatt_server.new_server([], 65)

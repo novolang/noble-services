@@ -18,7 +18,7 @@
 //
 // The module builds on `hid.nv`, which holds the characteristics of the
 // service, and adds the Boot Mouse Input Report, the checks of the
-// configuration (`noble_services_config.MAX_HID_REPORTS`, `noble_services_config.MAX_HID_MAP_OCTETS`), the
+// configuration (`noble_services.CONFIG.MAX_HID_REPORTS`, `noble_services.CONFIG.MAX_HID_MAP_OCTETS`), the
 // per-connection state (`HogpLinks`) and the procedures that serve the host's
 // writes (`hogp_serve_writes`).  A HID Device also holds the Device Information
 // Service with a PnP ID and a Battery Service (`add_hogp_device`).
@@ -36,8 +36,8 @@
 
 use att
 use gatt_server
-use noble_services_config
-use noble_config
+use noble_services.CONFIG
+use noble.CONFIG
 use links
 use profile_builder
 use hid
@@ -53,7 +53,7 @@ const UUID_BOOT_MOUSE_INPUT_REPORT = 0x2A33
 // along X and along Y.
 pub const BOOT_MOUSE_REPORT_SIZE = 3
 
-// The longest Report Map the HID Service allows ([HIDS] 2.6.1), whatever `noble_services_config.MAX_HID_MAP_OCTETS` is.
+// The longest Report Map the HID Service allows ([HIDS] 2.6.1), whatever `noble_services.CONFIG.MAX_HID_MAP_OCTETS` is.
 const MAX_REPORT_MAP_OCTETS = 512
 
 // The bits of the flags octet of HID Information that are not defined.
@@ -76,8 +76,8 @@ struct HogpHandles
     remote_wake: Bool
 
 // Why the service was refused.  EmptyReportMap: no report descriptor.
-// MapTooLong: a descriptor above `noble_services_config.MAX_HID_MAP_OCTETS` or 512 octets.  TooManyReports:
-// more reports than `noble_services_config.MAX_HID_REPORTS`.  NoReports: neither a report nor a
+// MapTooLong: a descriptor above `noble_services.CONFIG.MAX_HID_MAP_OCTETS` or 512 octets.  TooManyReports:
+// more reports than `noble_services.CONFIG.MAX_HID_REPORTS`.  NoReports: neither a report nor a
 // boot report.  DuplicateReport: two reports with the same ID and type.
 // ZeroReportId: a Report ID of 0 on one of several reports of a type ([HIDS] 2.5.3.2:
 // the ID shall be nonzero where a type has more than one Report characteristic).
@@ -121,9 +121,9 @@ fn check_config(config: HogpConfig) -> ?HogpError
     let c = config.hid
     if list.len(c.report_map) == 0
         return Some(HogpError.EmptyReportMap)
-    if list.len(c.report_map) > noble_services_config.MAX_HID_MAP_OCTETS or list.len(c.report_map) > MAX_REPORT_MAP_OCTETS
+    if list.len(c.report_map) > noble_services.CONFIG.MAX_HID_MAP_OCTETS or list.len(c.report_map) > MAX_REPORT_MAP_OCTETS
         return Some(HogpError.MapTooLong)
-    if list.len(c.reports) > noble_services_config.MAX_HID_REPORTS
+    if list.len(c.reports) > noble_services.CONFIG.MAX_HID_REPORTS
         return Some(HogpError.TooManyReports)
     if list.len(c.reports) == 0 and not c.boot_keyboard and not config.boot_mouse
         return Some(HogpError.NoReports)
@@ -190,7 +190,7 @@ pub fn add_hogp_service(var db: GattDb, config: HogpConfig) -> Result<HogpHandle
 // ── The state of each connection ────────────────────────────────────
 
 // The Protocol Mode and the suspend state of each connection slot:
-// `noble_config.MAX_CONNECTIONS` entries of each.
+// `noble.CONFIG.MAX_CONNECTIONS` entries of each.
 struct HogpLinks
     var mode: [Int]
     var suspended: [Int]
@@ -199,25 +199,25 @@ struct HogpLinks
 pub fn new_hogp_links() -> HogpLinks
     var mode: [Int] = []
     var suspended: [Int] = []
-    for _ in 0..noble_config.MAX_CONNECTIONS
+    for _ in 0..noble.CONFIG.MAX_CONNECTIONS
         list.push(mode, hid.PROTOCOL_MODE_REPORT)
         list.push(suspended, 0)
     HogpLinks { mode: mode, suspended: suspended }
 
 // A connection opened on `slot`: Report Protocol Mode, not suspended.
 pub fn hogp_link_opened(var state: HogpLinks, slot: Int)
-    if slot >= 0 and slot < noble_config.MAX_CONNECTIONS
+    if slot >= 0 and slot < noble.CONFIG.MAX_CONNECTIONS
         state.mode[slot] = hid.PROTOCOL_MODE_REPORT
         state.suspended[slot] = 0
 
 // The Protocol Mode of the connection on `slot`; Report Protocol for a slot the
 // state does not hold.
 pub fn hogp_mode(state: HogpLinks, slot: Int) -> Int
-    if slot < 0 or slot >= noble_config.MAX_CONNECTIONS then hid.PROTOCOL_MODE_REPORT else state.mode[slot]
+    if slot < 0 or slot >= noble.CONFIG.MAX_CONNECTIONS then hid.PROTOCOL_MODE_REPORT else state.mode[slot]
 
 // Whether the host on `slot` told the device to suspend.
 pub fn hogp_suspended(state: HogpLinks, slot: Int) -> Bool
-    slot >= 0 and slot < noble_config.MAX_CONNECTIONS and state.suspended[slot] == 1
+    slot >= 0 and slot < noble.CONFIG.MAX_CONNECTIONS and state.suspended[slot] == 1
 
 // ── Policy ──────────────────────────────────────────────────────────
 
@@ -286,7 +286,7 @@ fn written_value(db: GattDb, link: AttLink, handle: Int) -> [u8]
 // A change of the Protocol Mode by the host of `peer`.
 fn serve_mode<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: HogpHandles, var state: HogpLinks, var policy: P, peer: links.LinkId) [e, mutate]
     let written = written_value(db, link, handles.hid.protocol_mode)
-    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble_config.MAX_CONNECTIONS
+    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble.CONFIG.MAX_CONNECTIONS
         return
     let mode = written[0] as Int
     let before = state.mode[peer.slot]
@@ -302,7 +302,7 @@ fn serve_mode<P: HogpPolicy[e]>(var db: GattDb, var link: AttLink, handles: Hogp
 fn serve_control<P: HogpPolicy[e]>(db: GattDb, handles: HogpHandles, var state: HogpLinks, var policy: P, peer: links.LinkId) [e, mutate]
     let i = gatt_server.index_of(db, handles.hid.control_point)
     let written = if i < 0 then [] else db.attributes[i].value[:]
-    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble_config.MAX_CONNECTIONS
+    if list.len(written) != 1 or peer.slot < 0 or peer.slot >= noble.CONFIG.MAX_CONNECTIONS
         return
     let suspended = if (written[0] as Int) == hid.CONTROL_POINT_SUSPEND then 1 else 0
     if suspended == state.suspended[peer.slot]

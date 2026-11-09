@@ -34,11 +34,11 @@ coverage_floor = 0
 noble = { path = "../noble" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of a service that has a key of its own.  A consumer
-# writes a [noble-services] section in its config file; the generated module is `noble_services_config`, read in the sources as
-# `noble_services_config.MAX_DIS_OCTETS`.  The keys keep the names they had in the schema of orbit/ble, where the section was [ble].
+# writes a [noble-services] section in its config file; the generated module is `noble_services.CONFIG`, read in the sources as
+# `noble_services.CONFIG.MAX_DIS_OCTETS`.  The keys keep the names they had in the schema of orbit/ble, where the section was [ble].
 #
 # A cost formula and a relation read only the keys of their own schema.  `max_bas`, the number of Battery Service instances, multiplies
-# `max_connections`, so it stays in the schema of the package noble and is read here as `noble_config.MAX_BAS`; the keys below read no
+# `max_connections`, so it stays in the schema of the package noble and is read here as `noble.CONFIG.MAX_BAS`; the keys below read no
 # key of the core.  `services_budget.nv` adds up their storage and holds the sum to the total `novo config explain` prints.
 
 [config.max_dis_octets]
