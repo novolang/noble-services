@@ -148,7 +148,7 @@ fn test_the_boot_mouse_follows_the_boot_keyboard()
     test.assert_eq(gatt_server.group_end(s.db, 0), 28)
     // Read and Notify, three octets of zeros, readable at the access of the values.
     test.assert(gatt_server.same_bytes(s.db.attributes[gatt_server.index_of(s.db, 26)].value, octets([0x12, 0x1B, 0x00, 0x33, 0x2A])))
-    test.assert(gatt_server.same_bytes(read_value(s, h.boot_mouse_input)[1:], octets([0, 0, 0])))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.boot_mouse_input)[1:], octets([0, 0, 0])))
     test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.boot_mouse_input)].permissions, gatt_server.PERM_READ)
     test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.boot_mouse_cccd)].permissions, gatt_server.PERM_READ | gatt_server.PERM_WRITE)
     test.assert_eq(list.len(h.sizes), 3)
@@ -249,7 +249,7 @@ fn test_the_protocol_mode_is_the_connections_own_and_takes_a_mode()
     test.assert_eq(policy.modes, 1)
     test.assert_eq(policy.last_mode, hid.PROTOCOL_MODE_BOOT)
     // This connection reads Boot Protocol; the other one still reads Report Protocol.
-    test.assert(gatt_server.same_bytes(read_value(s, h.hid.protocol_mode)[1:], octets([0])))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.hid.protocol_mode)[1:], octets([0])))
     let seen = gatt_server.receive(var s.db, var other, octets([0x0A, h.hid.protocol_mode & 0xFF, 0]), 0)
     test.assert(gatt_server.same_bytes(seen[0], octets([0x0B, 1])))
     // The same mode again is not a change; Report Protocol is.
@@ -274,7 +274,7 @@ fn test_the_policy_may_decline_a_protocol_mode()
     serve(var s, h, var state, var policy)
     test.assert_eq(hogp_mode(state, 0), hid.PROTOCOL_MODE_REPORT)
     test.assert_eq(policy.modes, 0)
-    test.assert(gatt_server.same_bytes(read_value(s, h.hid.protocol_mode)[1:], octets([1])))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.hid.protocol_mode)[1:], octets([1])))
     // A slot or a write the state cannot hold is left alone.
     var bad_slot = HogpLinks { mode: [], suspended: [] }
     test.assert_eq(hogp_mode(bad_slot, -1), hid.PROTOCOL_MODE_REPORT)
@@ -366,9 +366,9 @@ fn test_a_report_goes_out_in_report_protocol_mode_only()
     let h = service(var s, keyboard_config())
     var state = new_hogp_links()
     var policy = default_hogp_policy()
-    subscribe(s, h.hid.reports[0].cccd)
-    subscribe(s, h.hid.boot_input_cccd)
-    subscribe(s, h.boot_mouse_cccd)
+    subscribe(var s, h.hid.reports[0].cccd)
+    subscribe(var s, h.hid.boot_input_cccd)
+    subscribe(var s, h.boot_mouse_cccd)
     let key = octets([0, 0, 4, 0, 0, 0, 0, 0])
     let ntf = hogp_send_report(var s.db, var s.link, h, state, var policy, peer(), 1, key, 0)
     test.assert_eq(list.len(ntf), 1)
@@ -414,7 +414,7 @@ fn test_a_suspended_host_is_sent_a_report_only_where_the_policy_wakes_it()
     test.assert(h.remote_wake)
     var state = new_hogp_links()
     var policy = recorder()
-    subscribe(s, h.hid.reports[0].cccd)
+    subscribe(var s, h.hid.reports[0].cccd)
     let key = octets([0, 0, 4, 0, 0, 0, 0, 0])
     state.suspended[0] = 1
     // The policy wakes the host, and the device allows remote wake.
@@ -425,7 +425,7 @@ fn test_a_suspended_host_is_sent_a_report_only_where_the_policy_wakes_it()
     // A device without the Remote Wake bit never wakes the host, whatever the policy says.
     var quiet = gatt_server.new_server([], 65)
     let q = service(var quiet, keyboard_config())
-    subscribe(quiet, q.hid.reports[0].cccd)
+    subscribe(var quiet, q.hid.reports[0].cccd)
     policy.wake = true
     test.assert_eq(list.len(hogp_send_report(var quiet.db, var quiet.link, q, state, var policy, peer(), 1, key, 0)), 0)
     state.suspended[0] = 0
@@ -433,10 +433,10 @@ fn test_a_suspended_host_is_sent_a_report_only_where_the_policy_wakes_it()
     // Boot reports follow the same rule.
     state.mode[0] = hid.PROTOCOL_MODE_BOOT
     state.suspended[0] = 1
-    subscribe(quiet, q.hid.boot_input_cccd)
+    subscribe(var quiet, q.hid.boot_input_cccd)
     test.assert_eq(list.len(hogp_send_boot_keyboard(var quiet.db, var quiet.link, q, state, var policy, peer(), key, 0)), 0)
-    subscribe(s, h.hid.boot_input_cccd)
-    subscribe(s, h.boot_mouse_cccd)
+    subscribe(var s, h.hid.boot_input_cccd)
+    subscribe(var s, h.boot_mouse_cccd)
     test.assert_eq(list.len(hogp_send_boot_keyboard(var s.db, var s.link, h, state, var policy, peer(), key, 0)), 1)
     test.assert_eq(list.len(hogp_send_boot_mouse(var s.db, var s.link, h, state, var policy, peer(), octets([0, 1, 1]), 0)), 1)
     policy.wake = false

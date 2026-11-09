@@ -162,10 +162,10 @@ fn test_report_stored_records_by_time_offset_ends_with_success()
     for m in 0..5
         cgm_set_clock(var dev, m * 5)
         test.assert(cgm_add_measurement(var dev, sample(100 + m)))
-    let counted = write_to(var s, dev, h, config, h.racp as Int, [0x04, 0x03, 0x01, 10, 0])
+    let counted = write_to(var s, var dev, h, config, h.racp as Int, [0x04, 0x03, 0x01, 10, 0])
     test.assert_eq(counted[1][5] as Int, 3)
     let _ = gatt_server.confirmed(var s.link, 0, 1)
-    let w = write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x04, 0x01, 5, 0, 15, 0])
+    let w = write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x04, 0x01, 5, 0, 15, 0])
     test.assert_eq(w, [[0x13]])
     let sent = cgm_pump(var s.db, var s.link, h, var dev, 10, 0)
     test.assert_eq(list.len(sent), 2)
@@ -175,7 +175,7 @@ fn test_report_stored_records_by_time_offset_ends_with_success()
     test.assert_eq(dev.run.active, false)
     // Filter Type 0x02 (User Facing Time) is not allowed in this service: Operand not supported.
     let _ = gatt_server.confirmed(var s.link, 0, 2)
-    let unsupported = write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x03, 0x02, 5, 0])
+    let unsupported = write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x03, 0x02, 5, 0])
     test.assert_eq(unsupported[0], [0x13])
     test.assert_eq(unsupported[1][6] as Int, 9)
 
@@ -191,15 +191,15 @@ fn test_the_control_point_errors_use_the_common_codes()
         cgm_set_clock(var dev, m)
         test.assert(cgm_add_measurement(var dev, sample(100)))
     // Nothing subscribed: 0xFD.
-    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
     subscribe(var s, h.racp_cccd as Int, 2)
-    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
     subscribe(var s, h.measurement_cccd as Int, 1)
-    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0], [0x13])
+    test.assert_eq(write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x01])[0], [0x13])
     // A second procedure while the first runs: 0xFE.
-    test.assert_eq(write_to(var s, dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
+    test.assert_eq(write_to(var s, var dev, h, config, h.racp as Int, [0x01, 0x01])[0][4] as Int, att.ATT_ERR_PROCEDURE_ALREADY_IN_PROGRESS)
     // The specific ops control point needs its own descriptor.
-    test.assert_eq(write_to(var s, dev, h, config, h.ops as Int, [0x02])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.ops as Int, [0x02])[0][4] as Int, att.ATT_ERR_CCC_IMPROPERLY_CONFIGURED)
 
 @test
 @satisfies("REQ-BLE-CGMS-001")
@@ -210,25 +210,25 @@ fn test_the_communication_interval_is_set_read_disabled_and_set_to_the_fastest()
     var s = built.0
     let h = built.1
     let ops = h.ops as Int
-    let set = write_to(var s, dev, h, config, ops, [0x01, 10])
+    let set = write_to(var s, var dev, h, config, ops, [0x01, 10])
     test.assert_eq(set[0], [0x13])
     test.assert_eq(set[1][3], 0x1C)
     test.assert_eq(set[1][4] as Int, 0x01)
     test.assert_eq(set[1][5] as Int, 1)
     test.assert_eq(dev.interval, 10)
     let _ = gatt_server.confirmed(var s.link, 0, 1)
-    let got = write_to(var s, dev, h, config, ops, [0x02])
+    let got = write_to(var s, var dev, h, config, ops, [0x02])
     test.assert_eq(got[1][3], 0x03)
     test.assert_eq(got[1][4] as Int, 10)
     let _ = gatt_server.confirmed(var s.link, 0, 1)
-    let _ = write_to(var s, dev, h, config, ops, [0x01, 0])
+    let _ = write_to(var s, var dev, h, config, ops, [0x01, 0])
     test.assert_eq(dev.interval, 0)
     let _ = gatt_server.confirmed(var s.link, 0, 1)
-    let _ = write_to(var s, dev, h, config, ops, [0x01, 0xFF])
+    let _ = write_to(var s, var dev, h, config, ops, [0x01, 0xFF])
     test.assert_eq(dev.interval, 5)
     let _ = gatt_server.confirmed(var s.link, 0, 1)
     // The wrong operand size is Invalid Operand.
-    let bad = write_to(var s, dev, h, config, ops, [0x01])
+    let bad = write_to(var s, var dev, h, config, ops, [0x01])
     test.assert_eq(bad[1][5] as Int, RESULT_INVALID_OPERAND)
 
 @test
@@ -304,15 +304,15 @@ fn test_the_session_start_time_is_written_checked_and_read_back_and_clears_the_t
     let h = built.1
     test.assert((cgm_status_bits(dev) & STATUS_TIME_SYNC_REQUIRED) != 0)
     let good = wire.octets([0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])
-    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, good)[0], [0x13])
+    test.assert_eq(write_to(var s, var dev, h, config, h.start_time as Int, good)[0], [0x13])
     test.assert_eq(dev.start_set, true)
     test.assert_eq(read(var s, h.start_time as Int), [0x0B, 0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])
     test.assert_eq((cgm_status_bits(dev) & STATUS_TIME_SYNC_REQUIRED), 0)
     test.assert_eq(wire.get(read(var s, h.status as Int), 3, 3) & 0x100, 0)
     // A time zone, a DST offset or a date out of their tables is refused, the value kept.
-    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 100, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
-    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 3])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
-    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 0, 1, 8, 30, 0, 4, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 100, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 3])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(write_to(var s, var dev, h, config, h.start_time as Int, [0xEA, 0x07, 0, 1, 8, 30, 0, 4, 0])[0][4] as Int, att.ATT_ERR_VALUE_NOT_ALLOWED)
 
 @test
 @satisfies("REQ-BLE-CGMS-001")
@@ -324,10 +324,10 @@ fn test_with_e2e_a_write_needs_the_right_crc()
     let h = built.1
     let ops = h.ops as Int
     // Missing CRC (0x80) and Invalid CRC (0x81), [CGMS] 1.8.
-    test.assert_eq(write_to(var s, dev, h, config, ops, [0x01, 10])[0][4] as Int, ERR_MISSING_CRC)
+    test.assert_eq(write_to(var s, var dev, h, config, ops, [0x01, 10])[0][4] as Int, ERR_MISSING_CRC)
     let crc = reconnection_configuration.crc16([0x01, 10])
-    test.assert_eq(write_to(var s, dev, h, config, ops, wire.octets([0x01, 10, (crc & 0xFF) ^ 1, crc >>> 8]))[0][4] as Int, ERR_INVALID_CRC)
-    let accepted = write_to(var s, dev, h, config, ops, wire.octets([0x01, 10, crc & 0xFF, crc >>> 8]))
+    test.assert_eq(write_to(var s, var dev, h, config, ops, wire.octets([0x01, 10, (crc & 0xFF) ^ 1, crc >>> 8]))[0][4] as Int, ERR_INVALID_CRC)
+    let accepted = write_to(var s, var dev, h, config, ops, wire.octets([0x01, 10, crc & 0xFF, crc >>> 8]))
     test.assert_eq(accepted[0], [0x13])
     // The response carries a CRC over its other octets.
     let response = accepted[1]
@@ -337,7 +337,7 @@ fn test_with_e2e_a_write_needs_the_right_crc()
     // The start time and the Status, Start Time and Run Time values have one too.
     test.assert_eq(list.len(read(var s, h.status as Int)), 1 + 7)
     test.assert_eq(list.len(read(var s, h.run_time as Int)), 1 + 4)
-    test.assert_eq(write_to(var s, dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])[0][4] as Int, ERR_MISSING_CRC)
+    test.assert_eq(write_to(var s, var dev, h, config, h.start_time as Int, [0xEA, 0x07, 11, 1, 8, 30, 0, 4, 0])[0][4] as Int, ERR_MISSING_CRC)
 
 @test
 @satisfies("REQ-BLE-CGMS-001")

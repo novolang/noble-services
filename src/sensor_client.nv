@@ -238,7 +238,7 @@ fn fail(var c: SensorClient, status: Int) -> Int
 fn issue(var t: gatt_client.ClientTable, var c: SensorClient) -> Int
     let r = begin_next(var t, var c)
     if r < 0
-        return fail(c, -r)
+        return fail(var c, -r)
     if r == 0
         c.running = false
         return SE_DONE
@@ -269,7 +269,7 @@ fn sc_start(var t: gatt_client.ClientTable, var c: SensorClient, now_ms: Int) ->
     c.cursor = 0
     let r = gatt_client.begin_discover_services_by_uuid(var t, c.link, 0, 1, 0xFFFF, gatt_client.uuid16(c.service))
     if r <= 0
-        return ScStep { event: fail(c, SC_NO_ROOM), pdus: [] }
+        return ScStep { event: fail(var c, SC_NO_ROOM), pdus: [] }
     ScStep { event: SE_NONE, pdus: pump(var t, c, now_ms) }
 
 // Run the steps queued after a finished plan (the discovery is kept).
@@ -294,17 +294,17 @@ fn value_octets(var t: gatt_client.ClientTable, link: links.LinkId) -> [u8]
 @tier(app)
 fn finished(var t: gatt_client.ClientTable, var c: SensorClient, status: Int) -> Int
     if status != gatt_client.STATUS_OK
-        return fail(c, status)
+        return fail(var c, status)
     var event = SE_NONE
     if c.phase == PH_SERVICE
         let s = gatt_client.cache_find(var t, c.link, gatt_client.KIND_SERVICE, gatt_client.uuid16(c.service), 0)
         if s < 0
-            return fail(c, SC_NOT_FOUND)
+            return fail(var c, SC_NOT_FOUND)
         c.first = gatt_client.cache_handle_at(var t, c.link, s)
         c.last = gatt_client.cache_a_at(var t, c.link, s)
         c.phase = PH_CHARS
         if queued(gatt_client.begin_discover_characteristics(var t, c.link, 0, c.first, c.last)) < 0
-            return fail(c, SC_NO_ROOM)
+            return fail(var c, SC_NO_ROOM)
         return SE_NONE
     if c.phase == PH_CHARS
         c.phase = PH_DESCS
@@ -342,7 +342,7 @@ fn sc_on_pdu(var t: gatt_client.ClientTable, var c: SensorClient, pdu: [u8], now
 fn sc_tick(var t: gatt_client.ClientTable, var c: SensorClient, now_ms: Int) -> ScStep
     var event = SE_NONE
     if gatt_client.tick(var t, c.link, 0, now_ms) == gatt_client.EV_DONE and c.running
-        event = fail(c, gatt_client.result_status(var t, c.link, 0))
+        event = fail(var c, gatt_client.result_status(var t, c.link, 0))
     ScStep { event: event, pdus: [] }
 
 // ── Fixtures that the suites of other modules share ────────────────────

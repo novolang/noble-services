@@ -144,8 +144,8 @@ fn test_every_characteristic_is_built_in_the_order_of_the_plain_builder()
     test.assert_eq(handle_of(h, DisKind.Software), 13)
     test.assert_eq(handle_of(h, DisKind.SystemId), 15)
     test.assert_eq(handle_of(h, DisKind.PnpId), 17)
-    test.assert(gatt_server.same_bytes(read_value(s, h.system_id)[1:], device_information.system_id_value(0x0102030405, 0xA1B2C3)))
-    test.assert(gatt_server.same_bytes(read_value(s, h.model)[1:], text("N-1")))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.system_id)[1:], device_information.system_id_value(0x0102030405, 0xA1B2C3)))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.model)[1:], text("N-1")))
     // The policy of a `DeviceInformation` serves its values at its access.
     var plain = gatt_server.new_server([], 65)
     let by_info = build(var plain.db, information_policy(full()))
@@ -161,10 +161,10 @@ fn test_every_characteristic_is_built_in_the_order_of_the_plain_builder()
 fn test_the_policy_chooses_the_access_of_each_characteristic()
     var s = gatt_server.new_server([], 65)
     let h = built(var s, product())
-    test.assert(gatt_server.same_bytes(read_value(s, h.model)[1:], text("N-1")))
-    test.assert_eq(read_value(s, h.serial)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    test.assert(gatt_server.same_bytes(read_value(var s, h.model)[1:], text("N-1")))
+    test.assert_eq(read_value(var s, h.serial)[4] as Int, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
     gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
-    test.assert(gatt_server.same_bytes(read_value(s, h.serial)[1:], text("SN0042")))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.serial)[1:], text("SN0042")))
 
 @test
 @satisfies("REQ-BLE-PRF-001")
@@ -236,7 +236,7 @@ fn test_a_value_changed_after_the_build_is_read_at_the_next_read()
     var s = gatt_server.new_server([], 65)
     let h = built(var s, product())
     test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, text("1.2.4")), None)
-    test.assert(gatt_server.same_bytes(read_value(s, h.firmware)[1:], text("1.2.4")))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.firmware)[1:], text("1.2.4")))
     // The characteristic is not there, the value is empty, the string is not
     // UTF-8, the value is longer than the profile allows, the handles belong to
     // another table.
@@ -249,7 +249,7 @@ fn test_a_value_changed_after_the_build_is_read_at_the_next_read()
     test.assert_eq(dis_update(var s.db, h, DisKind.Firmware, many), Some(DisError.TooLong))
     var other = gatt_server.new_server([], 65)
     test.assert_eq(dis_update(var other.db, h, DisKind.Firmware, text("1.2.5")), Some(DisError.Absent))
-    test.assert(gatt_server.same_bytes(read_value(s, h.firmware)[1:], text("1.2.4")))
+    test.assert(gatt_server.same_bytes(read_value(var s, h.firmware)[1:], text("1.2.4")))
 
 @test
 @satisfies("REQ-BLE-PRF-001")
