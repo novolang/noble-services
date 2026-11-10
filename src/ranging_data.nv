@@ -20,7 +20,9 @@ use hci_cs
 
 // ── The body ────────────────────────────────────────────────────────
 
+// The octets of the Ranging Header at the start of a body.
 pub const RAS_RANGING_HEADER_OCTETS = 4
+// The octets of the header of a subevent in a body.
 pub const RAS_SUBEVENT_HEADER_OCTETS = 8
 
 // The Ranging Header: `ranging_counter` is the 12 bits, `selected_tx_power` is in dBm and `antenna_paths_mask` has one bit for each path.
@@ -151,7 +153,9 @@ fn ras_body_parse(body: [u8], producer_initiator: Bool, pct: Bool, var hdr: RasH
 
 // ── The segmentation ────────────────────────────────────────────────
 
+// Bit of the segmentation header: the first segment of a body.
 pub const SEGMENT_FIRST = 0x01
+// Bit of the segmentation header: the last segment of a body.
 pub const SEGMENT_LAST = 0x02
 
 // The octets of data in a segment for an ATT_MTU: ATT_MTU - 4 (the ATT notification header of 3 and the segmentation header of 1).
@@ -205,10 +209,12 @@ pub struct RasReassembly
     var started: Bool
     var bad: Bool
 
+// A reassembly with no segment received.
 pub @tier(app)
 fn ras_reassembly_new() -> RasReassembly
     RasReassembly { slots: [], have: [], next: 0, count: 0, seg_octets: 0, started: false, bad: false }
 
+// Forget the segments received, ready for the next body.
 pub @tier(app)
 fn ras_reassembly_clear(var r: RasReassembly)
     r.slots = []

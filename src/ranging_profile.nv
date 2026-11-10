@@ -87,6 +87,7 @@ struct RapPair
     peer: hci_cs.HciCsProcResult
     common: Int
 
+// A pair record with empty results.
 pub @tier(embedded)
 fn rap_pair_new() -> RapPair
     RapPair { hdr: ranging_data.RasHeader { ranging_counter: 0, config_id: 0, selected_tx_power: 0, antenna_paths_mask: 0 }, local: hci_cs.cs_proc_result_new(),
@@ -94,8 +95,11 @@ fn rap_pair_new() -> RapPair
 
 // The statuses of `rap_pair`.
 pub const PAIR_OK = 0
+// Status of `rap_pair`: the peer's body did not read.
 pub const PAIR_BODY_UNREADABLE = 1
+// Status of `rap_pair`: the Ranging Counter or the Config_ID of the peer's body is not that of the Host's own result.
 pub const PAIR_COUNTER_MISMATCH = 2
+// Status of `rap_pair`: a step of the peer's body has another mode than the Host's own step.
 pub const PAIR_STEPS_MISMATCH = 3
 
 // Pair `local` with `body`, the Ranging Data Body the RRSP sent for the same procedure.  `peer_initiator` says whether the RRSP held the initiator role, `pct`

@@ -919,3 +919,58 @@ fn test_the_pair_is_made_subevent_by_subevent()
     test.assert_eq(pair.local.subs[1].first, 5)
     test.assert_eq(pair.peer.steps[3].channel, pair.local.steps[5].channel)
     test.assert_eq(pair.peer.steps[7].channel, pair.local.steps[9].channel)
+
+@test
+fn test_the_ranging_counter_is_the_low_twelve_bits_of_the_procedure_counter()
+    test.assert_eq(ranging_data.ras_ranging_counter(0x234), 0x234)
+    test.assert_eq(ranging_data.ras_ranging_counter(0x1234), 0x234)
+    test.assert_eq(ranging_data.ras_ranging_counter(0xFFFF), 0xFFF)
+
+@test
+fn test_a_reassembly_that_is_cleared_holds_no_segment()
+    var r = ranging_data.ras_reassembly_new()
+    r.next = 3
+    r.count = 4
+    r.started = true
+    ranging_data.ras_reassembly_clear(var r)
+    test.assert_eq(r.next, 0)
+    test.assert_eq(r.count, 0)
+    test.assert_eq(r.started, false)
+    test.assert_eq(list.len(r.slots), 0)
+
+@test
+fn test_the_features_value_has_the_realtime_bit_only_when_the_service_has_the_characteristic()
+    let with = ranging_service.RasConfig { realtime: true, access: gatt_server.Access.Open, max_bodies: 2 }
+    let without = ranging_service.RasConfig { realtime: false, access: gatt_server.Access.Open, max_bodies: 2 }
+    // Retrieve Lost Segments and Abort are always on; Filter (bit 3) never.
+    test.assert_eq(ranging_service.ras_features_value(with), [0x07, 0, 0, 0])
+    test.assert_eq(ranging_service.ras_features_value(without), [0x06, 0, 0, 0])
+
+@test
+fn test_the_client_writes_the_acknowledgement_and_the_abort_to_the_control_point()
+    if not fixtures.client_engine_present()
+        return
+    var p = paired(false)
+    var t = p.0
+    var c = p.1
+    let ack = ranging_client.ras_client_ack(var t, var c, 0x234, 100)
+    test.assert_eq(list.len(ack), 1)
+    // A Write Command (0x52) of ACK_Ranging_Data and the counter, least significant octet first.
+    test.assert_eq(ack[0][0], 0x52)
+    test.assert_eq(ack[0][3], ranging_service.RAS_OP_ACK_RANGING_DATA as u8)
+    test.assert_eq(ack[0][4], 0x34)
+    test.assert_eq(ack[0][5], 0x02)
+    // The server supports Abort_Operation: the command goes out.
+    let abort = ranging_client.ras_client_abort(var t, var c, 200)
+    test.assert_eq(list.len(abort), 1)
+    test.assert_eq(abort[0][3], ranging_service.RAS_OP_ABORT as u8)
+    // A server that does not support it is not asked.
+    c.features = 0
+    test.assert_eq(list.len(ranging_client.ras_client_abort(var t, var c, 300)), 0)
+
+@test
+fn test_the_client_starts_the_clock_for_the_ranging_data_ready_it_expects()
+    var c = ranging_client.ras_client_new(sensor_client.test_link(), false)
+    ranging_client.ras_client_expect(var c, 100)
+    test.assert_eq(c.deadline_ms, 100 + ranging_client.RAP_READY_MS)
+    test.assert_eq(c.timeout_next, true)

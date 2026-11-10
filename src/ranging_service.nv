@@ -37,54 +37,81 @@ use profile_builder
 use hci_cs
 use ranging_data
 
+// The UUID of the Ranging Service.
 pub const UUID_RANGING_SERVICE = 0x185B
+// The UUID of the RAS Features characteristic.
 pub const UUID_RAS_FEATURES = 0x2C14
+// The UUID of the Real-time Ranging Data characteristic.
 pub const UUID_REALTIME_RANGING_DATA = 0x2C15
+// The UUID of the On-demand Ranging Data characteristic.
 pub const UUID_ONDEMAND_RANGING_DATA = 0x2C16
+// The UUID of the RAS Control Point characteristic.
 pub const UUID_RAS_CONTROL_POINT = 0x2C17
+// The UUID of the Ranging Data Ready characteristic.
 pub const UUID_RANGING_DATA_READY = 0x2C18
+// The UUID of the Ranging Data Overwritten characteristic.
 pub const UUID_RANGING_DATA_OVERWRITTEN = 0x2C19
 
 // The RAS Features bits (Table 3.3).
 pub const RAS_FEATURE_REALTIME = 0x01
+// RAS Features bit 1: the server retrieves lost ranging data segments.
 pub const RAS_FEATURE_RETRIEVE_LOST = 0x02
+// RAS Features bit 2: the server aborts an operation.
 pub const RAS_FEATURE_ABORT = 0x04
+// RAS Features bit 3: the server filters ranging data (this server does not).
 pub const RAS_FEATURE_FILTER = 0x08
 
 // The op codes of the control point (Tables 3.10 and 3.11).
 pub const RAS_OP_GET_RANGING_DATA = 0x00
+// Op code of the control point: the client has the ranging data of a counter.
 pub const RAS_OP_ACK_RANGING_DATA = 0x01
+// Op code of the control point: send the lost segments of a counter again.
 pub const RAS_OP_RETRIEVE_LOST_SEGMENTS = 0x02
+// Op code of the control point: abort the operation in progress.
 pub const RAS_OP_ABORT = 0x03
+// Op code of the control point: set the filter of the ranging data (this server does not support it).
 pub const RAS_OP_SET_FILTER = 0x04
 
 // The responses on the control point.
 pub const RAS_RSP_COMPLETE_RANGING_DATA = 0x00
+// Response of the control point: the lost segments were sent again.
 pub const RAS_RSP_COMPLETE_LOST_SEGMENT = 0x01
+// Response of the control point: a Response Code Value for the op code.
 pub const RAS_RSP_CODE = 0x02
 
 // The Response Code Values (Table 3.12).
 pub const RAS_RV_SUCCESS = 0x01
+// Response Code Value: the server does not support the op code.
 pub const RAS_RV_OP_CODE_NOT_SUPPORTED = 0x02
+// Response Code Value: a parameter of the op code is invalid.
 pub const RAS_RV_INVALID_PARAMETER = 0x03
+// Response Code Value: the operation succeeded and the setting persists.
 pub const RAS_RV_SUCCESS_PERSISTED = 0x04
+// Response Code Value: the server could not abort the operation.
 pub const RAS_RV_ABORT_UNSUCCESSFUL = 0x05
+// Response Code Value: the procedure of the counter is not complete.
 pub const RAS_RV_PROCEDURE_NOT_COMPLETED = 0x06
+// Response Code Value: the server is busy with another operation.
 pub const RAS_RV_SERVER_BUSY = 0x07
+// Response Code Value: the server has no data for the counter.
 pub const RAS_RV_NO_RECORDS_FOUND = 0x08
 
 // The ATT application error codes of RAS (Table 2.1): a CCCD not configured as the service requires, and a write that cannot be fulfilled.
 pub const RAS_ERR_CCCD_IMPROPERLY_CONFIGURED = 0xFD
+// ATT application error: the write cannot be fulfilled.
 pub const RAS_ERR_WRITE_REQUEST_REJECTED = 0xFC
 
 // The times of RAP 3.2.1 and RAS 3.3.4 in milliseconds: the wait for ACK_Ranging_Data after a Complete Ranging Data Response, and how long the server keeps
 // data the client did not acknowledge.
 pub const RAS_ACK_TIMEOUT_MS = 5000
+// How long the server keeps the data the client did not acknowledge, in milliseconds.
 pub const RAS_RETAIN_TIMEOUT_MS = 10000
 
 // The mode a client enabled with the Client Characteristic Configuration descriptors.
 pub const RAS_MODE_NONE = 0
+// The client enabled the Real-time Ranging Data characteristic.
 pub const RAS_MODE_REALTIME = 1
+// The client enabled the On-demand Ranging Data characteristic.
 pub const RAS_MODE_ONDEMAND = 2
 
 // The configuration of the service.  `realtime` adds the Real-time Ranging Data characteristic and sets feature bit 0; `access` is the access a client needs to read the
@@ -180,6 +207,7 @@ pub struct RasServer
     var overwritten_value: Int
     var aborted: Bool
 
+// A server for `config` with no data stored and no operation in progress.
 pub @tier(app)
 fn ras_server_new(config: RasConfig) -> RasServer
     RasServer { max_bodies: config.max_bodies, counters: [], bodies: [], fetched: [], last_sent: -1, last_mtu: 0, last_segments: 0, awaiting_ack: -1,

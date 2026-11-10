@@ -40,26 +40,40 @@ use ranging_data
 use ranging_service
 use hci_cs
 
+// Event bit: nothing happened.
 pub const RE_NONE = 0
+// Event bit: the plan is done; the service is discovered, the features read and the subscriptions in place.
 pub const RE_SETUP = 1
+// Event bit: RAS Features arrived.
 pub const RE_FEATURES = 2
+// Event bit: a Ranging Data Ready arrived.
 pub const RE_DATA_READY = 4
+// Event bit: a body is complete.
 pub const RE_BODY = 8
+// Event bit: the server acknowledged the ACK_Ranging_Data with a success.
 pub const RE_ACKED = 16
+// Event bit: a Ranging Data Overwritten arrived; the data of that procedure is gone.
 pub const RE_OVERWRITTEN = 32
+// Event bit: the plan or a transfer failed.
 pub const RE_ERROR = 64
 
 // The codes the client adds to the statuses of the ATT engine and the Response Code Values of the server.
 pub const RC_TIMEOUT = 0x500
+// Error code: segments are missing and the server cannot send them again, or the client asked too often.
 pub const RC_SEGMENTS_LOST = 0x501
+// Error code: the reassembled body did not read as a Ranging Data Body (reserved; no call sets it yet).
 pub const RC_BAD_BODY = 0x502
+// Error code: the server does not support what the call needs (reserved; no call sets it yet).
 pub const RC_NOT_SUPPORTED = 0x503
+// Error code: a notification or a response of the server did not have the form RAS gives it.
 pub const RC_MALFORMED = 0x504
 
 // The RAP timeouts in milliseconds: the first segment after Get_Ranging_Data (RAP 4.5.4.1), a segment after the previous one, and Ranging Data Ready after the
 // start of the procedure (RAP 4.4.3.1).
 pub const RAP_FIRST_SEGMENT_MS = 5000
+// The longest wait for a segment after the previous one, in milliseconds.
 pub const RAP_NEXT_SEGMENT_MS = 1000
+// The longest wait for Ranging Data Ready after the start of the procedure, in milliseconds.
 pub const RAP_READY_MS = 5000
 
 // The phases of a transfer.
@@ -98,6 +112,7 @@ pub struct RasStep
     var event: Int
     var pdus: [[u8]]
 
+// A client for the Ranging Service of `link`, real-time or on-demand, with the automatic Get_Ranging_Data and ACK_Ranging_Data on.
 pub @tier(app)
 fn ras_client_new(link: links.LinkId, realtime: Bool) -> RasClient
     RasClient { sc: sensor_client.sc_new(link, ranging_service.UUID_RANGING_SERVICE), realtime: realtime, features: -1, auto_get: true, auto_ack: true, phase: PH_IDLE,
