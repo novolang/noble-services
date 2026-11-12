@@ -31,7 +31,7 @@ sibling_check = "warn"
 coverage_floor = 0
 
 [dependencies]
-noble = "^0.2.0"
+noble = { path = "../noble" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of a service that has a key of its own.  A consumer
 # writes a [noble-services] section in its config file; the generated module is `noble_services.CONFIG`, read in the sources as
