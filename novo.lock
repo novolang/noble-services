@@ -14,4 +14,4 @@ path = "../noble-hci"
 
 [config.main]
 sha256 = "a05d541781753a343b61ba58e70bacafd455a2aabb6c942a2b0009eaec82f0a9"
-schemas = "noble-services 0.1.1, noble 0.2.0"
+schemas = "noble-services 0.1.1, noble 0.2.1"
