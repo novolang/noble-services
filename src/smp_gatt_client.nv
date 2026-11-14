@@ -1,0 +1,124 @@
+// src/smp_gatt_client.nv — the Central's side of the SMP service, for a program on a PC.
+//
+// The service (src/smp_gatt.nv) carries SMP packets and knows nothing of what is in them, and so does this client: it finds the
+// service on a connection, subscribes to the characteristic, writes a packet to it without response in pieces of ATT_MTU - 3 bytes
+// and puts the notifications of the answer together by the Data Length in the header of the first.  The requests and the readings
+// of the responses are the program's, over `mcumgr-nv` (orbit/noble-examples/pc/ble_smp.nv).  A packet is a list of bytes: this
+// is a host client, and a PC has the heap.
+//
+//   match smp_gatt_client.open(var ble, conn)
+//       ...
+//   let sent = smp_gatt_client.send(var ble, peer, request)
+//   let response = smp_gatt_client.receive(var ble, peer, 5000)
+
+use noble
+use smp_gatt
+
+// The bytes of an SMP header, and the offset of the Data Length in it.
+const HEADER_BYTES = 8
+
+// The service on a connection: the link, the characteristic and the ATT_MTU the link settled on.
+pub @value
+struct SmpPeer
+    conn: noble.ConnId
+    chr: noble.Attr
+    mtu: Int
+
+// What `open` answers: the status, and the peer when it is ok.
+pub @value
+struct SmpOpen
+    status: noble.Status
+    peer: SmpPeer
+
+// The bytes a piece carries on a link of ATT_MTU `mtu`: the MTU less the 3 bytes of the ATT header, at most what a value of the
+// Host holds, and at least 1.
+@tier(app)
+pub fn piece_bytes(mtu: Int) -> Int
+    var n = mtu - 3
+    if n > noble.CONFIG.ATT_VALUE_BYTES
+        n = noble.CONFIG.ATT_VALUE_BYTES
+    if n < 1
+        n = 1
+    n
+
+// The length of the packet that starts `got`, header included, 0 while fewer than the 8 bytes of the header are there.
+@tier(app)
+pub fn packet_bytes(got: [u8]) -> Int
+    if list.len(got) < HEADER_BYTES
+        return 0
+    HEADER_BYTES + (got[2] as Int) * 256 + (got[3] as Int)
+
+// Whether `got` holds a whole packet.
+@tier(app)
+pub fn is_whole(got: [u8]) -> Bool
+    let total = packet_bytes(got)
+    total > 0 and list.len(got) >= total
+
+// The packet at the start of `got`: its first `packet_bytes` bytes.
+@tier(app)
+pub fn first_packet(got: [u8]) -> [u8]
+    got[0:packet_bytes(got)]
+
+// Finds the SMP service on `conn`, settles the ATT_MTU and subscribes to the characteristic's notifications.
+@tier(app)
+pub fn open<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: noble.Adapter<T, P, B>, conn: noble.ConnId) -> SmpOpen [e, f, g, async, time, mutate]
+    // cov: skip — drives a Controller; the bench runs it (orbit/noble-examples/pc/ble_smp.nv against a device, docs/examples.md)
+    let blank = noble.Attr { handle: 0, props: 0, cccd: 0 }
+    let none = SmpPeer { conn: conn, chr: blank, mtu: 23 }
+    let found = ble.discover(conn, smp_gatt.service_uuid())
+    if not found.is_ok()
+        return SmpOpen { status: found, peer: none }
+    match ble.find_char(conn, smp_gatt.service_uuid(), smp_gatt.char_uuid())
+        None => return SmpOpen { status: noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND), peer: none }
+        Some(chr) =>
+            let exchanged = ble.exchange_mtu(conn)
+            if not exchanged.is_ok()
+                return SmpOpen { status: exchanged, peer: none }
+            var mtu = 23
+            match ble.conn_info(conn)
+                Some(info) => mtu = info.mtu as Int
+                None => ()
+            let subscribed = ble.subscribe(conn, chr, noble.NOTIFY, noble.Security.Open)
+            if not subscribed.is_ok()
+                return SmpOpen { status: subscribed, peer: none }
+            SmpOpen { status: noble.ok(), peer: SmpPeer { conn: conn, chr: chr, mtu: mtu } }
+
+// Writes `packet` to the characteristic without response, in pieces.
+@tier(app)
+pub fn send<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: noble.Adapter<T, P, B>, peer: SmpPeer, packet: [u8]) -> noble.Status [e, f, g, async, time, mutate]
+    // cov: skip — drives a Controller; the bench runs it
+    let room = piece_bytes(peer.mtu)
+    var at = 0
+    for _w in 0..list.len(packet) + 1
+        if at >= list.len(packet)
+            break
+        var n = list.len(packet) - at
+        if n > room
+            n = room
+        var v: noble.Value = Vec.new()
+        for i in 0..n
+            let _ = v.push(packet[at + i])
+        let wrote = ble.write_no_response(peer.conn, peer.chr, noble.Security.Open, var v)
+        if not wrote.is_ok()
+            return wrote
+        at = at + n
+    noble.ok()
+
+// Waits for the notifications of one packet, `wait_ms` for each, and answers the packet; an empty list when none came in time or the
+// link went.
+@tier(app)
+pub fn receive<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: noble.Adapter<T, P, B>, peer: SmpPeer, wait_ms: Int) -> [u8] [e, f, g, async, time, mutate]
+    // cov: skip — drives a Controller; the bench runs it
+    var got: [u8] = []
+    for _n in 0..100000
+        match ble.wait_event(wait_ms)
+            Some(Notification(conn, attr, indication, value)) =>
+                if attr == peer.chr.handle
+                    for i in 0..value.len()
+                        list.push(got, value[i])
+                    if is_whole(got)
+                        return first_packet(got)
+            Some(Disconnected(conn, reason)) => return []
+            Some(_) => ()
+            None => return []
+    []

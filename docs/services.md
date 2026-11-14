@@ -38,6 +38,16 @@ No module of `noble` imports a module of this package, and the services import n
    `ranging_client` is the Ranging Requester's session over `sensor_client`; `ranging_profile` holds the procedures RAP 1.0 adds
    (the Responder, the Requester's checks and the pairing of the two results).  The server stores bodies on the heap, up to
    `max_bodies`; Set_Filter is not supported.  `planning/BLE-CS-HOST.md` has the state of each characteristic.
+9. **Firmware update.**  `smp_gatt` is the SMP service of MCUmgr (8D53DC1D-1DB7-4CD3-868B-8A527460AA84), the transport of nRF Connect Device
+   Manager, `mcumgr` and `smpmgr`.  A request is written to its one characteristic without response, in pieces of ATT_MTU - 3 bytes that the
+   Data Length in the header of the first puts together, and the response comes back in notifications of the same size.  The service
+   reassembles nothing itself: it hands each byte to the product's `SmpEngine` (the server, which owns the request and response buffers of
+   `smp_buf_bytes`), asks it to answer a request that is whole, and sends the bytes of the response.  The characteristic is bound to a
+   function, so the product's policy gives `on_write` to the service; `set_mtu` and `peer` let the product tell the service the link's
+   ATT_MTU.  A reset request resets the device 200 ms after its response is queued, and a request that stops arriving is dropped after 3 s.
+   `value_fits` is the condition on the `[noble]` section that `attach` checks: a value of the Host holds a piece of the largest ATT_MTU
+   (`att_value_bytes` at least `max_att_mtu` - 3).  `smp_gatt_client` is the Central's side for a PC (`open`, `send`, `receive`).
+   `orbit/noble-examples/pc/fota_product.nv` is a product with the service over `mcumgr-nv` and the bootloader of `orbit/novoboot`.
 
 Every `<service>_client` module is the Collector side of the service of the same name.
 

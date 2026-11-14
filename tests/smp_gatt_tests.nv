@@ -1,0 +1,478 @@
+// tests/smp_gatt_tests.nv — the unit tests of src/smp_gatt.nv.
+//
+//   novo test tests/smp_gatt_tests.nv --config configs/smp.toml
+//
+// The service runs over an engine of the test's own, a server that answers a request with the request's bytes and a write response
+// operation, so the pieces the service cuts a response into can be put together and compared.  A write reaches the service the way the
+// Host hands it one, through `on_write`, and the pieces of the response go out in `tick`.  The profile configs/smp.toml gives a value
+// of the Host 244 bytes, the size of a piece of the largest ATT_MTU; under the default configuration (a value of 64 bytes) `attach`
+// refuses, which one test checks.
+
+use std.test
+use host.{ host_blank, host_config }
+use gatt_server
+use wire
+use noble
+use smp_gatt.{ PUSH_BAD_HEADER, PUSH_TOO_LARGE, REASSEMBLY_TIMEOUT_MS, RESET_DELAY_MS, SmpEngine, SmpService, smp_service, value_fits }
+
+// The engine of the tests: the request in `rx`, the response in `tx`.  A command byte 98 asks for no response, 99 for a reset.
+var rx: Vec[u8; 512] = Vec.new()
+var tx: Vec[u8; 512] = Vec.new()
+var reset_asked = false
+var resets = 0
+var answered = 0
+
+@value
+struct Echo
+    id: Int
+
+impl SmpEngine[mutate] for Echo
+    @tier(embedded)
+    fn push(var self, b: Int) -> Int [mutate]
+        let _ = rx.push(b as u8)
+        if rx.len() < 8
+            return 0
+        if (rx[0] as Int) >= 0x20
+            rx.clear()
+            return PUSH_BAD_HEADER
+        let total = 8 + (rx[2] as Int) * 256 + (rx[3] as Int)
+        if total > 512
+            rx.clear()
+            return PUSH_TOO_LARGE
+        if rx.len() == total
+            return total
+        0
+
+    @tier(embedded)
+    fn answer(var self, n: Int) -> Int [mutate]
+        answered = answered + 1
+        let command = rx[7] as Int
+        tx.clear()
+        for i in 0..n
+            let _ = tx.push(rx[i])
+        tx[0] = ((rx[0] as Int & 0xF8) | 3) as u8
+        rx.clear()
+        if command == 98
+            return 0
+        if command == 99
+            reset_asked = true
+        n
+
+    @tier(embedded)
+    fn held(self) -> Int [mutate]
+        rx.len()
+
+    @tier(embedded)
+    fn clear(var self) [mutate]
+        rx.clear()
+
+    @tier(embedded)
+    fn tx_byte(self, i: Int) -> Int [mutate]
+        tx[i] as Int
+
+    @tier(embedded)
+    fn reset_requested(var self) -> Bool [mutate]
+        let r = reset_asked
+        reset_asked = false
+        r
+
+    @tier(embedded)
+    fn reset(var self) [mutate]
+        resets = resets + 1
+
+alias Pkt = Vec[u8; 512]
+
+fn fresh() [mutate]
+    rx.clear()
+    tx.clear()
+    reset_asked = false
+    resets = 0
+    answered = 0
+
+// The packet of a request: the header for `len` bytes of body and the command `command`, then `len` counting bytes.
+fn packet(len: Int, command: Int) -> Pkt
+    var p: Pkt = Vec.new()
+    let _ = p.push(2)
+    let _ = p.push(0)
+    let _ = p.push((len >> 8) as u8)
+    let _ = p.push((len & 255) as u8)
+    let _ = p.push(0)
+    let _ = p.push(1)
+    let _ = p.push(5)
+    let _ = p.push(command as u8)
+    for i in 0..len
+        let _ = p.push((i & 0x7F) as u8)
+    p
+
+// The bytes `lo` to `hi` of a packet, as a write of the client carries them.
+fn piece(p: Pkt, lo: Int, hi: Int) -> noble.Value
+    var v: noble.Value = Vec.new()
+    for i in lo..hi
+        let _ = v.push(p[i])
+    v
+
+// A packet of at most the bytes of a value, as one write.
+fn whole(p: Pkt) -> noble.Value
+    piece(p, 0, p.len())
+
+// One write command to the service, as the Host hands it over: answers what `on_write` answered.
+fn write(var svc: SmpService<Echo>, v: noble.Value) -> Int [mutate]
+    var w = v
+    svc.on_write(noble.no_conn(), svc.chr.handle, var w)
+
+// The notifications in `out`, put together in order.
+fn gathered(out: noble.Outbox, svc: SmpService<Echo>) -> Pkt
+    var all: Pkt = Vec.new()
+    for i in 0..out.len()
+        match out[i]
+            Notify(conn, attr, v) =>
+                test.assert_eq(attr.handle, svc.chr.handle)
+                for k in 0..v.len()
+                    let _ = all.push(v[k])
+            _ => test.fail("only notifications are queued")
+    all
+
+fn attached(var h: noble.Host) -> SmpService<Echo>
+    let svc = smp_service(Echo { id: 0 }, noble.Access.Open)
+    var s = svc
+    test.assert(s.attach(var h).is_ok())
+    s
+
+fn host() -> noble.Host
+    host_blank(host_config(1, ['n', 'o', 'b', 'l', 'e']))
+
+@test
+fn test_the_service_is_one_characteristic_that_is_written_without_response_and_notified() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    let before = list.len(h.link.db.attributes)
+    let svc = attached(var h)
+    // The service; the characteristic's declaration, value and descriptor.
+    test.assert_eq(list.len(h.link.db.attributes), before + 4)
+    test.assert_eq(svc.chr.props as Int, noble.PROP_WRITE_NO_RESPONSE | noble.PROP_NOTIFY)
+    test.assert(svc.chr.cccd != 0)
+    test.case("the UUIDs are the ones of Zephyr's SMP transport page")
+    let su = noble.uuid_octets(smp_gatt.service_uuid())
+    test.assert_eq(list.len(su), 16)
+    test.assert_eq(su[0] as Int, 0x84)
+    test.assert_eq(su[1] as Int, 0xAA)
+    test.assert_eq(su[7] as Int, 0x86)
+    test.assert_eq(su[8] as Int, 0xD3)
+    test.assert_eq(su[15] as Int, 0x8D)
+    let cu = noble.uuid_octets(smp_gatt.char_uuid())
+    test.assert_eq(cu[0] as Int, 0x48)
+    test.assert_eq(cu[1] as Int, 0x7C)
+    test.assert_eq(cu[8] as Int, 0x01)
+    test.assert_eq(cu[15] as Int, 0xDA)
+
+@test
+fn test_a_notification_does_not_shorten_the_longest_request() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    let svc = attached(var h)
+    // `host_api.notify` stores the value it sends with `gatt_server.set_value`; the first answer of a server is short.
+    let sent = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    test.assert(gatt_server.set_value(var h.link.db, svc.chr.handle as Int, wire.octets(sent)))
+    var pdu: [u8] = [0x52, (svc.chr.handle & 255) as u8, (svc.chr.handle >> 8) as u8]
+    for k in 0..noble.CONFIG.ATT_VALUE_BYTES
+        list.push(pdu, 7)
+    let rsp = gatt_server.receive(var h.link.db, var h.link.att, pdu, 0)
+    test.assert_eq(list.len(rsp), 0)
+    test.assert_eq(list.len(gatt_server.take_held(var h.link.att)), 1)
+
+@test
+fn test_a_request_in_one_write_is_answered_in_the_next_tick() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    let req = packet(10, 1)
+    test.assert_eq(write(var svc, whole(req)), 0)
+    test.assert_eq(answered, 1)
+    test.assert_eq(svc.requests(), 1)
+    test.assert_eq(out.len(), 0)
+    svc.tick(10, var out)
+    // 18 bytes: one piece of the default ATT_MTU of 23 less 3, which is 20.
+    test.assert_eq(out.len(), 1)
+    let got = gathered(out, svc)
+    test.assert_eq(got.len(), 18)
+    test.assert_eq(got[0] as Int, 3)
+    test.assert_eq(got[7] as Int, 1)
+    test.assert_eq(got[17] as Int, 9)
+
+@test
+fn test_a_write_of_another_attribute_is_not_the_services() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    var w = whole(packet(0, 1))
+    test.assert_eq(svc.on_write(noble.no_conn(), svc.chr.handle + 10, var w), noble.NOT_HANDLED)
+    svc.tick(1, var out)
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(answered, 0)
+    test.assert(not svc.on_event(noble.Event.Ready, var out))
+
+@test
+fn test_a_request_in_pieces_is_put_together_by_the_header() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    svc.set_mtu(247)
+    var out: noble.Outbox = Vec.new()
+    let req = packet(300, 1)
+    // 308 bytes in writes of 244 and 64: the first does not complete it.
+    test.assert_eq(write(var svc, piece(req, 0, 244)), 0)
+    test.assert_eq(answered, 0)
+    svc.tick(1, var out)
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(write(var svc, piece(req, 244, 308)), 0)
+    test.assert_eq(answered, 1)
+    test.case("the response of 308 bytes goes out in pieces of 244 and 64")
+    svc.tick(2, var out)
+    test.assert_eq(out.len(), 2)
+    let got = gathered(out, svc)
+    test.assert_eq(got.len(), 308)
+    test.assert_eq(got[307] as Int, (299 & 0x7F))
+
+@test
+fn test_a_response_is_cut_by_the_mtu_and_the_outbox_takes_a_few_pieces_a_turn() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    // The default MTU of 23 gives pieces of 20 bytes: 308 bytes are 16 of them, and the Outbox holds `OUTBOX`.
+    let req = packet(300, 1)
+    for k in 0..16
+        let lo = k * 20
+        var hi = lo + 20
+        if hi > 308
+            hi = 308
+        test.assert_eq(write(var svc, piece(req, lo, hi)), 0)
+    var sent = 0
+    var all: Pkt = Vec.new()
+    for turn in 0..16
+        var out: noble.Outbox = Vec.new()
+        svc.tick(10 + turn, var out)
+        test.assert(out.len() <= out.capacity())
+        sent = sent + out.len()
+        let more = gathered(out, svc)
+        for i in 0..more.len()
+            let _ = all.push(more[i])
+    test.assert_eq(sent, 16)
+    test.assert_eq(all.len(), 308)
+    test.assert_eq(all[100] as Int, ((100 - 8) & 0x7F))
+    test.case("nothing is left to send afterwards")
+    var out: noble.Outbox = Vec.new()
+    svc.tick(1000, var out)
+    test.assert_eq(out.len(), 0)
+
+// The bytes of the first notification the service queues for a request of `body` bytes written in pieces of at most 244, on a link
+// whose ATT_MTU the service was told is `mtu`.
+fn first_piece(mtu: Int, body: Int) -> Int [mutate]
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    svc.set_mtu(mtu)
+    var out: noble.Outbox = Vec.new()
+    let req = packet(body, 1)
+    var at = 0
+    for _w in 0..4
+        if at < req.len()
+            var hi = at + 244
+            if hi > req.len()
+                hi = req.len()
+            let _ = write(var svc, piece(req, at, hi))
+            at = hi
+    svc.tick(1, var out)
+    match out[0]
+        Notify(conn, attr, v) => return v.len()
+        _ => test.fail("a notification")
+    0
+
+@test
+fn test_the_mtu_bounds_a_piece_and_a_value_bounds_it_too() [mutate]
+    if not value_fits()
+        return
+    test.case("an MTU of 100 gives pieces of 97")
+    test.assert_eq(first_piece(100, 190), 97)
+    test.case("an MTU the link has not told, or a nonsense one, still moves a byte at a time")
+    test.assert_eq(first_piece(0, 10), 1)
+    test.assert_eq(first_piece(3, 10), 1)
+    test.case("an MTU larger than a value of the Host holds gives pieces of the value")
+    test.assert_eq(first_piece(10000, 300), noble.CONFIG.ATT_VALUE_BYTES)
+
+@test
+fn test_a_request_that_comes_before_the_last_response_has_gone_is_dropped() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    let big = packet(300, 1)
+    for k in 0..16
+        let lo = k * 20
+        var hi = lo + 20
+        if hi > 308
+            hi = 308
+        let _ = write(var svc, piece(big, lo, hi))
+    test.assert_eq(answered, 1)
+    // The response has not gone out: no tick has run.
+    test.assert_eq(write(var svc, whole(packet(2, 1))), 0)
+    test.assert_eq(answered, 1)
+    test.assert_eq(svc.dropped(), 1)
+    test.assert_eq(rx.len(), 0)
+
+@test
+fn test_packets_the_engine_refuses_are_counted() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    var bad = packet(4, 1)
+    bad[0] = 0xE0 as u8
+    test.assert_eq(write(var svc, piece(bad, 0, 12)), 0)
+    test.assert_eq(svc.dropped(), 1)
+    var huge = packet(4, 1)
+    huge[2] = 0x03 as u8
+    huge[3] = 0x00 as u8
+    test.assert_eq(write(var svc, piece(huge, 0, 8)), 0)
+    test.assert_eq(svc.dropped(), 2)
+    svc.tick(1, var out)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_request_with_no_response_queues_nothing() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    test.assert_eq(write(var svc, whole(packet(0, 98))), 0)
+    test.assert_eq(answered, 1)
+    test.assert_eq(svc.requests(), 0)
+    svc.tick(1, var out)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_request_that_stops_short_is_dropped_after_the_timeout() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    let req = packet(40, 1)
+    test.assert_eq(write(var svc, piece(req, 0, 20)), 0)
+    test.assert_eq(rx.len(), 20)
+    // The turn that first sees the held bytes starts the clock; more bytes restart it.
+    svc.tick(100, var out)
+    test.assert_eq(rx.len(), 20)
+    test.assert_eq(write(var svc, piece(req, 20, 30)), 0)
+    svc.tick(2000, var out)
+    svc.tick(2000 + REASSEMBLY_TIMEOUT_MS, var out)
+    test.assert_eq(rx.len(), 30)
+    svc.tick(2001 + 2 * REASSEMBLY_TIMEOUT_MS, var out)
+    test.assert_eq(rx.len(), 0)
+    test.assert_eq(svc.dropped(), 1)
+    test.case("a request after it starts afresh")
+    test.assert_eq(write(var svc, whole(packet(4, 1))), 0)
+    test.assert_eq(answered, 1)
+
+@test
+fn test_a_disconnect_and_a_new_connection_drop_what_was_in_flight() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    svc.set_mtu(247)
+    var out: noble.Outbox = Vec.new()
+    let req = packet(40, 1)
+    test.assert_eq(write(var svc, piece(req, 0, 20)), 0)
+    test.assert_eq(rx.len(), 20)
+    test.assert(not svc.on_event(noble.Event.Disconnected(noble.no_conn(), noble.ok()), var out))
+    test.assert_eq(rx.len(), 0)
+    // A response not yet sent goes with the link, and a new link starts at the default MTU.
+    let big = packet(300, 1)
+    test.assert_eq(write(var svc, piece(big, 0, 244)), 0)
+    test.assert_eq(write(var svc, piece(big, 244, 308)), 0)
+    let addr = noble.blank_report().addr
+    let link = noble.ConnId { slot: 0, generation: 3 }
+    test.assert_eq(svc.peer().slot as Int, 255)
+    test.assert(not svc.on_event(noble.Event.Connected(link, noble.Role.Peripheral, addr, noble.conn_params_default()), var out))
+    test.assert_eq(svc.peer().slot as Int, 0)
+    test.assert_eq(svc.peer().generation as Int, 3)
+    svc.tick(5, var out)
+    test.assert_eq(out.len(), 0)
+    test.case("and the disconnect clears the peer")
+    test.assert(not svc.on_event(noble.Event.Disconnected(link, noble.ok()), var out))
+    test.assert_eq(svc.peer().slot as Int, 255)
+
+@test
+fn test_a_reset_request_resets_the_device_after_its_response_has_gone() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    var out: noble.Outbox = Vec.new()
+    test.assert_eq(write(var svc, whole(packet(0, 99))), 0)
+    test.case("the turn that sends the response starts the delay")
+    svc.tick(1000, var out)
+    test.assert_eq(out.len(), 1)
+    test.assert_eq(resets, 0)
+    svc.tick(1000 + RESET_DELAY_MS - 1, var out)
+    test.assert_eq(resets, 0)
+    svc.tick(1000 + RESET_DELAY_MS, var out)
+    test.assert_eq(resets, 1)
+    test.case("and it happens once")
+    svc.tick(5000, var out)
+    test.assert_eq(resets, 1)
+
+@test
+fn test_a_service_attaches_only_where_a_value_holds_a_full_piece() [mutate]
+    fresh()
+    var h = host()
+    var svc = smp_service(Echo { id: 0 }, noble.Access.Open)
+    let st = svc.attach(var h)
+    if value_fits()
+        test.assert(st.is_ok())
+    else
+        test.assert(st.is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+// Services added until the database has `left` slots free.
+fn filled(var h: noble.Host, left: Int) [mutate]
+    for i in 0..noble.CONFIG.MAX_ATTRIBUTES
+        if noble.CONFIG.MAX_ATTRIBUTES - list.len(h.link.db.attributes) > left
+            let _ = h.add_service(noble.uuid16(0x1800 + i))
+
+@test
+fn test_a_database_with_no_room_refuses_the_service_or_its_characteristic() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    test.case("no room for the service")
+    var h = host()
+    filled(var h, 0)
+    var svc = smp_service(Echo { id: 0 }, noble.Access.Open)
+    test.assert(svc.attach(var h).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.case("room for the service and not for the characteristic")
+    var h2 = host()
+    filled(var h2, 1)
+    var svc2 = smp_service(Echo { id: 0 }, noble.Access.Open)
+    test.assert(svc2.attach(var h2).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))

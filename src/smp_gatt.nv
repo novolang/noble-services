@@ -1,0 +1,255 @@
+// src/smp_gatt.nv — the SMP service: the firmware update service of MCUmgr over GATT.
+//
+// SMP, the Simple Management Protocol of MCUboot, Zephyr, the nRF Connect SDK and Apache Mynewt, has a Bluetooth Low Energy
+// transport (Zephyr's SMP transport page).  The service is
+//
+//   service  8D53DC1D-1DB7-4CD3-868B-8A527460AA84
+//   the one  DA2E7828-FBCE-4E01-AE9E-261174997C48   Write Without Response and Notify, with a Client Characteristic
+//                                                   Configuration descriptor
+//
+// A request is written to the characteristic without a response and the response comes back as notifications.  A message too
+// large for one write or one notification is split with no added framing, and GATT keeps the order, so the Data Length in the
+// header of the first piece tells the receiver where the packet ends.  A piece is at most ATT_MTU - 3 bytes, and at most what one
+// value of the Host holds, `noble.CONFIG.ATT_VALUE_BYTES`.
+//
+// The service is the Bluetooth side of an SMP server and knows nothing of what the server does.  The server is the product's
+// `SmpEngine`: it takes the bytes of a request one at a time and says when the request is whole (for `mcumgr-nv` that is
+// `smpfrag.rx_byte` on the session's request buffer), answers it, and gives the bytes of the response.  The product wraps its image
+// store, its OS group and its file store in the engine, and the buffers, `smp_buf_bytes` bytes each, are the engine's: the service
+// holds no copy of a packet.  Nothing allocates after start-up: a piece is a fixed-capacity `Vec` on the stack, and the service
+// value itself is made once, inside `system`, as the other services are.
+//
+// A write arrives through the product's policy, not through the Host's event queue: the characteristic is bound to a function
+// (`bind_function`), so `HostPolicy.on_write` hands the bytes of each write command to `SmpService.on_write` inside the Host's turn.
+// A client sends a request of 512 bytes as nine writes in a row, and a queue of four events would drop five of them.  The policy
+// of a product that plugs the service forwards `on_write` to it (orbit/noble-examples/pc/fota_product.nv).
+//
+// The link tells the service its ATT_MTU through `set_mtu` (the Host API has no event for it): a product calls it with
+// `ble.conn_info(svc.peer()).mtu` from the loop around `ble.pump`.  Until it does, a piece is 20 bytes.  The pieces of a response are
+// queued as the Outbox allows, a few to a turn of the pump, and a request that completes while the last response is still being
+// sent is dropped and counted: SMP is a request and a response at a time, and a client sends the next request after the answer.
+//
+// A request that stops short is dropped after `REASSEMBLY_TIMEOUT_MS` without a byte, and on a disconnect.  A reset request
+// resets the device `RESET_DELAY_MS` after its response is queued, the time the Controller needs to send it.
+
+use noble
+
+// The 128-bit UUIDs, as the two 64-bit halves `noble.Uuid` holds: the first four groups are the high half.
+const SERVICE_HI = (0x8D53DC1D << 32) | 0x1DB74CD3
+const SERVICE_LO = (0x868B8A52 << 32) | 0x7460AA84
+const CHAR_HI = (0xDA2E7828 << 32) | 0xFBCE4E01
+const CHAR_LO = (0xAE9E2611 << 32) | 0x74997C48
+
+// A request that has stopped arriving in the middle is dropped after this many milliseconds.
+pub const REASSEMBLY_TIMEOUT_MS = 3000
+// The time between queueing the response to a reset request and the reset.
+pub const RESET_DELAY_MS = 200
+
+// What `SmpEngine.push` answers for a packet that does not fit the engine's buffer, and for eight bytes that are not a header.
+pub const PUSH_TOO_LARGE = 0 - 1
+pub const PUSH_BAD_HEADER = 0 - 2
+
+// Whether a value of the Host holds a piece of the largest ATT_MTU the Host offers.  If it does not, a write of that size is dropped
+// by the Host without a word, and the client waits for an answer that never comes.  `attach` refuses a configuration that fails it,
+// and a product that builds for a device states it at compile time:
+//
+//   assert_const(smp_gatt.value_fits(), "...")
+//
+// The default configuration of the package noble does not meet it (a value of 64 bytes, an ATT_MTU of 247); the product's
+// config file sets `att_value_bytes = 244` in its [noble] section (orbit/noble-examples/configs/fota.toml).
+pub @tier(embedded)
+const fn value_fits() -> Bool
+    noble.CONFIG.ATT_VALUE_BYTES + 3 >= noble.CONFIG.MAX_ATT_MTU
+
+// The service's UUID.
+pub @tier(embedded)
+fn service_uuid() -> noble.Uuid
+    noble.Uuid { wide: true, lo: SERVICE_LO, hi: SERVICE_HI }
+
+// The characteristic's UUID.
+pub @tier(embedded)
+fn char_uuid() -> noble.Uuid
+    noble.Uuid { wide: true, lo: CHAR_LO, hi: CHAR_HI }
+
+// The SMP server behind the service.  It owns the buffers of one request and one response.
+pub trait SmpEngine[e]
+    // The next byte of a request.  Answers the length of the packet when this byte completes it, 0 when more bytes are wanted,
+    // PUSH_TOO_LARGE or PUSH_BAD_HEADER when the bytes held were dropped.
+    fn push(var self, b: Int) -> Int [e, mutate]
+    // Answers the request of `n` bytes that `push` completed: the length of the response, 0 for none.  The request is gone after it.
+    fn answer(var self, n: Int) -> Int [e, mutate]
+    // How many bytes of a request in progress the engine holds.
+    fn held(self) -> Int [e, mutate]
+    // Drops the request in progress.
+    fn clear(var self) [e, mutate]
+    // Byte `i` of the response `answer` made.
+    fn tx_byte(self, i: Int) -> Int [e, mutate]
+    // Whether the last request asked for a reset; reading it clears it.
+    fn reset_requested(var self) -> Bool [e, mutate]
+    // Resets the device.  Called `RESET_DELAY_MS` after the response to a reset request was queued.
+    fn reset(var self) [e, mutate]
+
+// The service: the characteristic, the ATT_MTU, the response being sent and the time of the last byte of a request in progress.
+pub struct SmpService<E: SmpEngine[e]>
+    var engine: E
+    var chr: noble.Attr
+    var access: noble.Access
+    var mtu: Int
+    var conn: noble.ConnId
+    var peer: noble.ConnId
+    var tx_len: Int
+    var tx_sent: Int
+    var seen_len: Int
+    var seen_ms: Int
+    var reset_state: Int
+    var reset_ms: Int
+    var requests: Int
+    var dropped: Int
+
+// An SMP service over `engine`; a client needs `access` to write the characteristic and to subscribe.
+@tier(embedded)
+pub fn smp_service<E: SmpEngine[e]>(engine: E, access: noble.Access) -> SmpService<E>
+    system
+        SmpService { engine: engine, chr: noble.Attr { handle: 0, props: 0, cccd: 0 }, access: access, mtu: 23,
+                     conn: noble.no_conn(), peer: noble.no_conn(), tx_len: 0, tx_sent: 0, seen_len: 0, seen_ms: 0, reset_state: 0, reset_ms: 0,
+                     requests: 0, dropped: 0 }
+
+impl SmpService
+    // The ATT_MTU of the link, from `ble.conn_info(conn).mtu`.
+    @tier(embedded)
+    fn set_mtu(var self, mtu: Int)
+        self.mtu = mtu
+
+    // The connection the service is on, `noble.no_conn()` while there is none: a product asks the Host for the link's ATT_MTU with it.
+    @tier(embedded)
+    fn peer(self) -> noble.ConnId
+        self.peer
+
+    // How many requests were answered.
+    @tier(embedded)
+    fn requests(self) -> Int
+        self.requests
+
+    // How many requests were dropped: packets that did not fit or were no packets, requests that stopped short, and requests that
+    // came while the last response was still going out.
+    @tier(embedded)
+    fn dropped(self) -> Int
+        self.dropped
+
+    // Drops the request in progress, the response being sent and what is owed to the link that went.
+    @tier(embedded)
+    fn forget(var self) [e, mutate]
+        self.engine.clear()
+        self.seen_len = 0
+        self.tx_len = 0
+        self.tx_sent = 0
+
+    // Queues the pieces of the response that the Outbox has room for, the first of what is left.
+    @tier(embedded)
+    fn drain(var self, var out: noble.Outbox) [e, mutate]
+        let cap = noble.CONFIG.ATT_VALUE_BYTES
+        var room = self.mtu - 3
+        if room > cap
+            room = cap
+        if room < 1
+            room = 1
+        for _p in 0..out.capacity()
+            if self.tx_sent >= self.tx_len or out.len() >= out.capacity()
+                break
+            var n = self.tx_len - self.tx_sent
+            if n > room
+                n = room
+            var v: noble.Value = Vec.new()
+            for i in 0..n
+                let _ = v.push(self.engine.tx_byte(self.tx_sent + i) as u8)
+            let _ = out.push(noble.Out.Notify(self.conn, self.chr, v))
+            self.tx_sent = self.tx_sent + n
+
+    // The bytes of one write to the characteristic: each goes to the engine, and a request that is whole is answered.  The response is
+    // sent by the pieces `tick` queues.
+    @tier(embedded)
+    fn take(var self, conn: noble.ConnId, value: noble.Value) [e, mutate]
+        for i in 0..value.len()
+            let n = self.engine.push(value[i] as Int)
+            if n < 0
+                self.dropped = self.dropped + 1
+            else if n > 0
+                if self.tx_sent < self.tx_len
+                    self.dropped = self.dropped + 1
+                    self.engine.clear()
+                else
+                    let m = self.engine.answer(n)
+                    if m > 0
+                        self.requests = self.requests + 1
+                        self.tx_len = m
+                        self.tx_sent = 0
+                        self.conn = conn
+                    if self.engine.reset_requested()
+                        self.reset_state = 1
+
+impl noble.Service[e] for SmpService
+    // The service and its one characteristic, bound to a function: a write arrives at `on_write`.
+    @tier(embedded)
+    fn attach(var self, var h: noble.Host) -> noble.Status [e, mutate]
+        if not value_fits()
+            return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+        let s = h.add_service(service_uuid())
+        if not s.status.is_ok()
+            return s.status
+        let c = h.add_char(char_uuid(), noble.PROP_WRITE_NO_RESPONSE | noble.PROP_NOTIFY,
+            noble.Permissions { read: noble.Access.Denied, write: self.access }, self.access, noble.CONFIG.ATT_VALUE_BYTES)
+        if not c.status.is_ok()
+            return c.status
+        self.chr = c.attr
+        // workaround(notify-shortened-the-longest-write-of-its-characteristic): a value that is empty takes the length of its first notification
+        // as the longest write (host_api.notify), and the first answer of the server, 32 bytes, would then be the longest request.  A value of
+        // one octet is not empty, and `Host.set_value` keeps the longest write `add_char` gave.  The fix in host_api costs the images that
+        // notify 128 to 256 bytes of flash, which the size gate of tests/orbit/test_noble_examples.sh does not allow them.
+        var seed: noble.Value = Vec.new()
+        let _ = seed.push(0)
+        let seeded = h.set_value(c.attr, seed)
+        if not seeded.is_ok()
+            return seeded
+        h.bind_function(c.attr)
+
+    // A write command of the client: the bytes of a request, or a piece of one.  NOT_HANDLED for another attribute.
+    @tier(embedded)
+    fn on_write(var self, conn: noble.ConnId, attr: u16, var value: noble.Value) -> Int [e, mutate]
+        if attr != self.chr.handle
+            return noble.NOT_HANDLED
+        self.take(conn, value)
+        0
+
+    @tier(embedded)
+    fn on_event(var self, ev: noble.Event, var out: noble.Outbox) -> Bool [e, mutate]
+        match ev
+            Connected(conn, role, addr, params) =>
+                self.mtu = 23
+                self.peer = conn
+                self.forget()
+                false
+            Disconnected(conn, reason) =>
+                self.peer = noble.no_conn()
+                self.forget()
+                false
+            _ => false
+
+    @tier(embedded)
+    fn tick(var self, now_ms: Int, var out: noble.Outbox) [e, mutate]
+        let held = self.engine.held()
+        if held == 0
+            self.seen_len = 0
+        else if held != self.seen_len
+            self.seen_len = held
+            self.seen_ms = now_ms
+        else if now_ms - self.seen_ms > REASSEMBLY_TIMEOUT_MS
+            self.engine.clear()
+            self.seen_len = 0
+            self.dropped = self.dropped + 1
+        self.drain(var out)
+        if self.reset_state == 1 and self.tx_sent >= self.tx_len
+            self.reset_state = 2
+            self.reset_ms = now_ms + RESET_DELAY_MS
+        else if self.reset_state == 2 and now_ms >= self.reset_ms
+            self.reset_state = 0
+            self.engine.reset()

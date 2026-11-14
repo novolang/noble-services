@@ -1,0 +1,46 @@
+// tests/smp_gatt_client_tests.nv — the unit tests of src/smp_gatt_client.nv.
+//
+//   novo test tests/smp_gatt_client_tests.nv --config configs/smp.toml
+//
+// The calls that drive a Controller (`open`, `send`, `receive`) run on the bench; what is tested here is what they decide with: the
+// size of a piece and where a packet ends.
+
+use std.test
+use smp_gatt_client.{ first_packet, is_whole, packet_bytes, piece_bytes }
+
+fn packet(body: Int) -> [u8]
+    var p: [u8] = [3, 0, (body >>> 8) as u8, (body & 255) as u8, 0, 1, 7, 0]
+    for i in 0..body
+        list.push(p, (i & 0x7F) as u8)
+    p
+
+@test
+fn test_a_piece_is_the_mtu_less_three_and_no_more_than_a_value_holds()
+    test.assert_eq(piece_bytes(23), 20)
+    test.assert_eq(piece_bytes(247), if noble.CONFIG.ATT_VALUE_BYTES < 244 then noble.CONFIG.ATT_VALUE_BYTES else 244)
+    test.assert_eq(piece_bytes(1000), noble.CONFIG.ATT_VALUE_BYTES)
+    test.assert_eq(piece_bytes(0), 1)
+    test.assert_eq(piece_bytes(3), 1)
+
+@test
+fn test_the_length_of_a_packet_is_the_header_and_its_data_length()
+    test.assert_eq(packet_bytes([]), 0)
+    test.assert_eq(packet_bytes([3, 0, 0, 5, 0, 1, 7]), 0)
+    test.assert_eq(packet_bytes(packet(0)), 8)
+    test.assert_eq(packet_bytes(packet(5)), 13)
+    test.assert_eq(packet_bytes(packet(300)), 308)
+
+@test
+fn test_a_packet_is_whole_when_all_its_bytes_are_there()
+    let p = packet(40)
+    test.assert(not is_whole([]))
+    test.assert(not is_whole(p[0:7]))
+    test.assert(not is_whole(p[0:47]))
+    test.assert(is_whole(p))
+    test.case("bytes after it belong to the next packet and are cut off")
+    var two = packet(2)
+    for b in packet(3)
+        list.push(two, b)
+    test.assert(is_whole(two))
+    test.assert_eq(list.len(first_packet(two)), 10)
+    test.assert_eq(first_packet(two)[9] as Int, 1)

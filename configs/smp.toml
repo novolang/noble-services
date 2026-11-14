@@ -1,0 +1,7 @@
+# The profile of the tests of the SMP service (src/smp_gatt.nv): a value of the Host that holds a piece of the largest ATT_MTU the Host
+# offers (247 less the 3 bytes of the ATT header), which `attach` of the service needs.  `novo test tests/smp_gatt_tests.nv --config
+# configs/smp.toml`.
+
+[noble]
+att_value_bytes = 244
+event_queue = 4
