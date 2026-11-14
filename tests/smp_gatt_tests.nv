@@ -11,6 +11,7 @@
 use std.test
 use host.{ host_blank, host_config }
 use gatt_server
+use host_api
 use wire
 use noble
 use smp_gatt.{ PUSH_BAD_HEADER, PUSH_TOO_LARGE, REASSEMBLY_TIMEOUT_MS, RESET_DELAY_MS, SmpEngine, SmpService, smp_service, value_fits }
@@ -174,9 +175,9 @@ fn test_a_notification_does_not_shorten_the_longest_request() [mutate]
     fresh()
     var h = host()
     let svc = attached(var h)
-    // `host_api.notify` stores the value it sends with `gatt_server.set_value`; the first answer of a server is short.
+    // `host_api.notify` stores the value it sends with `store_sent_value`; the first answer of a server is short.
     let sent = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    test.assert(gatt_server.set_value(var h.link.db, svc.chr.handle as Int, wire.octets(sent)))
+    test.assert(host_api.store_sent_value(var h, svc.chr.handle as Int, wire.octets(sent)))
     var pdu: [u8] = [0x52, (svc.chr.handle & 255) as u8, (svc.chr.handle >> 8) as u8]
     for k in 0..noble.CONFIG.ATT_VALUE_BYTES
         list.push(pdu, 7)

@@ -201,15 +201,6 @@ impl noble.Service[e] for SmpService
         if not c.status.is_ok()
             return c.status
         self.chr = c.attr
-        // workaround(notify-shortened-the-longest-write-of-its-characteristic): a value that is empty takes the length of its first notification
-        // as the longest write (host_api.notify), and the first answer of the server, 32 bytes, would then be the longest request.  A value of
-        // one octet is not empty, and `Host.set_value` keeps the longest write `add_char` gave.  The fix in host_api costs the images that
-        // notify 128 to 256 bytes of flash, which the size gate of tests/orbit/test_noble_examples.sh does not allow them.
-        var seed: noble.Value = Vec.new()
-        let _ = seed.push(0)
-        let seeded = h.set_value(c.attr, seed)
-        if not seeded.is_ok()
-            return seeded
         h.bind_function(c.attr)
 
     // A write command of the client: the bytes of a request, or a piece of one.  NOT_HANDLED for another attribute.
