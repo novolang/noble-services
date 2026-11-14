@@ -41,8 +41,9 @@ No module of `noble` imports a module of this package, and the services import n
 9. **Firmware update.**  `smp_gatt` is the SMP service of MCUmgr (8D53DC1D-1DB7-4CD3-868B-8A527460AA84), the transport of nRF Connect Device
    Manager, `mcumgr` and `smpmgr`.  A request is written to its one characteristic without response, in pieces of ATT_MTU - 3 bytes that the
    Data Length in the header of the first puts together, and the response comes back in notifications of the same size.  The service
-   reassembles nothing itself: it hands each byte to the product's `SmpEngine` (the server, which owns the request and response buffers of
-   `smp_buf_bytes`), asks it to answer a request that is whole, and sends the bytes of the response.  The characteristic is bound to a
+   reassembles nothing itself: it hands each byte to the product's `SmpEngine` (the server, which owns the request buffer and the queue of the responses that wait,
+   `smp_buf_bytes` each), asks it to answer a request that is whole, and sends the bytes of the responses, oldest first, so that a client
+   that keeps several requests in flight gets each answered in order.  The characteristic is bound to a
    function, so the product's policy gives `on_write` to the service; `set_mtu` and `peer` let the product tell the service the link's
    ATT_MTU.  A reset request resets the device 200 ms after its response is queued, and a request that stops arriving is dropped after 3 s.
    `value_fits` is the condition on the `[noble]` section that `attach` checks: a value of the Host holds a piece of the largest ATT_MTU

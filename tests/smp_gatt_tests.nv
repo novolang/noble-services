@@ -16,9 +16,11 @@ use wire
 use noble
 use smp_gatt.{ PUSH_BAD_HEADER, PUSH_TOO_LARGE, REASSEMBLY_TIMEOUT_MS, RESET_DELAY_MS, SmpEngine, SmpService, smp_service, value_fits }
 
-// The engine of the tests: the request in `rx`, the response in `tx`.  A command byte 98 asks for no response, 99 for a reset.
+// The engine of the tests: the request in `rx`, the response made in `tx` and then queued in `outq`, each led by its length in two
+// bytes.  A command byte 98 asks for no response, 99 for a reset.
 var rx: Vec[u8; 512] = Vec.new()
 var tx: Vec[u8; 512] = Vec.new()
+var outq: Vec[u8; 2048] = Vec.new()
 var reset_asked = false
 var resets = 0
 var answered = 0
@@ -57,6 +59,10 @@ impl SmpEngine[mutate] for Echo
             return 0
         if command == 99
             reset_asked = true
+        let _ = outq.push(((n >> 8) & 0xFF) as u8)
+        let _ = outq.push((n & 0xFF) as u8)
+        for i in 0..n
+            let _ = outq.push(tx[i])
         n
 
     @tier(embedded)
@@ -68,8 +74,27 @@ impl SmpEngine[mutate] for Echo
         rx.clear()
 
     @tier(embedded)
+    fn out_len(self) -> Int [mutate]
+        if outq.len() < 2
+            return 0
+        (outq[0] as Int) * 256 + (outq[1] as Int)
+
+    @tier(embedded)
     fn tx_byte(self, i: Int) -> Int [mutate]
-        tx[i] as Int
+        outq[2 + i] as Int
+
+    @tier(embedded)
+    fn out_pop(var self) [mutate]
+        let n = self.out_len() + 2
+        let left = outq.len() - n
+        for i in 0..left
+            outq[i] = outq[i + n]
+        for _k in 0..n
+            let _ = outq.pop()
+
+    @tier(embedded)
+    fn out_clear(var self) [mutate]
+        outq.clear()
 
     @tier(embedded)
     fn reset_requested(var self) -> Bool [mutate]
@@ -86,6 +111,7 @@ alias Pkt = Vec[u8; 512]
 fn fresh() [mutate]
     rx.clear()
     tx.clear()
+    outq.clear()
     reset_asked = false
     resets = 0
     answered = 0
@@ -315,7 +341,7 @@ fn test_the_mtu_bounds_a_piece_and_a_value_bounds_it_too() [mutate]
     test.assert_eq(first_piece(10000, 300), noble.CONFIG.ATT_VALUE_BYTES)
 
 @test
-fn test_a_request_that_comes_before_the_last_response_has_gone_is_dropped() [mutate]
+fn test_a_request_that_comes_before_the_last_response_has_gone_is_answered_after_it() [mutate]
     if not value_fits()
         return
     fresh()
@@ -329,11 +355,49 @@ fn test_a_request_that_comes_before_the_last_response_has_gone_is_dropped() [mut
             hi = 308
         let _ = write(var svc, piece(big, lo, hi))
     test.assert_eq(answered, 1)
-    // The response has not gone out: no tick has run.
+    // The response has not gone out: no tick has run.  Two requests follow it.
     test.assert_eq(write(var svc, whole(packet(2, 1))), 0)
-    test.assert_eq(answered, 1)
-    test.assert_eq(svc.dropped(), 1)
+    test.assert_eq(write(var svc, whole(packet(4, 1))), 0)
+    test.assert_eq(answered, 3)
+    test.assert_eq(svc.requests(), 3)
+    test.assert_eq(svc.dropped(), 0)
     test.assert_eq(rx.len(), 0)
+    test.case("the responses go out in the order of the requests, each whole")
+    var all: Pkt = Vec.new()
+    for turn in 0..24
+        var out: noble.Outbox = Vec.new()
+        svc.tick(10 + turn, var out)
+        let more = gathered(out, svc)
+        for i in 0..more.len()
+            let _ = all.push(more[i])
+    test.assert_eq(all.len(), 308 + 10 + 12)
+    test.assert_eq(all[3] as Int, 300 & 255)
+    test.assert_eq(all[308 + 3] as Int, 2)
+    test.assert_eq(all[308 + 10 + 3] as Int, 4)
+    test.assert_eq(outq.len(), 0)
+
+@test
+fn test_a_full_outbox_takes_no_piece_and_keeps_the_response_for_the_next_turn() [mutate]
+    if not value_fits()
+        return
+    fresh()
+    var h = host()
+    var svc = attached(var h)
+    test.assert_eq(write(var svc, whole(packet(10, 1))), 0)
+    var out: noble.Outbox = Vec.new()
+    for _k in 0..out.capacity()
+        var v: noble.Value = Vec.new()
+        let _ = v.push(0)
+        let _ = out.push(noble.Out.Notify(noble.no_conn(), svc.chr, v))
+    svc.tick(10, var out)
+    test.assert_eq(out.len(), out.capacity())
+    test.case("the next turn, with room, sends the response whole")
+    var next: noble.Outbox = Vec.new()
+    svc.tick(20, var next)
+    test.assert_eq(next.len(), 1)
+    let got = gathered(next, svc)
+    test.assert_eq(got.len(), 18)
+    test.assert_eq(outq.len(), 0)
 
 @test
 fn test_packets_the_engine_refuses_are_counted() [mutate]
