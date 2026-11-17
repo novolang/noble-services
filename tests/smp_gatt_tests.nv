@@ -5,8 +5,10 @@
 // The service runs over an engine of the test's own, a server that answers a request with the request's bytes and a write response
 // operation, so the pieces the service cuts a response into can be put together and compared.  A write reaches the service the way the
 // Host hands it one, through `on_write`, and the pieces of the response go out in `tick`.  The profile configs/smp.toml gives a value
-// of the Host 244 bytes, the size of a piece of the largest ATT_MTU; under the default configuration (a value of 64 bytes) `attach`
-// refuses, which one test checks.
+// of the Host 244 bytes, the size of a piece of the largest ATT_MTU; under the default configuration (a value of 64 bytes and an
+// ATT_MTU of 247) `attach` refuses, which one test checks, and the others return.  Where `attach` accepts the configuration, the tests
+// hold for every size of a value: a write and a piece of a response carry `noble.CONFIG.ATT_VALUE_BYTES` bytes at most, so a request
+// of 308 bytes is two writes under configs/smp.toml and five under configs/peripheral.toml (a value of 64 bytes, an ATT_MTU of 23).
 
 use std.test
 use host.{ host_blank, host_config }
@@ -131,6 +133,22 @@ fn packet(len: Int, command: Int) -> Pkt
         let _ = p.push((i & 0x7F) as u8)
     p
 
+// The bytes of the largest write the Host hands the service, and of the largest piece of a response.
+fn cap() -> Int
+    noble.CONFIG.ATT_VALUE_BYTES
+
+// The bytes of a piece of a response on a link whose ATT_MTU the service was told is `mtu`, for a response of `total` bytes: the MTU
+// less the 3 bytes of the ATT header, at most a value of the Host and at most the response, and never less than one.
+fn piece_bytes(mtu: Int, total: Int) -> Int
+    var n = mtu - 3
+    if n > cap()
+        n = cap()
+    if n > total
+        n = total
+    if n < 1
+        n = 1
+    n
+
 // The bytes `lo` to `hi` of a packet, as a write of the client carries them.
 fn piece(p: Pkt, lo: Int, hi: Int) -> noble.Value
     var v: noble.Value = Vec.new()
@@ -146,6 +164,24 @@ fn whole(p: Pkt) -> noble.Value
 fn write(var svc: SmpService<Echo>, v: noble.Value) -> Int [mutate]
     var w = v
     svc.on_write(noble.no_conn(), svc.chr.handle, var w)
+
+// The bytes of a request from byte `from` on, as the writes of a client, each of at most a value of the Host; every write but the last
+// leaves the request incomplete.  Answers the number of writes.
+fn write_rest(var svc: SmpService<Echo>, req: Pkt, from: Int) -> Int [mutate]
+    var at = from
+    var writes = 0
+    for _w in 0..req.len()
+        if at < req.len()
+            var hi = at + cap()
+            if hi > req.len()
+                hi = req.len()
+            test.assert_eq(write(var svc, piece(req, at, hi)), 0)
+            at = hi
+            writes = writes + 1
+            if at < req.len()
+                test.assert_eq(answered, 0)
+    test.assert_eq(at, req.len())
+    writes
 
 // The notifications in `out`, put together in order.
 fn gathered(out: noble.Outbox, svc: SmpService<Echo>) -> Pkt
@@ -258,19 +294,31 @@ fn test_a_request_in_pieces_is_put_together_by_the_header() [mutate]
     svc.set_mtu(247)
     var out: noble.Outbox = Vec.new()
     let req = packet(300, 1)
-    // 308 bytes in writes of 244 and 64: the first does not complete it.
-    test.assert_eq(write(var svc, piece(req, 0, 244)), 0)
+    // 308 bytes in writes of a value of the Host, the first of at most 300: no write but the last completes it.
+    var first = cap()
+    if first > 300
+        first = 300
+    let first_write = piece(req, 0, first)
+    test.assert_eq(write(var svc, first_write), 0)
     test.assert_eq(answered, 0)
     svc.tick(1, var out)
     test.assert_eq(out.len(), 0)
-    test.assert_eq(write(var svc, piece(req, 244, 308)), 0)
+    test.assert(write_rest(var svc, req, first) >= 1)
     test.assert_eq(answered, 1)
-    test.case("the response of 308 bytes goes out in pieces of 244 and 64")
-    svc.tick(2, var out)
-    test.assert_eq(out.len(), 2)
-    let got = gathered(out, svc)
-    test.assert_eq(got.len(), 308)
-    test.assert_eq(got[307] as Int, (299 & 0x7F))
+    test.case("the response of 308 bytes goes out in pieces of 244, or of a value of the Host when that is less")
+    let room = piece_bytes(247, 308)
+    var all: Pkt = Vec.new()
+    var pieces = 0
+    for turn in 0..16
+        var o: noble.Outbox = Vec.new()
+        svc.tick(2 + turn, var o)
+        pieces = pieces + o.len()
+        let more = gathered(o, svc)
+        for i in 0..more.len()
+            let _ = all.push(more[i])
+    test.assert_eq(pieces, (308 + room - 1) / room)
+    test.assert_eq(all.len(), 308)
+    test.assert_eq(all[307] as Int, (299 & 0x7F))
 
 @test
 fn test_a_response_is_cut_by_the_mtu_and_the_outbox_takes_a_few_pieces_a_turn() [mutate]
@@ -305,8 +353,8 @@ fn test_a_response_is_cut_by_the_mtu_and_the_outbox_takes_a_few_pieces_a_turn() 
     svc.tick(1000, var out)
     test.assert_eq(out.len(), 0)
 
-// The bytes of the first notification the service queues for a request of `body` bytes written in pieces of at most 244, on a link
-// whose ATT_MTU the service was told is `mtu`.
+// The bytes of the first notification the service queues for a request of `body` bytes written in pieces of a value of the Host, on a
+// link whose ATT_MTU the service was told is `mtu`.
 fn first_piece(mtu: Int, body: Int) -> Int [mutate]
     fresh()
     var h = host()
@@ -314,14 +362,7 @@ fn first_piece(mtu: Int, body: Int) -> Int [mutate]
     svc.set_mtu(mtu)
     var out: noble.Outbox = Vec.new()
     let req = packet(body, 1)
-    var at = 0
-    for _w in 0..4
-        if at < req.len()
-            var hi = at + 244
-            if hi > req.len()
-                hi = req.len()
-            let _ = write(var svc, piece(req, at, hi))
-            at = hi
+    let _ = write_rest(var svc, req, 0)
     svc.tick(1, var out)
     match out[0]
         Notify(conn, attr, v) => return v.len()
@@ -332,13 +373,17 @@ fn first_piece(mtu: Int, body: Int) -> Int [mutate]
 fn test_the_mtu_bounds_a_piece_and_a_value_bounds_it_too() [mutate]
     if not value_fits()
         return
-    test.case("an MTU of 100 gives pieces of 97")
-    test.assert_eq(first_piece(100, 190), 97)
+    test.case("an MTU of 100 gives pieces of 97, or of a value of the Host when that is less")
+    test.assert_eq(first_piece(100, 190), piece_bytes(100, 198))
+    if cap() >= 97
+        test.assert_eq(first_piece(100, 190), 97)
     test.case("an MTU the link has not told, or a nonsense one, still moves a byte at a time")
     test.assert_eq(first_piece(0, 10), 1)
     test.assert_eq(first_piece(3, 10), 1)
     test.case("an MTU larger than a value of the Host holds gives pieces of the value")
-    test.assert_eq(first_piece(10000, 300), noble.CONFIG.ATT_VALUE_BYTES)
+    test.assert_eq(first_piece(10000, 300), piece_bytes(10000, 308))
+    if cap() <= 308
+        test.assert_eq(first_piece(10000, 300), cap())
 
 @test
 fn test_a_request_that_comes_before_the_last_response_has_gone_is_answered_after_it() [mutate]
@@ -474,8 +519,8 @@ fn test_a_disconnect_and_a_new_connection_drop_what_was_in_flight() [mutate]
     test.assert_eq(rx.len(), 0)
     // A response not yet sent goes with the link, and a new link starts at the default MTU.
     let big = packet(300, 1)
-    test.assert_eq(write(var svc, piece(big, 0, 244)), 0)
-    test.assert_eq(write(var svc, piece(big, 244, 308)), 0)
+    test.assert(write_rest(var svc, big, 0) >= 1)
+    test.assert_eq(answered, 1)
     let addr = noble.blank_report().addr
     let link = noble.ConnId { slot: 0, generation: 3 }
     test.assert_eq(svc.peer().slot as Int, 255)
