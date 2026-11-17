@@ -4,7 +4,7 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.1.2 — 2026-11-17
 
 2026-11-14: `smp_gatt` answers a request that completes while the last response is still being sent, in place of dropping it without a word.  A client that keeps several requests in flight (the window of the upload in nRF Connect Device Manager's Image Upload card) got no answer to the ones that came early and reported "Connection timed out".  `SmpEngine` gains `out_len`, `out_pop` and `out_clear`: the engine keeps the responses that wait in a queue, `answer` puts the response at its end, `tx_byte` reads the oldest, and the service sends them in the order of the requests and removes each once its last piece is queued.  What an engine does when its queue has no room is its own (`mcumgr-nv` 0.1.2 refuses a request that is not an upload with EBUSY and answers an upload request with the offset to send again).  `tests/smp_gatt_tests.nv` has the case, 16 tests.
 
